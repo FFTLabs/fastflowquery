@@ -1,12 +1,13 @@
 use ffq_common::Result;
 
 use crate::logical_plan::{AggExpr, Expr, JoinStrategyHint, JoinType};
+use serde::{Deserialize, Serialize};
 
 /// The physical operator graph.
 ///
 /// In v1 this is still a logical-ish physical plan (i.e., it can still carry Expr).
 /// Later we'll split "physical expr" vs "logical expr" more strictly.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PhysicalPlan {
     ParquetScan(ParquetScanExec),
     Filter(FilterExec),
@@ -43,7 +44,7 @@ impl PhysicalPlan {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParquetScanExec {
     /// Table name from the catalog (v1).
     pub table: String,
@@ -53,46 +54,46 @@ pub struct ParquetScanExec {
     pub filters: Vec<Expr>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterExec {
     pub predicate: Expr,
     pub input: Box<PhysicalPlan>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectExec {
     /// (expr, output_name)
     pub exprs: Vec<(Expr, String)>,
     pub input: Box<PhysicalPlan>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoalesceBatchesExec {
     pub target_batch_rows: usize,
     pub input: Box<PhysicalPlan>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartialHashAggregateExec {
     pub group_exprs: Vec<Expr>,
     pub aggr_exprs: Vec<(AggExpr, String)>,
     pub input: Box<PhysicalPlan>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalHashAggregateExec {
     pub group_exprs: Vec<Expr>,
     pub aggr_exprs: Vec<(AggExpr, String)>,
     pub input: Box<PhysicalPlan>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum BuildSide {
     Left,
     Right,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HashJoinExec {
     pub left: Box<PhysicalPlan>,
     pub right: Box<PhysicalPlan>,
@@ -104,39 +105,39 @@ pub struct HashJoinExec {
     pub build_side: BuildSide,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExchangeExec {
     ShuffleWrite(ShuffleWriteExchange),
     ShuffleRead(ShuffleReadExchange),
     Broadcast(BroadcastExchange),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShuffleWriteExchange {
     pub input: Box<PhysicalPlan>,
     pub partitioning: PartitioningSpec,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShuffleReadExchange {
     pub input: Box<PhysicalPlan>,
     pub partitioning: PartitioningSpec,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BroadcastExchange {
     pub input: Box<PhysicalPlan>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PartitioningSpec {
     /// Hash partition by expressions into N partitions.
-    Hash { exprs: Vec<Expr>, partitions: usize },
+    HashKeys { keys: Vec<String>, partitions: usize },
     /// Single partition.
     Single,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimitExec {
     pub n: usize,
     pub input: Box<PhysicalPlan>,

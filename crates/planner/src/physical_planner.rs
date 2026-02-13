@@ -66,8 +66,13 @@ pub fn create_physical_plan(logical: &LogicalPlan, cfg: &PhysicalPlannerConfig) 
                 input: Box::new(child),
             });
 
-            let partitioning = PartitioningSpec::Hash {
-                exprs: group_exprs.clone(),
+            let keys = group_exprs
+                .iter()
+                .map(expr_to_key_name)
+                .collect::<Result<Vec<_>>>()?;
+
+            let partitioning = PartitioningSpec::HashKeys {
+                keys,
                 partitions: cfg.shuffle_partitions,
             };
 
@@ -128,11 +133,17 @@ pub fn create_physical_plan(logical: &LogicalPlan, cfg: &PhysicalPlannerConfig) 
                 JoinStrategyHint::Shuffle | JoinStrategyHint::Auto => {
                     // v1: Auto treated as Shuffle at physical level unless optimizer already decided broadcast.
                     // Shuffle both sides by join keys.
-                    let left_hash_exprs: Vec<Expr> = on.iter().map(|(lk, _rk)| Expr::Column(lk.clone())).collect();
-                    let right_hash_exprs: Vec<Expr> = on.iter().map(|(_lk, rk)| Expr::Column(rk.clone())).collect();
+                    let left_keys: Vec<String> = on.iter().map(|(lk, _)| lk.clone()).collect();
+                    let right_keys: Vec<String> = on.iter().map(|(_, rk)| rk.clone()).collect();
 
-                    let part_l = PartitioningSpec::Hash { exprs: left_hash_exprs, partitions: cfg.shuffle_partitions };
-                    let part_r = PartitioningSpec::Hash { exprs: right_hash_exprs, partitions: cfg.shuffle_partitions };
+                    let part_l = PartitioningSpec::HashKeys {
+                        keys: left_keys,
+                        partitions: cfg.shuffle_partitions,
+                    };
+                    let part_r = PartitioningSpec::HashKeys {
+                        keys: right_keys,
+                        partitions: cfg.shuffle_partitions,
+                    };
 
                     let lw = PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(ShuffleWriteExchange {
                         input: Box::new(l),
@@ -163,5 +174,15 @@ pub fn create_physical_plan(logical: &LogicalPlan, cfg: &PhysicalPlannerConfig) 
                 }
             }
         }
+    }
+}
+
+fn expr_to_key_name(e: &Expr) -> Result<String> {
+    match e {
+        Expr::Column(name) => Ok(name.clone()),
+        Expr::ColumnRef { name, .. } => Ok(name.clone()),
+        _ => Err(FfqError::Unsupported(
+            "v1 physical planner only supports grouping by plain columns".to_string(),
+        )),
     }
 }

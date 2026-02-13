@@ -17,3 +17,6 @@ plan:
 
 tree:
 	cargo tree -p ffq-client
+
+test-planner:
+	cargo test -p ffq-planner
