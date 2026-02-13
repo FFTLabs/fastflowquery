@@ -26,5 +26,6 @@ ffq-shuffle = { path = "../shuffle" }
 ffq-distributed = { path = "../distributed", optional = true }
 
 arrow.workspace = true
+arrow-schema.workspace = true
 futures.workspace = true
 tracing.workspace = true

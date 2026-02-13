@@ -1,15 +1,33 @@
 use ffq_common::{FfqError, Result};
 use serde::{Deserialize, Serialize};
+use arrow_schema::{Schema, SchemaRef};
 use std::collections::HashMap;
 use std::fs;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
     pub name: String,
     pub uri: String,
     pub format: String,
+
+     #[serde(default)]
+    pub schema: Option<Schema>,
+
     #[serde(default)]
     pub options: HashMap<String, String>,
+}
+
+impl TableDef {
+    pub fn schema_ref(&self) -> Result<SchemaRef> {
+        match &self.schema {
+            Some(s) => Ok(Arc::new(s.clone())),
+            None => Err(FfqError::InvalidConfig(format!(
+                "table '{}' has no schema; v1 analyzer needs a schema to resolve columns",
+                self.name
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Default)]

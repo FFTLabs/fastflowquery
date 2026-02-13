@@ -631,6 +631,7 @@ name = "ffq-client"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "ffq-common",
  "ffq-distributed",
  "ffq-execution",
@@ -708,6 +709,7 @@ name = "ffq-storage"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "ffq-common",
  "futures",
  "object_store",

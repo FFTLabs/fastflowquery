@@ -6,6 +6,7 @@ use futures::TryStreamExt;
 use crate::runtime::QueryContext;
 use crate::session::SharedSession;
 
+
 #[derive(Debug, Clone)]
 pub struct DataFrame {
     session: SharedSession,
@@ -71,8 +72,26 @@ impl DataFrame {
     /// df.collect() (async)
     pub async fn collect(&self) -> Result<Vec<RecordBatch>> {
         // Ensure both SQL-built and DataFrame-built plans go through the same analyze/optimize pipeline.
-        let optimized = self.session.planner.optimize_logical(self.logical_plan.clone())?;
-        let physical = self.session.planner.create_physical_plan(&optimized)?;
+        // Build a schema provider from the catalog
+        struct CatalogProvider<'a> {
+            catalog: &'a ffq_storage::Catalog,
+        }
+        impl<'a> ffq_planner::SchemaProvider for CatalogProvider<'a> {
+            fn table_schema(&self, table: &str) -> ffq_common::Result<arrow_schema::SchemaRef> {
+                let t = self.catalog.get(table)?;
+                t.schema_ref()
+            }
+        }
+
+        let cat_guard = self.session.catalog.read().expect("catalog lock poisoned");
+        let provider = CatalogProvider { catalog: &*cat_guard };
+
+        let analyzed_optimized =
+            self.session
+                .planner
+                .analyze_optimize(self.logical_plan.clone(), &provider)?;
+
+        let physical = self.session.planner.create_physical_plan(&analyzed_optimized)?;
 
         let ctx = QueryContext {
             batch_size_rows: self.session.config.batch_size_rows,

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use ffq_common::Result;
-use ffq_planner::{Analyzer, LiteralValue, LogicalPlan, Optimizer, PhysicalPlan};
+use ffq_planner::{Analyzer, LiteralValue, LogicalPlan, Optimizer, PhysicalPlan, SchemaProvider};
 
 #[derive(Debug, Default)]
 pub struct PlannerFacade {
@@ -17,11 +17,6 @@ impl PlannerFacade {
         }
     }
 
-    pub fn optimize_logical(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
-        let analyzed = self.analyzer.analyze(plan)?;
-        self.optimizer.optimize(analyzed)
-    }
-
     pub fn plan_sql(&self, sql: &str) -> Result<LogicalPlan> {
         self.plan_sql_with_params(sql, &HashMap::new())
     }
@@ -31,11 +26,18 @@ impl PlannerFacade {
         sql: &str,
         params: &HashMap<String, LiteralValue>,
     ) -> Result<LogicalPlan> {
-        let logical = ffq_planner::sql_to_logical(sql, params)?;
-        self.optimize_logical(logical)
+        ffq_planner::sql_to_logical(sql, params)
     }
 
-    /// v1 placeholder: physical planning isn't implemented yet.
+    pub fn analyze_optimize(
+        &self,
+        plan: LogicalPlan,
+        provider: &dyn SchemaProvider,
+    ) -> Result<LogicalPlan> {
+        let analyzed = self.analyzer.analyze(plan, provider)?;
+        self.optimizer.optimize(analyzed)
+    }
+
     pub fn create_physical_plan(&self, _logical: &LogicalPlan) -> Result<PhysicalPlan> {
         Ok(PhysicalPlan::Placeholder("empty".to_string()))
     }

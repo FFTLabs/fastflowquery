@@ -1,7 +1,7 @@
 use arrow_schema::{DataType};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinType {
     Inner,
 }
@@ -9,6 +9,7 @@ pub enum JoinType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expr {
     Column(String),
+    ColumnRef { name: String, index: usize },
     Literal(LiteralValue),
     BinaryOp {
         left: Box<Expr>,
@@ -40,7 +41,7 @@ pub enum LiteralValue {
     Null,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinaryOp {
     Eq,
     NotEq,

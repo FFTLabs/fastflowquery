@@ -12,6 +12,7 @@ qdrant = ["dep:qdrant-client"]
 [dependencies]
 ffq-common = { path = "../common" }
 arrow.workspace = true
+arrow-schema.workspace = true
 parquet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
