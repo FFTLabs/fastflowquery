@@ -143,6 +143,7 @@ fn from_to_plan(from: &[TableWithJoins], params: &HashMap<String, LiteralValue>)
                     left: Box::new(left),
                     right: Box::new(right),
                     on: on_pairs,
+                    join_type: crate::logical_plan::JoinType::Inner,
                 };
             }
             _ => {
@@ -166,7 +167,6 @@ fn table_factor_to_scan(tf: &TableFactor) -> Result<LogicalPlan> {
                 table: t,
                 projection: None,
                 filters: vec![],
-                schema: None,
             })
         }
         _ => Err(FfqError::Unsupported(

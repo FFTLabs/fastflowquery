@@ -1,6 +1,6 @@
 use arrow::record_batch::RecordBatch;
 use ffq_common::{FfqError, Result};
-use ffq_planner::{AggExpr, Expr, LogicalPlan};
+use ffq_planner::{AggExpr, Expr, LogicalPlan, JoinType};
 use futures::TryStreamExt;
 
 use crate::runtime::QueryContext;
@@ -27,7 +27,6 @@ impl DataFrame {
             table: table.to_string(),
             projection: None,
             filters: vec![],
-            schema: None,
         };
         Self::new(session, plan)
     }
@@ -55,6 +54,7 @@ impl DataFrame {
             left: Box::new(self.logical_plan),
             right: Box::new(right.logical_plan),
             on,
+            join_type: JoinType::Inner,
         };
         Ok(Self::new(self.session, plan))
     }

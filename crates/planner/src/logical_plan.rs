@@ -1,6 +1,10 @@
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum JoinType {
+    Inner,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expr {
@@ -56,7 +60,6 @@ pub enum LogicalPlan {
         table: String,
         projection: Option<Vec<String>>,
         filters: Vec<Expr>,
-        schema: Option<SchemaRef>,
     },
     Projection {
         exprs: Vec<(Expr, String)>,
@@ -70,6 +73,7 @@ pub enum LogicalPlan {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
         on: Vec<(String, String)>,
+        join_type: JoinType,
     },
     Aggregate {
         group_exprs: Vec<Expr>,
@@ -89,8 +93,4 @@ pub enum AggExpr {
     Min(Expr),
     Max(Expr),
     Avg(Expr),
-}
-
-pub fn schema_placeholder() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new("placeholder", DataType::Null, true)]))
 }
