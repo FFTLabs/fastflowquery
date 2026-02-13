@@ -168,6 +168,7 @@ impl Analyzer {
                 right,
                 on,
                 join_type,
+                strategy_hint,
             } => {
                 if join_type != JoinType::Inner {
                     return Err(FfqError::Unsupported(
@@ -198,6 +199,7 @@ impl Analyzer {
                         right: Box::new(ar),
                         on,
                         join_type,
+                        strategy_hint,
                     },
                     out_schema,
                     out_resolver,

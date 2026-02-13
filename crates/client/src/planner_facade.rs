@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
-use ffq_common::Result;
-use ffq_planner::{Analyzer, LiteralValue, LogicalPlan, Optimizer, PhysicalPlan, SchemaProvider};
+use ffq_common::{EngineConfig, Result};
+use ffq_planner::{
+    Analyzer, LiteralValue, LogicalPlan, Optimizer, OptimizerConfig, OptimizerContext, PhysicalPlan
+};
 
 #[derive(Debug, Default)]
 pub struct PlannerFacade {
@@ -29,13 +31,37 @@ impl PlannerFacade {
         ffq_planner::sql_to_logical(sql, params)
     }
 
-    pub fn analyze_optimize(
+    /// v1: optimizer first (pushdown changes projection), then analyzer (name->idx, casts)
+    pub fn optimize_analyze(
         &self,
         plan: LogicalPlan,
-        provider: &dyn SchemaProvider,
+        ctx: &dyn OptimizerContext,
+        cfg: &EngineConfig,
     ) -> Result<LogicalPlan> {
-        let analyzed = self.analyzer.analyze(plan, provider)?;
-        self.optimizer.optimize(analyzed)
+        let opt = self.optimizer.optimize(
+            plan,
+            ctx,
+            OptimizerConfig {
+                broadcast_threshold_bytes: cfg.broadcast_threshold_bytes,
+            },
+        )?;
+        let analyzed = self.analyzer.analyze(opt, ctx)?;
+        Ok(analyzed)
+    }
+
+    pub fn optimize_only(
+        &self,
+        plan: LogicalPlan,
+        ctx: &dyn OptimizerContext,
+        cfg: &EngineConfig,
+    ) -> Result<LogicalPlan> {
+        self.optimizer.optimize(
+            plan,
+            ctx,
+            OptimizerConfig {
+                broadcast_threshold_bytes: cfg.broadcast_threshold_bytes,
+            },
+        )
     }
 
     pub fn create_physical_plan(&self, _logical: &LogicalPlan) -> Result<PhysicalPlan> {

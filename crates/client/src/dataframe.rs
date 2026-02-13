@@ -56,6 +56,7 @@ impl DataFrame {
             right: Box::new(right.logical_plan),
             on,
             join_type: JoinType::Inner,
+            strategy_hint: ffq_planner::JoinStrategyHint::Auto,
         };
         Ok(Self::new(self.session, plan))
     }
@@ -67,6 +68,34 @@ impl DataFrame {
             input: self.logical_plan,
             keys,
         }
+    }
+
+    pub fn explain(&self) -> Result<String> {
+        struct CatalogProvider<'a> {
+            catalog: &'a ffq_storage::Catalog,
+        }
+        impl<'a> ffq_planner::SchemaProvider for CatalogProvider<'a> {
+            fn table_schema(&self, table: &str) -> ffq_common::Result<arrow_schema::SchemaRef> {
+                let t = self.catalog.get(table)?;
+                t.schema_ref()
+            }
+        }
+        impl<'a> ffq_planner::OptimizerContext for CatalogProvider<'a> {
+            fn table_stats(&self, table: &str) -> ffq_common::Result<(Option<u64>, Option<u64>)> {
+                let t = self.catalog.get(table)?;
+                Ok((t.stats.bytes, t.stats.rows))
+            }
+        }
+
+        let cat = self.session.catalog.read().expect("catalog lock poisoned");
+        let provider = CatalogProvider { catalog: &*cat };
+
+        let opt = self
+            .session
+            .planner
+            .optimize_only(self.logical_plan.clone(), &provider, &self.session.config)?;
+
+        Ok(ffq_planner::explain_logical(&opt))
     }
 
     /// df.collect() (async)
@@ -82,16 +111,23 @@ impl DataFrame {
                 t.schema_ref()
             }
         }
+        impl<'a> ffq_planner::OptimizerContext for CatalogProvider<'a> {
+            fn table_stats(&self, table: &str) -> ffq_common::Result<(Option<u64>, Option<u64>)> {
+                let t = self.catalog.get(table)?;
+                Ok((t.stats.bytes, t.stats.rows))
+            }
+        }
 
         let cat_guard = self.session.catalog.read().expect("catalog lock poisoned");
         let provider = CatalogProvider { catalog: &*cat_guard };
 
-        let analyzed_optimized =
-            self.session
-                .planner
-                .analyze_optimize(self.logical_plan.clone(), &provider)?;
+        let analyzed = self.session.planner.optimize_analyze(
+            self.logical_plan.clone(),
+            &provider,
+            &self.session.config,
+        )?;
 
-        let physical = self.session.planner.create_physical_plan(&analyzed_optimized)?;
+        let physical = self.session.planner.create_physical_plan(&analyzed)?;
 
         let ctx = QueryContext {
             batch_size_rows: self.session.config.batch_size_rows,

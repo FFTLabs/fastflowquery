@@ -6,6 +6,14 @@ pub enum JoinType {
     Inner,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinStrategyHint {
+    Auto,
+    BroadcastLeft,
+    BroadcastRight,
+    Shuffle,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expr {
     Column(String),
@@ -75,6 +83,7 @@ pub enum LogicalPlan {
         right: Box<LogicalPlan>,
         on: Vec<(String, String)>,
         join_type: JoinType,
+        strategy_hint: JoinStrategyHint,
     },
     Aggregate {
         group_exprs: Vec<Expr>,

@@ -7,7 +7,7 @@ use sqlparser::ast::{
     Statement, TableFactor, TableWithJoins, Value,
 };
 
-use crate::logical_plan::{AggExpr, BinaryOp, Expr, LiteralValue, LogicalPlan};
+use crate::logical_plan::{AggExpr, BinaryOp, Expr, LiteralValue, LogicalPlan, JoinStrategyHint};
 
 /// Convert a SQL string into a LogicalPlan, binding named parameters (like :k, :query).
 pub fn sql_to_logical(sql: &str, params: &HashMap<String, LiteralValue>) -> Result<LogicalPlan> {
@@ -144,6 +144,7 @@ fn from_to_plan(from: &[TableWithJoins], params: &HashMap<String, LiteralValue>)
                     right: Box::new(right),
                     on: on_pairs,
                     join_type: crate::logical_plan::JoinType::Inner,
+                    strategy_hint: JoinStrategyHint::Auto,
                 };
             }
             _ => {

@@ -10,7 +10,10 @@ build-vector:
 	cargo build -p ffq-client --features vector
 
 run:
-	cargo run -p ffq-client -- "SELECT a FROM t LIMIT 5"
+	cargo run -p ffq-client -- "SELECT id FROM t WHERE id = 1 LIMIT 10"
+
+plan:
+	cargo run -p ffq-client -- --plan "SELECT id FROM t WHERE id = 1 LIMIT 10"
 
 tree:
 	cargo tree -p ffq-client

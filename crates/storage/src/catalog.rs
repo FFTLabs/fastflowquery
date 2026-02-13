@@ -15,6 +15,9 @@ pub struct TableDef {
     pub schema: Option<Schema>,
 
     #[serde(default)]
+    pub stats: crate::TableStats,
+
+    #[serde(default)]
     pub options: HashMap<String, String>,
 }
 
