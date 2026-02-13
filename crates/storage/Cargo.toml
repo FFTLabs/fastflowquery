@@ -1,0 +1,22 @@
+[package]
+name = "ffq-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+s3 = ["dep:object_store"]
+qdrant = ["dep:qdrant-client"]
+
+[dependencies]
+ffq-common = { path = "../common" }
+arrow.workspace = true
+parquet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+futures.workspace = true
+
+object_store = { version = "0.11", optional = true }
+qdrant-client = { version = "1.12", optional = true, default-features = false, features = ["reqwest"] }

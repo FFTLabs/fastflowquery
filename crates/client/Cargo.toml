@@ -1,0 +1,30 @@
+[package]
+name = "ffq-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["embedded"]
+embedded = []
+
+# enables the optional dependency + turns on its grpc feature
+distributed = ["dep:ffq-distributed", "ffq-distributed/grpc"]
+
+vector = ["ffq-execution/vector", "ffq-planner/vector"]
+qdrant = ["ffq-storage/qdrant", "vector"]
+s3 = ["ffq-storage/s3"]
+
+[dependencies]
+ffq-common = { path = "../common" }
+ffq-sql = { path = "../sql" }
+ffq-planner = { path = "../planner" }
+ffq-execution = { path = "../execution" }
+ffq-storage = { path = "../storage" }
+ffq-shuffle = { path = "../shuffle" }
+
+ffq-distributed = { path = "../distributed", optional = true }
+
+arrow.workspace = true
+futures.workspace = true
+tracing.workspace = true

@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/common",
+  "crates/sql",
+  "crates/planner",
+  "crates/execution",
+  "crates/storage",
+  "crates/shuffle",
+  "crates/distributed",
+  "crates/client",
+]
+default-members = ["crates/client"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+version = "0.1.0"
+repository = "https://example.invalid/ffq" # TODO
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+
+arrow = { version = "54", default-features = true }
+arrow-schema = { version = "54", features = ["serde"] }
+parquet = { version = "54" }
+
+futures = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"

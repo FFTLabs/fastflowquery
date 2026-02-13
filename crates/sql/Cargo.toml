@@ -1,0 +1,9 @@
+[package]
+name = "ffq-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ffq-common = { path = "../common" }
+sqlparser = "0.51"
