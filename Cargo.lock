@@ -671,6 +671,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "ffq-common",
+ "ffq-planner",
  "futures",
  "serde",
  "tracing",

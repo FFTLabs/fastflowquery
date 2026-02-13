@@ -10,6 +10,8 @@ vector = []
 
 [dependencies]
 ffq-common = { path = "../common" }
+ffq-planner = { path = "../planner", default-features = false }
+
 arrow.workspace = true
 arrow-schema.workspace = true
 futures.workspace = true

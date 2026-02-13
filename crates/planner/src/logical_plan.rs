@@ -47,6 +47,9 @@ pub enum LiteralValue {
     Utf8(String),
     Boolean(bool),
     Null,
+    
+    #[cfg(feature = "vector")]
+    VectorF32(Vec<f32>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
