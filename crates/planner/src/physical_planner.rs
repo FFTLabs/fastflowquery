@@ -1,0 +1,167 @@
+use ffq_common::{FfqError, Result};
+
+use crate::logical_plan::{Expr, JoinStrategyHint, JoinType, LogicalPlan};
+use crate::physical_plan::{
+    BroadcastExchange, BuildSide, CoalesceBatchesExec, ExchangeExec, FinalHashAggregateExec,
+    FilterExec, HashJoinExec, LimitExec, ParquetScanExec, PartialHashAggregateExec, PartitioningSpec,
+    PhysicalPlan, ProjectExec, ShuffleReadExchange, ShuffleWriteExchange,
+};
+
+#[derive(Debug, Clone)]
+pub struct PhysicalPlannerConfig {
+    pub shuffle_partitions: usize,
+    pub target_batch_rows: usize,
+}
+
+impl Default for PhysicalPlannerConfig {
+    fn default() -> Self {
+        Self {
+            shuffle_partitions: 64,
+            target_batch_rows: 8192,
+        }
+    }
+}
+
+pub fn create_physical_plan(logical: &LogicalPlan, cfg: &PhysicalPlannerConfig) -> Result<PhysicalPlan> {
+    match logical {
+        LogicalPlan::TableScan { table, projection, filters } => {
+            Ok(PhysicalPlan::ParquetScan(ParquetScanExec {
+                table: table.clone(),
+                projection: projection.clone(),
+                filters: filters.clone(),
+            }))
+        }
+
+        LogicalPlan::Filter { predicate, input } => {
+            let child = create_physical_plan(input, cfg)?;
+            Ok(PhysicalPlan::Filter(FilterExec {
+                predicate: predicate.clone(),
+                input: Box::new(child),
+            }))
+        }
+
+        LogicalPlan::Projection { exprs, input } => {
+            let child = create_physical_plan(input, cfg)?;
+            Ok(PhysicalPlan::Project(ProjectExec {
+                exprs: exprs.clone(),
+                input: Box::new(child),
+            }))
+        }
+
+        LogicalPlan::Limit { n, input } => {
+            let child = create_physical_plan(input, cfg)?;
+            Ok(PhysicalPlan::Limit(LimitExec {
+                n: *n,
+                input: Box::new(child),
+            }))
+        }
+
+        LogicalPlan::Aggregate { group_exprs, aggr_exprs, input } => {
+            // Aggregate -> Partial -> ShuffleExchange(hash(group_keys)) -> Final
+            let child = create_physical_plan(input, cfg)?;
+
+            let partial = PhysicalPlan::PartialHashAggregate(PartialHashAggregateExec {
+                group_exprs: group_exprs.clone(),
+                aggr_exprs: aggr_exprs.clone(),
+                input: Box::new(child),
+            });
+
+            let partitioning = PartitioningSpec::Hash {
+                exprs: group_exprs.clone(),
+                partitions: cfg.shuffle_partitions,
+            };
+
+            let write = PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(ShuffleWriteExchange {
+                input: Box::new(partial),
+                partitioning: partitioning.clone(),
+            }));
+
+            let read = PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
+                input: Box::new(write),
+                partitioning,
+            }));
+
+            Ok(PhysicalPlan::FinalHashAggregate(FinalHashAggregateExec {
+                group_exprs: group_exprs.clone(),
+                aggr_exprs: aggr_exprs.clone(),
+                input: Box::new(read),
+            }))
+        }
+
+        LogicalPlan::Join { left, right, on, join_type, strategy_hint } => {
+            if *join_type != JoinType::Inner {
+                return Err(FfqError::Unsupported("only INNER join supported in v1".to_string()));
+            }
+
+            let l = create_physical_plan(left, cfg)?;
+            let r = create_physical_plan(right, cfg)?;
+
+            // Build exchanges based on optimizer hint.
+            // Note: This is a *plan shape* decision; execution will implement actual exchange behavior.
+            match *strategy_hint {
+                JoinStrategyHint::BroadcastLeft => {
+                    let bcast_left = PhysicalPlan::Exchange(ExchangeExec::Broadcast(BroadcastExchange {
+                        input: Box::new(l),
+                    }));
+                    Ok(PhysicalPlan::HashJoin(HashJoinExec {
+                        left: Box::new(bcast_left),
+                        right: Box::new(r),
+                        on: on.clone(),
+                        join_type: *join_type,
+                        strategy_hint: *strategy_hint,
+                        build_side: BuildSide::Left,
+                    }))
+                }
+                JoinStrategyHint::BroadcastRight => {
+                    let bcast_right = PhysicalPlan::Exchange(ExchangeExec::Broadcast(BroadcastExchange {
+                        input: Box::new(r),
+                    }));
+                    Ok(PhysicalPlan::HashJoin(HashJoinExec {
+                        left: Box::new(l),
+                        right: Box::new(bcast_right),
+                        on: on.clone(),
+                        join_type: *join_type,
+                        strategy_hint: *strategy_hint,
+                        build_side: BuildSide::Right,
+                    }))
+                }
+                JoinStrategyHint::Shuffle | JoinStrategyHint::Auto => {
+                    // v1: Auto treated as Shuffle at physical level unless optimizer already decided broadcast.
+                    // Shuffle both sides by join keys.
+                    let left_hash_exprs: Vec<Expr> = on.iter().map(|(lk, _rk)| Expr::Column(lk.clone())).collect();
+                    let right_hash_exprs: Vec<Expr> = on.iter().map(|(_lk, rk)| Expr::Column(rk.clone())).collect();
+
+                    let part_l = PartitioningSpec::Hash { exprs: left_hash_exprs, partitions: cfg.shuffle_partitions };
+                    let part_r = PartitioningSpec::Hash { exprs: right_hash_exprs, partitions: cfg.shuffle_partitions };
+
+                    let lw = PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(ShuffleWriteExchange {
+                        input: Box::new(l),
+                        partitioning: part_l.clone(),
+                    }));
+                    let lr = PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
+                        input: Box::new(lw),
+                        partitioning: part_l,
+                    }));
+
+                    let rw = PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(ShuffleWriteExchange {
+                        input: Box::new(r),
+                        partitioning: part_r.clone(),
+                    }));
+                    let rr = PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
+                        input: Box::new(rw),
+                        partitioning: part_r,
+                    }));
+
+                    Ok(PhysicalPlan::HashJoin(HashJoinExec {
+                        left: Box::new(lr),
+                        right: Box::new(rr),
+                        on: on.clone(),
+                        join_type: *join_type,
+                        strategy_hint: *strategy_hint,
+                        build_side: BuildSide::Right, // arbitrary for shuffle-join, executor can decide
+                    }))
+                }
+            }
+        }
+    }
+}
