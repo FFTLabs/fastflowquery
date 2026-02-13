@@ -2,7 +2,7 @@ use ffq_common::{FfqError, Result};
 
 use crate::logical_plan::{Expr, JoinStrategyHint, JoinType, LogicalPlan};
 use crate::physical_plan::{
-    BroadcastExchange, BuildSide, CoalesceBatchesExec, ExchangeExec, FinalHashAggregateExec,
+    BroadcastExchange, BuildSide, ExchangeExec, FinalHashAggregateExec,
     FilterExec, HashJoinExec, LimitExec, ParquetScanExec, PartialHashAggregateExec, PartitioningSpec,
     PhysicalPlan, ProjectExec, ShuffleReadExchange, ShuffleWriteExchange,
 };

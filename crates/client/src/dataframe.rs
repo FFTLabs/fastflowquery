@@ -133,8 +133,11 @@ impl DataFrame {
             batch_size_rows: self.session.config.batch_size_rows,
         };
 
-        let stream = self.session.runtime.execute(physical, ctx).await?;
+        let stream: ffq_execution::stream::SendableRecordBatchStream =
+            self.session.runtime.execute(physical, ctx).await?;
+
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
+
         Ok(batches)
     }
 }

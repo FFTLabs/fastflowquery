@@ -1,11 +1,12 @@
 use std::fmt::Debug;
+use arrow_schema::Schema;
+use std::sync::Arc;
 
 use ffq_common::Result;
-use ffq_execution::SendableRecordBatchStream;
+use ffq_execution::stream::{empty_stream, SendableRecordBatchStream};
 use ffq_planner::PhysicalPlan;
 use futures::future::BoxFuture;
 use futures::FutureExt;
-use futures::StreamExt;
 
 #[derive(Debug, Clone)]
 pub struct QueryContext {
@@ -39,9 +40,8 @@ impl Runtime for EmbeddedRuntime {
         _ctx: QueryContext,
     ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
         async move {
-            // v1 skeleton: return an empty stream
-            let stream = futures::stream::empty::<Result<arrow::record_batch::RecordBatch>>().boxed();
-            Ok(stream)
+            let schema = Arc::new(Schema::empty());
+            Ok(empty_stream(schema))
         }
         .boxed()
     }

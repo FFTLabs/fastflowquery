@@ -669,6 +669,7 @@ name = "ffq-execution"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-schema",
  "ffq-common",
  "futures",
  "serde",

@@ -11,6 +11,7 @@ vector = []
 [dependencies]
 ffq-common = { path = "../common" }
 arrow.workspace = true
+arrow-schema.workspace = true
 futures.workspace = true
 tracing.workspace = true
 serde.workspace = true

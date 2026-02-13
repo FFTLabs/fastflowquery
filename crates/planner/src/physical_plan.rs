@@ -1,5 +1,3 @@
-use ffq_common::Result;
-
 use crate::logical_plan::{AggExpr, Expr, JoinStrategyHint, JoinType};
 use serde::{Deserialize, Serialize};
 
