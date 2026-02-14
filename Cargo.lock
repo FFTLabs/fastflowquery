@@ -730,6 +730,7 @@ dependencies = [
  "arrow",
  "ffq-common",
  "serde",
+ "serde_json",
  "tracing",
 ]
 

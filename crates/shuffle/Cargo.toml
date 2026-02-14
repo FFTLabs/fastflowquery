@@ -1,0 +1,12 @@
+[package]
+name = "ffq-shuffle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ffq-common = { path = "../common" }
+arrow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

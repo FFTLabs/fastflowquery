@@ -4,4 +4,3 @@
 **/*.parquet
 **/*.prof
 **/*.svg
-shuffle/
