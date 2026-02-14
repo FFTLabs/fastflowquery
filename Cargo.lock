@@ -705,9 +705,15 @@ dependencies = [
 name = "ffq-distributed"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "arrow-schema",
  "ffq-common",
+ "ffq-execution",
  "ffq-planner",
  "ffq-shuffle",
+ "ffq-storage",
+ "futures",
+ "parquet",
  "prost",
  "protoc-bin-vendored",
  "serde",
