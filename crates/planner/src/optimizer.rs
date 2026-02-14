@@ -231,6 +231,23 @@ fn proj_rewrite(
                 req,
             ))
         }
+        LogicalPlan::TopKByScore {
+            score_expr,
+            k,
+            input,
+        } => {
+            let mut req = required.unwrap_or_default();
+            req.extend(expr_columns(&score_expr));
+            let (new_in, child_req) = proj_rewrite(*input, Some(req), ctx)?;
+            Ok((
+                LogicalPlan::TopKByScore {
+                    score_expr,
+                    k,
+                    input: Box::new(new_in),
+                },
+                child_req,
+            ))
+        }
 
         LogicalPlan::Filter { predicate, input } => {
             let mut req = required.unwrap_or_default();
@@ -642,6 +659,15 @@ fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy
             n,
             input: Box::new(f(*input)),
         },
+        LogicalPlan::TopKByScore {
+            score_expr,
+            k,
+            input,
+        } => LogicalPlan::TopKByScore {
+            score_expr,
+            k,
+            input: Box::new(f(*input)),
+        },
         LogicalPlan::InsertInto {
             table,
             columns,
@@ -695,6 +721,15 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
         },
         LogicalPlan::Limit { n, input } => LogicalPlan::Limit {
             n,
+            input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+        },
+        LogicalPlan::TopKByScore {
+            score_expr,
+            k,
+            input,
+        } => LogicalPlan::TopKByScore {
+            score_expr: rewrite_expr(score_expr, rewrite),
+            k,
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
         },
         LogicalPlan::InsertInto {
@@ -852,6 +887,7 @@ fn plan_output_columns(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result
         }
         LogicalPlan::Filter { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::Limit { input, .. } => plan_output_columns(input, ctx),
+        LogicalPlan::TopKByScore { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::Projection { exprs, .. } => Ok(exprs.iter().map(|(_, n)| n.clone()).collect()),
         LogicalPlan::Aggregate { .. } => Ok(HashSet::new()), // v1: conservative
         LogicalPlan::Join { left, right, .. } => {
@@ -880,6 +916,7 @@ fn estimate_bytes(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result<Opti
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::TopKByScore { input, .. }
         | LogicalPlan::InsertInto { input, .. } => estimate_bytes(input, ctx),
         LogicalPlan::Join { .. } => Ok(None),
     }

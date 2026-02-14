@@ -21,6 +21,7 @@ pub enum PhysicalPlan {
     Exchange(ExchangeExec),
 
     Limit(LimitExec),
+    TopKByScore(TopKByScoreExec),
 }
 
 impl PhysicalPlan {
@@ -40,6 +41,7 @@ impl PhysicalPlan {
                 ExchangeExec::Broadcast(e) => vec![e.input.as_ref()],
             },
             PhysicalPlan::Limit(x) => vec![x.input.as_ref()],
+            PhysicalPlan::TopKByScore(x) => vec![x.input.as_ref()],
         }
     }
 }
@@ -149,5 +151,12 @@ pub enum PartitioningSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimitExec {
     pub n: usize,
+    pub input: Box<PhysicalPlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopKByScoreExec {
+    pub score_expr: Expr,
+    pub k: usize,
     pub input: Box<PhysicalPlan>,
 }

@@ -109,6 +109,11 @@ pub enum LogicalPlan {
         n: usize,
         input: Box<LogicalPlan>,
     },
+    TopKByScore {
+        score_expr: Expr,
+        k: usize,
+        input: Box<LogicalPlan>,
+    },
     InsertInto {
         table: String,
         columns: Vec<String>,

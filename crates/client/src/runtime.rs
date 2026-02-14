@@ -1,3 +1,5 @@
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::fmt::Debug;
 use std::fs::{self, File};
@@ -10,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arrow::array::{
     Array, ArrayRef, BooleanBuilder, Float64Builder, Int64Array, Int64Builder, StringBuilder,
 };
+use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::{FfqError, Result};
@@ -173,6 +176,10 @@ fn execute_plan(
                     batches: out,
                 })
             }
+            PhysicalPlan::TopKByScore(topk) => {
+                let child = execute_plan(*topk.input, ctx, catalog).await?;
+                run_topk_by_score(child, topk.score_expr, topk.k)
+            }
             PhysicalPlan::Exchange(exchange) => match exchange {
                 ExchangeExec::ShuffleWrite(x) => execute_plan(*x.input, ctx, catalog).await,
                 ExchangeExec::ShuffleRead(x) => execute_plan(*x.input, ctx, catalog).await,
@@ -278,6 +285,107 @@ enum AggState {
 struct SpillRow {
     key: Vec<ScalarValue>,
     states: Vec<AggState>,
+}
+
+#[derive(Debug, Clone)]
+struct TopKEntry {
+    score: f64,
+    batch_idx: usize,
+    row_idx: usize,
+    seq: usize,
+}
+
+impl PartialEq for TopKEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits() && self.seq == other.seq
+    }
+}
+impl Eq for TopKEntry {}
+impl PartialOrd for TopKEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TopKEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| self.seq.cmp(&other.seq))
+    }
+}
+
+fn run_topk_by_score(child: ExecOutput, score_expr: Expr, k: usize) -> Result<ExecOutput> {
+    if k == 0 {
+        return Ok(ExecOutput {
+            schema: child.schema.clone(),
+            batches: vec![RecordBatch::new_empty(child.schema)],
+        });
+    }
+
+    let score_eval = compile_expr(&score_expr, &child.schema)?;
+    let mut heap: BinaryHeap<Reverse<TopKEntry>> = BinaryHeap::new();
+    let mut seq = 0usize;
+
+    for (batch_idx, batch) in child.batches.iter().enumerate() {
+        let score_arr = score_eval.evaluate(batch)?;
+        for row_idx in 0..batch.num_rows() {
+            let score = score_at(&score_arr, row_idx)?;
+            if let Some(score) = score {
+                let entry = Reverse(TopKEntry {
+                    score,
+                    batch_idx,
+                    row_idx,
+                    seq,
+                });
+                seq += 1;
+                if heap.len() < k {
+                    heap.push(entry);
+                } else if let Some(min) = heap.peek() {
+                    if entry.0 > min.0 {
+                        let _ = heap.pop();
+                        heap.push(entry);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut picked = heap.into_vec();
+    picked.sort_by(|a, b| b.0.cmp(&a.0));
+
+    if picked.is_empty() {
+        return Ok(ExecOutput {
+            schema: child.schema.clone(),
+            batches: vec![RecordBatch::new_empty(child.schema)],
+        });
+    }
+
+    let mut one_row_batches = Vec::with_capacity(picked.len());
+    for Reverse(e) in picked {
+        one_row_batches.push(child.batches[e.batch_idx].slice(e.row_idx, 1));
+    }
+    let out = concat_batches(&child.schema, &one_row_batches)
+        .map_err(|e| FfqError::Execution(format!("top-k concat failed: {e}")))?;
+    Ok(ExecOutput {
+        schema: child.schema,
+        batches: vec![out],
+    })
+}
+
+fn score_at(arr: &ArrayRef, idx: usize) -> Result<Option<f64>> {
+    if arr.is_null(idx) {
+        return Ok(None);
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Float32Array>() {
+        return Ok(Some(a.value(idx) as f64));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<arrow::array::Float64Array>() {
+        return Ok(Some(a.value(idx)));
+    }
+    Err(FfqError::Execution(format!(
+        "top-k score expression must evaluate to Float32/Float64, got {:?}",
+        arr.data_type()
+    )))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

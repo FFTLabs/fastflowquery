@@ -4,7 +4,7 @@ use crate::logical_plan::{Expr, JoinStrategyHint, JoinType, LogicalPlan};
 use crate::physical_plan::{
     BroadcastExchange, BuildSide, ExchangeExec, FilterExec, FinalHashAggregateExec, HashJoinExec,
     LimitExec, ParquetScanExec, ParquetWriteExec, PartialHashAggregateExec, PartitioningSpec,
-    PhysicalPlan, ProjectExec, ShuffleReadExchange, ShuffleWriteExchange,
+    PhysicalPlan, ProjectExec, ShuffleReadExchange, ShuffleWriteExchange, TopKByScoreExec,
 };
 
 #[derive(Debug, Clone)]
@@ -57,6 +57,18 @@ pub fn create_physical_plan(
             let child = create_physical_plan(input, cfg)?;
             Ok(PhysicalPlan::Limit(LimitExec {
                 n: *n,
+                input: Box::new(child),
+            }))
+        }
+        LogicalPlan::TopKByScore {
+            score_expr,
+            k,
+            input,
+        } => {
+            let child = create_physical_plan(input, cfg)?;
+            Ok(PhysicalPlan::TopKByScore(TopKByScoreExec {
+                score_expr: score_expr.clone(),
+                k: *k,
                 input: Box::new(child),
             }))
         }

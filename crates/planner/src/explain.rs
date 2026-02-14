@@ -69,6 +69,17 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!("{pad}Limit n={n}\n"));
             fmt_plan(input, indent + 1, out);
         }
+        LogicalPlan::TopKByScore {
+            score_expr,
+            k,
+            input,
+        } => {
+            out.push_str(&format!(
+                "{pad}TopKByScore k={k} score={}\n",
+                fmt_expr(score_expr)
+            ));
+            fmt_plan(input, indent + 1, out);
+        }
         LogicalPlan::InsertInto {
             table,
             columns,

@@ -119,6 +119,8 @@ fn query_to_logical(q: &Query, params: &HashMap<String, LiteralValue>) -> Result
     }
 
     let needs_agg = saw_agg || !group_exprs.is_empty();
+    let output_proj_exprs = proj_exprs.clone();
+    let pre_projection_input = plan.clone();
     if needs_agg {
         plan = LogicalPlan::Aggregate {
             group_exprs,
@@ -138,8 +140,48 @@ fn query_to_logical(q: &Query, params: &HashMap<String, LiteralValue>) -> Result
         };
     }
 
-    // LIMIT
-    if let Some(limit_expr) = &q.limit {
+    // ORDER BY + LIMIT
+    if let Some(order_by) = &q.order_by {
+        if order_by.interpolate.is_some() {
+            return Err(FfqError::Unsupported(
+                "ORDER BY INTERPOLATE is not supported in v1".to_string(),
+            ));
+        }
+        if order_by.exprs.len() != 1 {
+            return Err(FfqError::Unsupported(
+                "only a single ORDER BY expression is supported in v1".to_string(),
+            ));
+        }
+        let item = &order_by.exprs[0];
+        if item.asc != Some(false) {
+            return Err(FfqError::Unsupported(
+                "only ORDER BY ... DESC is supported in v1 top-k mode".to_string(),
+            ));
+        }
+        let score_expr = sql_expr_to_expr(&item.expr, params)?;
+        if !is_topk_score_expr(&score_expr) {
+            return Err(FfqError::Unsupported(
+                "global ORDER BY is not supported in v1; only ORDER BY cosine_similarity(...) DESC LIMIT k is supported".to_string(),
+            ));
+        }
+        if needs_agg {
+            return Err(FfqError::Unsupported(
+                "ORDER BY cosine_similarity with aggregates is not supported in v1".to_string(),
+            ));
+        }
+        let limit_expr = q.limit.as_ref().ok_or_else(|| {
+            FfqError::Unsupported("ORDER BY cosine_similarity requires LIMIT k in v1".to_string())
+        })?;
+        let limit_val = sql_limit_to_usize(limit_expr, params)?;
+        plan = LogicalPlan::Projection {
+            exprs: output_proj_exprs,
+            input: Box::new(LogicalPlan::TopKByScore {
+                score_expr,
+                k: limit_val,
+                input: Box::new(pre_projection_input),
+            }),
+        };
+    } else if let Some(limit_expr) = &q.limit {
         let limit_val = sql_limit_to_usize(limit_expr, params)?;
         plan = LogicalPlan::Limit {
             n: limit_val,
@@ -521,6 +563,14 @@ fn expr_to_name_fallback(e: &Expr) -> String {
     }
 }
 
+fn is_topk_score_expr(_e: &Expr) -> bool {
+    #[cfg(feature = "vector")]
+    if matches!(_e, Expr::CosineSimilarity { .. }) {
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -562,6 +612,28 @@ mod tests {
                 }
             }
             other => panic!("expected projection, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn rewrites_order_by_cosine_limit_into_topk() {
+        let mut params = HashMap::new();
+        params.insert(
+            "q".to_string(),
+            LiteralValue::VectorF32(vec![1.0, 2.0, 3.0]),
+        );
+        let plan = sql_to_logical(
+            "SELECT id, title FROM docs ORDER BY cosine_similarity(emb, :q) DESC LIMIT 5",
+            &params,
+        )
+        .expect("parse");
+        match plan {
+            LogicalPlan::Projection { input, .. } => match *input {
+                LogicalPlan::TopKByScore { k, .. } => assert_eq!(k, 5),
+                other => panic!("expected TopKByScore input, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
         }
     }
 }

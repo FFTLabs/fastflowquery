@@ -217,6 +217,31 @@ impl Analyzer {
                     resolver,
                 ))
             }
+            LogicalPlan::TopKByScore {
+                score_expr,
+                k,
+                input,
+            } => {
+                let (ain, schema, resolver) = self.analyze_plan(*input, provider)?;
+                if k == 0 {
+                    return Err(FfqError::Planning("TOP-K value must be > 0".to_string()));
+                }
+                let (score_expr, score_dt) = self.analyze_expr(score_expr, &resolver)?;
+                if !matches!(score_dt, DataType::Float32 | DataType::Float64) {
+                    return Err(FfqError::Planning(format!(
+                        "top-k score expression must be Float32/Float64, got {score_dt:?}"
+                    )));
+                }
+                Ok((
+                    LogicalPlan::TopKByScore {
+                        score_expr,
+                        k,
+                        input: Box::new(ain),
+                    },
+                    schema,
+                    resolver,
+                ))
+            }
             LogicalPlan::InsertInto {
                 table,
                 columns,
