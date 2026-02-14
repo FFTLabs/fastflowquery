@@ -731,8 +731,45 @@ fn try_rewrite_projection_topk_to_vector(
     input: &LogicalPlan,
     ctx: &dyn OptimizerContext,
 ) -> Result<Option<LogicalPlan>> {
+    match evaluate_vector_topk_rewrite(exprs, input, ctx)? {
+        VectorRewriteDecision::Apply {
+            table,
+            query_vector,
+            k,
+            filter,
+        } => Ok(Some(LogicalPlan::VectorTopK {
+            table,
+            query_vector,
+            k,
+            filter,
+        })),
+        VectorRewriteDecision::Fallback { .. } => Ok(None),
+    }
+}
+
+#[cfg(feature = "vector")]
+enum VectorRewriteDecision {
+    Apply {
+        table: String,
+        query_vector: Vec<f32>,
+        k: usize,
+        filter: Option<String>,
+    },
+    Fallback {
+        _reason: &'static str,
+    },
+}
+
+#[cfg(feature = "vector")]
+fn evaluate_vector_topk_rewrite(
+    exprs: &[(Expr, String)],
+    input: &LogicalPlan,
+    ctx: &dyn OptimizerContext,
+) -> Result<VectorRewriteDecision> {
     if !projection_supported_for_vector_topk(exprs) {
-        return Ok(None);
+        return Ok(VectorRewriteDecision::Fallback {
+            _reason: "projection not satisfiable from [id,score,payload]",
+        });
     }
     let LogicalPlan::TopKByScore {
         score_expr,
@@ -740,36 +777,55 @@ fn try_rewrite_projection_topk_to_vector(
         input,
     } = input
     else {
-        return Ok(None);
+        return Ok(VectorRewriteDecision::Fallback {
+            _reason: "input is not TopKByScore",
+        });
     };
     if *k == 0 {
-        return Ok(None);
+        return Ok(VectorRewriteDecision::Fallback {
+            _reason: "k must be > 0",
+        });
     }
     let LogicalPlan::TableScan { table, filters, .. } = input.as_ref() else {
-        return Ok(None);
+        return Ok(VectorRewriteDecision::Fallback {
+            _reason: "TopK input is not TableScan",
+        });
     };
     if ctx.table_format(table)?.as_deref() != Some("qdrant") {
-        return Ok(None);
+        return Ok(VectorRewriteDecision::Fallback {
+            _reason: "table format is not qdrant",
+        });
     }
     let Expr::CosineSimilarity { vector, query } = score_expr else {
-        return Ok(None);
+        return Ok(VectorRewriteDecision::Fallback {
+            _reason: "score expr is not cosine_similarity",
+        });
     };
     if !matches!(vector.as_ref(), Expr::Column(_) | Expr::ColumnRef { .. }) {
-        return Ok(None);
+        return Ok(VectorRewriteDecision::Fallback {
+            _reason: "vector arg is not a column",
+        });
     }
     let Expr::Literal(LiteralValue::VectorF32(query_vector)) = query.as_ref() else {
-        return Ok(None);
+        return Ok(VectorRewriteDecision::Fallback {
+            _reason: "query arg is not vector literal",
+        });
     };
     let filter = match translate_qdrant_filter(filters) {
         Ok(v) => v,
-        Err(_) => return Ok(None),
+        Err(_) => {
+            return Ok(VectorRewriteDecision::Fallback {
+                _reason: "filter translation unsupported",
+            })
+        }
     };
-    Ok(Some(LogicalPlan::VectorTopK {
+
+    Ok(VectorRewriteDecision::Apply {
         table: table.clone(),
         query_vector: query_vector.clone(),
         k: *k,
         filter,
-    }))
+    })
 }
 
 #[cfg(feature = "vector")]
@@ -1208,6 +1264,7 @@ mod tests {
 
     use super::{Optimizer, OptimizerConfig, OptimizerContext, TableMetadata};
     use crate::analyzer::SchemaProvider;
+    use crate::explain::explain_logical;
     use crate::logical_plan::{Expr, LiteralValue, LogicalPlan};
 
     struct TestCtx {
@@ -1410,5 +1467,99 @@ mod tests {
             },
             other => panic!("expected Projection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unsupported_filter_shape_falls_back_without_error() {
+        let emb_field = Field::new("item", DataType::Float32, true);
+        let ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+            ])),
+            format: "qdrant".to_string(),
+        };
+
+        let plan = LogicalPlan::Projection {
+            exprs: vec![
+                (Expr::Column("id".to_string()), "id".to_string()),
+                (Expr::Column("score".to_string()), "score".to_string()),
+                (Expr::Column("payload".to_string()), "payload".to_string()),
+            ],
+            input: Box::new(LogicalPlan::TopKByScore {
+                score_expr: Expr::CosineSimilarity {
+                    vector: Box::new(Expr::Column("emb".to_string())),
+                    query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+                },
+                k: 3,
+                input: Box::new(LogicalPlan::TableScan {
+                    table: "docs_idx".to_string(),
+                    projection: None,
+                    // unsupported for v1 translator: non-equality predicate
+                    filters: vec![Expr::BinaryOp {
+                        left: Box::new(Expr::Column("tenant_id".to_string())),
+                        op: crate::logical_plan::BinaryOp::Gt,
+                        right: Box::new(Expr::Literal(LiteralValue::Int64(7))),
+                    }],
+                }),
+            }),
+        };
+
+        let optimized = Optimizer::new()
+            .optimize(plan, &ctx, OptimizerConfig::default())
+            .expect("optimize should not fail");
+        match optimized {
+            LogicalPlan::Projection { input, .. } => match *input {
+                LogicalPlan::TopKByScore { .. } => {}
+                other => panic!("expected TopKByScore fallback, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explain_marks_index_rewrite_state() {
+        let emb_field = Field::new("item", DataType::Float32, true);
+        let qdrant_ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new(
+                    "emb",
+                    DataType::FixedSizeList(Arc::new(emb_field.clone()), 3),
+                    true,
+                ),
+            ])),
+            format: "qdrant".to_string(),
+        };
+        let parquet_ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+            ])),
+            format: "parquet".to_string(),
+        };
+
+        let applied = Optimizer::new()
+            .optimize(
+                topk_plan(&["id", "score", "payload"]),
+                &qdrant_ctx,
+                OptimizerConfig::default(),
+            )
+            .expect("opt");
+        let fallback = Optimizer::new()
+            .optimize(
+                topk_plan(&["id", "score", "payload"]),
+                &parquet_ctx,
+                OptimizerConfig::default(),
+            )
+            .expect("opt");
+
+        let applied_s = explain_logical(&applied);
+        let fallback_s = explain_logical(&fallback);
+        assert!(applied_s.contains("rewrite=index_applied"));
+        assert!(fallback_s.contains("rewrite=index_fallback"));
     }
 }

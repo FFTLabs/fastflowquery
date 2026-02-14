@@ -75,7 +75,7 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             input,
         } => {
             out.push_str(&format!(
-                "{pad}TopKByScore k={k} score={}\n",
+                "{pad}TopKByScore k={k} score={} rewrite=index_fallback\n",
                 fmt_expr(score_expr)
             ));
             fmt_plan(input, indent + 1, out);
@@ -87,7 +87,7 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             filter,
         } => {
             out.push_str(&format!(
-                "{pad}VectorTopK table={table} k={k} query_dim={} filter={filter:?}\n",
+                "{pad}VectorTopK table={table} k={k} query_dim={} filter={filter:?} rewrite=index_applied\n",
                 query_vector.len()
             ));
         }
