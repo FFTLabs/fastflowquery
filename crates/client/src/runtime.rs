@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::fmt::Debug;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
@@ -14,7 +14,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::{FfqError, Result};
 use ffq_execution::{compile_expr, SendableRecordBatchStream, StreamAdapter, TaskContext};
-use ffq_planner::{AggExpr, ExchangeExec, Expr, PhysicalPlan};
+use ffq_planner::{AggExpr, BuildSide, ExchangeExec, Expr, PhysicalPlan};
 use ffq_storage::parquet_provider::ParquetProvider;
 use ffq_storage::{Catalog, StorageProvider};
 use futures::future::BoxFuture;
@@ -120,6 +120,18 @@ fn execute_plan(
                     &ctx,
                 )
             }
+            PhysicalPlan::HashJoin(join) => {
+                let ffq_planner::HashJoinExec {
+                    left: left_plan,
+                    right: right_plan,
+                    on,
+                    build_side,
+                    ..
+                } = join;
+                let left = execute_plan(*left_plan, ctx.clone(), catalog.clone()).await?;
+                let right = execute_plan(*right_plan, ctx.clone(), catalog).await?;
+                run_hash_join(left, right, on, build_side, &ctx)
+            }
             other => Err(FfqError::Unsupported(format!(
                 "embedded runtime does not support operator yet: {other:?}"
             ))),
@@ -188,6 +200,313 @@ enum AggState {
 struct SpillRow {
     key: Vec<ScalarValue>,
     states: Vec<AggState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JoinSpillRow {
+    key: Vec<ScalarValue>,
+    row: Vec<ScalarValue>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JoinInputSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JoinExecSide {
+    Build,
+    Probe,
+}
+
+fn run_hash_join(
+    left: ExecOutput,
+    right: ExecOutput,
+    on: Vec<(String, String)>,
+    build_side: BuildSide,
+    ctx: &QueryContext,
+) -> Result<ExecOutput> {
+    let left_rows = rows_from_batches(&left)?;
+    let right_rows = rows_from_batches(&right)?;
+
+    let (build_rows, probe_rows, build_schema, probe_schema, build_input_side) = match build_side {
+        BuildSide::Left => (
+            &left_rows,
+            &right_rows,
+            left.schema.clone(),
+            right.schema.clone(),
+            JoinInputSide::Left,
+        ),
+        BuildSide::Right => (
+            &right_rows,
+            &left_rows,
+            right.schema.clone(),
+            left.schema.clone(),
+            JoinInputSide::Right,
+        ),
+    };
+
+    let build_key_names = join_key_names(&on, build_input_side, JoinExecSide::Build);
+    let probe_key_names = join_key_names(&on, build_input_side, JoinExecSide::Probe);
+
+    let build_key_idx = resolve_key_indexes(&build_schema, &build_key_names)?;
+    let probe_key_idx = resolve_key_indexes(&probe_schema, &probe_key_names)?;
+
+    let output_schema = Arc::new(Schema::new(
+        left.schema
+            .fields()
+            .iter()
+            .chain(right.schema.fields().iter())
+            .map(|f| (**f).clone())
+            .collect::<Vec<_>>(),
+    ));
+
+    let joined_rows = if ctx.mem_budget_bytes > 0
+        && estimate_join_rows_bytes(build_rows) > ctx.mem_budget_bytes
+    {
+        grace_hash_join(
+            build_rows,
+            probe_rows,
+            &build_key_idx,
+            &probe_key_idx,
+            build_input_side,
+            ctx,
+        )?
+    } else {
+        in_memory_hash_join(
+            build_rows,
+            probe_rows,
+            &build_key_idx,
+            &probe_key_idx,
+            build_input_side,
+        )
+    };
+
+    let batch = rows_to_batch(&output_schema, &joined_rows)?;
+    Ok(ExecOutput {
+        schema: output_schema,
+        batches: vec![batch],
+    })
+}
+
+fn rows_from_batches(input: &ExecOutput) -> Result<Vec<Vec<ScalarValue>>> {
+    let mut out = Vec::new();
+    for batch in &input.batches {
+        for row in 0..batch.num_rows() {
+            let mut values = Vec::with_capacity(batch.num_columns());
+            for col in 0..batch.num_columns() {
+                values.push(scalar_from_array(batch.column(col), row)?);
+            }
+            out.push(values);
+        }
+    }
+    Ok(out)
+}
+
+fn rows_to_batch(schema: &SchemaRef, rows: &[Vec<ScalarValue>]) -> Result<RecordBatch> {
+    let mut cols = vec![Vec::<ScalarValue>::with_capacity(rows.len()); schema.fields().len()];
+    for row in rows {
+        for (idx, value) in row.iter().enumerate() {
+            cols[idx].push(value.clone());
+        }
+    }
+    let arrays = cols
+        .iter()
+        .enumerate()
+        .map(|(idx, col)| scalars_to_array(col, schema.field(idx).data_type()))
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(schema.clone(), arrays)
+        .map_err(|e| FfqError::Execution(format!("join output batch failed: {e}")))
+}
+
+fn join_key_names(
+    on: &[(String, String)],
+    build_side: JoinInputSide,
+    exec_side: JoinExecSide,
+) -> Vec<String> {
+    let use_left = match (build_side, exec_side) {
+        (JoinInputSide::Left, JoinExecSide::Build) => true,
+        (JoinInputSide::Left, JoinExecSide::Probe) => false,
+        (JoinInputSide::Right, JoinExecSide::Build) => false,
+        (JoinInputSide::Right, JoinExecSide::Probe) => true,
+    };
+    on.iter()
+        .map(|(l, r)| if use_left { l.clone() } else { r.clone() })
+        .collect()
+}
+
+fn resolve_key_indexes(schema: &SchemaRef, names: &[String]) -> Result<Vec<usize>> {
+    names
+        .iter()
+        .map(|name| {
+            let direct = schema.index_of(name);
+            match direct {
+                Ok(idx) => Ok(idx),
+                Err(_) => {
+                    let short = strip_qual(name);
+                    schema.index_of(&short).map_err(|e| {
+                        FfqError::Execution(format!("join key '{name}' not found in schema: {e}"))
+                    })
+                }
+            }
+        })
+        .collect()
+}
+
+fn strip_qual(name: &str) -> String {
+    name.rsplit('.').next().unwrap_or(name).to_string()
+}
+
+fn join_key_from_row(row: &[ScalarValue], idxs: &[usize]) -> Vec<ScalarValue> {
+    idxs.iter().map(|i| row[*i].clone()).collect()
+}
+
+fn in_memory_hash_join(
+    build_rows: &[Vec<ScalarValue>],
+    probe_rows: &[Vec<ScalarValue>],
+    build_key_idx: &[usize],
+    probe_key_idx: &[usize],
+    build_side: JoinInputSide,
+) -> Vec<Vec<ScalarValue>> {
+    let mut ht: HashMap<Vec<ScalarValue>, Vec<usize>> = HashMap::new();
+    for (idx, row) in build_rows.iter().enumerate() {
+        ht.entry(join_key_from_row(row, build_key_idx))
+            .or_default()
+            .push(idx);
+    }
+
+    let mut out = Vec::new();
+    for probe in probe_rows {
+        let probe_key = join_key_from_row(probe, probe_key_idx);
+        if let Some(build_matches) = ht.get(&probe_key) {
+            for build_idx in build_matches {
+                let build = &build_rows[*build_idx];
+                out.push(combine_join_rows(build, probe, build_side));
+            }
+        }
+    }
+    out
+}
+
+fn combine_join_rows(
+    build: &[ScalarValue],
+    probe: &[ScalarValue],
+    build_side: JoinInputSide,
+) -> Vec<ScalarValue> {
+    match build_side {
+        JoinInputSide::Left => build.iter().cloned().chain(probe.iter().cloned()).collect(),
+        JoinInputSide::Right => probe.iter().cloned().chain(build.iter().cloned()).collect(),
+    }
+}
+
+fn estimate_join_rows_bytes(rows: &[Vec<ScalarValue>]) -> usize {
+    rows.iter()
+        .map(|r| 64 + r.iter().map(scalar_estimate_bytes).sum::<usize>())
+        .sum()
+}
+
+fn grace_hash_join(
+    build_rows: &[Vec<ScalarValue>],
+    probe_rows: &[Vec<ScalarValue>],
+    build_key_idx: &[usize],
+    probe_key_idx: &[usize],
+    build_side: JoinInputSide,
+    ctx: &QueryContext,
+) -> Result<Vec<Vec<ScalarValue>>> {
+    fs::create_dir_all(&ctx.spill_dir)?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| FfqError::Execution(format!("clock error: {e}")))?
+        .as_nanos();
+    let parts = 16_usize;
+
+    let build_paths = (0..parts)
+        .map(|p| PathBuf::from(&ctx.spill_dir).join(format!("join_build_{suffix}_{p}.jsonl")))
+        .collect::<Vec<_>>();
+    let probe_paths = (0..parts)
+        .map(|p| PathBuf::from(&ctx.spill_dir).join(format!("join_probe_{suffix}_{p}.jsonl")))
+        .collect::<Vec<_>>();
+
+    spill_join_partitions(build_rows, build_key_idx, &build_paths)?;
+    spill_join_partitions(probe_rows, probe_key_idx, &probe_paths)?;
+
+    let mut out = Vec::<Vec<ScalarValue>>::new();
+    for p in 0..parts {
+        let mut ht: HashMap<Vec<ScalarValue>, Vec<Vec<ScalarValue>>> = HashMap::new();
+
+        if let Ok(file) = File::open(&build_paths[p]) {
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let rec: JoinSpillRow = serde_json::from_str(&line)
+                    .map_err(|e| FfqError::Execution(format!("join spill decode failed: {e}")))?;
+                ht.entry(rec.key).or_default().push(rec.row);
+            }
+        }
+
+        if let Ok(file) = File::open(&probe_paths[p]) {
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let line = line?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let rec: JoinSpillRow = serde_json::from_str(&line)
+                    .map_err(|e| FfqError::Execution(format!("join spill decode failed: {e}")))?;
+                if let Some(build_matches) = ht.get(&rec.key) {
+                    for build in build_matches {
+                        out.push(combine_join_rows(build, &rec.row, build_side));
+                    }
+                }
+            }
+        }
+
+        let _ = fs::remove_file(&build_paths[p]);
+        let _ = fs::remove_file(&probe_paths[p]);
+    }
+
+    Ok(out)
+}
+
+fn spill_join_partitions(
+    rows: &[Vec<ScalarValue>],
+    key_idx: &[usize],
+    paths: &[PathBuf],
+) -> Result<()> {
+    let mut writers = Vec::with_capacity(paths.len());
+    for path in paths {
+        let file = File::create(path)?;
+        writers.push(BufWriter::new(file));
+    }
+
+    for row in rows {
+        let key = join_key_from_row(row, key_idx);
+        let part = (hash_key(&key) as usize) % writers.len();
+        let rec = JoinSpillRow {
+            key,
+            row: row.clone(),
+        };
+        let line = serde_json::to_string(&rec)
+            .map_err(|e| FfqError::Execution(format!("join spill encode failed: {e}")))?;
+        writers[part].write_all(line.as_bytes())?;
+        writers[part].write_all(b"\n")?;
+    }
+
+    for mut w in writers {
+        w.flush()?;
+    }
+
+    Ok(())
+}
+
+fn hash_key(key: &[ScalarValue]) -> u64 {
+    let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
 }
 
 fn run_hash_aggregate(
