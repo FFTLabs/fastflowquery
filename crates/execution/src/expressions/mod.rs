@@ -527,7 +527,6 @@ impl PhysicalExpr for VectorExpr {
             .ok_or_else(|| FfqError::Execution("vector values must be Float32".to_string()))?;
 
         let mut out = Float32Builder::new();
-        out.reserve(list.len());
 
         let qnorm = if matches!(self.kind, VectorKind::Cosine) {
             let s: f32 = self.query.iter().map(|x| x * x).sum();
@@ -585,5 +584,59 @@ fn extract_vector_literal(e: &Expr) -> Result<Vec<f32>> {
             "v1 vector functions require query to be a vector literal param (LiteralValue::VectorF32)"
                 .to_string(),
         )),
+    }
+}
+
+#[cfg(all(test, feature = "vector"))]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Array, FixedSizeListBuilder, Float32Builder};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::compile_expr;
+    use ffq_planner::{Expr, LiteralValue};
+
+    #[test]
+    fn cosine_similarity_kernel_fixed_size_list_f32() {
+        let mut list_builder = FixedSizeListBuilder::new(Float32Builder::new(), 3);
+        list_builder.values().append_value(1.0);
+        list_builder.values().append_value(0.0);
+        list_builder.values().append_value(0.0);
+        list_builder.append(true);
+
+        list_builder.values().append_value(0.0);
+        list_builder.values().append_value(1.0);
+        list_builder.values().append_value(0.0);
+        list_builder.append(true);
+
+        list_builder.values().append_value(0.0);
+        list_builder.values().append_value(0.0);
+        list_builder.values().append_value(0.0);
+        list_builder.append(false);
+
+        let emb = Arc::new(list_builder.finish());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "emb",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 3),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![emb]).expect("batch");
+
+        let expr = Expr::CosineSimilarity {
+            vector: Box::new(Expr::Column("emb".to_string())),
+            query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+        };
+        let compiled = compile_expr(&expr, &schema).expect("compile");
+        let out = compiled.evaluate(&batch).expect("evaluate");
+        let out = out
+            .as_any()
+            .downcast_ref::<arrow::array::Float32Array>()
+            .expect("float32 out");
+
+        assert!((out.value(0) - 1.0).abs() < 1e-6);
+        assert!((out.value(1) - 0.0).abs() < 1e-6);
+        assert!(out.is_null(2));
     }
 }

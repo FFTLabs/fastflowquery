@@ -322,6 +322,7 @@ fn sql_expr_to_expr(e: &SqlExpr, params: &HashMap<String, LiteralValue>) -> Resu
         SqlExpr::Identifier(id) => Ok(Expr::Column(id.value.clone())),
         SqlExpr::CompoundIdentifier(parts) => Ok(Expr::Column(compound_ident_to_string(parts))),
         SqlExpr::Value(v) => sql_value_to_literal(v, params),
+        SqlExpr::Function(func) => parse_scalar_function(func, params),
         SqlExpr::BinaryOp { left, op, right } => {
             // AND/OR are represented as BinaryOp too
             if *op == SqlBinaryOp::And {
@@ -357,6 +358,54 @@ fn sql_expr_to_expr(e: &SqlExpr, params: &HashMap<String, LiteralValue>) -> Resu
         _ => Err(FfqError::Unsupported(format!(
             "unsupported SQL expression in v1: {e}"
         ))),
+    }
+}
+
+fn parse_scalar_function(
+    func: &sqlparser::ast::Function,
+    params: &HashMap<String, LiteralValue>,
+) -> Result<Expr> {
+    let fname = object_name_to_string(&func.name).to_lowercase();
+    #[cfg(not(feature = "vector"))]
+    let _ = params;
+
+    #[cfg(feature = "vector")]
+    {
+        if fname == "cosine_similarity" {
+            let args = function_expr_args(func)?;
+            if args.len() != 2 {
+                return Err(FfqError::Unsupported(
+                    "cosine_similarity requires exactly 2 arguments in v1".to_string(),
+                ));
+            }
+            return Ok(Expr::CosineSimilarity {
+                vector: Box::new(sql_expr_to_expr(args[0], params)?),
+                query: Box::new(sql_expr_to_expr(args[1], params)?),
+            });
+        }
+    }
+
+    Err(FfqError::Unsupported(format!(
+        "unsupported scalar function in v1: {fname}"
+    )))
+}
+
+#[cfg(feature = "vector")]
+fn function_expr_args<'a>(func: &'a sqlparser::ast::Function) -> Result<Vec<&'a SqlExpr>> {
+    match &func.args {
+        FunctionArguments::List(list) => list
+            .args
+            .iter()
+            .map(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
+                _ => Err(FfqError::Unsupported(
+                    "unsupported function argument form in v1".to_string(),
+                )),
+            })
+            .collect(),
+        _ => Err(FfqError::Unsupported(
+            "unsupported function argument form in v1".to_string(),
+        )),
     }
 }
 
@@ -477,7 +526,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::sql_to_logical;
-    use crate::logical_plan::LogicalPlan;
+    use crate::logical_plan::{LiteralValue, LogicalPlan};
 
     #[test]
     fn parses_insert_into_select() {
@@ -488,6 +537,31 @@ mod tests {
                 assert!(columns.is_empty());
             }
             other => panic!("expected InsertInto, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn parses_cosine_similarity_expression() {
+        let mut params = HashMap::new();
+        params.insert(
+            "q".to_string(),
+            LiteralValue::VectorF32(vec![1.0, 2.0, 3.0]),
+        );
+        let plan = sql_to_logical(
+            "SELECT cosine_similarity(emb, :q) AS score FROM docs",
+            &params,
+        )
+        .expect("parse");
+        match plan {
+            LogicalPlan::Projection { exprs, .. } => {
+                assert_eq!(exprs.len(), 1);
+                match &exprs[0].0 {
+                    crate::logical_plan::Expr::CosineSimilarity { .. } => {}
+                    other => panic!("expected cosine expr, got {other:?}"),
+                }
+            }
+            other => panic!("expected projection, got {other:?}"),
         }
     }
 }

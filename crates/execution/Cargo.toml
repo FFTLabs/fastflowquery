@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-vector = []
+vector = ["ffq-planner/vector"]
 
 [dependencies]
 ffq-common = { path = "../common" }

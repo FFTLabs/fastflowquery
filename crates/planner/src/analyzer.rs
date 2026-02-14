@@ -404,8 +404,10 @@ impl Analyzer {
 
             #[cfg(feature = "vector")]
             Expr::CosineSimilarity { vector, query } => {
-                let (av, _vdt) = self.analyze_expr(*vector, resolver)?;
-                let (aq, _qdt) = self.analyze_expr(*query, resolver)?;
+                let (av, vdt) = self.analyze_expr(*vector, resolver)?;
+                ensure_vector_type("cosine_similarity", &vdt)?;
+                let (aq, qdt) = self.analyze_expr(*query, resolver)?;
+                ensure_vector_literal_type("cosine_similarity", &qdt)?;
                 Ok((
                     Expr::CosineSimilarity {
                         vector: Box::new(av),
@@ -416,8 +418,10 @@ impl Analyzer {
             }
             #[cfg(feature = "vector")]
             Expr::L2Distance { vector, query } => {
-                let (av, _vdt) = self.analyze_expr(*vector, resolver)?;
-                let (aq, _qdt) = self.analyze_expr(*query, resolver)?;
+                let (av, vdt) = self.analyze_expr(*vector, resolver)?;
+                ensure_vector_type("l2_distance", &vdt)?;
+                let (aq, qdt) = self.analyze_expr(*query, resolver)?;
+                ensure_vector_literal_type("l2_distance", &qdt)?;
                 Ok((
                     Expr::L2Distance {
                         vector: Box::new(av),
@@ -428,8 +432,10 @@ impl Analyzer {
             }
             #[cfg(feature = "vector")]
             Expr::DotProduct { vector, query } => {
-                let (av, _vdt) = self.analyze_expr(*vector, resolver)?;
-                let (aq, _qdt) = self.analyze_expr(*query, resolver)?;
+                let (av, vdt) = self.analyze_expr(*vector, resolver)?;
+                ensure_vector_type("dot_product", &vdt)?;
+                let (aq, qdt) = self.analyze_expr(*query, resolver)?;
+                ensure_vector_literal_type("dot_product", &qdt)?;
                 Ok((
                     Expr::DotProduct {
                         vector: Box::new(av),
@@ -574,7 +580,27 @@ fn literal_type(v: &LiteralValue) -> DataType {
         LiteralValue::Utf8(_) => DataType::Utf8,
         LiteralValue::Boolean(_) => DataType::Boolean,
         LiteralValue::Null => DataType::Null,
+        #[cfg(feature = "vector")]
+        LiteralValue::VectorF32(v) => DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            v.len() as i32,
+        ),
     }
+}
+
+#[cfg(feature = "vector")]
+fn ensure_vector_type(func_name: &str, dt: &DataType) -> Result<()> {
+    match dt {
+        DataType::FixedSizeList(field, _) if field.data_type() == &DataType::Float32 => Ok(()),
+        other => Err(FfqError::Planning(format!(
+            "{func_name} requires vector column type FixedSizeList<Float32>, got {other:?}"
+        ))),
+    }
+}
+
+#[cfg(feature = "vector")]
+fn ensure_vector_literal_type(func_name: &str, dt: &DataType) -> Result<()> {
+    ensure_vector_type(func_name, dt)
 }
 
 fn is_numeric(dt: &DataType) -> bool {
@@ -665,6 +691,39 @@ mod tests {
         assert!(
             err.to_string().contains("INSERT type mismatch"),
             "err={err}"
+        );
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn analyze_cosine_similarity_requires_fixed_size_list_f32() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "docs".to_string(),
+            Arc::new(Schema::new(vec![Field::new(
+                "emb",
+                DataType::Float64,
+                false,
+            )])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+
+        let mut params = HashMap::new();
+        params.insert(
+            "q".to_string(),
+            crate::logical_plan::LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]),
+        );
+        let plan = sql_to_logical(
+            "SELECT cosine_similarity(emb, :q) AS score FROM docs",
+            &params,
+        )
+        .expect("parse");
+        let err = analyzer.analyze(plan, &provider).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("requires vector column type FixedSizeList<Float32>"),
+            "unexpected error: {err}"
         );
     }
 }

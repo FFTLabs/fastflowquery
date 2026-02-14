@@ -247,13 +247,8 @@ fn failed_save_as_table_leaves_no_catalog_entry_or_partial_data() {
             .save_as_table("blocked/table"),
     );
     assert!(result.is_err(), "expected write failure");
-    let query_failed = futures::executor::block_on(
-        engine
-            .table("blocked/table")
-            .expect("df")
-            .collect(),
-    )
-    .is_err();
+    let query_failed =
+        futures::executor::block_on(engine.table("blocked/table").expect("df").collect()).is_err();
     assert!(query_failed, "failed table write must not register table");
     let blocked_table_path = blocked_base.join("table");
     assert!(
