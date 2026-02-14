@@ -11,7 +11,9 @@ grpc = ["dep:tokio", "dep:tonic", "dep:prost", "dep:tokio-stream"]
 [dependencies]
 ffq-common = { path = "../common" }
 ffq-planner = { path = "../planner", default-features = false }
+ffq-shuffle = { path = "../shuffle" }
 serde.workspace = true
+serde_json.workspace = true
 
 tokio = { workspace = true, optional = true }
 tonic = { version = "0.12", optional = true }

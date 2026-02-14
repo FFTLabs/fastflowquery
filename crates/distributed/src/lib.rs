@@ -1,7 +1,12 @@
+pub mod coordinator;
 #[cfg(feature = "grpc")]
 pub mod grpc;
 pub mod stage;
 
+pub use coordinator::{
+    Coordinator, CoordinatorConfig, MapOutputPartitionMeta, QueryState, QueryStatus, StageMetrics,
+    TaskAssignment, TaskState,
+};
 use ffq_common::Result;
 use ffq_planner::PhysicalPlan;
 pub use stage::{StageDag, StageId, StageNode};
