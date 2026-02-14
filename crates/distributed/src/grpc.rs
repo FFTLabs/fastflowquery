@@ -1,5 +1,7 @@
 use std::sync::Arc;
+use std::{collections::HashMap, path::PathBuf};
 
+use ffq_shuffle::ShuffleReader;
 use tokio::sync::Mutex;
 use tokio_stream::{self as stream, Stream};
 use tonic::{Request, Response, Status};
@@ -240,5 +242,84 @@ fn to_status(err: ffq_common::FfqError) -> Status {
         ffq_common::FfqError::Execution(msg) => Status::internal(msg),
         ffq_common::FfqError::Io(e) => Status::internal(e.to_string()),
         ffq_common::FfqError::Unsupported(msg) => Status::unimplemented(msg),
+    }
+}
+
+#[derive(Clone)]
+pub struct WorkerShuffleService {
+    shuffle_root: PathBuf,
+    map_outputs: Arc<Mutex<HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>>>,
+}
+
+impl WorkerShuffleService {
+    pub fn new(shuffle_root: impl Into<PathBuf>) -> Self {
+        Self {
+            shuffle_root: shuffle_root.into(),
+            map_outputs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl ShuffleService for WorkerShuffleService {
+    async fn register_map_output(
+        &self,
+        request: Request<v1::RegisterMapOutputRequest>,
+    ) -> Result<Response<v1::RegisterMapOutputResponse>, Status> {
+        let req = request.into_inner();
+        let partitions = req
+            .partitions
+            .into_iter()
+            .map(|p| MapOutputPartitionMeta {
+                reduce_partition: p.reduce_partition,
+                bytes: p.bytes,
+                rows: p.rows,
+                batches: p.batches,
+            })
+            .collect::<Vec<_>>();
+        let key = (req.query_id, req.stage_id, req.map_task, req.attempt);
+        self.map_outputs.lock().await.insert(key, partitions);
+        Ok(Response::new(v1::RegisterMapOutputResponse {}))
+    }
+
+    type FetchShufflePartitionStream =
+        std::pin::Pin<Box<dyn Stream<Item = Result<v1::ShufflePartitionChunk, Status>> + Send>>;
+
+    async fn fetch_shuffle_partition(
+        &self,
+        request: Request<v1::FetchShufflePartitionRequest>,
+    ) -> Result<Response<Self::FetchShufflePartitionStream>, Status> {
+        let req = request.into_inner();
+        let query_num = req
+            .query_id
+            .parse::<u64>()
+            .map_err(|e| Status::invalid_argument(format!("query_id must be numeric: {e}")))?;
+        let reader = ShuffleReader::new(&self.shuffle_root);
+        let chunks = if req.attempt == 0 {
+            let (_attempt, chunks) = reader
+                .fetch_partition_chunks_latest(
+                    query_num,
+                    req.stage_id,
+                    req.map_task,
+                    req.reduce_partition,
+                )
+                .map_err(to_status)?;
+            chunks
+        } else {
+            reader
+                .fetch_partition_chunks(
+                    query_num,
+                    req.stage_id,
+                    req.map_task,
+                    req.attempt,
+                    req.reduce_partition,
+                )
+                .map_err(to_status)?
+        };
+
+        let out = chunks
+            .into_iter()
+            .map(|payload| Ok(v1::ShufflePartitionChunk { payload }));
+        Ok(Response::new(Box::pin(stream::iter(out))))
     }
 }

@@ -144,7 +144,7 @@ impl Coordinator {
         let plan: PhysicalPlan = serde_json::from_slice(physical_plan_json)
             .map_err(|e| FfqError::Planning(format!("invalid physical plan json: {e}")))?;
         let dag = build_stage_dag(&plan);
-        let qr = build_query_runtime(&query_id, dag)?;
+        let qr = build_query_runtime(&query_id, dag, physical_plan_json)?;
         self.queries.insert(query_id, qr);
         Ok(QueryState::Queued)
     }
@@ -338,7 +338,11 @@ impl Coordinator {
     }
 }
 
-fn build_query_runtime(query_id: &str, dag: StageDag) -> Result<QueryRuntime> {
+fn build_query_runtime(
+    query_id: &str,
+    dag: StageDag,
+    physical_plan_json: &[u8],
+) -> Result<QueryRuntime> {
     let submitted_at_ms = now_ms()?;
     let mut stages = HashMap::<u64, StageRuntime>::new();
     let mut tasks = HashMap::<(u64, u64, u32), TaskRuntime>::new();
@@ -356,8 +360,9 @@ fn build_query_runtime(query_id: &str, dag: StageDag) -> Result<QueryRuntime> {
                 },
             },
         );
-        let fragment = serde_json::to_vec(&node)
-            .map_err(|e| FfqError::Execution(format!("stage fragment encode failed: {e}")))?;
+        // v1 simplification: each scheduled task carries the submitted physical plan bytes.
+        // Stage boundaries are still respected by coordinator scheduling.
+        let fragment = physical_plan_json.to_vec();
         tasks.insert(
             (sid, 0, 1),
             TaskRuntime {
