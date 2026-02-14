@@ -6,6 +6,6 @@ pub mod dataframe;
 pub mod engine;
 pub mod expr;
 
-pub use dataframe::DataFrame;
+pub use dataframe::{DataFrame, WriteMode};
 pub use engine::Engine;
 pub use expr::*;
