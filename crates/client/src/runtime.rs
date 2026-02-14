@@ -21,7 +21,6 @@ use ffq_planner::{AggExpr, BuildSide, ExchangeExec, Expr, PhysicalPlan};
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
 use ffq_storage::qdrant_provider::QdrantProvider;
-#[cfg(feature = "qdrant")]
 use ffq_storage::vector_index::VectorIndexProvider;
 use ffq_storage::{Catalog, StorageProvider};
 use futures::future::BoxFuture;
@@ -416,13 +415,20 @@ fn execute_vector_topk(
         #[cfg(feature = "qdrant")]
         {
             let provider = QdrantProvider::from_table(&table)?;
-            let rows = provider
-                .topk(exec.query_vector, exec.k, exec.filter)
-                .await?;
-            rows_to_vector_topk_output(rows)
+            run_vector_topk_with_provider(&exec, &provider).await
         }
     }
     .boxed()
+}
+
+async fn run_vector_topk_with_provider(
+    exec: &ffq_planner::VectorTopKExec,
+    provider: &dyn VectorIndexProvider,
+) -> Result<ExecOutput> {
+    let rows = provider
+        .topk(exec.query_vector.clone(), exec.k, exec.filter.clone())
+        .await?;
+    rows_to_vector_topk_output(rows)
 }
 
 #[allow(dead_code)]
@@ -1704,7 +1710,37 @@ fn decode_record_batches_ipc(payload: &[u8]) -> Result<(SchemaRef, Vec<RecordBat
 
 #[cfg(test)]
 mod tests {
-    use super::rows_to_vector_topk_output;
+    use ffq_planner::VectorTopKExec;
+    use ffq_storage::vector_index::{VectorIndexProvider, VectorTopKRow};
+    use futures::future::BoxFuture;
+
+    use super::{rows_to_vector_topk_output, run_vector_topk_with_provider};
+
+    struct MockVectorProvider;
+
+    impl VectorIndexProvider for MockVectorProvider {
+        fn topk<'a>(
+            &'a self,
+            _query_vec: Vec<f32>,
+            _k: usize,
+            _filter: Option<String>,
+        ) -> BoxFuture<'a, ffq_common::Result<Vec<VectorTopKRow>>> {
+            Box::pin(async {
+                Ok(vec![
+                    VectorTopKRow {
+                        id: 7,
+                        score: 0.77,
+                        payload_json: Some("{\"tenant\":\"a\"}".to_string()),
+                    },
+                    VectorTopKRow {
+                        id: 2,
+                        score: 0.65,
+                        payload_json: None,
+                    },
+                ])
+            })
+        }
+    }
 
     #[test]
     fn vector_topk_rows_are_encoded_as_batch() {
@@ -1721,6 +1757,25 @@ mod tests {
             },
         ];
         let out = rows_to_vector_topk_output(rows).expect("build output");
+        assert_eq!(out.batches.len(), 1);
+        let b = &out.batches[0];
+        assert_eq!(b.num_rows(), 2);
+        assert_eq!(b.schema().field(0).name(), "id");
+        assert_eq!(b.schema().field(1).name(), "score");
+        assert_eq!(b.schema().field(2).name(), "payload");
+    }
+
+    #[test]
+    fn vector_topk_exec_uses_provider_rows() {
+        let exec = VectorTopKExec {
+            table: "docs_idx".to_string(),
+            query_vector: vec![1.0, 0.0, 0.0],
+            k: 2,
+            filter: Some("{\"must\":[]}".to_string()),
+        };
+        let provider = MockVectorProvider;
+        let out = futures::executor::block_on(run_vector_topk_with_provider(&exec, &provider))
+            .expect("vector topk output");
         assert_eq!(out.batches.len(), 1);
         let b = &out.batches[0];
         assert_eq!(b.num_rows(), 2);
