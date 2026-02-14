@@ -14,6 +14,10 @@ pub fn map_task_dir(query_id: u64, stage_id: u64, map_task: u64, attempt: u32) -
     format!("shuffle/{query_id}/{stage_id}/{map_task}/{attempt}")
 }
 
+pub fn map_task_base_dir(query_id: u64, stage_id: u64, map_task: u64) -> String {
+    format!("shuffle/{query_id}/{stage_id}/{map_task}")
+}
+
 pub fn index_json_path(query_id: u64, stage_id: u64, map_task: u64, attempt: u32) -> String {
     format!(
         "{}/index.json",
@@ -43,5 +47,7 @@ pub struct MapTaskIndex {
     pub stage_id: u64,
     pub map_task: u64,
     pub attempt: u32,
+    #[serde(default)]
+    pub created_at_ms: u64,
     pub partitions: Vec<ShufflePartitionMeta>,
 }

@@ -6,7 +6,8 @@ use arrow::record_batch::RecordBatch;
 use ffq_common::{FfqError, Result};
 
 use crate::layout::{
-    index_bin_path, index_json_path, shuffle_path, MapTaskIndex, ShufflePartitionMeta,
+    index_bin_path, index_json_path, map_task_base_dir, shuffle_path, MapTaskIndex,
+    ShufflePartitionMeta,
 };
 
 const INDEX_BIN_MAGIC: &[u8; 4] = b"FFQI";
@@ -53,6 +54,45 @@ impl ShuffleReader {
             .map_err(|e| FfqError::Execution(format!("index json decode failed: {e}")))
     }
 
+    pub fn available_attempts(
+        &self,
+        query_id: u64,
+        stage_id: u64,
+        map_task: u64,
+    ) -> Result<Vec<u32>> {
+        let base = self
+            .root_dir
+            .join(map_task_base_dir(query_id, stage_id, map_task));
+        if !base.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut attempts = fs::read_dir(base)?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let is_dir = e.file_type().ok()?.is_dir();
+                if !is_dir {
+                    return None;
+                }
+                e.file_name().to_string_lossy().parse::<u32>().ok()
+            })
+            .collect::<Vec<_>>();
+        attempts.sort_unstable();
+        Ok(attempts)
+    }
+
+    pub fn latest_attempt(
+        &self,
+        query_id: u64,
+        stage_id: u64,
+        map_task: u64,
+    ) -> Result<Option<u32>> {
+        Ok(self
+            .available_attempts(query_id, stage_id, map_task)?
+            .into_iter()
+            .max())
+    }
+
     pub fn partition_meta(
         &self,
         query_id: u64,
@@ -85,6 +125,23 @@ impl ShuffleReader {
         decode_ipc_bytes(&bytes)
     }
 
+    pub fn read_partition_latest(
+        &self,
+        query_id: u64,
+        stage_id: u64,
+        map_task: u64,
+        reduce_partition: u32,
+    ) -> Result<(u32, Vec<RecordBatch>)> {
+        let attempt = self
+            .latest_attempt(query_id, stage_id, map_task)?
+            .ok_or_else(|| {
+                FfqError::Execution("no shuffle attempts found for map task".to_string())
+            })?;
+        let batches =
+            self.read_partition(query_id, stage_id, map_task, attempt, reduce_partition)?;
+        Ok((attempt, batches))
+    }
+
     // Simulates FetchShufflePartition as server-streamed byte chunks.
     pub fn fetch_partition_chunks(
         &self,
@@ -104,6 +161,23 @@ impl ShuffleReader {
             offset = end;
         }
         Ok(out)
+    }
+
+    pub fn fetch_partition_chunks_latest(
+        &self,
+        query_id: u64,
+        stage_id: u64,
+        map_task: u64,
+        reduce_partition: u32,
+    ) -> Result<(u32, Vec<Vec<u8>>)> {
+        let attempt = self
+            .latest_attempt(query_id, stage_id, map_task)?
+            .ok_or_else(|| {
+                FfqError::Execution("no shuffle attempts found for map task".to_string())
+            })?;
+        let chunks =
+            self.fetch_partition_chunks(query_id, stage_id, map_task, attempt, reduce_partition)?;
+        Ok((attempt, chunks))
     }
 
     pub fn read_partition_from_streamed_chunks(
