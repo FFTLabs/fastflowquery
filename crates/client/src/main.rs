@@ -1,5 +1,5 @@
-use ffq_common::EngineConfig;
 use ffq_client::Engine;
+use ffq_common::EngineConfig;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();

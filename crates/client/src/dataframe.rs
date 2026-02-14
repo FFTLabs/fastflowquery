@@ -1,11 +1,10 @@
 use arrow::record_batch::RecordBatch;
 use ffq_common::{FfqError, Result};
-use ffq_planner::{AggExpr, Expr, LogicalPlan, JoinType};
+use ffq_planner::{AggExpr, Expr, JoinType, LogicalPlan};
 use futures::TryStreamExt;
 
 use crate::runtime::QueryContext;
 use crate::session::SharedSession;
-
 
 #[derive(Debug, Clone)]
 pub struct DataFrame {
@@ -15,7 +14,10 @@ pub struct DataFrame {
 
 impl DataFrame {
     pub(crate) fn new(session: SharedSession, logical_plan: LogicalPlan) -> Self {
-        Self { session, logical_plan }
+        Self {
+            session,
+            logical_plan,
+        }
     }
 
     pub fn logical_plan(&self) -> &LogicalPlan {
@@ -90,10 +92,11 @@ impl DataFrame {
         let cat = self.session.catalog.read().expect("catalog lock poisoned");
         let provider = CatalogProvider { catalog: &*cat };
 
-        let opt = self
-            .session
-            .planner
-            .optimize_only(self.logical_plan.clone(), &provider, &self.session.config)?;
+        let opt = self.session.planner.optimize_only(
+            self.logical_plan.clone(),
+            &provider,
+            &self.session.config,
+        )?;
 
         Ok(ffq_planner::explain_logical(&opt))
     }
@@ -118,14 +121,19 @@ impl DataFrame {
             }
         }
 
-        let cat_guard = self.session.catalog.read().expect("catalog lock poisoned");
-        let provider = CatalogProvider { catalog: &*cat_guard };
+        let (analyzed, catalog_snapshot) = {
+            let cat_guard = self.session.catalog.read().expect("catalog lock poisoned");
+            let provider = CatalogProvider {
+                catalog: &*cat_guard,
+            };
 
-        let analyzed = self.session.planner.optimize_analyze(
-            self.logical_plan.clone(),
-            &provider,
-            &self.session.config,
-        )?;
+            let analyzed = self.session.planner.optimize_analyze(
+                self.logical_plan.clone(),
+                &provider,
+                &self.session.config,
+            )?;
+            (analyzed, std::sync::Arc::new((*cat_guard).clone()))
+        };
 
         let physical = self.session.planner.create_physical_plan(&analyzed)?;
 
@@ -133,8 +141,11 @@ impl DataFrame {
             batch_size_rows: self.session.config.batch_size_rows,
         };
 
-        let stream: ffq_execution::stream::SendableRecordBatchStream =
-            self.session.runtime.execute(physical, ctx).await?;
+        let stream: ffq_execution::stream::SendableRecordBatchStream = self
+            .session
+            .runtime
+            .execute(physical, ctx, catalog_snapshot)
+            .await?;
 
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
 

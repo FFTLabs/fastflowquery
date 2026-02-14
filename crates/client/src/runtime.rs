@@ -1,10 +1,11 @@
 use std::fmt::Debug;
-use arrow_schema::Schema;
 use std::sync::Arc;
 
-use ffq_common::Result;
-use ffq_execution::stream::{empty_stream, SendableRecordBatchStream};
+use ffq_common::{FfqError, Result};
+use ffq_execution::{SendableRecordBatchStream, TaskContext};
 use ffq_planner::PhysicalPlan;
+use ffq_storage::parquet_provider::ParquetProvider;
+use ffq_storage::{Catalog, StorageProvider};
 use futures::future::BoxFuture;
 use futures::FutureExt;
 
@@ -16,8 +17,12 @@ pub struct QueryContext {
 
 /// Runtime = something that can execute a PhysicalPlan and return a stream of RecordBatches.
 pub trait Runtime: Send + Sync + Debug {
-    fn execute(&self, plan: PhysicalPlan, ctx: QueryContext)
-        -> BoxFuture<'static, Result<SendableRecordBatchStream>>;
+    fn execute(
+        &self,
+        plan: PhysicalPlan,
+        ctx: QueryContext,
+        catalog: Arc<Catalog>,
+    ) -> BoxFuture<'static, Result<SendableRecordBatchStream>>;
 
     fn shutdown(&self) -> BoxFuture<'static, Result<()>> {
         async { Ok(()) }.boxed()
@@ -36,12 +41,29 @@ impl EmbeddedRuntime {
 impl Runtime for EmbeddedRuntime {
     fn execute(
         &self,
-        _plan: PhysicalPlan,
-        _ctx: QueryContext,
+        plan: PhysicalPlan,
+        ctx: QueryContext,
+        catalog: Arc<Catalog>,
     ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
         async move {
-            let schema = Arc::new(Schema::empty());
-            Ok(empty_stream(schema))
+            match plan {
+                PhysicalPlan::ParquetScan(scan) => {
+                    let table = catalog.get(&scan.table)?.clone();
+                    let provider = ParquetProvider::new();
+                    let node = provider.scan(
+                        &table,
+                        scan.projection,
+                        scan.filters.into_iter().map(|f| format!("{f:?}")).collect(),
+                    )?;
+                    node.execute(Arc::new(TaskContext {
+                        batch_size_rows: ctx.batch_size_rows,
+                        mem_budget_bytes: 0,
+                    }))
+                }
+                _ => Err(FfqError::Unsupported(
+                    "embedded runtime currently supports only ParquetScan execution".to_string(),
+                )),
+            }
         }
         .boxed()
     }
@@ -71,13 +93,15 @@ impl Runtime for DistributedRuntime {
         &self,
         _plan: PhysicalPlan,
         _ctx: QueryContext,
+        _catalog: Arc<Catalog>,
     ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
         async move {
             // v1 skeleton: distributed implementation will:
             // - serialize plan
             // - submit to coordinator
             // - stream results back
-            let stream = futures::stream::empty::<Result<arrow::record_batch::RecordBatch>>().boxed();
+            let stream =
+                futures::stream::empty::<Result<arrow::record_batch::RecordBatch>>().boxed();
             Ok(stream)
         }
         .boxed()

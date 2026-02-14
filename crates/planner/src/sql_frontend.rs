@@ -2,12 +2,12 @@ use std::collections::HashMap;
 
 use ffq_common::{FfqError, Result};
 use sqlparser::ast::{
-    BinaryOperator as SqlBinaryOp, Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Query, SelectItem, SetExpr,
-    Statement, TableFactor, TableWithJoins, Value,
+    BinaryOperator as SqlBinaryOp, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Query,
+    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value,
 };
 
-use crate::logical_plan::{AggExpr, BinaryOp, Expr, LiteralValue, LogicalPlan, JoinStrategyHint};
+use crate::logical_plan::{AggExpr, BinaryOp, Expr, JoinStrategyHint, LiteralValue, LogicalPlan};
 
 /// Convert a SQL string into a LogicalPlan, binding named parameters (like :k, :query).
 pub fn sql_to_logical(sql: &str, params: &HashMap<String, LiteralValue>) -> Result<LogicalPlan> {
@@ -20,7 +20,10 @@ pub fn sql_to_logical(sql: &str, params: &HashMap<String, LiteralValue>) -> Resu
     statement_to_logical(&stmts[0], params)
 }
 
-pub fn statement_to_logical(stmt: &Statement, params: &HashMap<String, LiteralValue>) -> Result<LogicalPlan> {
+pub fn statement_to_logical(
+    stmt: &Statement,
+    params: &HashMap<String, LiteralValue>,
+) -> Result<LogicalPlan> {
     match stmt {
         Statement::Query(q) => query_to_logical(q, params),
         _ => Err(FfqError::Unsupported(
@@ -124,7 +127,10 @@ fn query_to_logical(q: &Query, params: &HashMap<String, LiteralValue>) -> Result
     Ok(plan)
 }
 
-fn from_to_plan(from: &[TableWithJoins], params: &HashMap<String, LiteralValue>) -> Result<LogicalPlan> {
+fn from_to_plan(
+    from: &[TableWithJoins],
+    params: &HashMap<String, LiteralValue>,
+) -> Result<LogicalPlan> {
     if from.len() != 1 {
         return Err(FfqError::Unsupported(
             "only one FROM source is supported in v1".to_string(),
@@ -233,7 +239,10 @@ fn first_function_arg(func: &sqlparser::ast::Function) -> Option<&FunctionArg> {
     }
 }
 
-fn try_parse_agg(e: &SqlExpr, params: &HashMap<String, LiteralValue>) -> Result<Option<(AggExpr, String)>> {
+fn try_parse_agg(
+    e: &SqlExpr,
+    params: &HashMap<String, LiteralValue>,
+) -> Result<Option<(AggExpr, String)>> {
     let (func, alias) = match e {
         SqlExpr::Function(f) => (f, None),
         _ => return Ok(None),
@@ -253,7 +262,9 @@ fn try_parse_agg(e: &SqlExpr, params: &HashMap<String, LiteralValue>) -> Result<
                 let ex = function_arg_to_expr(a0, params)?;
                 AggExpr::Count(ex)
             } else {
-                return Err(FfqError::Unsupported("COUNT() requires an argument in v1".to_string()));
+                return Err(FfqError::Unsupported(
+                    "COUNT() requires an argument in v1".to_string(),
+                ));
             }
         }
         "SUM" => AggExpr::Sum(function_arg_to_expr(required_arg(arg0, "SUM")?, params)?),
@@ -330,10 +341,14 @@ fn sql_value_to_literal(v: &Value, params: &HashMap<String, LiteralValue>) -> Re
     match v {
         Value::Number(s, _) => {
             if s.contains('.') {
-                let f: f64 = s.parse().map_err(|_| FfqError::Planning(format!("bad number: {s}")))?;
+                let f: f64 = s
+                    .parse()
+                    .map_err(|_| FfqError::Planning(format!("bad number: {s}")))?;
                 Ok(Expr::Literal(LiteralValue::Float64(f)))
             } else {
-                let i: i64 = s.parse().map_err(|_| FfqError::Planning(format!("bad number: {s}")))?;
+                let i: i64 = s
+                    .parse()
+                    .map_err(|_| FfqError::Planning(format!("bad number: {s}")))?;
                 Ok(Expr::Literal(LiteralValue::Int64(i)))
             }
         }
@@ -365,9 +380,9 @@ fn sql_limit_to_usize(e: &SqlExpr, params: &HashMap<String, LiteralValue>) -> Re
                 Ok(i as usize)
             }
         }
-        Expr::Literal(LiteralValue::Float64(_)) => Err(FfqError::Planning(
-            "LIMIT must be an integer".to_string(),
-        )),
+        Expr::Literal(LiteralValue::Float64(_)) => {
+            Err(FfqError::Planning("LIMIT must be an integer".to_string()))
+        }
         _ => Err(FfqError::Planning(
             "LIMIT must be a literal integer or bound parameter".to_string(),
         )),
@@ -395,11 +410,18 @@ fn sql_binop_to_binop(op: &SqlBinaryOp) -> Result<BinaryOp> {
 }
 
 fn object_name_to_string(n: &ObjectName) -> String {
-    n.0.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".")
+    n.0.iter()
+        .map(|i| i.value.clone())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn compound_ident_to_string(parts: &[Ident]) -> String {
-    parts.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".")
+    parts
+        .iter()
+        .map(|i| i.value.clone())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn sql_ident_expr_to_col(e: &SqlExpr) -> Result<String> {

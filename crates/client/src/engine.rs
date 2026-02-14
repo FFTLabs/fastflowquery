@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ffq_common::{EngineConfig, Result};
 use ffq_planner::LiteralValue;

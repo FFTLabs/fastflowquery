@@ -20,3 +20,9 @@ tree:
 
 test-planner:
 	cargo test -p ffq-planner
+
+test-unit:
+	cargo test --workspace --lib
+
+test:
+	cargo test

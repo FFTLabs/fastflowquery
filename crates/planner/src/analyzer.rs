@@ -265,13 +265,21 @@ impl Analyzer {
             Expr::Literal(v) => Ok((Expr::Literal(v.clone()), literal_type(&v))),
             Expr::Cast { expr, to_type } => {
                 let (ae, _dt) = self.analyze_expr(*expr, resolver)?;
-                Ok((Expr::Cast { expr: Box::new(ae), to_type: to_type.clone() }, to_type))
+                Ok((
+                    Expr::Cast {
+                        expr: Box::new(ae),
+                        to_type: to_type.clone(),
+                    },
+                    to_type,
+                ))
             }
             Expr::And(l, r) => {
                 let (al, ldt) = self.analyze_expr(*l, resolver)?;
                 let (ar, rdt) = self.analyze_expr(*r, resolver)?;
                 if ldt != DataType::Boolean || rdt != DataType::Boolean {
-                    return Err(FfqError::Planning("AND requires boolean operands".to_string()));
+                    return Err(FfqError::Planning(
+                        "AND requires boolean operands".to_string(),
+                    ));
                 }
                 Ok((Expr::And(Box::new(al), Box::new(ar)), DataType::Boolean))
             }
@@ -279,14 +287,18 @@ impl Analyzer {
                 let (al, ldt) = self.analyze_expr(*l, resolver)?;
                 let (ar, rdt) = self.analyze_expr(*r, resolver)?;
                 if ldt != DataType::Boolean || rdt != DataType::Boolean {
-                    return Err(FfqError::Planning("OR requires boolean operands".to_string()));
+                    return Err(FfqError::Planning(
+                        "OR requires boolean operands".to_string(),
+                    ));
                 }
                 Ok((Expr::Or(Box::new(al), Box::new(ar)), DataType::Boolean))
             }
             Expr::Not(e) => {
                 let (ae, dt) = self.analyze_expr(*e, resolver)?;
                 if dt != DataType::Boolean {
-                    return Err(FfqError::Planning("NOT requires boolean operand".to_string()));
+                    return Err(FfqError::Planning(
+                        "NOT requires boolean operand".to_string(),
+                    ));
                 }
                 Ok((Expr::Not(Box::new(ae)), DataType::Boolean))
             }
@@ -471,7 +483,9 @@ impl Resolver {
             }
             base += r.fields.len();
         }
-        Err(FfqError::Planning(format!("column index out of range: {idx}")))
+        Err(FfqError::Planning(format!(
+            "column index out of range: {idx}"
+        )))
     }
 
     fn data_type_at(&self, idx: usize) -> Result<DataType> {

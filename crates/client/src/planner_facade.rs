@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ffq_common::{EngineConfig, Result};
 use ffq_planner::{
-    Analyzer, LiteralValue, LogicalPlan, Optimizer, OptimizerConfig, OptimizerContext, PhysicalPlan
+    Analyzer, LiteralValue, LogicalPlan, Optimizer, OptimizerConfig, OptimizerContext, PhysicalPlan,
 };
 
 #[derive(Debug, Default)]

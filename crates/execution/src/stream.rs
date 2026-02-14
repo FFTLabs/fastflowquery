@@ -76,16 +76,18 @@ impl BatchSender {
     /// Send a batch (awaits if the channel buffer is full).
     pub async fn send_batch(&mut self, batch: RecordBatch) -> Result<()> {
         use futures::SinkExt;
-        self.tx.send(Ok(batch)).await.map_err(|e| {
-            ffq_common::FfqError::Execution(format!("batch channel closed: {e}"))
-        })
+        self.tx
+            .send(Ok(batch))
+            .await
+            .map_err(|e| ffq_common::FfqError::Execution(format!("batch channel closed: {e}")))
     }
 
     /// Send an error and terminate downstream consumption.
     pub async fn send_error(&mut self, err: ffq_common::FfqError) -> Result<()> {
         use futures::SinkExt;
-        self.tx.send(Err(err)).await.map_err(|e| {
-            ffq_common::FfqError::Execution(format!("batch channel closed: {e}"))
-        })
+        self.tx
+            .send(Err(err))
+            .await
+            .map_err(|e| ffq_common::FfqError::Execution(format!("batch channel closed: {e}")))
     }
 }

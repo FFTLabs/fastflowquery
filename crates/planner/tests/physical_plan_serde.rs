@@ -1,5 +1,5 @@
 use ffq_planner::{
-    create_physical_plan, LogicalPlan, PhysicalPlannerConfig, JoinStrategyHint, JoinType,
+    create_physical_plan, JoinStrategyHint, JoinType, LogicalPlan, PhysicalPlannerConfig,
 };
 
 #[test]

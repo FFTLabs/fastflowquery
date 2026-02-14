@@ -1,10 +1,8 @@
-use std::collections::{HashSet};
-use ffq_common::{Result};
+use ffq_common::Result;
+use std::collections::HashSet;
 
 use crate::analyzer::SchemaProvider;
-use crate::logical_plan::{
-    BinaryOp, Expr, JoinStrategyHint, JoinType, LiteralValue, LogicalPlan,
-};
+use crate::logical_plan::{BinaryOp, Expr, JoinStrategyHint, JoinType, LiteralValue, LogicalPlan};
 
 #[derive(Debug, Clone, Copy)]
 pub struct OptimizerConfig {
@@ -225,7 +223,13 @@ fn proj_rewrite(
     match plan {
         LogicalPlan::Limit { n, input } => {
             let (new_in, req) = proj_rewrite(*input, required, ctx)?;
-            Ok((LogicalPlan::Limit { n, input: Box::new(new_in) }, req))
+            Ok((
+                LogicalPlan::Limit {
+                    n,
+                    input: Box::new(new_in),
+                },
+                req,
+            ))
         }
 
         LogicalPlan::Filter { predicate, input } => {
@@ -268,10 +272,16 @@ fn proj_rewrite(
             ))
         }
 
-        LogicalPlan::Aggregate { group_exprs, aggr_exprs, input } => {
+        LogicalPlan::Aggregate {
+            group_exprs,
+            aggr_exprs,
+            input,
+        } => {
             // v1: no column pruning across aggregates yet
             let mut child_req = HashSet::new();
-            for g in &group_exprs { child_req.extend(expr_columns(g)); }
+            for g in &group_exprs {
+                child_req.extend(expr_columns(g));
+            }
             for (agg, _name) in &aggr_exprs {
                 child_req.extend(agg_columns(agg));
             }
@@ -286,7 +296,13 @@ fn proj_rewrite(
             ))
         }
 
-        LogicalPlan::Join { left, right, on, join_type, strategy_hint } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            join_type,
+            strategy_hint,
+        } => {
             // Split required columns by side if we can.
             let left_cols = plan_output_columns(&left, ctx)?;
             let right_cols = plan_output_columns(&right, ctx)?;
@@ -332,7 +348,11 @@ fn proj_rewrite(
             ))
         }
 
-        LogicalPlan::TableScan { table, projection, filters } => {
+        LogicalPlan::TableScan {
+            table,
+            projection,
+            filters,
+        } => {
             // Compute required cols from parent and from scan filters.
             let mut req = required.unwrap_or_default();
             for f in &filters {
@@ -341,7 +361,14 @@ fn proj_rewrite(
 
             if req.is_empty() {
                 // no restriction -> keep existing projection
-                return Ok((LogicalPlan::TableScan { table, projection, filters }, HashSet::new()));
+                return Ok((
+                    LogicalPlan::TableScan {
+                        table,
+                        projection,
+                        filters,
+                    },
+                    HashSet::new(),
+                ));
             }
 
             // Validate against schema (and keep stable ordering)
@@ -376,27 +403,65 @@ fn predicate_pushdown(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result<L
             let input = predicate_pushdown(*input, ctx)?;
 
             // push into TableScan
-            if let LogicalPlan::TableScan { table, projection, mut filters } = input {
+            if let LogicalPlan::TableScan {
+                table,
+                projection,
+                mut filters,
+            } = input
+            {
                 filters.push(predicate);
-                return Ok(LogicalPlan::TableScan { table, projection, filters });
+                return Ok(LogicalPlan::TableScan {
+                    table,
+                    projection,
+                    filters,
+                });
             }
 
             // push below passthrough projection
-            if let LogicalPlan::Projection { exprs, input: inner } = input {
+            if let LogicalPlan::Projection {
+                exprs,
+                input: inner,
+            } = input
+            {
                 if projection_is_passthrough(&exprs) {
-                    let pushed = LogicalPlan::Filter { predicate, input: inner };
-                    return Ok(LogicalPlan::Projection { exprs, input: Box::new(pushed) });
+                    let pushed = LogicalPlan::Filter {
+                        predicate,
+                        input: inner,
+                    };
+                    return Ok(LogicalPlan::Projection {
+                        exprs,
+                        input: Box::new(pushed),
+                    });
                 } else {
-                    return Ok(LogicalPlan::Filter { predicate, input: Box::new(LogicalPlan::Projection { exprs, input: inner }) });
+                    return Ok(LogicalPlan::Filter {
+                        predicate,
+                        input: Box::new(LogicalPlan::Projection {
+                            exprs,
+                            input: inner,
+                        }),
+                    });
                 }
             }
 
             // push to join sides
-            if let LogicalPlan::Join { left, right, on, join_type, strategy_hint } = input {
+            if let LogicalPlan::Join {
+                left,
+                right,
+                on,
+                join_type,
+                strategy_hint,
+            } = input
+            {
                 if join_type != JoinType::Inner {
                     return Ok(LogicalPlan::Filter {
                         predicate,
-                        input: Box::new(LogicalPlan::Join { left, right, on, join_type, strategy_hint }),
+                        input: Box::new(LogicalPlan::Join {
+                            left,
+                            right,
+                            on,
+                            join_type,
+                            strategy_hint,
+                        }),
                     });
                 }
 
@@ -414,8 +479,12 @@ fn predicate_pushdown(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result<L
                     let mut seen_r = false;
                     for col in cols {
                         let col2 = strip_qual(&col);
-                        if left_cols.contains(&col2) { seen_l = true; }
-                        if right_cols.contains(&col2) { seen_r = true; }
+                        if left_cols.contains(&col2) {
+                            seen_l = true;
+                        }
+                        if right_cols.contains(&col2) {
+                            seen_r = true;
+                        }
                     }
                     if seen_l && !seen_r {
                         left_push.push(c);
@@ -481,7 +550,13 @@ fn join_strategy_hint(
     cfg: OptimizerConfig,
 ) -> Result<LogicalPlan> {
     match plan {
-        LogicalPlan::Join { left, right, on, join_type, strategy_hint: _ } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            join_type,
+            strategy_hint: _,
+        } => {
             let l_bytes = estimate_bytes(&left, ctx)?;
             let r_bytes = estimate_bytes(&right, ctx)?;
 
@@ -506,7 +581,9 @@ fn join_strategy_hint(
                 strategy_hint: hint,
             })
         }
-        other => Ok(map_children(other, |p| join_strategy_hint(p, ctx, cfg).unwrap())),
+        other => Ok(map_children(other, |p| {
+            join_strategy_hint(p, ctx, cfg).unwrap()
+        })),
     }
 }
 
@@ -516,11 +593,40 @@ fn join_strategy_hint(
 
 fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy) -> LogicalPlan {
     match plan {
-        LogicalPlan::Filter { predicate, input } => LogicalPlan::Filter { predicate, input: Box::new(f(*input)) },
-        LogicalPlan::Projection { exprs, input } => LogicalPlan::Projection { exprs, input: Box::new(f(*input)) },
-        LogicalPlan::Aggregate { group_exprs, aggr_exprs, input } => LogicalPlan::Aggregate { group_exprs, aggr_exprs, input: Box::new(f(*input)) },
-        LogicalPlan::Join { left, right, on, join_type, strategy_hint } => LogicalPlan::Join { left: Box::new(f(*left)), right: Box::new(f(*right)), on, join_type, strategy_hint },
-        LogicalPlan::Limit { n, input } => LogicalPlan::Limit { n, input: Box::new(f(*input)) },
+        LogicalPlan::Filter { predicate, input } => LogicalPlan::Filter {
+            predicate,
+            input: Box::new(f(*input)),
+        },
+        LogicalPlan::Projection { exprs, input } => LogicalPlan::Projection {
+            exprs,
+            input: Box::new(f(*input)),
+        },
+        LogicalPlan::Aggregate {
+            group_exprs,
+            aggr_exprs,
+            input,
+        } => LogicalPlan::Aggregate {
+            group_exprs,
+            aggr_exprs,
+            input: Box::new(f(*input)),
+        },
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            join_type,
+            strategy_hint,
+        } => LogicalPlan::Join {
+            left: Box::new(f(*left)),
+            right: Box::new(f(*right)),
+            on,
+            join_type,
+            strategy_hint,
+        },
+        LogicalPlan::Limit { n, input } => LogicalPlan::Limit {
+            n,
+            input: Box::new(f(*input)),
+        },
         s @ LogicalPlan::TableScan { .. } => s,
     }
 }
@@ -532,20 +638,41 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
         },
         LogicalPlan::Projection { exprs, input } => LogicalPlan::Projection {
-            exprs: exprs.into_iter().map(|(e, n)| (rewrite_expr(e, rewrite), n)).collect(),
+            exprs: exprs
+                .into_iter()
+                .map(|(e, n)| (rewrite_expr(e, rewrite), n))
+                .collect(),
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
         },
-        LogicalPlan::Aggregate { group_exprs, aggr_exprs, input } => LogicalPlan::Aggregate {
-            group_exprs: group_exprs.into_iter().map(|e| rewrite_expr(e, rewrite)).collect(),
+        LogicalPlan::Aggregate {
+            group_exprs,
+            aggr_exprs,
+            input,
+        } => LogicalPlan::Aggregate {
+            group_exprs: group_exprs
+                .into_iter()
+                .map(|e| rewrite_expr(e, rewrite))
+                .collect(),
             aggr_exprs,
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
         },
-        LogicalPlan::Join { left, right, on, join_type, strategy_hint } => LogicalPlan::Join {
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            join_type,
+            strategy_hint,
+        } => LogicalPlan::Join {
             left: Box::new(rewrite_plan_exprs(*left, rewrite)),
             right: Box::new(rewrite_plan_exprs(*right, rewrite)),
-            on, join_type, strategy_hint,
+            on,
+            join_type,
+            strategy_hint,
         },
-        LogicalPlan::Limit { n, input } => LogicalPlan::Limit { n, input: Box::new(rewrite_plan_exprs(*input, rewrite)) },
+        LogicalPlan::Limit { n, input } => LogicalPlan::Limit {
+            n,
+            input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+        },
         s @ LogicalPlan::TableScan { .. } => s,
     }
 }
@@ -557,10 +684,19 @@ fn rewrite_expr(e: Expr, rewrite: &dyn Fn(Expr) -> Expr) -> Expr {
             op,
             right: Box::new(rewrite_expr(*right, rewrite)),
         },
-        Expr::And(a, b) => Expr::And(Box::new(rewrite_expr(*a, rewrite)), Box::new(rewrite_expr(*b, rewrite))),
-        Expr::Or(a, b) => Expr::Or(Box::new(rewrite_expr(*a, rewrite)), Box::new(rewrite_expr(*b, rewrite))),
+        Expr::And(a, b) => Expr::And(
+            Box::new(rewrite_expr(*a, rewrite)),
+            Box::new(rewrite_expr(*b, rewrite)),
+        ),
+        Expr::Or(a, b) => Expr::Or(
+            Box::new(rewrite_expr(*a, rewrite)),
+            Box::new(rewrite_expr(*b, rewrite)),
+        ),
         Expr::Not(x) => Expr::Not(Box::new(rewrite_expr(*x, rewrite))),
-        Expr::Cast { expr, to_type } => Expr::Cast { expr: Box::new(rewrite_expr(*expr, rewrite)), to_type },
+        Expr::Cast { expr, to_type } => Expr::Cast {
+            expr: Box::new(rewrite_expr(*expr, rewrite)),
+            to_type,
+        },
         #[cfg(feature = "vector")]
         Expr::CosineSimilarity { vector, query } => Expr::CosineSimilarity {
             vector: Box::new(rewrite_expr(*vector, rewrite)),
@@ -597,7 +733,8 @@ fn combine_conjuncts(mut v: Vec<Expr>) -> Expr {
         return Expr::Literal(LiteralValue::Boolean(true));
     }
     let first = v.remove(0);
-    v.into_iter().fold(first, |acc, e| Expr::And(Box::new(acc), Box::new(e)))
+    v.into_iter()
+        .fold(first, |acc, e| Expr::And(Box::new(acc), Box::new(e)))
 }
 
 fn projection_is_passthrough(exprs: &[(Expr, String)]) -> bool {
@@ -616,16 +753,31 @@ fn expr_columns(e: &Expr) -> HashSet<String> {
 
 fn collect_cols(e: &Expr, out: &mut HashSet<String>) {
     match e {
-        Expr::Column(c) => { out.insert(c.clone()); }
-        Expr::ColumnRef { name, .. } => { out.insert(name.clone()); }
-        Expr::BinaryOp { left, right, .. } => { collect_cols(left, out); collect_cols(right, out); }
-        Expr::And(a, b) | Expr::Or(a, b) => { collect_cols(a, out); collect_cols(b, out); }
-        Expr::Not(x) | Expr::Cast { expr: x, .. } => { collect_cols(x, out); }
+        Expr::Column(c) => {
+            out.insert(c.clone());
+        }
+        Expr::ColumnRef { name, .. } => {
+            out.insert(name.clone());
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_cols(left, out);
+            collect_cols(right, out);
+        }
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            collect_cols(a, out);
+            collect_cols(b, out);
+        }
+        Expr::Not(x) | Expr::Cast { expr: x, .. } => {
+            collect_cols(x, out);
+        }
         Expr::Literal(_) => {}
         #[cfg(feature = "vector")]
         Expr::CosineSimilarity { vector, query }
         | Expr::L2Distance { vector, query }
-        | Expr::DotProduct { vector, query } => { collect_cols(vector, out); collect_cols(query, out); }
+        | Expr::DotProduct { vector, query } => {
+            collect_cols(vector, out);
+            collect_cols(query, out);
+        }
     }
 }
 
@@ -635,18 +787,28 @@ fn agg_columns(_agg: &crate::logical_plan::AggExpr) -> HashSet<String> {
 }
 
 fn strip_qual(s: &str) -> String {
-    if let Some((_t, c)) = s.split_once('.') { c.to_string() } else { s.to_string() }
+    if let Some((_t, c)) = s.split_once('.') {
+        c.to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 fn plan_output_columns(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result<HashSet<String>> {
     match plan {
-        LogicalPlan::TableScan { table, projection, .. } => {
+        LogicalPlan::TableScan {
+            table, projection, ..
+        } => {
             let schema = ctx.table_schema(table)?;
             let mut set = HashSet::new();
             if let Some(cols) = projection {
-                for c in cols { set.insert(c.clone()); }
+                for c in cols {
+                    set.insert(c.clone());
+                }
             } else {
-                for f in schema.fields() { set.insert(f.name().to_string()); }
+                for f in schema.fields() {
+                    set.insert(f.name().to_string());
+                }
             }
             Ok(set)
         }
@@ -667,8 +829,12 @@ fn estimate_bytes(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result<Opti
     match plan {
         LogicalPlan::TableScan { table, .. } => {
             let (bytes, rows) = ctx.table_stats(table)?;
-            if let Some(b) = bytes { return Ok(Some(b)); }
-            if let Some(r) = rows { return Ok(Some(r.saturating_mul(100))); } // heuristic row size
+            if let Some(b) = bytes {
+                return Ok(Some(b));
+            }
+            if let Some(r) = rows {
+                return Ok(Some(r.saturating_mul(100)));
+            } // heuristic row size
             Ok(None)
         }
         LogicalPlan::Filter { input, .. }

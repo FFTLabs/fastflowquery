@@ -130,7 +130,10 @@ pub struct BroadcastExchange {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PartitioningSpec {
     /// Hash partition by expressions into N partitions.
-    HashKeys { keys: Vec<String>, partitions: usize },
+    HashKeys {
+        keys: Vec<String>,
+        partitions: usize,
+    },
     /// Single partition.
     Single,
 }

@@ -41,7 +41,9 @@ pub fn compile_expr(expr: &Expr, input_schema: &SchemaRef) -> Result<Arc<dyn Phy
                 .fields()
                 .iter()
                 .position(|f| f.name() == name)
-                .ok_or_else(|| FfqError::Planning(format!("unknown column in execution: {name}")))?;
+                .ok_or_else(|| {
+                    FfqError::Planning(format!("unknown column in execution: {name}"))
+                })?;
             let dt = input_schema.field(idx).data_type().clone();
             Ok(Arc::new(ColumnExpr { index: idx, dt }))
         }
@@ -179,8 +181,7 @@ impl PhysicalExpr for CastExpr {
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
         let arr = self.inner.evaluate(batch)?;
-        cast(&arr, &self.to_type)
-            .map_err(|e| FfqError::Execution(format!("cast failed: {e}")))
+        cast(&arr, &self.to_type).map_err(|e| FfqError::Execution(format!("cast failed: {e}")))
     }
 }
 
@@ -324,7 +325,8 @@ fn scalar_to_array(v: &LiteralValue, len: usize) -> Result<ArrayRef> {
         LiteralValue::Null => Ok(arrow::array::new_null_array(&DataType::Null, len)),
         #[cfg(feature = "vector")]
         LiteralValue::VectorF32(_) => Err(FfqError::Unsupported(
-            "Vector literal can only be used as query literal for vector functions in v1".to_string(),
+            "Vector literal can only be used as query literal for vector functions in v1"
+                .to_string(),
         )),
     }
 }
@@ -505,7 +507,9 @@ impl PhysicalExpr for VectorExpr {
         let list = arr
             .as_any()
             .downcast_ref::<FixedSizeListArray>()
-            .ok_or_else(|| FfqError::Execution("vector column must be FixedSizeList".to_string()))?;
+            .ok_or_else(|| {
+                FfqError::Execution("vector column must be FixedSizeList".to_string())
+            })?;
 
         let dim = list.value_length() as usize;
         if self.query.len() != dim {

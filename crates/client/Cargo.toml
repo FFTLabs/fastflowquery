@@ -29,3 +29,6 @@ arrow.workspace = true
 arrow-schema.workspace = true
 futures.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+parquet.workspace = true
