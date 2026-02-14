@@ -4,3 +4,8 @@
 **/*.parquet
 **/*.prof
 **/*.svg
+
+# local environment
+.env
+.env.*
+!.env.example

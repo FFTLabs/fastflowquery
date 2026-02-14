@@ -21,6 +21,9 @@ pub struct Session {
 
 impl Session {
     pub fn new(config: EngineConfig) -> Result<Self> {
+        // Best-effort local env loading for FFQ_COORDINATOR_ENDPOINT and other dev vars.
+        let _ = dotenvy::dotenv();
+
         let runtime: Arc<dyn Runtime> = {
             #[cfg(feature = "distributed")]
             {
