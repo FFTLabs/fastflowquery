@@ -1,0 +1,141 @@
+syntax = "proto3";
+
+package ffq.distributed.v1;
+
+service ControlPlane {
+  rpc SubmitQuery(SubmitQueryRequest) returns (SubmitQueryResponse);
+  rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+  rpc ReportTaskStatus(ReportTaskStatusRequest) returns (ReportTaskStatusResponse);
+  rpc GetQueryStatus(GetQueryStatusRequest) returns (GetQueryStatusResponse);
+  rpc CancelQuery(CancelQueryRequest) returns (CancelQueryResponse);
+}
+
+service ShuffleService {
+  rpc RegisterMapOutput(RegisterMapOutputRequest) returns (RegisterMapOutputResponse);
+  rpc FetchShufflePartition(FetchShufflePartitionRequest) returns (stream ShufflePartitionChunk);
+}
+
+service HeartbeatService {
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+enum QueryState {
+  QUERY_STATE_UNSPECIFIED = 0;
+  QUERY_STATE_QUEUED = 1;
+  QUERY_STATE_RUNNING = 2;
+  QUERY_STATE_SUCCEEDED = 3;
+  QUERY_STATE_FAILED = 4;
+  QUERY_STATE_CANCELED = 5;
+}
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_QUEUED = 1;
+  TASK_STATE_RUNNING = 2;
+  TASK_STATE_SUCCEEDED = 3;
+  TASK_STATE_FAILED = 4;
+}
+
+message SubmitQueryRequest {
+  string query_id = 1;
+  bytes physical_plan_json = 2;
+}
+
+message SubmitQueryResponse {
+  string query_id = 1;
+  QueryState state = 2;
+}
+
+message GetTaskRequest {
+  string worker_id = 1;
+  uint32 capacity = 2;
+}
+
+message TaskAssignment {
+  string query_id = 1;
+  uint64 stage_id = 2;
+  uint64 task_id = 3;
+  uint32 attempt = 4;
+  bytes plan_fragment_json = 5;
+}
+
+message GetTaskResponse {
+  repeated TaskAssignment tasks = 1;
+}
+
+message ReportTaskStatusRequest {
+  string query_id = 1;
+  uint64 stage_id = 2;
+  uint64 task_id = 3;
+  uint32 attempt = 4;
+  TaskState state = 5;
+  string message = 6;
+}
+
+message ReportTaskStatusResponse {}
+
+message GetQueryStatusRequest {
+  string query_id = 1;
+}
+
+message QueryStatus {
+  string query_id = 1;
+  QueryState state = 2;
+  uint64 submitted_at_ms = 3;
+  uint64 started_at_ms = 4;
+  uint64 finished_at_ms = 5;
+  string message = 6;
+}
+
+message GetQueryStatusResponse {
+  QueryStatus status = 1;
+}
+
+message CancelQueryRequest {
+  string query_id = 1;
+  string reason = 2;
+}
+
+message CancelQueryResponse {
+  string query_id = 1;
+  QueryState state = 2;
+}
+
+message RegisterMapOutputRequest {
+  string query_id = 1;
+  uint64 stage_id = 2;
+  uint64 map_task = 3;
+  uint32 attempt = 4;
+  repeated MapOutputPartition partitions = 5;
+}
+
+message MapOutputPartition {
+  uint32 reduce_partition = 1;
+  uint64 bytes = 2;
+  uint64 rows = 3;
+  uint64 batches = 4;
+}
+
+message RegisterMapOutputResponse {}
+
+message FetchShufflePartitionRequest {
+  string query_id = 1;
+  uint64 stage_id = 2;
+  uint64 map_task = 3;
+  uint32 attempt = 4;
+  uint32 reduce_partition = 5;
+}
+
+message ShufflePartitionChunk {
+  bytes payload = 1;
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  uint64 at_ms = 2;
+  uint32 running_tasks = 3;
+}
+
+message HeartbeatResponse {
+  bool accepted = 1;
+}
