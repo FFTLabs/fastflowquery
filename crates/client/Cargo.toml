@@ -27,6 +27,7 @@ ffq-distributed = { path = "../distributed", optional = true }
 
 arrow.workspace = true
 arrow-schema.workspace = true
+parquet.workspace = true
 futures.workspace = true
 tracing.workspace = true
 serde.workspace = true
@@ -35,5 +36,4 @@ tokio.workspace = true
 dotenvy = "0.15"
 
 [dev-dependencies]
-parquet.workspace = true
 tonic = "0.12"

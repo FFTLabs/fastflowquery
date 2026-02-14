@@ -74,7 +74,9 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             columns,
             input,
         } => {
-            out.push_str(&format!("{pad}InsertInto table={table} columns={columns:?}\n"));
+            out.push_str(&format!(
+                "{pad}InsertInto table={table} columns={columns:?}\n"
+            ));
             fmt_plan(input, indent + 1, out);
         }
     }

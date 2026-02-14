@@ -16,6 +16,7 @@ ffq-shuffle = { path = "../shuffle" }
 ffq-storage = { path = "../storage" }
 arrow.workspace = true
 arrow-schema.workspace = true
+parquet.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true

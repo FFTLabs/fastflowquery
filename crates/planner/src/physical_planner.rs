@@ -3,8 +3,8 @@ use ffq_common::{FfqError, Result};
 use crate::logical_plan::{Expr, JoinStrategyHint, JoinType, LogicalPlan};
 use crate::physical_plan::{
     BroadcastExchange, BuildSide, ExchangeExec, FilterExec, FinalHashAggregateExec, HashJoinExec,
-    LimitExec, ParquetScanExec, PartialHashAggregateExec, PartitioningSpec, PhysicalPlan,
-    ProjectExec, ShuffleReadExchange, ShuffleWriteExchange,
+    LimitExec, ParquetScanExec, ParquetWriteExec, PartialHashAggregateExec, PartitioningSpec,
+    PhysicalPlan, ProjectExec, ShuffleReadExchange, ShuffleWriteExchange,
 };
 
 #[derive(Debug, Clone)]
@@ -197,9 +197,13 @@ pub fn create_physical_plan(
                 }
             }
         }
-        LogicalPlan::InsertInto { .. } => Err(FfqError::Unsupported(
-            "INSERT planning to physical operators is not implemented yet".to_string(),
-        )),
+        LogicalPlan::InsertInto { table, input, .. } => {
+            let child = create_physical_plan(input, cfg)?;
+            Ok(PhysicalPlan::ParquetWrite(ParquetWriteExec {
+                table: table.clone(),
+                input: Box::new(child),
+            }))
+        }
     }
 }
 

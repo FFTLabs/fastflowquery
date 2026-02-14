@@ -250,7 +250,11 @@ impl Analyzer {
                     )));
                 }
 
-                for (idx, (src, dst)) in input_schema.fields().iter().zip(target_fields.iter()).enumerate()
+                for (idx, (src, dst)) in input_schema
+                    .fields()
+                    .iter()
+                    .zip(target_fields.iter())
+                    .enumerate()
                 {
                     if !insert_type_compatible(src.data_type(), dst.data_type()) {
                         return Err(FfqError::Planning(format!(
@@ -655,10 +659,13 @@ mod tests {
         let analyzer = Analyzer::new();
         let plan = sql_to_logical("INSERT INTO dst SELECT a FROM src", &HashMap::new())
             .expect("parse insert");
-        let err = analyzer.analyze(plan, &provider).expect_err("expected type mismatch");
-        assert!(err
-            .to_string()
-            .contains("INSERT type mismatch"), "err={err}");
+        let err = analyzer
+            .analyze(plan, &provider)
+            .expect_err("expected type mismatch");
+        assert!(
+            err.to_string().contains("INSERT type mismatch"),
+            "err={err}"
+        );
     }
 }
 

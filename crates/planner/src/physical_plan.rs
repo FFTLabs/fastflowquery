@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PhysicalPlan {
     ParquetScan(ParquetScanExec),
+    ParquetWrite(ParquetWriteExec),
     Filter(FilterExec),
     Project(ProjectExec),
     CoalesceBatches(CoalesceBatchesExec),
@@ -26,6 +27,7 @@ impl PhysicalPlan {
     pub fn children(&self) -> Vec<&PhysicalPlan> {
         match self {
             PhysicalPlan::ParquetScan(_) => vec![],
+            PhysicalPlan::ParquetWrite(x) => vec![x.input.as_ref()],
             PhysicalPlan::Filter(x) => vec![x.input.as_ref()],
             PhysicalPlan::Project(x) => vec![x.input.as_ref()],
             PhysicalPlan::CoalesceBatches(x) => vec![x.input.as_ref()],
@@ -50,6 +52,12 @@ pub struct ParquetScanExec {
     pub projection: Option<Vec<String>>,
     /// Pushdown-able predicates (best-effort; execution decides how much it can push).
     pub filters: Vec<Expr>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParquetWriteExec {
+    pub table: String,
+    pub input: Box<PhysicalPlan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

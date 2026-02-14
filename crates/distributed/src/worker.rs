@@ -18,6 +18,7 @@ use ffq_shuffle::{ShuffleReader, ShuffleWriter};
 use ffq_storage::parquet_provider::ParquetProvider;
 use ffq_storage::{Catalog, StorageProvider};
 use futures::TryStreamExt;
+use parquet::arrow::ArrowWriter;
 use tokio::sync::{Mutex, Semaphore};
 use tonic::async_trait;
 
@@ -60,6 +61,7 @@ pub struct TaskContext {
 pub struct TaskExecutionResult {
     pub map_output_partitions: Vec<MapOutputPartitionMeta>,
     pub output_batches: Vec<RecordBatch>,
+    pub publish_results: bool,
     pub message: String,
 }
 
@@ -152,11 +154,13 @@ impl TaskExecutor for DefaultTaskExecutor {
         let mut result = TaskExecutionResult {
             map_output_partitions: state.map_outputs,
             output_batches: Vec::new(),
+            publish_results: false,
             message: String::new(),
         };
         if stage.children.is_empty() {
             result.message = format!("sink stage rows={}", count_rows(&output.batches));
             result.output_batches = output.batches.clone();
+            result.publish_results = true;
             self.sink_outputs
                 .lock()
                 .await
@@ -249,7 +253,7 @@ where
                                 )
                                 .await?;
                         }
-                        if !exec_result.output_batches.is_empty() {
+                        if exec_result.publish_results {
                             let payload = encode_record_batches_ipc(&exec_result.output_batches)?;
                             control_plane
                                 .register_query_results(&assignment.query_id, payload)
@@ -551,6 +555,22 @@ fn eval_plan_for_stage(
             let batches = futures::executor::block_on(stream.try_collect::<Vec<RecordBatch>>())?;
             Ok(ExecOutput { schema, batches })
         }
+        PhysicalPlan::ParquetWrite(write) => {
+            let child = eval_plan_for_stage(
+                &write.input,
+                current_stage,
+                target_stage,
+                state,
+                ctx,
+                catalog.clone(),
+            )?;
+            let table = catalog.get(&write.table)?.clone();
+            write_parquet_sink(&table, &child)?;
+            Ok(ExecOutput {
+                schema: Arc::new(Schema::empty()),
+                batches: Vec::new(),
+            })
+        }
         PhysicalPlan::Exchange(exchange) => match exchange {
             ExchangeExec::Broadcast(x) => {
                 eval_plan_for_stage(&x.input, current_stage, target_stage, state, ctx, catalog)
@@ -841,6 +861,47 @@ fn partition_batches(
 
 fn count_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
+}
+
+fn write_parquet_sink(table: &ffq_storage::TableDef, child: &ExecOutput) -> Result<()> {
+    let out_path = resolve_sink_output_path(table)?;
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let file = File::create(&out_path)?;
+    let mut writer = ArrowWriter::try_new(file, child.schema.clone(), None)
+        .map_err(|e| FfqError::Execution(format!("parquet writer init failed: {e}")))?;
+    for batch in &child.batches {
+        writer
+            .write(batch)
+            .map_err(|e| FfqError::Execution(format!("parquet write failed: {e}")))?;
+    }
+    writer
+        .close()
+        .map_err(|e| FfqError::Execution(format!("parquet writer close failed: {e}")))?;
+    Ok(())
+}
+
+fn resolve_sink_output_path(table: &ffq_storage::TableDef) -> Result<PathBuf> {
+    let raw = if !table.uri.is_empty() {
+        table.uri.clone()
+    } else if let Some(first) = table.paths.first() {
+        first.clone()
+    } else {
+        return Err(FfqError::InvalidConfig(format!(
+            "table '{}' must define uri or paths for sink writes",
+            table.name
+        )));
+    };
+
+    let path = PathBuf::from(raw);
+    let as_text = path.to_string_lossy();
+    if as_text.ends_with(".parquet") {
+        Ok(path)
+    } else {
+        Ok(path.join("part-00000.parquet"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1872,9 +1933,10 @@ fn scalar_gt(a: &ScalarValue, b: &ScalarValue) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordinator::CoordinatorConfig;
     use ffq_planner::{
         create_physical_plan, AggExpr, Expr, JoinStrategyHint, JoinType, LogicalPlan,
-        PhysicalPlannerConfig,
+        ParquetScanExec, ParquetWriteExec, PhysicalPlan, PhysicalPlannerConfig,
     };
     use ffq_storage::{TableDef, TableStats};
     use parquet::arrow::ArrowWriter;
@@ -2049,5 +2111,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(spill_dir);
         let _ = std::fs::remove_dir_all(shuffle_root);
         panic!("query did not finish in allotted polls");
+    }
+
+    #[tokio::test]
+    async fn worker_executes_parquet_write_sink() {
+        let src_path = unique_path("ffq_worker_sink_src", "parquet");
+        let out_dir = unique_path("ffq_worker_sink_out", "dir");
+        let out_file = out_dir.join("part-00000.parquet");
+        let spill_dir = unique_path("ffq_worker_sink_spill", "dir");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        write_parquet(
+            &src_path,
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+                Arc::new(Int64Array::from(vec![10_i64, 20, 30])),
+            ],
+        );
+
+        let mut catalog = Catalog::new();
+        catalog.register_table(TableDef {
+            name: "src".to_string(),
+            uri: src_path.to_string_lossy().to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: Some((*schema).clone()),
+            stats: TableStats::default(),
+            options: HashMap::new(),
+        });
+        catalog.register_table(TableDef {
+            name: "dst".to_string(),
+            uri: out_dir.to_string_lossy().to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: Some((*schema).clone()),
+            stats: TableStats::default(),
+            options: HashMap::new(),
+        });
+        let catalog = Arc::new(catalog);
+
+        let plan = PhysicalPlan::ParquetWrite(ParquetWriteExec {
+            table: "dst".to_string(),
+            input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
+                table: "src".to_string(),
+                projection: Some(vec!["a".to_string(), "b".to_string()]),
+                filters: vec![],
+            })),
+        });
+        let plan_json = serde_json::to_vec(&plan).expect("plan json");
+
+        let coordinator = Arc::new(Mutex::new(Coordinator::new(CoordinatorConfig {
+            blacklist_failure_threshold: 3,
+            shuffle_root: out_dir.clone(),
+        })));
+        {
+            let mut c = coordinator.lock().await;
+            c.submit_query("2001".to_string(), &plan_json)
+                .expect("submit");
+        }
+        let control = Arc::new(InProcessControlPlane::new(Arc::clone(&coordinator)));
+        let worker = Worker::new(
+            WorkerConfig {
+                worker_id: "w1".to_string(),
+                cpu_slots: 1,
+                spill_dir: spill_dir.clone(),
+                shuffle_root: out_dir.clone(),
+                ..WorkerConfig::default()
+            },
+            control,
+            Arc::new(DefaultTaskExecutor::new(catalog)),
+        );
+
+        for _ in 0..16 {
+            let _ = worker.poll_once().await.expect("worker poll");
+            let state = {
+                let c = coordinator.lock().await;
+                c.get_query_status("2001").expect("status").state
+            };
+            if state == crate::coordinator::QueryState::Succeeded {
+                assert!(out_file.exists(), "sink file missing");
+                let file = File::open(&out_file).expect("open sink");
+                let reader =
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                        .expect("reader build")
+                        .build()
+                        .expect("reader");
+                let rows = reader.map(|b| b.expect("decode").num_rows()).sum::<usize>();
+                assert_eq!(rows, 3);
+                let _ = std::fs::remove_file(src_path);
+                let _ = std::fs::remove_file(out_file);
+                let _ = std::fs::remove_dir_all(out_dir);
+                let _ = std::fs::remove_dir_all(spill_dir);
+                return;
+            }
+            assert_ne!(state, crate::coordinator::QueryState::Failed);
+        }
+
+        let _ = std::fs::remove_file(src_path);
+        let _ = std::fs::remove_file(out_file);
+        let _ = std::fs::remove_dir_all(out_dir);
+        let _ = std::fs::remove_dir_all(spill_dir);
+        panic!("sink query did not finish");
     }
 }

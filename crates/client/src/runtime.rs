@@ -19,6 +19,7 @@ use ffq_storage::parquet_provider::ParquetProvider;
 use ffq_storage::{Catalog, StorageProvider};
 use futures::future::BoxFuture;
 use futures::{FutureExt, TryStreamExt};
+use parquet::arrow::ArrowWriter;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
@@ -94,6 +95,83 @@ fn execute_plan(
                 let schema = stream.schema();
                 let batches = stream.try_collect::<Vec<RecordBatch>>().await?;
                 Ok(ExecOutput { schema, batches })
+            }
+            PhysicalPlan::ParquetWrite(write) => {
+                let child = execute_plan(*write.input, ctx, catalog.clone()).await?;
+                let table = catalog.get(&write.table)?.clone();
+                write_parquet_sink(&table, &child)?;
+                Ok(ExecOutput {
+                    schema: Arc::new(Schema::empty()),
+                    batches: Vec::new(),
+                })
+            }
+            PhysicalPlan::Project(project) => {
+                let child = execute_plan(*project.input, ctx, catalog).await?;
+                let mut out_batches = Vec::with_capacity(child.batches.len());
+                let schema = Arc::new(Schema::new(
+                    project
+                        .exprs
+                        .iter()
+                        .map(|(expr, name)| {
+                            let dt = compile_expr(expr, &child.schema)?.data_type();
+                            Ok(Field::new(name, dt, true))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ));
+                for batch in &child.batches {
+                    let cols = project
+                        .exprs
+                        .iter()
+                        .map(|(expr, _)| compile_expr(expr, &child.schema)?.evaluate(batch))
+                        .collect::<Result<Vec<_>>>()?;
+                    out_batches.push(RecordBatch::try_new(schema.clone(), cols).map_err(|e| {
+                        FfqError::Execution(format!("project build batch failed: {e}"))
+                    })?);
+                }
+                Ok(ExecOutput {
+                    schema,
+                    batches: out_batches,
+                })
+            }
+            PhysicalPlan::Filter(filter) => {
+                let child = execute_plan(*filter.input, ctx, catalog).await?;
+                let pred = compile_expr(&filter.predicate, &child.schema)?;
+                let mut out = Vec::new();
+                for batch in &child.batches {
+                    let mask = pred.evaluate(batch)?;
+                    let mask = mask
+                        .as_any()
+                        .downcast_ref::<arrow::array::BooleanArray>()
+                        .ok_or_else(|| {
+                            FfqError::Execution(
+                                "filter predicate must evaluate to boolean".to_string(),
+                            )
+                        })?;
+                    let filtered = arrow::compute::filter_record_batch(batch, mask)
+                        .map_err(|e| FfqError::Execution(format!("filter batch failed: {e}")))?;
+                    out.push(filtered);
+                }
+                Ok(ExecOutput {
+                    schema: child.schema,
+                    batches: out,
+                })
+            }
+            PhysicalPlan::Limit(limit) => {
+                let child = execute_plan(*limit.input, ctx, catalog).await?;
+                let mut out = Vec::new();
+                let mut remaining = limit.n;
+                for batch in &child.batches {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let take = remaining.min(batch.num_rows());
+                    out.push(batch.slice(0, take));
+                    remaining -= take;
+                }
+                Ok(ExecOutput {
+                    schema: child.schema,
+                    batches: out,
+                })
             }
             PhysicalPlan::Exchange(exchange) => match exchange {
                 ExchangeExec::ShuffleWrite(x) => execute_plan(*x.input, ctx, catalog).await,
@@ -1180,6 +1258,47 @@ fn scalar_lt(a: &ScalarValue, b: &ScalarValue) -> Result<bool> {
 
 fn scalar_gt(a: &ScalarValue, b: &ScalarValue) -> Result<bool> {
     scalar_lt(b, a)
+}
+
+fn write_parquet_sink(table: &ffq_storage::TableDef, child: &ExecOutput) -> Result<()> {
+    let out_path = resolve_sink_output_path(table)?;
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let file = File::create(&out_path)?;
+    let mut writer = ArrowWriter::try_new(file, child.schema.clone(), None)
+        .map_err(|e| FfqError::Execution(format!("parquet writer init failed: {e}")))?;
+    for batch in &child.batches {
+        writer
+            .write(batch)
+            .map_err(|e| FfqError::Execution(format!("parquet write failed: {e}")))?;
+    }
+    writer
+        .close()
+        .map_err(|e| FfqError::Execution(format!("parquet writer close failed: {e}")))?;
+    Ok(())
+}
+
+fn resolve_sink_output_path(table: &ffq_storage::TableDef) -> Result<PathBuf> {
+    let raw = if !table.uri.is_empty() {
+        table.uri.clone()
+    } else if let Some(first) = table.paths.first() {
+        first.clone()
+    } else {
+        return Err(FfqError::InvalidConfig(format!(
+            "table '{}' must define uri or paths for sink writes",
+            table.name
+        )));
+    };
+
+    let path = PathBuf::from(raw);
+    let as_text = path.to_string_lossy();
+    if as_text.ends_with(".parquet") {
+        Ok(path)
+    } else {
+        Ok(path.join("part-00000.parquet"))
+    }
 }
 
 #[cfg(feature = "distributed")]

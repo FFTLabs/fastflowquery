@@ -96,6 +96,7 @@ fn visit_upstream(plan: &PhysicalPlan, stage: StageId, dag: &mut StageDag) {
 fn op_name(plan: &PhysicalPlan) -> &'static str {
     match plan {
         PhysicalPlan::ParquetScan(_) => "ParquetScan",
+        PhysicalPlan::ParquetWrite(_) => "ParquetWrite",
         PhysicalPlan::Filter(_) => "Filter",
         PhysicalPlan::Project(_) => "Project",
         PhysicalPlan::CoalesceBatches(_) => "CoalesceBatches",

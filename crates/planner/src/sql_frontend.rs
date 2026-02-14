@@ -481,8 +481,7 @@ mod tests {
 
     #[test]
     fn parses_insert_into_select() {
-        let plan = sql_to_logical("INSERT INTO t SELECT a FROM s", &HashMap::new())
-            .expect("parse");
+        let plan = sql_to_logical("INSERT INTO t SELECT a FROM s", &HashMap::new()).expect("parse");
         match plan {
             LogicalPlan::InsertInto { table, columns, .. } => {
                 assert_eq!(table, "t");
