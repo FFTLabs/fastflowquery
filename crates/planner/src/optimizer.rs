@@ -1149,12 +1149,12 @@ mod tests {
         }
     }
 
-    fn topk_plan() -> LogicalPlan {
+    fn topk_plan(select_cols: &[&str]) -> LogicalPlan {
         LogicalPlan::Projection {
-            exprs: vec![
-                (Expr::Column("id".to_string()), "id".to_string()),
-                (Expr::Column("payload".to_string()), "payload".to_string()),
-            ],
+            exprs: select_cols
+                .iter()
+                .map(|c| (Expr::Column((*c).to_string()), (*c).to_string()))
+                .collect(),
             input: Box::new(LogicalPlan::TopKByScore {
                 score_expr: Expr::CosineSimilarity {
                     vector: Box::new(Expr::Column("emb".to_string())),
@@ -1183,7 +1183,11 @@ mod tests {
         };
 
         let optimized = Optimizer::new()
-            .optimize(topk_plan(), &ctx, OptimizerConfig::default())
+            .optimize(
+                topk_plan(&["id", "score", "payload"]),
+                &ctx,
+                OptimizerConfig::default(),
+            )
             .expect("optimize");
         match optimized {
             LogicalPlan::Projection { input, .. } => match *input {
@@ -1216,7 +1220,36 @@ mod tests {
         };
 
         let optimized = Optimizer::new()
-            .optimize(topk_plan(), &ctx, OptimizerConfig::default())
+            .optimize(
+                topk_plan(&["id", "score", "payload"]),
+                &ctx,
+                OptimizerConfig::default(),
+            )
+            .expect("optimize");
+        match optimized {
+            LogicalPlan::Projection { input, .. } => match *input {
+                LogicalPlan::TopKByScore { .. } => {}
+                other => panic!("expected TopKByScore fallback, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn does_not_rewrite_when_projection_needs_unsupported_column() {
+        let emb_field = Field::new("item", DataType::Float32, true);
+        let ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("title", DataType::Utf8, true),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+            ])),
+            format: "qdrant".to_string(),
+        };
+
+        let optimized = Optimizer::new()
+            .optimize(topk_plan(&["title"]), &ctx, OptimizerConfig::default())
             .expect("optimize");
         match optimized {
             LogicalPlan::Projection { input, .. } => match *input {
