@@ -748,9 +748,6 @@ fn try_rewrite_projection_topk_to_vector(
     let LogicalPlan::TableScan { table, filters, .. } = input.as_ref() else {
         return Ok(None);
     };
-    if !filters.is_empty() {
-        return Ok(None);
-    }
     if ctx.table_format(table)?.as_deref() != Some("qdrant") {
         return Ok(None);
     }
@@ -763,11 +760,15 @@ fn try_rewrite_projection_topk_to_vector(
     let Expr::Literal(LiteralValue::VectorF32(query_vector)) = query.as_ref() else {
         return Ok(None);
     };
+    let filter = match translate_qdrant_filter(filters) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
     Ok(Some(LogicalPlan::VectorTopK {
         table: table.clone(),
         query_vector: query_vector.clone(),
         k: *k,
-        filter: None,
+        filter,
     }))
 }
 
@@ -782,6 +783,90 @@ fn projection_supported_for_vector_topk(exprs: &[(Expr, String)]) -> bool {
             Expr::ColumnRef { name, .. } if name == "id" || name == "score" || name == "payload"
         )
     })
+}
+
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct QdrantFilterSpec {
+    must: Vec<QdrantMatchClause>,
+}
+
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct QdrantMatchClause {
+    field: String,
+    value: serde_json::Value,
+}
+
+#[cfg(feature = "vector")]
+fn translate_qdrant_filter(filters: &[Expr]) -> Result<Option<String>> {
+    if filters.is_empty() {
+        return Ok(None);
+    }
+    let mut clauses = Vec::new();
+    for f in filters {
+        collect_qdrant_match_clauses(f, &mut clauses)?;
+    }
+    let encoded = serde_json::to_string(&QdrantFilterSpec { must: clauses })
+        .map_err(|e| ffq_common::FfqError::Planning(format!("qdrant filter encode failed: {e}")))?;
+    Ok(Some(encoded))
+}
+
+#[cfg(feature = "vector")]
+fn collect_qdrant_match_clauses(e: &Expr, out: &mut Vec<QdrantMatchClause>) -> Result<()> {
+    match e {
+        Expr::And(a, b) => {
+            collect_qdrant_match_clauses(a, out)?;
+            collect_qdrant_match_clauses(b, out)?;
+            Ok(())
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+        } => {
+            if let Some((field, value)) = eq_clause_parts(left, right) {
+                out.push(QdrantMatchClause { field, value });
+                return Ok(());
+            }
+            Err(ffq_common::FfqError::Planning(
+                "unsupported qdrant filter expression; expected `col = literal`".to_string(),
+            ))
+        }
+        _ => Err(ffq_common::FfqError::Planning(
+            "unsupported qdrant filter expression; only equality and AND are supported".to_string(),
+        )),
+    }
+}
+
+#[cfg(feature = "vector")]
+fn eq_clause_parts(left: &Expr, right: &Expr) -> Option<(String, serde_json::Value)> {
+    match (extract_filter_field(left), extract_filter_literal(right)) {
+        (Some(field), Some(value)) => Some((field, value)),
+        _ => match (extract_filter_field(right), extract_filter_literal(left)) {
+            (Some(field), Some(value)) => Some((field, value)),
+            _ => None,
+        },
+    }
+}
+
+#[cfg(feature = "vector")]
+fn extract_filter_field(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Column(c) => Some(c.clone()),
+        Expr::ColumnRef { name, .. } => Some(name.clone()),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "vector")]
+fn extract_filter_literal(e: &Expr) -> Option<serde_json::Value> {
+    match e {
+        Expr::Literal(LiteralValue::Int64(v)) => Some(serde_json::Value::from(*v)),
+        Expr::Literal(LiteralValue::Utf8(v)) => Some(serde_json::Value::from(v.clone())),
+        Expr::Literal(LiteralValue::Boolean(v)) => Some(serde_json::Value::from(*v)),
+        _ => None,
+    }
 }
 
 // -----------------------------
@@ -1255,6 +1340,73 @@ mod tests {
             LogicalPlan::Projection { input, .. } => match *input {
                 LogicalPlan::TopKByScore { .. } => {}
                 other => panic!("expected TopKByScore fallback, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrites_with_translated_filter_pushdown() {
+        let emb_field = Field::new("item", DataType::Float32, true);
+        let ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+            ])),
+            format: "qdrant".to_string(),
+        };
+
+        let plan = LogicalPlan::Projection {
+            exprs: vec![
+                (Expr::Column("id".to_string()), "id".to_string()),
+                (Expr::Column("score".to_string()), "score".to_string()),
+                (Expr::Column("payload".to_string()), "payload".to_string()),
+            ],
+            input: Box::new(LogicalPlan::TopKByScore {
+                score_expr: Expr::CosineSimilarity {
+                    vector: Box::new(Expr::Column("emb".to_string())),
+                    query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+                },
+                k: 3,
+                input: Box::new(LogicalPlan::TableScan {
+                    table: "docs_idx".to_string(),
+                    projection: None,
+                    filters: vec![Expr::And(
+                        Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("tenant_id".to_string())),
+                            op: crate::logical_plan::BinaryOp::Eq,
+                            right: Box::new(Expr::Literal(LiteralValue::Int64(7))),
+                        }),
+                        Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("lang".to_string())),
+                            op: crate::logical_plan::BinaryOp::Eq,
+                            right: Box::new(Expr::Literal(LiteralValue::Utf8("en".to_string()))),
+                        }),
+                    )],
+                }),
+            }),
+        };
+
+        let optimized = Optimizer::new()
+            .optimize(plan, &ctx, OptimizerConfig::default())
+            .expect("optimize");
+        match optimized {
+            LogicalPlan::Projection { input, .. } => match *input {
+                LogicalPlan::VectorTopK { filter, .. } => {
+                    let filter = filter.expect("translated filter");
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&filter).expect("json filter");
+                    assert_eq!(
+                        parsed
+                            .get("must")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or_default(),
+                        2
+                    );
+                }
+                other => panic!("expected VectorTopK, got {other:?}"),
             },
             other => panic!("expected Projection, got {other:?}"),
         }
