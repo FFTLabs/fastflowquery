@@ -10,6 +10,7 @@ grpc = ["dep:tokio", "dep:tonic", "dep:prost", "dep:tokio-stream"]
 
 [dependencies]
 ffq-common = { path = "../common" }
+ffq-planner = { path = "../planner", default-features = false }
 serde.workspace = true
 
 tokio = { workspace = true, optional = true }

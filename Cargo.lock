@@ -690,6 +690,7 @@ name = "ffq-distributed"
 version = "0.1.0"
 dependencies = [
  "ffq-common",
+ "ffq-planner",
  "prost",
  "serde",
  "tokio",

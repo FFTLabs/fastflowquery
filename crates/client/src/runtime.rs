@@ -1204,17 +1204,18 @@ impl DistributedRuntime {
 impl Runtime for DistributedRuntime {
     fn execute(
         &self,
-        _plan: PhysicalPlan,
+        plan: PhysicalPlan,
         _ctx: QueryContext,
         _catalog: Arc<Catalog>,
     ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
+        let stage_dag = self._inner.build_stage_dag(&plan);
         async move {
+            let _stage_dag = stage_dag?;
             // v1 skeleton: distributed implementation will:
             // - serialize plan
             // - submit to coordinator
             // - stream results back
-            let stream =
-                futures::stream::empty::<Result<arrow::record_batch::RecordBatch>>().boxed();
+            let stream = ffq_execution::empty_stream(Arc::new(Schema::empty()));
             Ok(stream)
         }
         .boxed()
