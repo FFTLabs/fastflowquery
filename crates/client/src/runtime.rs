@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
-    Array, ArrayRef, BooleanBuilder, Float64Builder, Int64Array, Int64Builder, StringBuilder,
+    Array, ArrayRef, BooleanBuilder, FixedSizeListBuilder, Float32Builder, Float64Builder,
+    Int64Array, Int64Builder, StringBuilder,
 };
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
@@ -21,6 +22,7 @@ use ffq_planner::{AggExpr, BuildSide, ExchangeExec, Expr, PhysicalPlan};
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
 use ffq_storage::qdrant_provider::QdrantProvider;
+#[cfg(any(feature = "qdrant", test))]
 use ffq_storage::vector_index::VectorIndexProvider;
 use ffq_storage::{Catalog, StorageProvider};
 use futures::future::BoxFuture;
@@ -246,6 +248,7 @@ struct AggSpec {
 enum ScalarValue {
     Int64(i64),
     Float64Bits(u64),
+    VectorF32Bits(Vec<u32>),
     Utf8(String),
     Boolean(bool),
     Null,
@@ -262,15 +265,22 @@ impl Hash for ScalarValue {
                 1_u8.hash(state);
                 v.hash(state);
             }
-            Self::Utf8(v) => {
+            Self::VectorF32Bits(v) => {
                 2_u8.hash(state);
-                v.hash(state);
+                v.len().hash(state);
+                for x in v {
+                    x.hash(state);
+                }
             }
-            Self::Boolean(v) => {
+            Self::Utf8(v) => {
                 3_u8.hash(state);
                 v.hash(state);
             }
-            Self::Null => 4_u8.hash(state),
+            Self::Boolean(v) => {
+                4_u8.hash(state);
+                v.hash(state);
+            }
+            Self::Null => 5_u8.hash(state),
         }
     }
 }
@@ -398,6 +408,9 @@ fn execute_vector_topk(
 ) -> BoxFuture<'static, Result<ExecOutput>> {
     async move {
         let table = catalog.get(&exec.table)?.clone();
+        if let Some(rows) = mock_vector_rows_from_table(&table, exec.k)? {
+            return rows_to_vector_topk_output(rows);
+        }
         if table.format != "qdrant" {
             return Err(FfqError::Unsupported(format!(
                 "VectorTopKExec requires table format='qdrant', got '{}'",
@@ -421,6 +434,7 @@ fn execute_vector_topk(
     .boxed()
 }
 
+#[cfg(any(feature = "qdrant", test))]
 async fn run_vector_topk_with_provider(
     exec: &ffq_planner::VectorTopKExec,
     provider: &dyn VectorIndexProvider,
@@ -429,6 +443,40 @@ async fn run_vector_topk_with_provider(
         .topk(exec.query_vector.clone(), exec.k, exec.filter.clone())
         .await?;
     rows_to_vector_topk_output(rows)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct MockVectorRow {
+    id: i64,
+    score: f32,
+    #[serde(default)]
+    payload: Option<String>,
+}
+
+fn mock_vector_rows_from_table(
+    table: &ffq_storage::TableDef,
+    k: usize,
+) -> Result<Option<Vec<ffq_storage::vector_index::VectorTopKRow>>> {
+    let Some(raw) = table.options.get("vector.mock_rows_json") else {
+        return Ok(None);
+    };
+    let mut rows: Vec<MockVectorRow> = serde_json::from_str(raw).map_err(|e| {
+        FfqError::Execution(format!(
+            "invalid vector.mock_rows_json for table '{}': {e}",
+            table.name
+        ))
+    })?;
+    rows.sort_by(|a, b| b.score.total_cmp(&a.score));
+    rows.truncate(k);
+    Ok(Some(
+        rows.into_iter()
+            .map(|r| ffq_storage::vector_index::VectorTopKRow {
+                id: r.id,
+                score: r.score,
+                payload_json: r.payload,
+            })
+            .collect(),
+    ))
 }
 
 #[allow(dead_code)]
@@ -1292,6 +1340,7 @@ fn scalar_estimate_bytes(v: &ScalarValue) -> usize {
     match v {
         ScalarValue::Int64(_) => 8,
         ScalarValue::Float64Bits(_) => 8,
+        ScalarValue::VectorF32Bits(v) => v.len() * std::mem::size_of::<f32>(),
         ScalarValue::Utf8(s) => s.len(),
         ScalarValue::Boolean(_) => 1,
         ScalarValue::Null => 0,
@@ -1332,6 +1381,13 @@ fn scalar_from_array(array: &ArrayRef, row: usize) -> Result<ScalarValue> {
                 .ok_or_else(|| FfqError::Execution("expected Float64Array".to_string()))?;
             Ok(ScalarValue::Float64Bits(a.value(row).to_bits()))
         }
+        DataType::Float32 => {
+            let a = array
+                .as_any()
+                .downcast_ref::<arrow::array::Float32Array>()
+                .ok_or_else(|| FfqError::Execution("expected Float32Array".to_string()))?;
+            Ok(ScalarValue::Float64Bits((a.value(row) as f64).to_bits()))
+        }
         DataType::Utf8 => {
             let a = array
                 .as_any()
@@ -1345,6 +1401,32 @@ fn scalar_from_array(array: &ArrayRef, row: usize) -> Result<ScalarValue> {
                 .downcast_ref::<arrow::array::BooleanArray>()
                 .ok_or_else(|| FfqError::Execution("expected BooleanArray".to_string()))?;
             Ok(ScalarValue::Boolean(a.value(row)))
+        }
+        DataType::FixedSizeList(field, size) => {
+            if field.data_type() != &DataType::Float32 {
+                return Err(FfqError::Unsupported(format!(
+                    "only FixedSizeList<Float32> is supported in scalar conversion, got {:?}",
+                    array.data_type()
+                )));
+            }
+            let a = array
+                .as_any()
+                .downcast_ref::<arrow::array::FixedSizeListArray>()
+                .ok_or_else(|| FfqError::Execution("expected FixedSizeListArray".to_string()))?;
+            let vals = a
+                .values()
+                .as_any()
+                .downcast_ref::<arrow::array::Float32Array>()
+                .ok_or_else(|| FfqError::Execution("expected Float32 list values".to_string()))?;
+            let len = *size as usize;
+            let start = row * len;
+            let mut out = Vec::with_capacity(len);
+            for i in 0..len {
+                out.push(vals.value(start + i));
+            }
+            Ok(ScalarValue::VectorF32Bits(
+                out.into_iter().map(f32::to_bits).collect(),
+            ))
         }
         other => Err(FfqError::Unsupported(format!(
             "aggregate scalar type not supported yet: {other:?}"
@@ -1385,6 +1467,22 @@ fn scalars_to_array(values: &[ScalarValue], dt: &DataType) -> Result<ArrayRef> {
             }
             Ok(Arc::new(b.finish()))
         }
+        DataType::Float32 => {
+            let mut b = arrow::array::Float32Builder::with_capacity(values.len());
+            for v in values {
+                match v {
+                    ScalarValue::Float64Bits(x) => b.append_value(f64::from_bits(*x) as f32),
+                    ScalarValue::Int64(x) => b.append_value(*x as f32),
+                    ScalarValue::Null => b.append_null(),
+                    _ => {
+                        return Err(FfqError::Execution(
+                            "type mismatch while building Float32 array".to_string(),
+                        ));
+                    }
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
         DataType::Utf8 => {
             let mut b = StringBuilder::with_capacity(values.len(), values.len() * 8);
             for v in values {
@@ -1409,6 +1507,39 @@ fn scalars_to_array(values: &[ScalarValue], dt: &DataType) -> Result<ArrayRef> {
                     _ => {
                         return Err(FfqError::Execution(
                             "type mismatch while building Boolean array".to_string(),
+                        ));
+                    }
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::FixedSizeList(field, size) => {
+            if field.data_type() != &DataType::Float32 {
+                return Err(FfqError::Unsupported(format!(
+                    "aggregate output FixedSizeList item type not supported: {:?}",
+                    field.data_type()
+                )));
+            }
+            let mut b = FixedSizeListBuilder::new(Float32Builder::new(), *size);
+            for v in values {
+                match v {
+                    ScalarValue::VectorF32Bits(xs) => {
+                        if xs.len() != *size as usize {
+                            return Err(FfqError::Execution(format!(
+                                "vector length mismatch while building FixedSizeList: expected {}, got {}",
+                                *size,
+                                xs.len()
+                            )));
+                        }
+                        for x in xs {
+                            b.values().append_value(f32::from_bits(*x));
+                        }
+                        b.append(true);
+                    }
+                    ScalarValue::Null => b.append(false),
+                    _ => {
+                        return Err(FfqError::Execution(
+                            "type mismatch while building FixedSizeList array".to_string(),
                         ));
                     }
                 }
