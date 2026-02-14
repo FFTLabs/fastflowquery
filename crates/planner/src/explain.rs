@@ -80,6 +80,17 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             ));
             fmt_plan(input, indent + 1, out);
         }
+        LogicalPlan::VectorTopK {
+            table,
+            query_vector,
+            k,
+            filter,
+        } => {
+            out.push_str(&format!(
+                "{pad}VectorTopK table={table} k={k} query_dim={} filter={filter:?}\n",
+                query_vector.len()
+            ));
+        }
         LogicalPlan::InsertInto {
             table,
             columns,

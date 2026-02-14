@@ -72,6 +72,19 @@ pub fn create_physical_plan(
                 input: Box::new(child),
             }))
         }
+        LogicalPlan::VectorTopK {
+            table,
+            query_vector,
+            k,
+            filter,
+        } => Ok(PhysicalPlan::VectorTopK(
+            crate::physical_plan::VectorTopKExec {
+                table: table.clone(),
+                query_vector: query_vector.clone(),
+                k: *k,
+                filter: filter.clone(),
+            },
+        )),
 
         LogicalPlan::Aggregate {
             group_exprs,

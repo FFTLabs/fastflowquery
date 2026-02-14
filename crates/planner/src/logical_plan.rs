@@ -114,6 +114,12 @@ pub enum LogicalPlan {
         k: usize,
         input: Box<LogicalPlan>,
     },
+    VectorTopK {
+        table: String,
+        query_vector: Vec<f32>,
+        k: usize,
+        filter: Option<String>,
+    },
     InsertInto {
         table: String,
         columns: Vec<String>,

@@ -69,6 +69,9 @@ impl Optimizer {
         // 5) join strategy hint
         let plan = join_strategy_hint(plan, ctx, cfg)?;
 
+        // 6) rewrite to vector index execution when possible
+        let plan = vector_index_rewrite(plan, ctx)?;
+
         Ok(plan)
     }
 }
@@ -397,6 +400,20 @@ fn proj_rewrite(
                 HashSet::new(),
             ))
         }
+        LogicalPlan::VectorTopK {
+            table,
+            query_vector,
+            k,
+            filter,
+        } => Ok((
+            LogicalPlan::VectorTopK {
+                table,
+                query_vector,
+                k,
+                filter,
+            },
+            HashSet::new(),
+        )),
 
         LogicalPlan::TableScan {
             table,
@@ -637,6 +654,136 @@ fn join_strategy_hint(
     }
 }
 
+fn vector_index_rewrite(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::Filter { predicate, input } => Ok(LogicalPlan::Filter {
+            predicate,
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+        }),
+        LogicalPlan::Projection { exprs, input } => {
+            let rewritten_input = vector_index_rewrite(*input, ctx)?;
+            #[cfg(feature = "vector")]
+            if let Some(vector_topk) =
+                try_rewrite_projection_topk_to_vector(&exprs, &rewritten_input, ctx)?
+            {
+                return Ok(LogicalPlan::Projection {
+                    exprs,
+                    input: Box::new(vector_topk),
+                });
+            }
+            Ok(LogicalPlan::Projection {
+                exprs,
+                input: Box::new(rewritten_input),
+            })
+        }
+        LogicalPlan::Aggregate {
+            group_exprs,
+            aggr_exprs,
+            input,
+        } => Ok(LogicalPlan::Aggregate {
+            group_exprs,
+            aggr_exprs,
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+        }),
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            join_type,
+            strategy_hint,
+        } => Ok(LogicalPlan::Join {
+            left: Box::new(vector_index_rewrite(*left, ctx)?),
+            right: Box::new(vector_index_rewrite(*right, ctx)?),
+            on,
+            join_type,
+            strategy_hint,
+        }),
+        LogicalPlan::Limit { n, input } => Ok(LogicalPlan::Limit {
+            n,
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+        }),
+        LogicalPlan::TopKByScore {
+            score_expr,
+            k,
+            input,
+        } => Ok(LogicalPlan::TopKByScore {
+            score_expr,
+            k,
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+        }),
+        LogicalPlan::InsertInto {
+            table,
+            columns,
+            input,
+        } => Ok(LogicalPlan::InsertInto {
+            table,
+            columns,
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+        }),
+        leaf @ LogicalPlan::TableScan { .. } => Ok(leaf),
+        leaf @ LogicalPlan::VectorTopK { .. } => Ok(leaf),
+    }
+}
+
+#[cfg(feature = "vector")]
+fn try_rewrite_projection_topk_to_vector(
+    exprs: &[(Expr, String)],
+    input: &LogicalPlan,
+    ctx: &dyn OptimizerContext,
+) -> Result<Option<LogicalPlan>> {
+    if !projection_supported_for_vector_topk(exprs) {
+        return Ok(None);
+    }
+    let LogicalPlan::TopKByScore {
+        score_expr,
+        k,
+        input,
+    } = input
+    else {
+        return Ok(None);
+    };
+    if *k == 0 {
+        return Ok(None);
+    }
+    let LogicalPlan::TableScan { table, filters, .. } = input.as_ref() else {
+        return Ok(None);
+    };
+    if !filters.is_empty() {
+        return Ok(None);
+    }
+    if ctx.table_format(table)?.as_deref() != Some("qdrant") {
+        return Ok(None);
+    }
+    let Expr::CosineSimilarity { vector, query } = score_expr else {
+        return Ok(None);
+    };
+    if !matches!(vector.as_ref(), Expr::Column(_) | Expr::ColumnRef { .. }) {
+        return Ok(None);
+    }
+    let Expr::Literal(LiteralValue::VectorF32(query_vector)) = query.as_ref() else {
+        return Ok(None);
+    };
+    Ok(Some(LogicalPlan::VectorTopK {
+        table: table.clone(),
+        query_vector: query_vector.clone(),
+        k: *k,
+        filter: None,
+    }))
+}
+
+#[cfg(feature = "vector")]
+fn projection_supported_for_vector_topk(exprs: &[(Expr, String)]) -> bool {
+    exprs.iter().all(|(e, _)| {
+        matches!(
+            e,
+            Expr::Column(c) if c == "id" || c == "score" || c == "payload"
+        ) || matches!(
+            e,
+            Expr::ColumnRef { name, .. } if name == "id" || name == "score" || name == "payload"
+        )
+    })
+}
+
 // -----------------------------
 // Helpers
 // -----------------------------
@@ -685,6 +832,17 @@ fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy
             score_expr,
             k,
             input: Box::new(f(*input)),
+        },
+        LogicalPlan::VectorTopK {
+            table,
+            query_vector,
+            k,
+            filter,
+        } => LogicalPlan::VectorTopK {
+            table,
+            query_vector,
+            k,
+            filter,
         },
         LogicalPlan::InsertInto {
             table,
@@ -749,6 +907,17 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
             score_expr: rewrite_expr(score_expr, rewrite),
             k,
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+        },
+        LogicalPlan::VectorTopK {
+            table,
+            query_vector,
+            k,
+            filter,
+        } => LogicalPlan::VectorTopK {
+            table,
+            query_vector,
+            k,
+            filter,
         },
         LogicalPlan::InsertInto {
             table,
@@ -908,6 +1077,10 @@ fn plan_output_columns(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result
         LogicalPlan::TopKByScore { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::Projection { exprs, .. } => Ok(exprs.iter().map(|(_, n)| n.clone()).collect()),
         LogicalPlan::Aggregate { .. } => Ok(HashSet::new()), // v1: conservative
+        LogicalPlan::VectorTopK { .. } => Ok(["id", "score", "payload"]
+            .into_iter()
+            .map(std::string::ToString::to_string)
+            .collect()),
         LogicalPlan::Join { left, right, .. } => {
             let mut l = plan_output_columns(left, ctx)?;
             let r = plan_output_columns(right, ctx)?;
@@ -936,6 +1109,121 @@ fn estimate_bytes(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result<Opti
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::TopKByScore { input, .. }
         | LogicalPlan::InsertInto { input, .. } => estimate_bytes(input, ctx),
+        LogicalPlan::VectorTopK { .. } => Ok(None),
         LogicalPlan::Join { .. } => Ok(None),
+    }
+}
+
+#[cfg(all(test, feature = "vector"))]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
+
+    use super::{Optimizer, OptimizerConfig, OptimizerContext, TableMetadata};
+    use crate::analyzer::SchemaProvider;
+    use crate::logical_plan::{Expr, LiteralValue, LogicalPlan};
+
+    struct TestCtx {
+        schema: SchemaRef,
+        format: String,
+    }
+
+    impl SchemaProvider for TestCtx {
+        fn table_schema(&self, _table: &str) -> ffq_common::Result<SchemaRef> {
+            Ok(self.schema.clone())
+        }
+    }
+
+    impl OptimizerContext for TestCtx {
+        fn table_stats(&self, _table: &str) -> ffq_common::Result<(Option<u64>, Option<u64>)> {
+            Ok((None, None))
+        }
+
+        fn table_metadata(&self, _table: &str) -> ffq_common::Result<Option<TableMetadata>> {
+            Ok(Some(TableMetadata {
+                format: self.format.clone(),
+                options: HashMap::new(),
+            }))
+        }
+    }
+
+    fn topk_plan() -> LogicalPlan {
+        LogicalPlan::Projection {
+            exprs: vec![
+                (Expr::Column("id".to_string()), "id".to_string()),
+                (Expr::Column("payload".to_string()), "payload".to_string()),
+            ],
+            input: Box::new(LogicalPlan::TopKByScore {
+                score_expr: Expr::CosineSimilarity {
+                    vector: Box::new(Expr::Column("emb".to_string())),
+                    query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+                },
+                k: 5,
+                input: Box::new(LogicalPlan::TableScan {
+                    table: "docs_idx".to_string(),
+                    projection: None,
+                    filters: vec![],
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn rewrites_qdrant_topk_to_vector_topk() {
+        let emb_field = Field::new("item", DataType::Float32, true);
+        let ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+            ])),
+            format: "qdrant".to_string(),
+        };
+
+        let optimized = Optimizer::new()
+            .optimize(topk_plan(), &ctx, OptimizerConfig::default())
+            .expect("optimize");
+        match optimized {
+            LogicalPlan::Projection { input, .. } => match *input {
+                LogicalPlan::VectorTopK {
+                    table,
+                    query_vector,
+                    k,
+                    ..
+                } => {
+                    assert_eq!(table, "docs_idx");
+                    assert_eq!(query_vector, vec![1.0, 0.0, 0.0]);
+                    assert_eq!(k, 5);
+                }
+                other => panic!("expected VectorTopK, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn does_not_rewrite_non_qdrant_format() {
+        let emb_field = Field::new("item", DataType::Float32, true);
+        let ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+            ])),
+            format: "parquet".to_string(),
+        };
+
+        let optimized = Optimizer::new()
+            .optimize(topk_plan(), &ctx, OptimizerConfig::default())
+            .expect("optimize");
+        match optimized {
+            LogicalPlan::Projection { input, .. } => match *input {
+                LogicalPlan::TopKByScore { .. } => {}
+                other => panic!("expected TopKByScore fallback, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
     }
 }

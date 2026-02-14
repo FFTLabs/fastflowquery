@@ -242,6 +242,39 @@ impl Analyzer {
                     resolver,
                 ))
             }
+            LogicalPlan::VectorTopK {
+                table,
+                query_vector,
+                k,
+                filter,
+            } => {
+                if k == 0 {
+                    return Err(FfqError::Planning("TOP-K value must be > 0".to_string()));
+                }
+                if query_vector.is_empty() {
+                    return Err(FfqError::Planning(
+                        "vector top-k query vector cannot be empty".to_string(),
+                    ));
+                }
+                // Validate table exists.
+                let _ = provider.table_schema(&table)?;
+                let out_schema = Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("score", DataType::Float32, false),
+                    Field::new("payload", DataType::Utf8, true),
+                ]));
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                Ok((
+                    LogicalPlan::VectorTopK {
+                        table,
+                        query_vector,
+                        k,
+                        filter,
+                    },
+                    out_schema,
+                    out_resolver,
+                ))
+            }
             LogicalPlan::InsertInto {
                 table,
                 columns,
