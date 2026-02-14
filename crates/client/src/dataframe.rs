@@ -139,6 +139,8 @@ impl DataFrame {
 
         let ctx = QueryContext {
             batch_size_rows: self.session.config.batch_size_rows,
+            mem_budget_bytes: self.session.config.mem_budget_bytes,
+            spill_dir: self.session.config.spill_dir.clone(),
         };
 
         let stream: ffq_execution::stream::SendableRecordBatchStream = self

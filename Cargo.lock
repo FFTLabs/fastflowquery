@@ -671,6 +671,8 @@ dependencies = [
  "ffq-storage",
  "futures",
  "parquet",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

@@ -781,9 +781,14 @@ fn collect_cols(e: &Expr, out: &mut HashSet<String>) {
     }
 }
 
-fn agg_columns(_agg: &crate::logical_plan::AggExpr) -> HashSet<String> {
-    // v1: keep conservative (handled by expr columns elsewhere later if needed)
-    HashSet::new()
+fn agg_columns(agg: &crate::logical_plan::AggExpr) -> HashSet<String> {
+    match agg {
+        crate::logical_plan::AggExpr::Count(e)
+        | crate::logical_plan::AggExpr::Sum(e)
+        | crate::logical_plan::AggExpr::Min(e)
+        | crate::logical_plan::AggExpr::Max(e)
+        | crate::logical_plan::AggExpr::Avg(e) => expr_columns(e),
+    }
 }
 
 fn strip_qual(s: &str) -> String {
