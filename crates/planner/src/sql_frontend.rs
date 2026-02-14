@@ -576,9 +576,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::sql_to_logical;
-    use crate::logical_plan::LogicalPlan;
     #[cfg(feature = "vector")]
     use crate::logical_plan::LiteralValue;
+    use crate::logical_plan::LogicalPlan;
 
     #[test]
     fn parses_insert_into_select() {

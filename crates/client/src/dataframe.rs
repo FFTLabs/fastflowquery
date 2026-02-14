@@ -11,6 +11,35 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::runtime::QueryContext;
 use crate::session::SharedSession;
 
+struct CatalogProvider<'a> {
+    catalog: &'a ffq_storage::Catalog,
+}
+
+impl<'a> ffq_planner::SchemaProvider for CatalogProvider<'a> {
+    fn table_schema(&self, table: &str) -> ffq_common::Result<arrow_schema::SchemaRef> {
+        let t = self.catalog.get(table)?;
+        t.schema_ref()
+    }
+}
+
+impl<'a> ffq_planner::OptimizerContext for CatalogProvider<'a> {
+    fn table_stats(&self, table: &str) -> ffq_common::Result<(Option<u64>, Option<u64>)> {
+        let t = self.catalog.get(table)?;
+        Ok((t.stats.bytes, t.stats.rows))
+    }
+
+    fn table_metadata(
+        &self,
+        table: &str,
+    ) -> ffq_common::Result<Option<ffq_planner::TableMetadata>> {
+        let t = self.catalog.get(table)?;
+        Ok(Some(ffq_planner::TableMetadata {
+            format: t.format.clone(),
+            options: t.options.clone(),
+        }))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteMode {
     Overwrite,
@@ -84,22 +113,6 @@ impl DataFrame {
     }
 
     pub fn explain(&self) -> Result<String> {
-        struct CatalogProvider<'a> {
-            catalog: &'a ffq_storage::Catalog,
-        }
-        impl<'a> ffq_planner::SchemaProvider for CatalogProvider<'a> {
-            fn table_schema(&self, table: &str) -> ffq_common::Result<arrow_schema::SchemaRef> {
-                let t = self.catalog.get(table)?;
-                t.schema_ref()
-            }
-        }
-        impl<'a> ffq_planner::OptimizerContext for CatalogProvider<'a> {
-            fn table_stats(&self, table: &str) -> ffq_common::Result<(Option<u64>, Option<u64>)> {
-                let t = self.catalog.get(table)?;
-                Ok((t.stats.bytes, t.stats.rows))
-            }
-        }
-
         let cat = self.session.catalog.read().expect("catalog lock poisoned");
         let provider = CatalogProvider { catalog: &*cat };
 
@@ -201,23 +214,6 @@ impl DataFrame {
 
     async fn execute_with_schema(&self) -> Result<(SchemaRef, Vec<RecordBatch>)> {
         // Ensure both SQL-built and DataFrame-built plans go through the same analyze/optimize pipeline.
-        // Build a schema provider from the catalog
-        struct CatalogProvider<'a> {
-            catalog: &'a ffq_storage::Catalog,
-        }
-        impl<'a> ffq_planner::SchemaProvider for CatalogProvider<'a> {
-            fn table_schema(&self, table: &str) -> ffq_common::Result<arrow_schema::SchemaRef> {
-                let t = self.catalog.get(table)?;
-                t.schema_ref()
-            }
-        }
-        impl<'a> ffq_planner::OptimizerContext for CatalogProvider<'a> {
-            fn table_stats(&self, table: &str) -> ffq_common::Result<(Option<u64>, Option<u64>)> {
-                let t = self.catalog.get(table)?;
-                Ok((t.stats.bytes, t.stats.rows))
-            }
-        }
-
         let (analyzed, catalog_snapshot) = {
             let cat_guard = self.session.catalog.read().expect("catalog lock poisoned");
             let provider = CatalogProvider {
@@ -464,5 +460,49 @@ fn replace_dir_atomically(staged: &Path, target: &Path) -> Result<()> {
                 target.display()
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::CatalogProvider;
+    use ffq_planner::OptimizerContext;
+
+    #[test]
+    fn optimizer_context_exposes_table_metadata_from_catalog() {
+        let mut catalog = ffq_storage::Catalog::new();
+        catalog.register_table(ffq_storage::TableDef {
+            name: "docs_idx".to_string(),
+            uri: String::new(),
+            paths: Vec::new(),
+            format: "qdrant".to_string(),
+            schema: None,
+            stats: ffq_storage::TableStats::default(),
+            options: HashMap::from([
+                ("qdrant.collection".to_string(), "docs".to_string()),
+                (
+                    "qdrant.endpoint".to_string(),
+                    "http://127.0.0.1:6334".to_string(),
+                ),
+            ]),
+        });
+        let ctx = CatalogProvider { catalog: &catalog };
+
+        let fmt = ctx
+            .table_format("docs_idx")
+            .expect("table format")
+            .expect("format");
+        assert_eq!(fmt, "qdrant");
+
+        let opts = ctx
+            .table_options("docs_idx")
+            .expect("table options")
+            .expect("options");
+        assert_eq!(
+            opts.get("qdrant.collection").expect("collection option"),
+            "docs"
+        );
     }
 }

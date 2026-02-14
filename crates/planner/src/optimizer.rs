@@ -1,5 +1,5 @@
 use ffq_common::Result;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::analyzer::SchemaProvider;
 use crate::logical_plan::{BinaryOp, Expr, JoinStrategyHint, JoinType, LiteralValue, LogicalPlan};
@@ -17,9 +17,27 @@ impl Default for OptimizerConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TableMetadata {
+    pub format: String,
+    pub options: HashMap<String, String>,
+}
+
 /// Provide table stats for join hinting + schemas for pushdown decisions.
 pub trait OptimizerContext: SchemaProvider {
     fn table_stats(&self, table: &str) -> Result<(Option<u64>, Option<u64>)>; // (bytes, rows)
+
+    fn table_metadata(&self, _table: &str) -> Result<Option<TableMetadata>> {
+        Ok(None)
+    }
+
+    fn table_format(&self, table: &str) -> Result<Option<String>> {
+        Ok(self.table_metadata(table)?.map(|m| m.format))
+    }
+
+    fn table_options(&self, table: &str) -> Result<Option<HashMap<String, String>>> {
+        Ok(self.table_metadata(table)?.map(|m| m.options))
+    }
 }
 
 #[derive(Debug, Default)]
