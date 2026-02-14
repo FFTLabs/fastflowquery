@@ -19,6 +19,10 @@ use ffq_common::{FfqError, Result};
 use ffq_execution::{compile_expr, SendableRecordBatchStream, StreamAdapter, TaskContext};
 use ffq_planner::{AggExpr, BuildSide, ExchangeExec, Expr, PhysicalPlan};
 use ffq_storage::parquet_provider::ParquetProvider;
+#[cfg(feature = "qdrant")]
+use ffq_storage::qdrant_provider::QdrantProvider;
+#[cfg(feature = "qdrant")]
+use ffq_storage::vector_index::VectorIndexProvider;
 use ffq_storage::{Catalog, StorageProvider};
 use futures::future::BoxFuture;
 use futures::{FutureExt, TryStreamExt};
@@ -180,6 +184,7 @@ fn execute_plan(
                 let child = execute_plan(*topk.input, ctx, catalog).await?;
                 run_topk_by_score(child, topk.score_expr, topk.k)
             }
+            PhysicalPlan::VectorTopK(exec) => execute_vector_topk(exec, catalog).await,
             PhysicalPlan::Exchange(exchange) => match exchange {
                 ExchangeExec::ShuffleWrite(x) => execute_plan(*x.input, ctx, catalog).await,
                 ExchangeExec::ShuffleRead(x) => execute_plan(*x.input, ctx, catalog).await,
@@ -386,6 +391,74 @@ fn score_at(arr: &ArrayRef, idx: usize) -> Result<Option<f64>> {
         "top-k score expression must evaluate to Float32/Float64, got {:?}",
         arr.data_type()
     )))
+}
+
+fn execute_vector_topk(
+    exec: ffq_planner::VectorTopKExec,
+    catalog: Arc<Catalog>,
+) -> BoxFuture<'static, Result<ExecOutput>> {
+    async move {
+        let table = catalog.get(&exec.table)?.clone();
+        if table.format != "qdrant" {
+            return Err(FfqError::Unsupported(format!(
+                "VectorTopKExec requires table format='qdrant', got '{}'",
+                table.format
+            )));
+        }
+        #[cfg(not(feature = "qdrant"))]
+        {
+            let _ = table;
+            let _ = exec;
+            return Err(FfqError::Unsupported(
+                "qdrant feature is disabled; build ffq-client with --features qdrant".to_string(),
+            ));
+        }
+        #[cfg(feature = "qdrant")]
+        {
+            let provider = QdrantProvider::from_table(&table)?;
+            let rows = provider
+                .topk(exec.query_vector, exec.k, exec.filter)
+                .await?;
+            rows_to_vector_topk_output(rows)
+        }
+    }
+    .boxed()
+}
+
+#[allow(dead_code)]
+fn rows_to_vector_topk_output(
+    rows: Vec<ffq_storage::vector_index::VectorTopKRow>,
+) -> Result<ExecOutput> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("score", DataType::Float32, false),
+        Field::new("payload", DataType::Utf8, true),
+    ]));
+    let mut id_b = Int64Builder::with_capacity(rows.len());
+    let mut score_b = arrow::array::Float32Builder::with_capacity(rows.len());
+    let mut payload_b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+    for row in rows {
+        id_b.append_value(row.id);
+        score_b.append_value(row.score);
+        if let Some(p) = row.payload_json {
+            payload_b.append_value(p);
+        } else {
+            payload_b.append_null();
+        }
+    }
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_b.finish()),
+            Arc::new(score_b.finish()),
+            Arc::new(payload_b.finish()),
+        ],
+    )
+    .map_err(|e| FfqError::Execution(format!("build VectorTopK record batch failed: {e}")))?;
+    Ok(ExecOutput {
+        schema,
+        batches: vec![batch],
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1627,4 +1700,32 @@ fn decode_record_batches_ipc(payload: &[u8]) -> Result<(SchemaRef, Vec<RecordBat
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| FfqError::Execution(format!("ipc decode failed: {e}")))?;
     Ok((schema, batches))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rows_to_vector_topk_output;
+
+    #[test]
+    fn vector_topk_rows_are_encoded_as_batch() {
+        let rows = vec![
+            ffq_storage::vector_index::VectorTopKRow {
+                id: 10,
+                score: 0.9,
+                payload_json: Some("{\"title\":\"a\"}".to_string()),
+            },
+            ffq_storage::vector_index::VectorTopKRow {
+                id: 20,
+                score: 0.8,
+                payload_json: None,
+            },
+        ];
+        let out = rows_to_vector_topk_output(rows).expect("build output");
+        assert_eq!(out.batches.len(), 1);
+        let b = &out.batches[0];
+        assert_eq!(b.num_rows(), 2);
+        assert_eq!(b.schema().field(0).name(), "id");
+        assert_eq!(b.schema().field(1).name(), "score");
+        assert_eq!(b.schema().field(2).name(), "payload");
+    }
 }

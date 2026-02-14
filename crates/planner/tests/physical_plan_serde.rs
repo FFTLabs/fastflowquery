@@ -1,6 +1,4 @@
-use ffq_planner::{
-    create_physical_plan, JoinStrategyHint, JoinType, LogicalPlan, PhysicalPlannerConfig,
-};
+use ffq_planner::{create_physical_plan, LogicalPlan, PhysicalPlan, PhysicalPlannerConfig};
 
 #[test]
 fn physical_plan_is_serializable() {
@@ -18,4 +16,13 @@ fn physical_plan_is_serializable() {
 
     let s = serde_json::to_string(&phys).unwrap();
     let _back: ffq_planner::PhysicalPlan = serde_json::from_str(&s).unwrap();
+
+    let v = PhysicalPlan::VectorTopK(ffq_planner::VectorTopKExec {
+        table: "docs_idx".to_string(),
+        query_vector: vec![1.0, 2.0, 3.0],
+        k: 5,
+        filter: None,
+    });
+    let sv = serde_json::to_string(&v).unwrap();
+    let _back_v: ffq_planner::PhysicalPlan = serde_json::from_str(&sv).unwrap();
 }

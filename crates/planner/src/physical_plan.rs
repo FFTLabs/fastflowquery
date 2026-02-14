@@ -22,6 +22,7 @@ pub enum PhysicalPlan {
 
     Limit(LimitExec),
     TopKByScore(TopKByScoreExec),
+    VectorTopK(VectorTopKExec),
 }
 
 impl PhysicalPlan {
@@ -42,6 +43,7 @@ impl PhysicalPlan {
             },
             PhysicalPlan::Limit(x) => vec![x.input.as_ref()],
             PhysicalPlan::TopKByScore(x) => vec![x.input.as_ref()],
+            PhysicalPlan::VectorTopK(_) => vec![],
         }
     }
 }
@@ -159,4 +161,12 @@ pub struct TopKByScoreExec {
     pub score_expr: Expr,
     pub k: usize,
     pub input: Box<PhysicalPlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorTopKExec {
+    pub table: String,
+    pub query_vector: Vec<f32>,
+    pub k: usize,
+    pub filter: Option<String>,
 }

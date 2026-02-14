@@ -759,6 +759,9 @@ fn eval_plan_for_stage(
             )?;
             run_topk_by_score(child, topk.score_expr.clone(), topk.k)
         }
+        PhysicalPlan::VectorTopK(_) => Err(FfqError::Unsupported(
+            "VectorTopK execution is not implemented in distributed worker v1".to_string(),
+        )),
         PhysicalPlan::CoalesceBatches(_) => Err(FfqError::Unsupported(
             "CoalesceBatches execution is not implemented in distributed worker".to_string(),
         )),

@@ -108,6 +108,7 @@ fn op_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Exchange(ExchangeExec::Broadcast(_)) => "Broadcast",
         PhysicalPlan::Limit(_) => "Limit",
         PhysicalPlan::TopKByScore(_) => "TopKByScore",
+        PhysicalPlan::VectorTopK(_) => "VectorTopK",
     }
 }
 
