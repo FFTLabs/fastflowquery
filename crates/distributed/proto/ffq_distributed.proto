@@ -8,6 +8,8 @@ service ControlPlane {
   rpc ReportTaskStatus(ReportTaskStatusRequest) returns (ReportTaskStatusResponse);
   rpc GetQueryStatus(GetQueryStatusRequest) returns (GetQueryStatusResponse);
   rpc CancelQuery(CancelQueryRequest) returns (CancelQueryResponse);
+  rpc RegisterQueryResults(RegisterQueryResultsRequest) returns (RegisterQueryResultsResponse);
+  rpc FetchQueryResults(FetchQueryResultsRequest) returns (stream QueryResultsChunk);
 }
 
 service ShuffleService {
@@ -99,6 +101,21 @@ message CancelQueryRequest {
 message CancelQueryResponse {
   string query_id = 1;
   QueryState state = 2;
+}
+
+message RegisterQueryResultsRequest {
+  string query_id = 1;
+  bytes ipc_payload = 2;
+}
+
+message RegisterQueryResultsResponse {}
+
+message FetchQueryResultsRequest {
+  string query_id = 1;
+}
+
+message QueryResultsChunk {
+  bytes payload = 1;
 }
 
 message RegisterMapOutputRequest {

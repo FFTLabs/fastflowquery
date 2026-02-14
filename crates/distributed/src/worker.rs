@@ -78,6 +78,7 @@ pub trait WorkerControlPlane: Send + Sync {
         assignment: &TaskAssignment,
         partitions: Vec<MapOutputPartitionMeta>,
     ) -> Result<()>;
+    async fn register_query_results(&self, query_id: &str, ipc_payload: Vec<u8>) -> Result<()>;
     async fn heartbeat(&self, worker_id: &str, running_tasks: u32) -> Result<()>;
 }
 
@@ -248,6 +249,12 @@ where
                                 )
                                 .await?;
                         }
+                        if !exec_result.output_batches.is_empty() {
+                            let payload = encode_record_batches_ipc(&exec_result.output_batches)?;
+                            control_plane
+                                .register_query_results(&assignment.query_id, payload)
+                                .await?;
+                        }
                         control_plane
                             .report_task_status(
                                 &worker_id,
@@ -359,6 +366,11 @@ impl WorkerControlPlane for InProcessControlPlane {
     async fn heartbeat(&self, _worker_id: &str, _running_tasks: u32) -> Result<()> {
         Ok(())
     }
+
+    async fn register_query_results(&self, query_id: &str, ipc_payload: Vec<u8>) -> Result<()> {
+        let mut c = self.coordinator.lock().await;
+        c.register_query_results(query_id.to_string(), ipc_payload)
+    }
 }
 
 #[async_trait]
@@ -450,6 +462,18 @@ impl WorkerControlPlane for GrpcControlPlane {
             .map_err(map_tonic_err)?;
         Ok(())
     }
+
+    async fn register_query_results(&self, query_id: &str, ipc_payload: Vec<u8>) -> Result<()> {
+        let mut client = self.control.lock().await;
+        client
+            .register_query_results(v1::RegisterQueryResultsRequest {
+                query_id: query_id.to_string(),
+                ipc_payload,
+            })
+            .await
+            .map_err(map_tonic_err)?;
+        Ok(())
+    }
 }
 
 fn map_tonic_err(err: tonic::Status) -> FfqError {
@@ -467,6 +491,27 @@ fn proto_task_state(state: TaskState) -> v1::TaskState {
         TaskState::Succeeded => v1::TaskState::Succeeded,
         TaskState::Failed => v1::TaskState::Failed,
     }
+}
+
+pub fn encode_record_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schema = batches[0].schema();
+    let mut out = Vec::<u8>::new();
+    {
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut out, schema.as_ref())
+            .map_err(|e| FfqError::Execution(format!("ipc writer init failed: {e}")))?;
+        for batch in batches {
+            writer
+                .write(batch)
+                .map_err(|e| FfqError::Execution(format!("ipc write failed: {e}")))?;
+        }
+        writer
+            .finish()
+            .map_err(|e| FfqError::Execution(format!("ipc finish failed: {e}")))?;
+    }
+    Ok(out)
 }
 
 #[derive(Clone)]
@@ -1985,6 +2030,11 @@ mod tests {
                 let batches = exec.take_query_output("1001").await.expect("sink output");
                 let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
                 assert!(rows > 0);
+                let encoded = {
+                    let c = coordinator.lock().await;
+                    c.fetch_query_results("1001").expect("coordinator results")
+                };
+                assert!(!encoded.is_empty());
                 let _ = std::fs::remove_file(&lineitem_path);
                 let _ = std::fs::remove_file(&orders_path);
                 let _ = std::fs::remove_dir_all(&spill_dir);

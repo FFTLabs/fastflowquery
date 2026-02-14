@@ -119,6 +119,7 @@ pub struct Coordinator {
     config: CoordinatorConfig,
     queries: HashMap<String, QueryRuntime>,
     map_outputs: HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>,
+    query_results: HashMap<String, Vec<u8>>,
     blacklisted_workers: HashSet<String>,
     worker_failures: HashMap<String, u32>,
 }
@@ -307,6 +308,24 @@ impl Coordinator {
 
     pub fn map_output_registry_size(&self) -> usize {
         self.map_outputs.len()
+    }
+
+    pub fn register_query_results(&mut self, query_id: String, ipc_payload: Vec<u8>) -> Result<()> {
+        if !self.queries.contains_key(&query_id) {
+            return Err(FfqError::Planning(format!("unknown query: {query_id}")));
+        }
+        self.query_results.insert(query_id, ipc_payload);
+        Ok(())
+    }
+
+    pub fn fetch_query_results(&self, query_id: &str) -> Result<Vec<u8>> {
+        if !self.queries.contains_key(query_id) {
+            return Err(FfqError::Planning(format!("unknown query: {query_id}")));
+        }
+        self.query_results
+            .get(query_id)
+            .cloned()
+            .ok_or_else(|| FfqError::Execution("query results not ready".to_string()))
     }
 
     pub fn is_worker_blacklisted(&self, worker_id: &str) -> bool {

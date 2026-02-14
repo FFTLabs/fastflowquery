@@ -1183,20 +1183,33 @@ fn scalar_gt(a: &ScalarValue, b: &ScalarValue) -> Result<bool> {
 }
 
 #[cfg(feature = "distributed")]
+use ffq_distributed::grpc::v1::QueryState as DistQueryState;
+#[cfg(feature = "distributed")]
+use ffq_distributed::grpc::ControlPlaneClient;
+#[cfg(feature = "distributed")]
 use ffq_distributed::DistributedRuntime as InnerDistributedRuntime;
 
 #[cfg(feature = "distributed")]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DistributedRuntime {
     _inner: InnerDistributedRuntime,
+    coordinator_endpoint: String,
 }
 
 #[cfg(feature = "distributed")]
 impl DistributedRuntime {
-    pub fn new() -> Self {
+    pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             _inner: InnerDistributedRuntime::default(),
+            coordinator_endpoint: endpoint.into(),
         }
+    }
+}
+
+#[cfg(feature = "distributed")]
+impl Default for DistributedRuntime {
+    fn default() -> Self {
+        Self::new("http://127.0.0.1:50051")
     }
 }
 
@@ -1208,16 +1221,124 @@ impl Runtime for DistributedRuntime {
         _ctx: QueryContext,
         _catalog: Arc<Catalog>,
     ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
+        let endpoint = self.coordinator_endpoint.clone();
         let stage_dag = self._inner.build_stage_dag(&plan);
         async move {
             let _stage_dag = stage_dag?;
-            // v1 skeleton: distributed implementation will:
-            // - serialize plan
-            // - submit to coordinator
-            // - stream results back
-            let stream = ffq_execution::empty_stream(Arc::new(Schema::empty()));
-            Ok(stream)
+            let plan_bytes = serde_json::to_vec(&plan)
+                .map_err(|e| FfqError::Execution(format!("encode physical plan failed: {e}")))?;
+            let query_id = distributed_query_id()?;
+
+            let mut client = ControlPlaneClient::connect(endpoint.clone())
+                .await
+                .map_err(|e| FfqError::Execution(format!("connect coordinator failed: {e}")))?;
+            client
+                .submit_query(ffq_distributed::grpc::v1::SubmitQueryRequest {
+                    query_id: query_id.clone(),
+                    physical_plan_json: plan_bytes,
+                })
+                .await
+                .map_err(|e| FfqError::Execution(format!("submit query failed: {e}")))?;
+
+            let mut polls = 0_u32;
+            let terminal = loop {
+                let status = client
+                    .get_query_status(ffq_distributed::grpc::v1::GetQueryStatusRequest {
+                        query_id: query_id.clone(),
+                    })
+                    .await
+                    .map_err(|e| FfqError::Execution(format!("get query status failed: {e}")))?
+                    .into_inner()
+                    .status
+                    .ok_or_else(|| {
+                        FfqError::Execution("empty query status response".to_string())
+                    })?;
+
+                let qstate = DistQueryState::try_from(status.state).map_err(|_| {
+                    FfqError::Execution(format!("invalid query state value: {}", status.state))
+                })?;
+                if matches!(
+                    qstate,
+                    DistQueryState::Succeeded | DistQueryState::Failed | DistQueryState::Canceled
+                ) {
+                    break (qstate, status.message);
+                }
+
+                polls = polls.saturating_add(1);
+                if polls > 600 {
+                    return Err(FfqError::Execution(
+                        "distributed query timed out waiting for completion".to_string(),
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            };
+
+            match terminal.0 {
+                DistQueryState::Succeeded => {}
+                DistQueryState::Failed => {
+                    return Err(FfqError::Execution(format!(
+                        "distributed query failed: {}",
+                        terminal.1
+                    )))
+                }
+                DistQueryState::Canceled => {
+                    return Err(FfqError::Execution(format!(
+                        "distributed query canceled: {}",
+                        terminal.1
+                    )))
+                }
+                _ => {
+                    return Err(FfqError::Execution(
+                        "unexpected terminal query state".to_string(),
+                    ))
+                }
+            }
+
+            let mut stream = client
+                .fetch_query_results(ffq_distributed::grpc::v1::FetchQueryResultsRequest {
+                    query_id,
+                })
+                .await
+                .map_err(|e| FfqError::Execution(format!("fetch query results failed: {e}")))?
+                .into_inner();
+
+            let mut payload = Vec::<u8>::new();
+            while let Some(chunk) = stream
+                .message()
+                .await
+                .map_err(|e| FfqError::Execution(format!("results stream failed: {e}")))?
+            {
+                payload.extend_from_slice(&chunk.payload);
+            }
+
+            let (schema, batches) = decode_record_batches_ipc(&payload)?;
+            let out_stream = futures::stream::iter(batches.into_iter().map(Ok));
+            Ok(Box::pin(StreamAdapter::new(schema, out_stream)) as SendableRecordBatchStream)
         }
         .boxed()
     }
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_query_id() -> Result<String> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| FfqError::Execution(format!("clock error: {e}")))?
+        .as_nanos();
+    Ok(nanos.to_string())
+}
+
+#[cfg(feature = "distributed")]
+fn decode_record_batches_ipc(payload: &[u8]) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+    if payload.is_empty() {
+        return Ok((Arc::new(Schema::empty()), Vec::new()));
+    }
+    let cursor = std::io::Cursor::new(payload.to_vec());
+    let reader = arrow::ipc::reader::StreamReader::try_new(cursor, None)
+        .map_err(|e| FfqError::Execution(format!("ipc reader init failed: {e}")))?;
+    let schema = reader.schema();
+    let batches = reader
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| FfqError::Execution(format!("ipc decode failed: {e}")))?;
+    Ok((schema, batches))
 }

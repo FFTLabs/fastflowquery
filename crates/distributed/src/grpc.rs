@@ -123,6 +123,45 @@ impl ControlPlane for CoordinatorServices {
             state: proto_query_state(state) as i32,
         }))
     }
+
+    async fn register_query_results(
+        &self,
+        request: Request<v1::RegisterQueryResultsRequest>,
+    ) -> Result<Response<v1::RegisterQueryResultsResponse>, Status> {
+        let req = request.into_inner();
+        let mut coordinator = self.coordinator.lock().await;
+        coordinator
+            .register_query_results(req.query_id, req.ipc_payload)
+            .map_err(to_status)?;
+        Ok(Response::new(v1::RegisterQueryResultsResponse {}))
+    }
+
+    type FetchQueryResultsStream =
+        std::pin::Pin<Box<dyn Stream<Item = Result<v1::QueryResultsChunk, Status>> + Send>>;
+
+    async fn fetch_query_results(
+        &self,
+        request: Request<v1::FetchQueryResultsRequest>,
+    ) -> Result<Response<Self::FetchQueryResultsStream>, Status> {
+        let req = request.into_inner();
+        let coordinator = self.coordinator.lock().await;
+        let payload = coordinator
+            .fetch_query_results(&req.query_id)
+            .map_err(to_status)?;
+        drop(coordinator);
+
+        let mut out = Vec::new();
+        let mut offset = 0_usize;
+        let chunk_size = 64 * 1024;
+        while offset < payload.len() {
+            let end = (offset + chunk_size).min(payload.len());
+            out.push(Ok(v1::QueryResultsChunk {
+                payload: payload[offset..end].to_vec(),
+            }));
+            offset = end;
+        }
+        Ok(Response::new(Box::pin(stream::iter(out))))
+    }
 }
 
 #[tonic::async_trait]
