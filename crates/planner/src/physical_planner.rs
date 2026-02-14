@@ -197,6 +197,9 @@ pub fn create_physical_plan(
                 }
             }
         }
+        LogicalPlan::InsertInto { .. } => Err(FfqError::Unsupported(
+            "INSERT planning to physical operators is not implemented yet".to_string(),
+        )),
     }
 }
 

@@ -217,6 +217,64 @@ impl Analyzer {
                     resolver,
                 ))
             }
+            LogicalPlan::InsertInto {
+                table,
+                columns,
+                input,
+            } => {
+                let (ain, input_schema, _input_resolver) = self.analyze_plan(*input, provider)?;
+                let target_schema = provider.table_schema(&table)?;
+
+                let mut target_fields: Vec<Field> = Vec::new();
+                if columns.is_empty() {
+                    for idx in 0..target_schema.fields().len() {
+                        target_fields.push(target_schema.field(idx).clone());
+                    }
+                } else {
+                    target_fields.reserve(columns.len());
+                    for col in &columns {
+                        let idx = target_schema.index_of(col).map_err(|_| {
+                            FfqError::Planning(format!(
+                                "INSERT target column '{col}' not found in table '{table}'"
+                            ))
+                        })?;
+                        target_fields.push(target_schema.field(idx).clone());
+                    }
+                }
+
+                if input_schema.fields().len() != target_fields.len() {
+                    return Err(FfqError::Planning(format!(
+                        "INSERT column count mismatch: target has {}, SELECT has {}",
+                        target_fields.len(),
+                        input_schema.fields().len()
+                    )));
+                }
+
+                for (idx, (src, dst)) in input_schema.fields().iter().zip(target_fields.iter()).enumerate()
+                {
+                    if !insert_type_compatible(src.data_type(), dst.data_type()) {
+                        return Err(FfqError::Planning(format!(
+                            "INSERT type mismatch at column {}: target '{}' is {:?}, SELECT is {:?}",
+                            idx,
+                            dst.name(),
+                            dst.data_type(),
+                            src.data_type()
+                        )));
+                    }
+                }
+
+                let out_schema = Arc::new(Schema::new(target_fields));
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                Ok((
+                    LogicalPlan::InsertInto {
+                        table,
+                        columns,
+                        input: Box::new(ain),
+                    },
+                    out_schema,
+                    out_resolver,
+                ))
+            }
         }
     }
 
@@ -529,6 +587,79 @@ fn is_numeric(dt: &DataType) -> bool {
             | DataType::Float32
             | DataType::Float64
     )
+}
+
+fn insert_type_compatible(src: &DataType, dst: &DataType) -> bool {
+    src == dst
+        || matches!(
+            (src, dst),
+            (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64)
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
+
+    use super::{Analyzer, SchemaProvider};
+    use crate::logical_plan::LogicalPlan;
+    use crate::sql_frontend::sql_to_logical;
+
+    struct TestSchemaProvider {
+        schemas: HashMap<String, SchemaRef>,
+    }
+
+    impl SchemaProvider for TestSchemaProvider {
+        fn table_schema(&self, table: &str) -> ffq_common::Result<SchemaRef> {
+            self.schemas
+                .get(table)
+                .cloned()
+                .ok_or_else(|| ffq_common::FfqError::Planning(format!("unknown table: {table}")))
+        }
+    }
+
+    #[test]
+    fn analyze_insert_valid() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "src".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        schemas.insert(
+            "dst".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical("INSERT INTO dst SELECT a FROM src", &HashMap::new())
+            .expect("parse insert");
+        let analyzed = analyzer.analyze(plan, &provider).expect("analyze insert");
+        assert!(matches!(analyzed, LogicalPlan::InsertInto { .. }));
+    }
+
+    #[test]
+    fn analyze_insert_type_mismatch() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "src".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)])),
+        );
+        schemas.insert(
+            "dst".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical("INSERT INTO dst SELECT a FROM src", &HashMap::new())
+            .expect("parse insert");
+        let err = analyzer.analyze(plan, &provider).expect_err("expected type mismatch");
+        assert!(err
+            .to_string()
+            .contains("INSERT type mismatch"), "err={err}");
+    }
 }
 
 fn numeric_rank(dt: &DataType) -> Option<u8> {

@@ -69,6 +69,14 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!("{pad}Limit n={n}\n"));
             fmt_plan(input, indent + 1, out);
         }
+        LogicalPlan::InsertInto {
+            table,
+            columns,
+            input,
+        } => {
+            out.push_str(&format!("{pad}InsertInto table={table} columns={columns:?}\n"));
+            fmt_plan(input, indent + 1, out);
+        }
     }
 }
 

@@ -109,6 +109,11 @@ pub enum LogicalPlan {
         n: usize,
         input: Box<LogicalPlan>,
     },
+    InsertInto {
+        table: String,
+        columns: Vec<String>,
+        input: Box<LogicalPlan>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

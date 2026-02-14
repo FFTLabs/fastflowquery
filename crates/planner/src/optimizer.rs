@@ -347,6 +347,21 @@ fn proj_rewrite(
                 HashSet::new(),
             ))
         }
+        LogicalPlan::InsertInto {
+            table,
+            columns,
+            input,
+        } => {
+            let (new_in, _) = proj_rewrite(*input, None, ctx)?;
+            Ok((
+                LogicalPlan::InsertInto {
+                    table,
+                    columns,
+                    input: Box::new(new_in),
+                },
+                HashSet::new(),
+            ))
+        }
 
         LogicalPlan::TableScan {
             table,
@@ -627,6 +642,15 @@ fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy
             n,
             input: Box::new(f(*input)),
         },
+        LogicalPlan::InsertInto {
+            table,
+            columns,
+            input,
+        } => LogicalPlan::InsertInto {
+            table,
+            columns,
+            input: Box::new(f(*input)),
+        },
         s @ LogicalPlan::TableScan { .. } => s,
     }
 }
@@ -671,6 +695,15 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
         },
         LogicalPlan::Limit { n, input } => LogicalPlan::Limit {
             n,
+            input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+        },
+        LogicalPlan::InsertInto {
+            table,
+            columns,
+            input,
+        } => LogicalPlan::InsertInto {
+            table,
+            columns,
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
         },
         s @ LogicalPlan::TableScan { .. } => s,
@@ -827,6 +860,7 @@ fn plan_output_columns(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result
             l.extend(r);
             Ok(l)
         }
+        LogicalPlan::InsertInto { input, .. } => plan_output_columns(input, ctx),
     }
 }
 
@@ -845,7 +879,8 @@ fn estimate_bytes(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result<Opti
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::Limit { input, .. } => estimate_bytes(input, ctx),
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::InsertInto { input, .. } => estimate_bytes(input, ctx),
         LogicalPlan::Join { .. } => Ok(None),
     }
 }

@@ -26,10 +26,33 @@ pub fn statement_to_logical(
 ) -> Result<LogicalPlan> {
     match stmt {
         Statement::Query(q) => query_to_logical(q, params),
+        Statement::Insert(insert) => insert_to_logical(insert, params),
         _ => Err(FfqError::Unsupported(
-            "only SELECT queries are supported in v1".to_string(),
+            "only SELECT and INSERT INTO ... SELECT are supported in v1".to_string(),
         )),
     }
+}
+
+fn insert_to_logical(
+    insert: &sqlparser::ast::Insert,
+    params: &HashMap<String, LiteralValue>,
+) -> Result<LogicalPlan> {
+    let table = object_name_to_string(&insert.table_name);
+    let columns = insert
+        .columns
+        .iter()
+        .map(|c| c.value.clone())
+        .collect::<Vec<_>>();
+
+    let source = insert.source.as_ref().ok_or_else(|| {
+        FfqError::Unsupported("INSERT must have a SELECT source in v1".to_string())
+    })?;
+    let select_plan = query_to_logical(source, params)?;
+    Ok(LogicalPlan::InsertInto {
+        table,
+        columns,
+        input: Box::new(select_plan),
+    })
 }
 
 fn query_to_logical(q: &Query, params: &HashMap<String, LiteralValue>) -> Result<LogicalPlan> {
@@ -446,5 +469,26 @@ fn expr_to_name_fallback(e: &Expr) -> String {
         Expr::Column(c) => c.clone(),
         Expr::Literal(_) => "lit".to_string(),
         _ => "expr".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::sql_to_logical;
+    use crate::logical_plan::LogicalPlan;
+
+    #[test]
+    fn parses_insert_into_select() {
+        let plan = sql_to_logical("INSERT INTO t SELECT a FROM s", &HashMap::new())
+            .expect("parse");
+        match plan {
+            LogicalPlan::InsertInto { table, columns, .. } => {
+                assert_eq!(table, "t");
+                assert!(columns.is_empty());
+            }
+            other => panic!("expected InsertInto, got {other:?}"),
+        }
     }
 }
