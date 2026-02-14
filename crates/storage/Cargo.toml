@@ -11,6 +11,7 @@ qdrant = ["dep:qdrant-client"]
 
 [dependencies]
 ffq-common = { path = "../common" }
+ffq-execution = { path = "../execution" }
 arrow.workspace = true
 arrow-schema.workspace = true
 parquet.workspace = true
@@ -19,5 +20,5 @@ serde_json.workspace = true
 tracing.workspace = true
 futures.workspace = true
 
-object_store = { version = "0.11", optional = true }
+object_store = { version = "0.11", optional = true, features = ["aws", "gcp", "azure"] }
 qdrant-client = { version = "1.12", optional = true, default-features = false, features = ["reqwest"] }

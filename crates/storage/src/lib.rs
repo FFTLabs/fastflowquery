@@ -9,6 +9,6 @@ pub mod object_store_provider;
 #[cfg(feature = "qdrant")]
 pub mod qdrant_provider;
 
-pub use stats::TableStats;
 pub use catalog::*;
 pub use provider::*;
+pub use stats::TableStats;

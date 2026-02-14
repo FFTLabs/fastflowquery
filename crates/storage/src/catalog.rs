@@ -1,6 +1,6 @@
+use arrow_schema::{Schema, SchemaRef};
 use ffq_common::{FfqError, Result};
 use serde::{Deserialize, Serialize};
-use arrow_schema::{Schema, SchemaRef};
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ pub struct TableDef {
     pub uri: String,
     pub format: String,
 
-     #[serde(default)]
+    #[serde(default)]
     pub schema: Option<Schema>,
 
     #[serde(default)]
@@ -40,7 +40,9 @@ pub struct Catalog {
 
 impl Catalog {
     pub fn new() -> Self {
-        Self { tables: HashMap::new() }
+        Self {
+            tables: HashMap::new(),
+        }
     }
 
     pub fn register_table(&mut self, table: TableDef) {

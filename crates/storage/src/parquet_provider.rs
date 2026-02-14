@@ -1,9 +1,12 @@
-use crate::catalog::TableDef;
-use crate::provider::{RecordBatchStream, Stats, StorageProvider};
-use arrow::record_batch::RecordBatch;
-use ffq_common::{FfqError, Result};
 use std::fs::File;
-use std::pin::Pin;
+use std::sync::Arc;
+
+use arrow_schema::{Schema, SchemaRef};
+use ffq_common::Result;
+use ffq_execution::{empty_stream, ExecNode, SendableRecordBatchStream, TaskContext};
+
+use crate::catalog::TableDef;
+use crate::provider::{Stats, StorageExecNode, StorageProvider};
 
 pub struct ParquetProvider;
 
@@ -14,25 +17,54 @@ impl ParquetProvider {
 }
 
 impl StorageProvider for ParquetProvider {
-    fn estimate_stats(&self, _table: &TableDef) -> Result<Stats> {
-        Ok(Stats::default())
+    fn estimate_stats(&self, table: &TableDef) -> Stats {
+        Stats {
+            estimated_rows: table.stats.rows,
+            estimated_bytes: table.stats.bytes,
+        }
     }
 
     fn scan(
         &self,
         table: &TableDef,
-        _projection: Option<Vec<String>>,
-        _filters: Vec<String>,
-    ) -> Result<RecordBatchStream> {
-        if table.format.to_lowercase() != "parquet" {
-            return Err(FfqError::Unsupported(format!(
-                "format not supported: {}",
-                table.format
-            )));
-        }
+        projection: Option<Vec<String>>,
+        filters: Vec<String>,
+    ) -> Result<StorageExecNode> {
+        Ok(Arc::new(ParquetScanNode {
+            uri: table.uri.clone(),
+            schema: table
+                .schema
+                .clone()
+                .map(Arc::new)
+                .unwrap_or_else(|| Arc::new(Schema::empty())),
+            projection,
+            filters,
+        }))
+    }
+}
 
-        let _f = File::open(&table.uri)?;
-        let stream = futures::stream::empty::<Result<RecordBatch>>();
-        Ok(Box::pin(stream) as Pin<Box<dyn futures::Stream<Item = Result<RecordBatch>> + Send>>)
+pub struct ParquetScanNode {
+    uri: String,
+    schema: SchemaRef,
+    #[allow(dead_code)]
+    projection: Option<Vec<String>>,
+    #[allow(dead_code)]
+    filters: Vec<String>,
+}
+
+impl ExecNode for ParquetScanNode {
+    fn name(&self) -> &'static str {
+        "ParquetScanNode"
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn execute(&self, _ctx: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+        // v1: validate local path and return an empty stream placeholder.
+        // Actual parquet decoding is implemented in a later ticket.
+        let _file = File::open(&self.uri)?;
+        Ok(empty_stream(self.schema.clone()))
     }
 }
