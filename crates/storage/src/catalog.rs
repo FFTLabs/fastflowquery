@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
@@ -104,9 +105,52 @@ impl Catalog {
         }
         cat
     }
+
+    pub fn tables(&self) -> Vec<TableDef> {
+        let mut v = self.tables.values().cloned().collect::<Vec<_>>();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+
+    pub fn save_to_json(&self, path: &str) -> Result<()> {
+        if let Some(parent) = Path::new(path).parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let payload = serde_json::to_string_pretty(&CatalogFile::Wrapped {
+            tables: self.tables(),
+        })
+        .map_err(|e| FfqError::InvalidConfig(format!("catalog json encode failed: {e}")))?;
+        write_atomically(path, payload.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn save_to_toml(&self, path: &str) -> Result<()> {
+        if let Some(parent) = Path::new(path).parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let payload = toml::to_string_pretty(&CatalogFile::Wrapped {
+            tables: self.tables(),
+        })
+        .map_err(|e| FfqError::InvalidConfig(format!("catalog toml encode failed: {e}")))?;
+        write_atomically(path, payload.as_bytes())?;
+        Ok(())
+    }
+
+    pub fn save(&self, path: &str) -> Result<()> {
+        match Path::new(path).extension().and_then(|ext| ext.to_str()) {
+            Some("json") => self.save_to_json(path),
+            Some("toml") => self.save_to_toml(path),
+            Some(other) => Err(FfqError::InvalidConfig(format!(
+                "unsupported catalog extension '.{other}'; use .json or .toml"
+            ))),
+            None => Err(FfqError::InvalidConfig(
+                "catalog path must include extension .json or .toml".to_string(),
+            )),
+        }
+    }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 enum CatalogFile {
     TableList(Vec<TableDef>),
@@ -132,6 +176,61 @@ fn parse_tables_toml(s: &str) -> Result<Vec<TableDef>> {
     let parsed: CatalogFile =
         toml::from_str(s).map_err(|e| FfqError::InvalidConfig(e.to_string()))?;
     Ok(parsed.into_tables())
+}
+
+fn write_atomically(path: &str, content: &[u8]) -> Result<()> {
+    let target = Path::new(path);
+    let parent = target
+        .parent()
+        .map(std::borrow::ToOwned::to_owned)
+        .unwrap_or_else(|| ".".into());
+    fs::create_dir_all(&parent)?;
+
+    let stem = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("catalog");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let staged = parent.join(format!(".ffq_staged_{stem}_{nanos}.tmp"));
+    fs::write(&staged, content)?;
+
+    if !target.exists() {
+        fs::rename(&staged, target).map_err(|e| {
+            FfqError::InvalidConfig(format!(
+                "catalog commit failed: {} -> {} ({e})",
+                staged.display(),
+                target.display()
+            ))
+        })?;
+        return Ok(());
+    }
+
+    let backup = parent.join(format!(".ffq_backup_{stem}_{nanos}.tmp"));
+    fs::rename(target, &backup).map_err(|e| {
+        FfqError::InvalidConfig(format!(
+            "catalog backup rename failed: {} -> {} ({e})",
+            target.display(),
+            backup.display()
+        ))
+    })?;
+
+    match fs::rename(&staged, target) {
+        Ok(_) => {
+            let _ = fs::remove_file(backup);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = fs::rename(&backup, target);
+            let _ = fs::remove_file(&staged);
+            Err(FfqError::InvalidConfig(format!(
+                "catalog commit failed: {} -> {} ({e})",
+                staged.display(),
+                target.display()
+            )))
+        }
+    }
 }
 
 #[cfg(test)]

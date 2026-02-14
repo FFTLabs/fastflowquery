@@ -1262,11 +1262,11 @@ fn scalar_gt(a: &ScalarValue, b: &ScalarValue) -> Result<bool> {
 
 fn write_parquet_sink(table: &ffq_storage::TableDef, child: &ExecOutput) -> Result<()> {
     let out_path = resolve_sink_output_path(table)?;
-    if let Some(parent) = out_path.parent() {
+    let staged_path = temp_sibling_path(&out_path, "staged");
+    if let Some(parent) = staged_path.parent() {
         fs::create_dir_all(parent)?;
     }
-
-    let file = File::create(&out_path)?;
+    let file = File::create(&staged_path)?;
     let mut writer = ArrowWriter::try_new(file, child.schema.clone(), None)
         .map_err(|e| FfqError::Execution(format!("parquet writer init failed: {e}")))?;
     for batch in &child.batches {
@@ -1277,6 +1277,10 @@ fn write_parquet_sink(table: &ffq_storage::TableDef, child: &ExecOutput) -> Resu
     writer
         .close()
         .map_err(|e| FfqError::Execution(format!("parquet writer close failed: {e}")))?;
+    if let Err(err) = replace_file_atomically(&staged_path, &out_path) {
+        let _ = fs::remove_file(&staged_path);
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -1298,6 +1302,61 @@ fn resolve_sink_output_path(table: &ffq_storage::TableDef) -> Result<PathBuf> {
         Ok(path)
     } else {
         Ok(path.join("part-00000.parquet"))
+    }
+}
+
+fn temp_sibling_path(path: &PathBuf, label: &str) -> PathBuf {
+    let parent = path
+        .parent()
+        .map(std::borrow::ToOwned::to_owned)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("target");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    parent.join(format!(".ffq_{label}_{stem}_{nanos}.tmp"))
+}
+
+fn replace_file_atomically(staged: &PathBuf, target: &PathBuf) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if !target.exists() {
+        fs::rename(staged, target).map_err(|e| {
+            FfqError::Execution(format!(
+                "file commit failed: {} -> {} ({e})",
+                staged.display(),
+                target.display()
+            ))
+        })?;
+        return Ok(());
+    }
+
+    let backup = temp_sibling_path(target, "backup");
+    fs::rename(target, &backup).map_err(|e| {
+        FfqError::Execution(format!(
+            "file backup rename failed: {} -> {} ({e})",
+            target.display(),
+            backup.display()
+        ))
+    })?;
+
+    match fs::rename(staged, target) {
+        Ok(_) => {
+            let _ = fs::remove_file(backup);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = fs::rename(&backup, target);
+            Err(FfqError::Execution(format!(
+                "file commit failed: {} -> {} ({e})",
+                staged.display(),
+                target.display()
+            )))
+        }
     }
 }
 

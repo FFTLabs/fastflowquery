@@ -6,6 +6,7 @@ use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::runtime::QueryContext;
 use crate::session::SharedSession;
@@ -140,11 +141,11 @@ impl DataFrame {
                         .to_string(),
                 ));
             }
-            write_single_parquet_file(target, &schema, &batches)?;
+            write_single_parquet_file_durable(target, &schema, &batches)?;
             return Ok(());
         }
 
-        let _written = write_parquet_parts(target, &schema, &batches, mode)?;
+        let _written = write_parquet_parts_durable(target, &schema, &batches, mode)?;
         Ok(())
     }
 
@@ -158,40 +159,43 @@ impl DataFrame {
             return Err(FfqError::Planning("table name cannot be empty".to_string()));
         }
         let (schema, batches) = self.execute_with_schema().await?;
-        let table_dir = PathBuf::from("./ffq_tables").join(name);
-        let new_paths = write_parquet_parts(&table_dir, &schema, &batches, mode)?;
+        let table_dir = self.session.managed_table_path(name);
+        let new_paths = write_parquet_parts_durable(&table_dir, &schema, &batches, mode)?;
 
-        let mut catalog = self.session.catalog.write().expect("catalog lock poisoned");
-        let table = if let Ok(existing) = catalog.get(name).cloned() {
-            let mut t = existing;
-            t.name = name.to_string();
-            t.format = "parquet".to_string();
-            t.schema = Some((*schema).clone());
-            match mode {
-                WriteMode::Overwrite => {
-                    t.uri.clear();
-                    t.paths = new_paths.clone();
+        {
+            let mut catalog = self.session.catalog.write().expect("catalog lock poisoned");
+            let table = if let Ok(existing) = catalog.get(name).cloned() {
+                let mut t = existing;
+                t.name = name.to_string();
+                t.format = "parquet".to_string();
+                t.schema = Some((*schema).clone());
+                match mode {
+                    WriteMode::Overwrite => {
+                        t.uri.clear();
+                        t.paths = new_paths.clone();
+                    }
+                    WriteMode::Append => {
+                        t.uri.clear();
+                        t.paths.extend(new_paths.clone());
+                        t.paths.sort();
+                        t.paths.dedup();
+                    }
                 }
-                WriteMode::Append => {
-                    t.uri.clear();
-                    t.paths.extend(new_paths.clone());
-                    t.paths.sort();
-                    t.paths.dedup();
+                t
+            } else {
+                ffq_storage::TableDef {
+                    name: name.to_string(),
+                    uri: String::new(),
+                    paths: new_paths,
+                    format: "parquet".to_string(),
+                    schema: Some((*schema).clone()),
+                    stats: ffq_storage::TableStats::default(),
+                    options: std::collections::HashMap::new(),
                 }
-            }
-            t
-        } else {
-            ffq_storage::TableDef {
-                name: name.to_string(),
-                uri: String::new(),
-                paths: new_paths,
-                format: "parquet".to_string(),
-                schema: Some((*schema).clone()),
-                stats: ffq_storage::TableStats::default(),
-                options: std::collections::HashMap::new(),
-            }
-        };
-        catalog.register_table(table);
+            };
+            catalog.register_table(table);
+        }
+        self.session.persist_catalog()?;
         Ok(())
     }
 
@@ -289,25 +293,61 @@ fn write_single_parquet_file(
     Ok(())
 }
 
-fn write_parquet_parts(
+fn write_single_parquet_file_durable(
+    path: &Path,
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+) -> Result<()> {
+    let stage = temp_sibling_path(path, "staged");
+    write_single_parquet_file(&stage, schema, batches)?;
+    if let Err(err) = replace_file_atomically(&stage, path) {
+        let _ = fs::remove_file(&stage);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn write_parquet_parts_durable(
     dir: &Path,
     schema: &SchemaRef,
     batches: &[RecordBatch],
     mode: WriteMode,
 ) -> Result<Vec<String>> {
-    if mode == WriteMode::Overwrite && dir.exists() {
-        fs::remove_dir_all(dir)?;
+    match mode {
+        WriteMode::Overwrite => {
+            let stage_dir = temp_sibling_path(dir, "staged");
+            fs::create_dir_all(&stage_dir)?;
+            let stage_file = stage_dir.join("part-00000.parquet");
+            if let Err(err) = write_single_parquet_file(&stage_file, schema, batches) {
+                let _ = fs::remove_dir_all(&stage_dir);
+                return Err(err);
+            }
+            if let Err(err) = replace_dir_atomically(&stage_dir, dir) {
+                let _ = fs::remove_dir_all(&stage_dir);
+                return Err(err);
+            }
+            let file_path = dir.join("part-00000.parquet");
+            Ok(vec![file_path.to_string_lossy().to_string()])
+        }
+        WriteMode::Append => {
+            fs::create_dir_all(dir)?;
+            let start_idx = next_part_index(dir)?;
+            let final_file = dir.join(format!("part-{start_idx:05}.parquet"));
+            let stage_file = temp_sibling_path(&final_file, "staged");
+            if let Err(err) = write_single_parquet_file(&stage_file, schema, batches) {
+                let _ = fs::remove_file(&stage_file);
+                return Err(err);
+            }
+            if let Err(err) = fs::rename(&stage_file, &final_file) {
+                let _ = fs::remove_file(&stage_file);
+                return Err(FfqError::Execution(format!(
+                    "append commit failed for {}: {err}",
+                    final_file.display()
+                )));
+            }
+            Ok(vec![final_file.to_string_lossy().to_string()])
+        }
     }
-    fs::create_dir_all(dir)?;
-
-    let start_idx = if mode == WriteMode::Append {
-        next_part_index(dir)?
-    } else {
-        0
-    };
-    let file_path = dir.join(format!("part-{start_idx:05}.parquet"));
-    write_single_parquet_file(&file_path, schema, batches)?;
-    Ok(vec![file_path.to_string_lossy().to_string()])
 }
 
 fn next_part_index(dir: &Path) -> Result<usize> {
@@ -330,4 +370,99 @@ fn next_part_index(dir: &Path) -> Result<usize> {
         }
     }
     Ok(max_idx.map_or(0, |m| m + 1))
+}
+
+fn temp_sibling_path(path: &Path, label: &str) -> PathBuf {
+    let parent = path
+        .parent()
+        .map(std::borrow::ToOwned::to_owned)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("target");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    parent.join(format!(".ffq_{label}_{stem}_{nanos}.tmp"))
+}
+
+fn replace_file_atomically(staged: &Path, target: &Path) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if !target.exists() {
+        fs::rename(staged, target).map_err(|e| {
+            FfqError::Execution(format!(
+                "file commit failed: {} -> {} ({e})",
+                staged.display(),
+                target.display()
+            ))
+        })?;
+        return Ok(());
+    }
+
+    let backup = temp_sibling_path(target, "backup");
+    fs::rename(target, &backup).map_err(|e| {
+        FfqError::Execution(format!(
+            "file backup rename failed: {} -> {} ({e})",
+            target.display(),
+            backup.display()
+        ))
+    })?;
+
+    match fs::rename(staged, target) {
+        Ok(_) => {
+            let _ = fs::remove_file(backup);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = fs::rename(&backup, target);
+            Err(FfqError::Execution(format!(
+                "file commit failed: {} -> {} ({e})",
+                staged.display(),
+                target.display()
+            )))
+        }
+    }
+}
+
+fn replace_dir_atomically(staged: &Path, target: &Path) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if !target.exists() {
+        fs::rename(staged, target).map_err(|e| {
+            FfqError::Execution(format!(
+                "dir commit failed: {} -> {} ({e})",
+                staged.display(),
+                target.display()
+            ))
+        })?;
+        return Ok(());
+    }
+
+    let backup = temp_sibling_path(target, "backup");
+    fs::rename(target, &backup).map_err(|e| {
+        FfqError::Execution(format!(
+            "dir backup rename failed: {} -> {} ({e})",
+            target.display(),
+            backup.display()
+        ))
+    })?;
+
+    match fs::rename(staged, target) {
+        Ok(_) => {
+            let _ = fs::remove_dir_all(backup);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = fs::rename(&backup, target);
+            Err(FfqError::Execution(format!(
+                "dir commit failed: {} -> {} ({e})",
+                staged.display(),
+                target.display()
+            )))
+        }
+    }
 }

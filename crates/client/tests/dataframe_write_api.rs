@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::Int64Array;
@@ -18,6 +19,13 @@ fn unique_path(prefix: &str, ext: &str) -> std::path::PathBuf {
         .expect("clock before epoch")
         .as_nanos();
     std::env::temp_dir().join(format!("{prefix}_{nanos}.{ext}"))
+}
+
+fn catalog_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 fn write_src_parquet(path: &std::path::Path, schema: Arc<Schema>) {
@@ -86,7 +94,10 @@ fn dataframe_write_parquet_supports_overwrite_and_append() {
 
 #[test]
 fn dataframe_save_as_table_updates_catalog_and_is_queryable_immediately() {
+    let _guard = catalog_lock();
     let src_path = unique_path("ffq_df_save_src", "parquet");
+    let catalog_path = unique_path("ffq_catalog", "json");
+    std::env::set_var("FFQ_CATALOG_PATH", &catalog_path);
     let table_name = format!(
         "saved_{}",
         SystemTime::now()
@@ -132,6 +143,191 @@ fn dataframe_save_as_table_updates_catalog_and_is_queryable_immediately() {
     let rows2: usize = batches2.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows2, 6);
 
+    let _ = std::fs::remove_file(catalog_path);
     let _ = std::fs::remove_file(src_path);
     let _ = std::fs::remove_dir_all(table_dir);
+    std::env::remove_var("FFQ_CATALOG_PATH");
+}
+
+#[test]
+fn save_as_table_persists_across_engine_restart() {
+    let _guard = catalog_lock();
+    let src_path = unique_path("ffq_df_restart_src", "parquet");
+    let catalog_path = unique_path("ffq_catalog_restart", "json");
+    std::env::set_var("FFQ_CATALOG_PATH", &catalog_path);
+
+    let table_name = format!(
+        "restart_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    let table_dir = catalog_path
+        .parent()
+        .expect("catalog parent")
+        .join(&table_name);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int64, false),
+        Field::new("b", DataType::Int64, false),
+    ]));
+    write_src_parquet(&src_path, schema.clone());
+
+    let engine = Engine::new(EngineConfig::default()).expect("engine");
+    engine.register_table(
+        "src",
+        TableDef {
+            name: "src".to_string(),
+            uri: src_path.to_string_lossy().to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: Some((*schema).clone()),
+            stats: ffq_storage::TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+    futures::executor::block_on(engine.table("src").expect("src").save_as_table(&table_name))
+        .expect("save table");
+    drop(engine);
+
+    let restarted = Engine::new(EngineConfig::default()).expect("restarted engine");
+    let rows: usize = futures::executor::block_on(
+        restarted
+            .table(&table_name)
+            .expect("persisted table")
+            .collect(),
+    )
+    .expect("collect persisted table")
+    .iter()
+    .map(|b| b.num_rows())
+    .sum();
+    assert_eq!(rows, 3);
+
+    let _ = std::fs::remove_file(catalog_path);
+    let _ = std::fs::remove_file(src_path);
+    let _ = std::fs::remove_dir_all(table_dir);
+    std::env::remove_var("FFQ_CATALOG_PATH");
+}
+
+#[test]
+fn failed_save_as_table_leaves_no_catalog_entry_or_partial_data() {
+    let _guard = catalog_lock();
+    let src_path = unique_path("ffq_df_fail_src", "parquet");
+    let catalog_path = unique_path("ffq_catalog_fail", "json");
+    std::env::set_var("FFQ_CATALOG_PATH", &catalog_path);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int64, false),
+        Field::new("b", DataType::Int64, false),
+    ]));
+    write_src_parquet(&src_path, schema.clone());
+
+    let engine = Engine::new(EngineConfig::default()).expect("engine");
+    engine.register_table(
+        "src",
+        TableDef {
+            name: "src".to_string(),
+            uri: src_path.to_string_lossy().to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: Some((*schema).clone()),
+            stats: ffq_storage::TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+
+    let blocked_base = catalog_path
+        .parent()
+        .expect("catalog parent")
+        .join("blocked");
+    std::fs::write(&blocked_base, b"not a directory").expect("write blocker file");
+    let result = futures::executor::block_on(
+        engine
+            .table("src")
+            .expect("src")
+            .save_as_table("blocked/table"),
+    );
+    assert!(result.is_err(), "expected write failure");
+    let query_failed = futures::executor::block_on(
+        engine
+            .table("blocked/table")
+            .expect("df")
+            .collect(),
+    )
+    .is_err();
+    assert!(query_failed, "failed table write must not register table");
+    let blocked_table_path = blocked_base.join("table");
+    assert!(
+        !blocked_table_path.exists(),
+        "failed table write should not leave committed data"
+    );
+
+    let _ = std::fs::remove_file(catalog_path);
+    let _ = std::fs::remove_file(src_path);
+    let _ = std::fs::remove_file(blocked_base);
+    std::env::remove_var("FFQ_CATALOG_PATH");
+}
+
+#[test]
+fn overwrite_retries_are_deterministic() {
+    let _guard = catalog_lock();
+    let src_path = unique_path("ffq_df_retry_src", "parquet");
+    let catalog_path = unique_path("ffq_catalog_retry", "json");
+    std::env::set_var("FFQ_CATALOG_PATH", &catalog_path);
+    let table_name = format!(
+        "retry_{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    let table_dir = catalog_path
+        .parent()
+        .expect("catalog parent")
+        .join(&table_name);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int64, false),
+        Field::new("b", DataType::Int64, false),
+    ]));
+    write_src_parquet(&src_path, schema.clone());
+
+    let engine = Engine::new(EngineConfig::default()).expect("engine");
+    engine.register_table(
+        "src",
+        TableDef {
+            name: "src".to_string(),
+            uri: src_path.to_string_lossy().to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: Some((*schema).clone()),
+            stats: ffq_storage::TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+
+    let df = engine.table("src").expect("src");
+    futures::executor::block_on(df.save_as_table_with_mode(&table_name, WriteMode::Overwrite))
+        .expect("overwrite one");
+    futures::executor::block_on(df.save_as_table_with_mode(&table_name, WriteMode::Overwrite))
+        .expect("overwrite retry");
+
+    let p0 = table_dir.join("part-00000.parquet");
+    assert!(p0.exists());
+    assert_eq!(parquet_rows(&p0), 3);
+    let part_count = std::fs::read_dir(&table_dir)
+        .expect("read table dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path().is_file()
+                && e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("part-") && n.ends_with(".parquet"))
+        })
+        .count();
+    assert_eq!(part_count, 1, "overwrite retries must remain deterministic");
+
+    let _ = std::fs::remove_file(catalog_path);
+    let _ = std::fs::remove_file(src_path);
+    let _ = std::fs::remove_dir_all(table_dir);
+    std::env::remove_var("FFQ_CATALOG_PATH");
 }
