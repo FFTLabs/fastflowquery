@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(feature = "profiling")]
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use ffq_common::{EngineConfig, Result};
@@ -54,5 +56,10 @@ impl Engine {
 
     pub fn prometheus_metrics(&self) -> String {
         self.session.prometheus_metrics()
+    }
+
+    #[cfg(feature = "profiling")]
+    pub async fn serve_metrics_exporter(&self, addr: SocketAddr) -> Result<()> {
+        self.session.serve_metrics_exporter(addr).await
     }
 }

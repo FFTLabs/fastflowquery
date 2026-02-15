@@ -1356,7 +1356,10 @@ impl Ord for TopKEntry {
     }
 }
 
+#[cfg_attr(feature = "profiling", inline(never))]
 fn run_topk_by_score(child: ExecOutput, score_expr: Expr, k: usize) -> Result<ExecOutput> {
+    #[cfg(feature = "profiling")]
+    let _profile_span = info_span!("profile_topk_by_score").entered();
     if k == 0 {
         return Ok(ExecOutput {
             schema: child.schema.clone(),
@@ -1505,6 +1508,7 @@ enum JoinExecSide {
     Probe,
 }
 
+#[cfg_attr(feature = "profiling", inline(never))]
 fn run_hash_join(
     left: ExecOutput,
     right: ExecOutput,
@@ -1512,6 +1516,14 @@ fn run_hash_join(
     build_side: BuildSide,
     ctx: &TaskContext,
 ) -> Result<ExecOutput> {
+    #[cfg(feature = "profiling")]
+    let _profile_span = info_span!(
+        "profile_hash_join",
+        query_id = %ctx.query_id,
+        stage_id = ctx.stage_id,
+        task_id = ctx.task_id
+    )
+    .entered();
     let left_rows = rows_from_batches(&left)?;
     let right_rows = rows_from_batches(&right)?;
 
@@ -1691,6 +1703,7 @@ fn estimate_join_rows_bytes(rows: &[Vec<ScalarValue>]) -> usize {
         .sum()
 }
 
+#[cfg_attr(feature = "profiling", inline(never))]
 fn grace_hash_join(
     build_rows: &[Vec<ScalarValue>],
     probe_rows: &[Vec<ScalarValue>],
@@ -1699,6 +1712,14 @@ fn grace_hash_join(
     build_side: JoinInputSide,
     ctx: &TaskContext,
 ) -> Result<Vec<Vec<ScalarValue>>> {
+    #[cfg(feature = "profiling")]
+    let _profile_span = info_span!(
+        "profile_grace_hash_join",
+        query_id = %ctx.query_id,
+        stage_id = ctx.stage_id,
+        task_id = ctx.task_id
+    )
+    .entered();
     let spill_started = Instant::now();
     fs::create_dir_all(&ctx.spill_dir)?;
     let suffix = SystemTime::now()
@@ -1804,6 +1825,7 @@ fn hash_key(key: &[ScalarValue]) -> u64 {
     h.finish()
 }
 
+#[cfg_attr(feature = "profiling", inline(never))]
 fn run_hash_aggregate(
     child: ExecOutput,
     group_exprs: Vec<Expr>,
@@ -1811,6 +1833,15 @@ fn run_hash_aggregate(
     mode: AggregateMode,
     ctx: &TaskContext,
 ) -> Result<ExecOutput> {
+    #[cfg(feature = "profiling")]
+    let _profile_span = info_span!(
+        "profile_hash_aggregate",
+        query_id = %ctx.query_id,
+        stage_id = ctx.stage_id,
+        task_id = ctx.task_id,
+        mode = ?mode
+    )
+    .entered();
     let input_schema = child.schema;
     let specs = build_agg_specs(&aggr_exprs, &input_schema, &group_exprs, mode)?;
     let mut groups: HashMap<Vec<ScalarValue>, Vec<AggState>> = HashMap::new();

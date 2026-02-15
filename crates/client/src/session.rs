@@ -1,3 +1,5 @@
+#[cfg(feature = "profiling")]
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::{env, path::Path, path::PathBuf};
 
@@ -72,5 +74,12 @@ impl Session {
 
     pub fn prometheus_metrics(&self) -> String {
         ffq_common::metrics::global_metrics().render_prometheus()
+    }
+
+    #[cfg(feature = "profiling")]
+    pub async fn serve_metrics_exporter(&self, addr: SocketAddr) -> Result<()> {
+        ffq_common::run_metrics_exporter(addr)
+            .await
+            .map_err(Into::into)
     }
 }

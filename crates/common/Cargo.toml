@@ -4,8 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+profiling = ["dep:axum", "dep:tokio"]
+
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
 tracing.workspace = true
 prometheus = "0.13"
+axum = { version = "0.7", optional = true }
+tokio = { workspace = true, optional = true, features = ["net", "rt", "io-util"] }
