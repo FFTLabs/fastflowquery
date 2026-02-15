@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use arrow::array::Int64Array;
 #[cfg(feature = "vector")]
 use arrow::array::{FixedSizeListBuilder, Float32Builder, StringArray};
-use arrow::array::Int64Array;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use ffq_client::expr::col;
@@ -114,7 +114,11 @@ fn collect_group_counts(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
 #[cfg(feature = "vector")]
 fn write_docs_vector(path: &std::path::Path, schema: Arc<Schema>) {
     let mut emb = FixedSizeListBuilder::new(Float32Builder::new(), 3);
-    let vectors = [[1.0_f32, 0.0, 0.0], [0.8_f32, 0.2, 0.0], [0.0_f32, 1.0, 0.0]];
+    let vectors = [
+        [1.0_f32, 0.0, 0.0],
+        [0.8_f32, 0.2, 0.0],
+        [0.0_f32, 1.0, 0.0],
+    ];
     for v in vectors {
         for x in v {
             emb.values().append_value(x);
@@ -521,7 +525,10 @@ async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
     let sql =
         "SELECT id, title FROM docs WHERE lang = 'en' ORDER BY cosine_similarity(emb, :q) DESC LIMIT 1";
     let mut params = HashMap::new();
-    params.insert("q".to_string(), LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]));
+    params.insert(
+        "q".to_string(),
+        LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]),
+    );
     let dist_batches = dist_engine
         .sql_with_params(sql, params.clone())
         .expect("dist sql")

@@ -51,4 +51,8 @@ impl Engine {
     pub async fn shutdown(&self) -> Result<()> {
         self.session.runtime.shutdown().await
     }
+
+    pub fn prometheus_metrics(&self) -> String {
+        self.session.prometheus_metrics()
+    }
 }

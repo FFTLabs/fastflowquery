@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
     Array, ArrayRef, BooleanBuilder, FixedSizeListBuilder, Float32Builder, Float64Builder,
@@ -14,6 +14,7 @@ use arrow::array::{
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result};
 use ffq_execution::{compile_expr, TaskContext as ExecTaskContext};
 use ffq_planner::{AggExpr, BuildSide, ExchangeExec, Expr, PartitioningSpec, PhysicalPlan};
@@ -608,6 +609,7 @@ fn eval_plan_for_stage(
     ctx: &TaskContext,
     catalog: Arc<Catalog>,
 ) -> Result<ExecOutput> {
+    let started = Instant::now();
     let _span = info_span!(
         "operator_execute",
         query_id = %ctx.query_id,
@@ -616,7 +618,7 @@ fn eval_plan_for_stage(
         operator = operator_name(plan)
     )
     .entered();
-    match plan {
+    let eval = match plan {
         PhysicalPlan::ParquetScan(scan) => {
             let table = catalog.get(&scan.table)?.clone();
             let provider = ParquetProvider::new();
@@ -631,7 +633,12 @@ fn eval_plan_for_stage(
             }))?;
             let schema = stream.schema();
             let batches = futures::executor::block_on(stream.try_collect::<Vec<RecordBatch>>())?;
-            Ok(ExecOutput { schema, batches })
+            Ok(OpEval {
+                out: ExecOutput { schema, batches },
+                in_rows: 0,
+                in_batches: 0,
+                in_bytes: 0,
+            })
         }
         PhysicalPlan::ParquetWrite(write) => {
             let child = eval_plan_for_stage(
@@ -643,35 +650,68 @@ fn eval_plan_for_stage(
                 catalog.clone(),
             )?;
             let table = catalog.get(&write.table)?.clone();
+            let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
             write_parquet_sink(&table, &child)?;
-            Ok(ExecOutput {
-                schema: Arc::new(Schema::empty()),
-                batches: Vec::new(),
+            Ok(OpEval {
+                out: ExecOutput {
+                    schema: Arc::new(Schema::empty()),
+                    batches: Vec::new(),
+                },
+                in_rows,
+                in_batches,
+                in_bytes,
             })
         }
         PhysicalPlan::Exchange(exchange) => match exchange {
             ExchangeExec::Broadcast(x) => {
-                eval_plan_for_stage(&x.input, current_stage, target_stage, state, ctx, catalog)
+                let out = eval_plan_for_stage(
+                    &x.input,
+                    current_stage,
+                    target_stage,
+                    state,
+                    ctx,
+                    catalog,
+                )?;
+                let (in_rows, in_batches, in_bytes) = batch_stats(&out.batches);
+                Ok(OpEval {
+                    out,
+                    in_rows,
+                    in_batches,
+                    in_bytes,
+                })
             }
             ExchangeExec::ShuffleRead(read) => {
                 let upstream_stage_id = state.next_stage_id;
                 state.next_stage_id += 1;
                 if current_stage == target_stage {
-                    read_stage_input_from_shuffle(
+                    let out = read_stage_input_from_shuffle(
                         upstream_stage_id,
                         &read.partitioning,
                         state.query_numeric_id,
                         ctx,
-                    )
+                    )?;
+                    Ok(OpEval {
+                        out,
+                        in_rows: 0,
+                        in_batches: 0,
+                        in_bytes: 0,
+                    })
                 } else {
-                    eval_plan_for_stage(
+                    let out = eval_plan_for_stage(
                         &read.input,
                         upstream_stage_id,
                         target_stage,
                         state,
                         ctx,
                         catalog,
-                    )
+                    )?;
+                    let (in_rows, in_batches, in_bytes) = batch_stats(&out.batches);
+                    Ok(OpEval {
+                        out,
+                        in_rows,
+                        in_batches,
+                        in_bytes,
+                    })
                 }
             }
             ExchangeExec::ShuffleWrite(write) => {
@@ -692,30 +732,50 @@ fn eval_plan_for_stage(
                     )?;
                     state.map_outputs.extend(metas);
                 }
-                Ok(child)
+                let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                Ok(OpEval {
+                    out: child,
+                    in_rows,
+                    in_batches,
+                    in_bytes,
+                })
             }
         },
         PhysicalPlan::PartialHashAggregate(agg) => {
             let child =
                 eval_plan_for_stage(&agg.input, current_stage, target_stage, state, ctx, catalog)?;
-            run_hash_aggregate(
+            let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+            let out = run_hash_aggregate(
                 child,
                 agg.group_exprs.clone(),
                 agg.aggr_exprs.clone(),
                 AggregateMode::Partial,
                 ctx,
-            )
+            )?;
+            Ok(OpEval {
+                out,
+                in_rows,
+                in_batches,
+                in_bytes,
+            })
         }
         PhysicalPlan::FinalHashAggregate(agg) => {
             let child =
                 eval_plan_for_stage(&agg.input, current_stage, target_stage, state, ctx, catalog)?;
-            run_hash_aggregate(
+            let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+            let out = run_hash_aggregate(
                 child,
                 agg.group_exprs.clone(),
                 agg.aggr_exprs.clone(),
                 AggregateMode::Final,
                 ctx,
-            )
+            )?;
+            Ok(OpEval {
+                out,
+                in_rows,
+                in_batches,
+                in_bytes,
+            })
         }
         PhysicalPlan::HashJoin(join) => {
             let ffq_planner::HashJoinExec {
@@ -735,7 +795,15 @@ fn eval_plan_for_stage(
             )?;
             let right =
                 eval_plan_for_stage(right, current_stage, target_stage, state, ctx, catalog)?;
-            run_hash_join(left, right, on.clone(), *build_side, ctx)
+            let (left_rows, left_batches, left_bytes) = batch_stats(&left.batches);
+            let (right_rows, right_batches, right_bytes) = batch_stats(&right.batches);
+            let out = run_hash_join(left, right, on.clone(), *build_side, ctx)?;
+            Ok(OpEval {
+                out,
+                in_rows: left_rows + right_rows,
+                in_batches: left_batches + right_batches,
+                in_bytes: left_bytes + right_bytes,
+            })
         }
         PhysicalPlan::Project(project) => {
             let child = eval_plan_for_stage(
@@ -767,9 +835,15 @@ fn eval_plan_for_stage(
                     FfqError::Execution(format!("project build batch failed: {e}"))
                 })?);
             }
-            Ok(ExecOutput {
-                schema,
-                batches: out_batches,
+            let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+            Ok(OpEval {
+                out: ExecOutput {
+                    schema,
+                    batches: out_batches,
+                },
+                in_rows,
+                in_batches,
+                in_bytes,
             })
         }
         PhysicalPlan::Filter(filter) => {
@@ -795,9 +869,15 @@ fn eval_plan_for_stage(
                     .map_err(|e| FfqError::Execution(format!("filter batch failed: {e}")))?;
                 out.push(filtered);
             }
-            Ok(ExecOutput {
-                schema: child.schema,
-                batches: out,
+            let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+            Ok(OpEval {
+                out: ExecOutput {
+                    schema: child.schema,
+                    batches: out,
+                },
+                in_rows,
+                in_batches,
+                in_bytes,
             })
         }
         PhysicalPlan::Limit(limit) => {
@@ -819,9 +899,15 @@ fn eval_plan_for_stage(
                 out.push(batch.slice(0, take));
                 remaining -= take;
             }
-            Ok(ExecOutput {
-                schema: child.schema,
-                batches: out,
+            let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+            Ok(OpEval {
+                out: ExecOutput {
+                    schema: child.schema,
+                    batches: out,
+                },
+                in_rows,
+                in_batches,
+                in_bytes,
             })
         }
         PhysicalPlan::TopKByScore(topk) => {
@@ -833,13 +919,47 @@ fn eval_plan_for_stage(
                 ctx,
                 catalog,
             )?;
-            run_topk_by_score(child, topk.score_expr.clone(), topk.k)
+            let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+            let out = run_topk_by_score(child, topk.score_expr.clone(), topk.k)?;
+            Ok(OpEval {
+                out,
+                in_rows,
+                in_batches,
+                in_bytes,
+            })
         }
-        PhysicalPlan::VectorTopK(exec) => execute_vector_topk(exec, catalog),
+        PhysicalPlan::VectorTopK(exec) => Ok(OpEval {
+            out: execute_vector_topk(exec, catalog)?,
+            in_rows: 0,
+            in_batches: 0,
+            in_bytes: 0,
+        }),
         PhysicalPlan::CoalesceBatches(_) => Err(FfqError::Unsupported(
             "CoalesceBatches execution is not implemented in distributed worker".to_string(),
         )),
-    }
+    }?;
+    let (out_rows, out_batches, out_bytes) = batch_stats(&eval.out.batches);
+    global_metrics().record_operator(
+        &ctx.query_id,
+        ctx.stage_id,
+        ctx.task_id,
+        operator_name(plan),
+        eval.in_rows,
+        out_rows,
+        eval.in_batches,
+        out_batches,
+        eval.in_bytes,
+        out_bytes,
+        started.elapsed().as_secs_f64(),
+    );
+    Ok(eval.out)
+}
+
+struct OpEval {
+    out: ExecOutput,
+    in_rows: u64,
+    in_batches: u64,
+    in_bytes: u64,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -850,7 +970,10 @@ struct MockVectorRow {
     payload: Option<String>,
 }
 
-fn execute_vector_topk(exec: &ffq_planner::VectorTopKExec, catalog: Arc<Catalog>) -> Result<ExecOutput> {
+fn execute_vector_topk(
+    exec: &ffq_planner::VectorTopKExec,
+    catalog: Arc<Catalog>,
+) -> Result<ExecOutput> {
     let table = catalog.get(&exec.table)?.clone();
     if let Some(rows) = mock_vector_rows_from_table(&table, exec.k)? {
         return rows_to_vector_topk_output(rows);
@@ -907,7 +1030,9 @@ fn mock_vector_rows_from_table(
     ))
 }
 
-fn rows_to_vector_topk_output(rows: Vec<ffq_storage::vector_index::VectorTopKRow>) -> Result<ExecOutput> {
+fn rows_to_vector_topk_output(
+    rows: Vec<ffq_storage::vector_index::VectorTopKRow>,
+) -> Result<ExecOutput> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("score", DataType::Float32, false),
@@ -946,6 +1071,7 @@ fn write_stage_shuffle_outputs(
     query_numeric_id: u64,
     ctx: &TaskContext,
 ) -> Result<Vec<MapOutputPartitionMeta>> {
+    let started = Instant::now();
     let writer = ShuffleWriter::new(&ctx.shuffle_root);
     let partitioned = partition_batches(child, partitioning)?;
     let mut metas = Vec::new();
@@ -970,7 +1096,7 @@ fn write_stage_shuffle_outputs(
         ctx.attempt,
         metas.clone(),
     )?;
-    Ok(index
+    let out = index
         .partitions
         .into_iter()
         .map(|m| MapOutputPartitionMeta {
@@ -979,7 +1105,17 @@ fn write_stage_shuffle_outputs(
             rows: m.rows,
             batches: m.batches,
         })
-        .collect())
+        .collect::<Vec<_>>();
+    let written_bytes = out.iter().map(|m| m.bytes).sum::<u64>();
+    global_metrics().record_shuffle_write(
+        &ctx.query_id,
+        ctx.stage_id,
+        ctx.task_id,
+        written_bytes,
+        out.len() as u64,
+        started.elapsed().as_secs_f64(),
+    );
+    Ok(out)
 }
 
 fn read_stage_input_from_shuffle(
@@ -988,14 +1124,17 @@ fn read_stage_input_from_shuffle(
     query_numeric_id: u64,
     ctx: &TaskContext,
 ) -> Result<ExecOutput> {
+    let started = Instant::now();
     let reader = ShuffleReader::new(&ctx.shuffle_root);
     let mut out_batches = Vec::new();
+    let mut read_partitions = 0_u64;
     match partitioning {
         PartitioningSpec::Single => {
             if let Ok((_attempt, batches)) =
                 reader.read_partition_latest(query_numeric_id, upstream_stage_id, 0, 0)
             {
                 out_batches.extend(batches);
+                read_partitions += 1;
             }
         }
         PartitioningSpec::HashKeys { partitions, .. } => {
@@ -1007,6 +1146,7 @@ fn read_stage_input_from_shuffle(
                     reduce as u32,
                 ) {
                     out_batches.extend(batches);
+                    read_partitions += 1;
                 }
             }
         }
@@ -1015,10 +1155,20 @@ fn read_stage_input_from_shuffle(
         .first()
         .map(|b| b.schema())
         .unwrap_or_else(|| Arc::new(Schema::empty()));
-    Ok(ExecOutput {
+    let out = ExecOutput {
         schema,
         batches: out_batches,
-    })
+    };
+    let (_, _, read_bytes) = batch_stats(&out.batches);
+    global_metrics().record_shuffle_read(
+        &ctx.query_id,
+        ctx.stage_id,
+        ctx.task_id,
+        read_bytes,
+        read_partitions,
+        started.elapsed().as_secs_f64(),
+    );
+    Ok(out)
 }
 
 fn partition_batches(
@@ -1049,6 +1199,21 @@ fn partition_batches(
 
 fn count_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
+}
+
+fn batch_stats(batches: &[RecordBatch]) -> (u64, u64, u64) {
+    let rows = batches.iter().map(|b| b.num_rows() as u64).sum::<u64>();
+    let batch_count = batches.len() as u64;
+    let bytes = batches
+        .iter()
+        .map(|b| {
+            b.columns()
+                .iter()
+                .map(|a| a.get_array_memory_size() as u64)
+                .sum::<u64>()
+        })
+        .sum::<u64>();
+    (rows, batch_count, bytes)
 }
 
 fn write_parquet_sink(table: &ffq_storage::TableDef, child: &ExecOutput) -> Result<()> {
@@ -1534,6 +1699,7 @@ fn grace_hash_join(
     build_side: JoinInputSide,
     ctx: &TaskContext,
 ) -> Result<Vec<Vec<ScalarValue>>> {
+    let spill_started = Instant::now();
     fs::create_dir_all(&ctx.spill_dir)?;
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1550,6 +1716,15 @@ fn grace_hash_join(
 
     spill_join_partitions(build_rows, build_key_idx, &build_paths)?;
     spill_join_partitions(probe_rows, probe_key_idx, &probe_paths)?;
+    let spill_bytes = estimate_join_rows_bytes(build_rows) + estimate_join_rows_bytes(probe_rows);
+    global_metrics().record_spill(
+        &ctx.query_id,
+        ctx.stage_id,
+        ctx.task_id,
+        "join",
+        spill_bytes as u64,
+        spill_started.elapsed().as_secs_f64(),
+    );
 
     let mut out = Vec::<Vec<ScalarValue>>::new();
     for p in 0..parts {
@@ -2019,6 +2194,7 @@ fn maybe_spill(
         return Ok(());
     }
 
+    let spill_started = Instant::now();
     fs::create_dir_all(&ctx.spill_dir)?;
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2039,6 +2215,15 @@ fn maybe_spill(
         writer.write_all(b"\n")?;
     }
     writer.flush()?;
+    let spill_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    global_metrics().record_spill(
+        &ctx.query_id,
+        ctx.stage_id,
+        ctx.task_id,
+        "aggregate",
+        spill_bytes,
+        spill_started.elapsed().as_secs_f64(),
+    );
     groups.clear();
     spills.push(path);
     Ok(())

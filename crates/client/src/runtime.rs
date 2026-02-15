@@ -7,7 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
     Array, ArrayRef, BooleanBuilder, FixedSizeListBuilder, Float32Builder, Float64Builder,
@@ -16,6 +16,7 @@ use arrow::array::{
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result};
 use ffq_execution::{compile_expr, SendableRecordBatchStream, StreamAdapter, TaskContext};
 use ffq_planner::{AggExpr, BuildSide, ExchangeExec, Expr, PhysicalPlan};
@@ -29,9 +30,9 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, TryStreamExt};
 use parquet::arrow::ArrowWriter;
 use serde::{Deserialize, Serialize};
-use tracing::{info, info_span, Instrument};
 #[cfg(feature = "distributed")]
 use tracing::{debug, error};
+use tracing::{info, info_span, Instrument};
 
 #[derive(Debug, Clone)]
 pub struct QueryContext {
@@ -126,7 +127,8 @@ fn execute_plan(
         operator = operator
     );
     async move {
-        match plan {
+        let started = Instant::now();
+        let eval = match plan {
             PhysicalPlan::ParquetScan(scan) => {
                 let table = catalog.get(&scan.table)?.clone();
                 let provider = ParquetProvider::new();
@@ -141,15 +143,27 @@ fn execute_plan(
                 }))?;
                 let schema = stream.schema();
                 let batches = stream.try_collect::<Vec<RecordBatch>>().await?;
-                Ok(ExecOutput { schema, batches })
+                Ok(OpEval {
+                    out: ExecOutput { schema, batches },
+                    in_rows: 0,
+                    in_batches: 0,
+                    in_bytes: 0,
+                })
             }
             PhysicalPlan::ParquetWrite(write) => {
-                let child = execute_plan(*write.input, ctx, catalog.clone(), Arc::clone(&trace)).await?;
+                let child =
+                    execute_plan(*write.input, ctx, catalog.clone(), Arc::clone(&trace)).await?;
                 let table = catalog.get(&write.table)?.clone();
                 write_parquet_sink(&table, &child)?;
-                Ok(ExecOutput {
-                    schema: Arc::new(Schema::empty()),
-                    batches: Vec::new(),
+                let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                Ok(OpEval {
+                    out: ExecOutput {
+                        schema: Arc::new(Schema::empty()),
+                        batches: Vec::new(),
+                    },
+                    in_rows,
+                    in_batches,
+                    in_bytes,
                 })
             }
             PhysicalPlan::Project(project) => {
@@ -175,9 +189,15 @@ fn execute_plan(
                         FfqError::Execution(format!("project build batch failed: {e}"))
                     })?);
                 }
-                Ok(ExecOutput {
-                    schema,
-                    batches: out_batches,
+                let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                Ok(OpEval {
+                    out: ExecOutput {
+                        schema,
+                        batches: out_batches,
+                    },
+                    in_rows,
+                    in_batches,
+                    in_bytes,
                 })
             }
             PhysicalPlan::Filter(filter) => {
@@ -198,9 +218,15 @@ fn execute_plan(
                         .map_err(|e| FfqError::Execution(format!("filter batch failed: {e}")))?;
                     out.push(filtered);
                 }
-                Ok(ExecOutput {
-                    schema: child.schema,
-                    batches: out,
+                let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                Ok(OpEval {
+                    out: ExecOutput {
+                        schema: child.schema,
+                        batches: out,
+                    },
+                    in_rows,
+                    in_batches,
+                    in_bytes,
                 })
             }
             PhysicalPlan::Limit(limit) => {
@@ -215,40 +241,100 @@ fn execute_plan(
                     out.push(batch.slice(0, take));
                     remaining -= take;
                 }
-                Ok(ExecOutput {
-                    schema: child.schema,
-                    batches: out,
+                let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                Ok(OpEval {
+                    out: ExecOutput {
+                        schema: child.schema,
+                        batches: out,
+                    },
+                    in_rows,
+                    in_batches,
+                    in_bytes,
                 })
             }
             PhysicalPlan::TopKByScore(topk) => {
                 let child = execute_plan(*topk.input, ctx, catalog, Arc::clone(&trace)).await?;
-                run_topk_by_score(child, topk.score_expr, topk.k)
+                let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                Ok(OpEval {
+                    out: run_topk_by_score(child, topk.score_expr, topk.k)?,
+                    in_rows,
+                    in_batches,
+                    in_bytes,
+                })
             }
-            PhysicalPlan::VectorTopK(exec) => execute_vector_topk(exec, catalog).await,
+            PhysicalPlan::VectorTopK(exec) => Ok(OpEval {
+                out: execute_vector_topk(exec, catalog).await?,
+                in_rows: 0,
+                in_batches: 0,
+                in_bytes: 0,
+            }),
             PhysicalPlan::Exchange(exchange) => match exchange {
-                ExchangeExec::ShuffleWrite(x) => execute_plan(*x.input, ctx, catalog, Arc::clone(&trace)).await,
-                ExchangeExec::ShuffleRead(x) => execute_plan(*x.input, ctx, catalog, Arc::clone(&trace)).await,
-                ExchangeExec::Broadcast(x) => execute_plan(*x.input, ctx, catalog, Arc::clone(&trace)).await,
+                ExchangeExec::ShuffleWrite(x) => {
+                    let child = execute_plan(*x.input, ctx, catalog, Arc::clone(&trace)).await?;
+                    let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                    Ok(OpEval {
+                        out: child,
+                        in_rows,
+                        in_batches,
+                        in_bytes,
+                    })
+                }
+                ExchangeExec::ShuffleRead(x) => {
+                    let child = execute_plan(*x.input, ctx, catalog, Arc::clone(&trace)).await?;
+                    let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                    Ok(OpEval {
+                        out: child,
+                        in_rows,
+                        in_batches,
+                        in_bytes,
+                    })
+                }
+                ExchangeExec::Broadcast(x) => {
+                    let child = execute_plan(*x.input, ctx, catalog, Arc::clone(&trace)).await?;
+                    let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                    Ok(OpEval {
+                        out: child,
+                        in_rows,
+                        in_batches,
+                        in_bytes,
+                    })
+                }
             },
             PhysicalPlan::PartialHashAggregate(agg) => {
-                let child = execute_plan(*agg.input, ctx.clone(), catalog, Arc::clone(&trace)).await?;
-                run_hash_aggregate(
-                    child,
-                    agg.group_exprs,
-                    agg.aggr_exprs,
-                    AggregateMode::Partial,
-                    &ctx,
-                )
+                let child =
+                    execute_plan(*agg.input, ctx.clone(), catalog, Arc::clone(&trace)).await?;
+                let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                Ok(OpEval {
+                    out: run_hash_aggregate(
+                        child,
+                        agg.group_exprs,
+                        agg.aggr_exprs,
+                        AggregateMode::Partial,
+                        &ctx,
+                        &trace,
+                    )?,
+                    in_rows,
+                    in_batches,
+                    in_bytes,
+                })
             }
             PhysicalPlan::FinalHashAggregate(agg) => {
-                let child = execute_plan(*agg.input, ctx.clone(), catalog, Arc::clone(&trace)).await?;
-                run_hash_aggregate(
-                    child,
-                    agg.group_exprs,
-                    agg.aggr_exprs,
-                    AggregateMode::Final,
-                    &ctx,
-                )
+                let child =
+                    execute_plan(*agg.input, ctx.clone(), catalog, Arc::clone(&trace)).await?;
+                let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                Ok(OpEval {
+                    out: run_hash_aggregate(
+                        child,
+                        agg.group_exprs,
+                        agg.aggr_exprs,
+                        AggregateMode::Final,
+                        &ctx,
+                        &trace,
+                    )?,
+                    in_rows,
+                    in_batches,
+                    in_bytes,
+                })
             }
             PhysicalPlan::HashJoin(join) => {
                 let ffq_planner::HashJoinExec {
@@ -258,17 +344,64 @@ fn execute_plan(
                     build_side,
                     ..
                 } = join;
-                let left = execute_plan(*left_plan, ctx.clone(), catalog.clone(), Arc::clone(&trace)).await?;
-                let right = execute_plan(*right_plan, ctx.clone(), catalog, Arc::clone(&trace)).await?;
-                run_hash_join(left, right, on, build_side, &ctx)
+                let left =
+                    execute_plan(*left_plan, ctx.clone(), catalog.clone(), Arc::clone(&trace))
+                        .await?;
+                let right =
+                    execute_plan(*right_plan, ctx.clone(), catalog, Arc::clone(&trace)).await?;
+                let (l_rows, l_batches, l_bytes) = batch_stats(&left.batches);
+                let (r_rows, r_batches, r_bytes) = batch_stats(&right.batches);
+                Ok(OpEval {
+                    out: run_hash_join(left, right, on, build_side, &ctx, &trace)?,
+                    in_rows: l_rows + r_rows,
+                    in_batches: l_batches + r_batches,
+                    in_bytes: l_bytes + r_bytes,
+                })
             }
             other => Err(FfqError::Unsupported(format!(
                 "embedded runtime does not support operator yet: {other:?}"
             ))),
-        }
+        }?;
+        let (out_rows, out_batches, out_bytes) = batch_stats(&eval.out.batches);
+        global_metrics().record_operator(
+            &trace.query_id,
+            trace.stage_id,
+            trace.task_id,
+            operator,
+            eval.in_rows,
+            out_rows,
+            eval.in_batches,
+            out_batches,
+            eval.in_bytes,
+            out_bytes,
+            started.elapsed().as_secs_f64(),
+        );
+        Ok(eval.out)
     }
     .instrument(span)
     .boxed()
+}
+
+struct OpEval {
+    out: ExecOutput,
+    in_rows: u64,
+    in_batches: u64,
+    in_bytes: u64,
+}
+
+fn batch_stats(batches: &[RecordBatch]) -> (u64, u64, u64) {
+    let rows = batches.iter().map(|b| b.num_rows() as u64).sum::<u64>();
+    let batch_count = batches.len() as u64;
+    let bytes = batches
+        .iter()
+        .map(|b| {
+            b.columns()
+                .iter()
+                .map(|a| a.get_array_memory_size() as u64)
+                .sum::<u64>()
+        })
+        .sum::<u64>();
+    (rows, batch_count, bytes)
 }
 
 fn operator_name(plan: &PhysicalPlan) -> &'static str {
@@ -606,6 +739,7 @@ fn run_hash_join(
     on: Vec<(String, String)>,
     build_side: BuildSide,
     ctx: &QueryContext,
+    trace: &TraceIds,
 ) -> Result<ExecOutput> {
     let left_rows = rows_from_batches(&left)?;
     let right_rows = rows_from_batches(&right)?;
@@ -652,6 +786,7 @@ fn run_hash_join(
             &probe_key_idx,
             build_input_side,
             ctx,
+            trace,
         )?
     } else {
         in_memory_hash_join(
@@ -793,7 +928,9 @@ fn grace_hash_join(
     probe_key_idx: &[usize],
     build_side: JoinInputSide,
     ctx: &QueryContext,
+    trace: &TraceIds,
 ) -> Result<Vec<Vec<ScalarValue>>> {
+    let spill_started = Instant::now();
     fs::create_dir_all(&ctx.spill_dir)?;
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -810,6 +947,15 @@ fn grace_hash_join(
 
     spill_join_partitions(build_rows, build_key_idx, &build_paths)?;
     spill_join_partitions(probe_rows, probe_key_idx, &probe_paths)?;
+    let spill_bytes = estimate_join_rows_bytes(build_rows) + estimate_join_rows_bytes(probe_rows);
+    global_metrics().record_spill(
+        &trace.query_id,
+        trace.stage_id,
+        trace.task_id,
+        "join",
+        spill_bytes as u64,
+        spill_started.elapsed().as_secs_f64(),
+    );
 
     let mut out = Vec::<Vec<ScalarValue>>::new();
     for p in 0..parts {
@@ -895,6 +1041,7 @@ fn run_hash_aggregate(
     aggr_exprs: Vec<(AggExpr, String)>,
     mode: AggregateMode,
     ctx: &QueryContext,
+    trace: &TraceIds,
 ) -> Result<ExecOutput> {
     let input_schema = child.schema;
     let specs = build_agg_specs(&aggr_exprs, &input_schema, &group_exprs, mode)?;
@@ -911,7 +1058,7 @@ fn run_hash_aggregate(
             batch,
             &mut groups,
         )?;
-        maybe_spill(&mut groups, &mut spills, ctx)?;
+        maybe_spill(&mut groups, &mut spills, ctx, trace)?;
     }
 
     if group_exprs.is_empty() && groups.is_empty() {
@@ -919,7 +1066,7 @@ fn run_hash_aggregate(
     }
 
     if !groups.is_empty() {
-        maybe_spill(&mut groups, &mut spills, ctx)?;
+        maybe_spill(&mut groups, &mut spills, ctx, trace)?;
     }
 
     if !spills.is_empty() {
@@ -1281,6 +1428,7 @@ fn maybe_spill(
     groups: &mut HashMap<Vec<ScalarValue>, Vec<AggState>>,
     spills: &mut Vec<PathBuf>,
     ctx: &QueryContext,
+    trace: &TraceIds,
 ) -> Result<()> {
     if groups.is_empty() || ctx.mem_budget_bytes == 0 {
         return Ok(());
@@ -1291,6 +1439,7 @@ fn maybe_spill(
         return Ok(());
     }
 
+    let spill_started = Instant::now();
     fs::create_dir_all(&ctx.spill_dir)?;
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1311,6 +1460,15 @@ fn maybe_spill(
         writer.write_all(b"\n").map_err(FfqError::from)?;
     }
     writer.flush().map_err(FfqError::from)?;
+    let spill_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    global_metrics().record_spill(
+        &trace.query_id,
+        trace.stage_id,
+        trace.task_id,
+        "aggregate",
+        spill_bytes,
+        spill_started.elapsed().as_secs_f64(),
+    );
 
     groups.clear();
     spills.push(path);

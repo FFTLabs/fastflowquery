@@ -69,4 +69,8 @@ impl Session {
             .unwrap_or_else(|| Path::new("."))
             .join(name)
     }
+
+    pub fn prometheus_metrics(&self) -> String {
+        ffq_common::metrics::global_metrics().render_prometheus()
+    }
 }

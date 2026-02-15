@@ -1714,7 +1714,11 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("title", DataType::Utf8, true),
             Field::new("lang", DataType::Utf8, true),
-            Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field.clone()), 3), true),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(Arc::new(emb_field.clone()), 3),
+                true,
+            ),
         ]));
         let idx_schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),

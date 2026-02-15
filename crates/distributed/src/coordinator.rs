@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result};
 use ffq_planner::PhysicalPlan;
 use ffq_shuffle::ShuffleReader;
@@ -196,6 +197,10 @@ impl Coordinator {
                         .expect("stage exists for task");
                     stage.metrics.queued_tasks = stage.metrics.queued_tasks.saturating_sub(1);
                     stage.metrics.running_tasks += 1;
+                    update_scheduler_metrics(&task.query_id, stage_id, &stage.metrics);
+                    if task.attempt > 0 {
+                        global_metrics().inc_scheduler_retries(&task.query_id, stage_id);
+                    }
 
                     out.push(TaskAssignment {
                         query_id: task.query_id.clone(),
@@ -254,7 +259,12 @@ impl Coordinator {
         task.state = state;
         task.message = message.clone();
         match state {
-            TaskState::Queued => stage.metrics.queued_tasks += 1,
+            TaskState::Queued => {
+                stage.metrics.queued_tasks += 1;
+                if attempt > 0 {
+                    global_metrics().inc_scheduler_retries(query_id, stage_id);
+                }
+            }
             TaskState::Running => stage.metrics.running_tasks += 1,
             TaskState::Succeeded => stage.metrics.succeeded_tasks += 1,
             TaskState::Failed => {
@@ -278,6 +288,7 @@ impl Coordinator {
                 query.message = message;
             }
         }
+        update_scheduler_metrics(query_id, stage_id, &stage.metrics);
 
         if query.state != QueryState::Failed && is_query_succeeded(query) {
             query.state = QueryState::Succeeded;
@@ -502,6 +513,11 @@ fn build_query_status(query_id: &str, q: &QueryRuntime) -> QueryStatus {
         failed_tasks: failed,
         stage_metrics,
     }
+}
+
+fn update_scheduler_metrics(query_id: &str, stage_id: u64, m: &StageMetrics) {
+    global_metrics().set_scheduler_queued_tasks(query_id, stage_id, m.queued_tasks as u64);
+    global_metrics().set_scheduler_running_tasks(query_id, stage_id, m.running_tasks as u64);
 }
 
 fn now_ms() -> Result<u64> {

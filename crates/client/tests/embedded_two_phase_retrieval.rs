@@ -24,7 +24,11 @@ fn unique_path(prefix: &str, ext: &str) -> std::path::PathBuf {
 
 fn write_docs(path: &std::path::Path, schema: Arc<Schema>) {
     let mut emb = FixedSizeListBuilder::new(Float32Builder::new(), 3);
-    let vectors = [[1.0_f32, 0.0, 0.0], [0.8_f32, 0.2, 0.0], [0.0_f32, 1.0, 0.0]];
+    let vectors = [
+        [1.0_f32, 0.0, 0.0],
+        [0.8_f32, 0.2, 0.0],
+        [0.0_f32, 1.0, 0.0],
+    ];
     for v in vectors {
         for x in v {
             emb.values().append_value(x);
