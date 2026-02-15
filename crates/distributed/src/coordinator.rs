@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ffq_common::{FfqError, Result};
 use ffq_planner::PhysicalPlan;
 use ffq_shuffle::ShuffleReader;
+use tracing::{debug, info, warn};
 
 use crate::stage::{build_stage_dag, StageDag};
 
@@ -145,6 +146,12 @@ impl Coordinator {
         let plan: PhysicalPlan = serde_json::from_slice(physical_plan_json)
             .map_err(|e| FfqError::Planning(format!("invalid physical plan json: {e}")))?;
         let dag = build_stage_dag(&plan);
+        info!(
+            query_id = %query_id,
+            stages = dag.stages.len(),
+            operator = "CoordinatorSubmit",
+            "query submitted"
+        );
         let qr = build_query_runtime(&query_id, dag, physical_plan_json)?;
         self.queries.insert(query_id, qr);
         Ok(QueryState::Queued)
@@ -152,6 +159,12 @@ impl Coordinator {
 
     pub fn get_task(&mut self, worker_id: &str, capacity: u32) -> Result<Vec<TaskAssignment>> {
         if self.blacklisted_workers.contains(worker_id) || capacity == 0 {
+            debug!(
+                worker_id = %worker_id,
+                capacity,
+                operator = "CoordinatorGetTask",
+                "no tasks assigned (blacklisted or no capacity)"
+            );
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
@@ -191,6 +204,15 @@ impl Coordinator {
                         attempt: task.attempt,
                         plan_fragment_json: task.plan_fragment_json.clone(),
                     });
+                    debug!(
+                        worker_id = %worker_id,
+                        query_id = %task.query_id,
+                        stage_id = task.stage_id,
+                        task_id = task.task_id,
+                        attempt = task.attempt,
+                        operator = "CoordinatorGetTask",
+                        "assigned task"
+                    );
                 }
             }
         }
@@ -241,6 +263,13 @@ impl Coordinator {
                     let failures = self.worker_failures.entry(worker.to_string()).or_default();
                     *failures += 1;
                     if *failures >= self.config.blacklist_failure_threshold {
+                        warn!(
+                            worker_id = %worker,
+                            failures = *failures,
+                            threshold = self.config.blacklist_failure_threshold,
+                            operator = "CoordinatorReportTaskStatus",
+                            "worker blacklisted due to repeated failures"
+                        );
                         self.blacklisted_workers.insert(worker.to_string());
                     }
                 }
@@ -253,6 +282,11 @@ impl Coordinator {
         if query.state != QueryState::Failed && is_query_succeeded(query) {
             query.state = QueryState::Succeeded;
             query.finished_at_ms = now_ms()?;
+            info!(
+                query_id = %query_id,
+                operator = "CoordinatorReportTaskStatus",
+                "query reached succeeded state"
+            );
         }
 
         Ok(())

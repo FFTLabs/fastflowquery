@@ -28,6 +28,7 @@ use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
 use tokio::sync::{Mutex, Semaphore};
 use tonic::async_trait;
+use tracing::{debug, error, info, info_span};
 
 use crate::coordinator::{Coordinator, MapOutputPartitionMeta, TaskAssignment, TaskState};
 use crate::grpc::v1;
@@ -132,6 +133,14 @@ impl TaskExecutor for DefaultTaskExecutor {
         assignment: &TaskAssignment,
         ctx: &TaskContext,
     ) -> Result<TaskExecutionResult> {
+        info!(
+            query_id = %ctx.query_id,
+            stage_id = ctx.stage_id,
+            task_id = ctx.task_id,
+            attempt = ctx.attempt,
+            operator = "TaskExecutor",
+            "task execution started"
+        );
         let plan: PhysicalPlan = serde_json::from_slice(&assignment.plan_fragment_json)
             .map_err(|e| FfqError::Execution(format!("task plan decode failed: {e}")))?;
 
@@ -178,6 +187,16 @@ impl TaskExecutor for DefaultTaskExecutor {
                 result.map_output_partitions.len()
             );
         }
+        info!(
+            query_id = %ctx.query_id,
+            stage_id = ctx.stage_id,
+            task_id = ctx.task_id,
+            attempt = ctx.attempt,
+            map_partitions = result.map_output_partitions.len(),
+            output_batches = result.output_batches.len(),
+            publish_results = result.publish_results,
+            "task execution completed"
+        );
         Ok(result)
     }
 }
@@ -229,6 +248,14 @@ where
 
         let mut handles = Vec::with_capacity(tasks.len());
         for assignment in tasks {
+            debug!(
+                worker_id = %self.config.worker_id,
+                query_id = %assignment.query_id,
+                stage_id = assignment.stage_id,
+                task_id = assignment.task_id,
+                attempt = assignment.attempt,
+                "worker picked task assignment"
+            );
             let permit = self
                 .cpu_slots
                 .clone()
@@ -252,6 +279,14 @@ where
                 let result = task_executor.execute(&assignment, &task_ctx).await;
                 match result {
                     Ok(exec_result) => {
+                        info!(
+                            worker_id = %worker_id,
+                            query_id = %assignment.query_id,
+                            stage_id = assignment.stage_id,
+                            task_id = assignment.task_id,
+                            attempt = assignment.attempt,
+                            "task execution succeeded"
+                        );
                         if !exec_result.map_output_partitions.is_empty() {
                             control_plane
                                 .register_map_output(
@@ -277,6 +312,15 @@ where
                     }
                     Err(e) => {
                         let msg = e.to_string();
+                        error!(
+                            worker_id = %worker_id,
+                            query_id = %assignment.query_id,
+                            stage_id = assignment.stage_id,
+                            task_id = assignment.task_id,
+                            attempt = assignment.attempt,
+                            error = %msg,
+                            "task execution failed"
+                        );
                         let _ = control_plane
                             .report_task_status(&worker_id, &assignment, TaskState::Failed, msg)
                             .await;
@@ -537,6 +581,25 @@ struct EvalState {
     query_numeric_id: u64,
 }
 
+fn operator_name(plan: &PhysicalPlan) -> &'static str {
+    match plan {
+        PhysicalPlan::ParquetScan(_) => "ParquetScan",
+        PhysicalPlan::ParquetWrite(_) => "ParquetWrite",
+        PhysicalPlan::Filter(_) => "Filter",
+        PhysicalPlan::Project(_) => "Project",
+        PhysicalPlan::CoalesceBatches(_) => "CoalesceBatches",
+        PhysicalPlan::PartialHashAggregate(_) => "PartialHashAggregate",
+        PhysicalPlan::FinalHashAggregate(_) => "FinalHashAggregate",
+        PhysicalPlan::HashJoin(_) => "HashJoin",
+        PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(_)) => "ShuffleWrite",
+        PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(_)) => "ShuffleRead",
+        PhysicalPlan::Exchange(ExchangeExec::Broadcast(_)) => "Broadcast",
+        PhysicalPlan::Limit(_) => "Limit",
+        PhysicalPlan::TopKByScore(_) => "TopKByScore",
+        PhysicalPlan::VectorTopK(_) => "VectorTopK",
+    }
+}
+
 fn eval_plan_for_stage(
     plan: &PhysicalPlan,
     current_stage: u64,
@@ -545,6 +608,14 @@ fn eval_plan_for_stage(
     ctx: &TaskContext,
     catalog: Arc<Catalog>,
 ) -> Result<ExecOutput> {
+    let _span = info_span!(
+        "operator_execute",
+        query_id = %ctx.query_id,
+        stage_id = ctx.stage_id,
+        task_id = ctx.task_id,
+        operator = operator_name(plan)
+    )
+    .entered();
     match plan {
         PhysicalPlan::ParquetScan(scan) => {
             let table = catalog.get(&scan.table)?.clone();

@@ -29,6 +29,9 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, TryStreamExt};
 use parquet::arrow::ArrowWriter;
 use serde::{Deserialize, Serialize};
+use tracing::{info, info_span, Instrument};
+#[cfg(feature = "distributed")]
+use tracing::{debug, error};
 
 #[derive(Debug, Clone)]
 pub struct QueryContext {
@@ -68,7 +71,27 @@ impl Runtime for EmbeddedRuntime {
         catalog: Arc<Catalog>,
     ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
         async move {
-            let exec = execute_plan(plan, ctx, catalog).await?;
+            let trace = Arc::new(TraceIds {
+                query_id: local_query_id()?,
+                stage_id: 0,
+                task_id: 0,
+            });
+            info!(
+                query_id = %trace.query_id,
+                stage_id = trace.stage_id,
+                task_id = trace.task_id,
+                mode = "embedded",
+                "query execution started"
+            );
+            let exec = execute_plan(plan, ctx, catalog, Arc::clone(&trace)).await?;
+            info!(
+                query_id = %trace.query_id,
+                stage_id = trace.stage_id,
+                task_id = trace.task_id,
+                rows = exec.batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                batches = exec.batches.len(),
+                "query execution completed"
+            );
             let stream = futures::stream::iter(exec.batches.into_iter().map(Ok));
             Ok(Box::pin(StreamAdapter::new(exec.schema, stream)) as SendableRecordBatchStream)
         }
@@ -81,11 +104,27 @@ struct ExecOutput {
     batches: Vec<RecordBatch>,
 }
 
+#[derive(Debug, Clone)]
+struct TraceIds {
+    query_id: String,
+    stage_id: u64,
+    task_id: u64,
+}
+
 fn execute_plan(
     plan: PhysicalPlan,
     ctx: QueryContext,
     catalog: Arc<Catalog>,
+    trace: Arc<TraceIds>,
 ) -> BoxFuture<'static, Result<ExecOutput>> {
+    let operator = operator_name(&plan);
+    let span = info_span!(
+        "operator_execute",
+        query_id = %trace.query_id,
+        stage_id = trace.stage_id,
+        task_id = trace.task_id,
+        operator = operator
+    );
     async move {
         match plan {
             PhysicalPlan::ParquetScan(scan) => {
@@ -105,7 +144,7 @@ fn execute_plan(
                 Ok(ExecOutput { schema, batches })
             }
             PhysicalPlan::ParquetWrite(write) => {
-                let child = execute_plan(*write.input, ctx, catalog.clone()).await?;
+                let child = execute_plan(*write.input, ctx, catalog.clone(), Arc::clone(&trace)).await?;
                 let table = catalog.get(&write.table)?.clone();
                 write_parquet_sink(&table, &child)?;
                 Ok(ExecOutput {
@@ -114,7 +153,7 @@ fn execute_plan(
                 })
             }
             PhysicalPlan::Project(project) => {
-                let child = execute_plan(*project.input, ctx, catalog).await?;
+                let child = execute_plan(*project.input, ctx, catalog, Arc::clone(&trace)).await?;
                 let mut out_batches = Vec::with_capacity(child.batches.len());
                 let schema = Arc::new(Schema::new(
                     project
@@ -142,7 +181,7 @@ fn execute_plan(
                 })
             }
             PhysicalPlan::Filter(filter) => {
-                let child = execute_plan(*filter.input, ctx, catalog).await?;
+                let child = execute_plan(*filter.input, ctx, catalog, Arc::clone(&trace)).await?;
                 let pred = compile_expr(&filter.predicate, &child.schema)?;
                 let mut out = Vec::new();
                 for batch in &child.batches {
@@ -165,7 +204,7 @@ fn execute_plan(
                 })
             }
             PhysicalPlan::Limit(limit) => {
-                let child = execute_plan(*limit.input, ctx, catalog).await?;
+                let child = execute_plan(*limit.input, ctx, catalog, Arc::clone(&trace)).await?;
                 let mut out = Vec::new();
                 let mut remaining = limit.n;
                 for batch in &child.batches {
@@ -182,17 +221,17 @@ fn execute_plan(
                 })
             }
             PhysicalPlan::TopKByScore(topk) => {
-                let child = execute_plan(*topk.input, ctx, catalog).await?;
+                let child = execute_plan(*topk.input, ctx, catalog, Arc::clone(&trace)).await?;
                 run_topk_by_score(child, topk.score_expr, topk.k)
             }
             PhysicalPlan::VectorTopK(exec) => execute_vector_topk(exec, catalog).await,
             PhysicalPlan::Exchange(exchange) => match exchange {
-                ExchangeExec::ShuffleWrite(x) => execute_plan(*x.input, ctx, catalog).await,
-                ExchangeExec::ShuffleRead(x) => execute_plan(*x.input, ctx, catalog).await,
-                ExchangeExec::Broadcast(x) => execute_plan(*x.input, ctx, catalog).await,
+                ExchangeExec::ShuffleWrite(x) => execute_plan(*x.input, ctx, catalog, Arc::clone(&trace)).await,
+                ExchangeExec::ShuffleRead(x) => execute_plan(*x.input, ctx, catalog, Arc::clone(&trace)).await,
+                ExchangeExec::Broadcast(x) => execute_plan(*x.input, ctx, catalog, Arc::clone(&trace)).await,
             },
             PhysicalPlan::PartialHashAggregate(agg) => {
-                let child = execute_plan(*agg.input, ctx.clone(), catalog).await?;
+                let child = execute_plan(*agg.input, ctx.clone(), catalog, Arc::clone(&trace)).await?;
                 run_hash_aggregate(
                     child,
                     agg.group_exprs,
@@ -202,7 +241,7 @@ fn execute_plan(
                 )
             }
             PhysicalPlan::FinalHashAggregate(agg) => {
-                let child = execute_plan(*agg.input, ctx.clone(), catalog).await?;
+                let child = execute_plan(*agg.input, ctx.clone(), catalog, Arc::clone(&trace)).await?;
                 run_hash_aggregate(
                     child,
                     agg.group_exprs,
@@ -219,8 +258,8 @@ fn execute_plan(
                     build_side,
                     ..
                 } = join;
-                let left = execute_plan(*left_plan, ctx.clone(), catalog.clone()).await?;
-                let right = execute_plan(*right_plan, ctx.clone(), catalog).await?;
+                let left = execute_plan(*left_plan, ctx.clone(), catalog.clone(), Arc::clone(&trace)).await?;
+                let right = execute_plan(*right_plan, ctx.clone(), catalog, Arc::clone(&trace)).await?;
                 run_hash_join(left, right, on, build_side, &ctx)
             }
             other => Err(FfqError::Unsupported(format!(
@@ -228,7 +267,35 @@ fn execute_plan(
             ))),
         }
     }
+    .instrument(span)
     .boxed()
+}
+
+fn operator_name(plan: &PhysicalPlan) -> &'static str {
+    match plan {
+        PhysicalPlan::ParquetScan(_) => "ParquetScan",
+        PhysicalPlan::ParquetWrite(_) => "ParquetWrite",
+        PhysicalPlan::Filter(_) => "Filter",
+        PhysicalPlan::Project(_) => "Project",
+        PhysicalPlan::CoalesceBatches(_) => "CoalesceBatches",
+        PhysicalPlan::PartialHashAggregate(_) => "PartialHashAggregate",
+        PhysicalPlan::FinalHashAggregate(_) => "FinalHashAggregate",
+        PhysicalPlan::HashJoin(_) => "HashJoin",
+        PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(_)) => "ShuffleWrite",
+        PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(_)) => "ShuffleRead",
+        PhysicalPlan::Exchange(ExchangeExec::Broadcast(_)) => "Broadcast",
+        PhysicalPlan::Limit(_) => "Limit",
+        PhysicalPlan::TopKByScore(_) => "TopKByScore",
+        PhysicalPlan::VectorTopK(_) => "VectorTopK",
+    }
+}
+
+fn local_query_id() -> Result<String> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| FfqError::Execution(format!("clock error: {e}")))?
+        .as_nanos();
+    Ok(format!("local-{nanos}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1724,92 +1791,117 @@ impl Runtime for DistributedRuntime {
             let plan_bytes = serde_json::to_vec(&plan)
                 .map_err(|e| FfqError::Execution(format!("encode physical plan failed: {e}")))?;
             let query_id = distributed_query_id()?;
+            let span = info_span!(
+                "distributed_query_execute",
+                query_id = %query_id,
+                stage_id = 0_u64,
+                task_id = 0_u64,
+                operator = "DistributedRuntime"
+            );
+            async move {
+                info!(query_id = %query_id, endpoint = %endpoint, "submitting distributed query");
 
-            let mut client = ControlPlaneClient::connect(endpoint.clone())
-                .await
-                .map_err(|e| FfqError::Execution(format!("connect coordinator failed: {e}")))?;
-            client
-                .submit_query(ffq_distributed::grpc::v1::SubmitQueryRequest {
-                    query_id: query_id.clone(),
-                    physical_plan_json: plan_bytes,
-                })
-                .await
-                .map_err(|e| FfqError::Execution(format!("submit query failed: {e}")))?;
-
-            let mut polls = 0_u32;
-            let terminal = loop {
-                let status = client
-                    .get_query_status(ffq_distributed::grpc::v1::GetQueryStatusRequest {
+                let mut client = ControlPlaneClient::connect(endpoint.clone())
+                    .await
+                    .map_err(|e| FfqError::Execution(format!("connect coordinator failed: {e}")))?;
+                client
+                    .submit_query(ffq_distributed::grpc::v1::SubmitQueryRequest {
                         query_id: query_id.clone(),
+                        physical_plan_json: plan_bytes,
                     })
                     .await
-                    .map_err(|e| FfqError::Execution(format!("get query status failed: {e}")))?
-                    .into_inner()
-                    .status
-                    .ok_or_else(|| {
-                        FfqError::Execution("empty query status response".to_string())
+                    .map_err(|e| FfqError::Execution(format!("submit query failed: {e}")))?;
+
+                let mut polls = 0_u32;
+                let terminal = loop {
+                    let status = client
+                        .get_query_status(ffq_distributed::grpc::v1::GetQueryStatusRequest {
+                            query_id: query_id.clone(),
+                        })
+                        .await
+                        .map_err(|e| FfqError::Execution(format!("get query status failed: {e}")))?
+                        .into_inner()
+                        .status
+                        .ok_or_else(|| {
+                            FfqError::Execution("empty query status response".to_string())
+                        })?;
+
+                    let qstate = DistQueryState::try_from(status.state).map_err(|_| {
+                        FfqError::Execution(format!("invalid query state value: {}", status.state))
                     })?;
+                    debug!(
+                        query_id = %query_id,
+                        polls,
+                        state = ?qstate,
+                        "polled distributed query status"
+                    );
+                    if matches!(
+                        qstate,
+                        DistQueryState::Succeeded
+                            | DistQueryState::Failed
+                            | DistQueryState::Canceled
+                    ) {
+                        break (qstate, status.message);
+                    }
 
-                let qstate = DistQueryState::try_from(status.state).map_err(|_| {
-                    FfqError::Execution(format!("invalid query state value: {}", status.state))
-                })?;
-                if matches!(
-                    qstate,
-                    DistQueryState::Succeeded | DistQueryState::Failed | DistQueryState::Canceled
-                ) {
-                    break (qstate, status.message);
+                    polls = polls.saturating_add(1);
+                    if polls > 600 {
+                        return Err(FfqError::Execution(
+                            "distributed query timed out waiting for completion".to_string(),
+                        ));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                };
+
+                match terminal.0 {
+                    DistQueryState::Succeeded => {
+                        info!(query_id = %query_id, "distributed query succeeded");
+                    }
+                    DistQueryState::Failed => {
+                        error!(query_id = %query_id, message = %terminal.1, "distributed query failed");
+                        return Err(FfqError::Execution(format!(
+                            "distributed query failed: {}",
+                            terminal.1
+                        )));
+                    }
+                    DistQueryState::Canceled => {
+                        error!(query_id = %query_id, message = %terminal.1, "distributed query canceled");
+                        return Err(FfqError::Execution(format!(
+                            "distributed query canceled: {}",
+                            terminal.1
+                        )));
+                    }
+                    _ => {
+                        return Err(FfqError::Execution(
+                            "unexpected terminal query state".to_string(),
+                        ));
+                    }
                 }
 
-                polls = polls.saturating_add(1);
-                if polls > 600 {
-                    return Err(FfqError::Execution(
-                        "distributed query timed out waiting for completion".to_string(),
-                    ));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            };
+                let mut stream = client
+                    .fetch_query_results(ffq_distributed::grpc::v1::FetchQueryResultsRequest {
+                        query_id,
+                    })
+                    .await
+                    .map_err(|e| FfqError::Execution(format!("fetch query results failed: {e}")))?
+                    .into_inner();
 
-            match terminal.0 {
-                DistQueryState::Succeeded => {}
-                DistQueryState::Failed => {
-                    return Err(FfqError::Execution(format!(
-                        "distributed query failed: {}",
-                        terminal.1
-                    )))
+                let mut payload = Vec::<u8>::new();
+                while let Some(chunk) = stream
+                    .message()
+                    .await
+                    .map_err(|e| FfqError::Execution(format!("results stream failed: {e}")))?
+                {
+                    payload.extend_from_slice(&chunk.payload);
                 }
-                DistQueryState::Canceled => {
-                    return Err(FfqError::Execution(format!(
-                        "distributed query canceled: {}",
-                        terminal.1
-                    )))
-                }
-                _ => {
-                    return Err(FfqError::Execution(
-                        "unexpected terminal query state".to_string(),
-                    ))
-                }
+
+                let (schema, batches) = decode_record_batches_ipc(&payload)?;
+                info!(batches = batches.len(), "received distributed query results");
+                let out_stream = futures::stream::iter(batches.into_iter().map(Ok));
+                Ok(Box::pin(StreamAdapter::new(schema, out_stream)) as SendableRecordBatchStream)
             }
-
-            let mut stream = client
-                .fetch_query_results(ffq_distributed::grpc::v1::FetchQueryResultsRequest {
-                    query_id,
-                })
-                .await
-                .map_err(|e| FfqError::Execution(format!("fetch query results failed: {e}")))?
-                .into_inner();
-
-            let mut payload = Vec::<u8>::new();
-            while let Some(chunk) = stream
-                .message()
-                .await
-                .map_err(|e| FfqError::Execution(format!("results stream failed: {e}")))?
-            {
-                payload.extend_from_slice(&chunk.payload);
-            }
-
-            let (schema, batches) = decode_record_batches_ipc(&payload)?;
-            let out_stream = futures::stream::iter(batches.into_iter().map(Ok));
-            Ok(Box::pin(StreamAdapter::new(schema, out_stream)) as SendableRecordBatchStream)
+            .instrument(span)
+            .await
         }
         .boxed()
     }
