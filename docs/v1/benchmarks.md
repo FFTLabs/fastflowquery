@@ -268,3 +268,23 @@ Optional qdrant matrix variant (`--features qdrant`):
 1. Set `FFQ_BENCH_QDRANT_COLLECTION` (required to enable qdrant variant runs).
 2. Optional `FFQ_BENCH_QDRANT_ENDPOINT` (default `http://127.0.0.1:6334`).
 3. JSON includes `rag_comparisons` rows for baseline-vs-qdrant where matching variant keys exist.
+
+## Make Command Matrix
+
+1. `make bench-13.3-embedded`
+   - Runs embedded benchmark baseline.
+   - Common env knobs: `FFQ_BENCH_WARMUP`, `FFQ_BENCH_ITERATIONS`, `FFQ_BENCH_THREADS`, `FFQ_BENCH_BATCH_SIZE_ROWS`, `FFQ_BENCH_MEM_BUDGET_BYTES`, `FFQ_BENCH_SHUFFLE_PARTITIONS`.
+2. `make bench-13.3-distributed`
+   - Runs distributed benchmark baseline.
+   - Required env: `FFQ_COORDINATOR_ENDPOINT`.
+   - Optional env: `FFQ_WORKER1_ENDPOINT`, `FFQ_WORKER2_ENDPOINT`.
+3. `make bench-13.3-rag`
+   - Runs embedded RAG matrix path.
+   - Optional env: `FFQ_BENCH_RAG_MATRIX`.
+   - Optional qdrant env: `FFQ_BENCH_QDRANT_COLLECTION`, `FFQ_BENCH_QDRANT_ENDPOINT`.
+4. `make bench-13.3-compare BASELINE=<json-or-dir> CANDIDATE=<json-or-dir> [THRESHOLD=0.10]`
+   - Compares candidate vs baseline and fails on threshold regression.
+
+Legacy alias:
+
+1. `make compare-13.3` forwards to `bench-13.3-compare`.

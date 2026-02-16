@@ -18,6 +18,8 @@
 	test-13.2-parity \
 	bench-13.3-embedded \
 	bench-13.3-distributed \
+	bench-13.3-rag \
+	bench-13.3-compare \
 	compare-13.3
 
 clean:
@@ -91,7 +93,13 @@ bench-13.3-embedded:
 bench-13.3-distributed:
 	FFQ_BENCH_MODE=distributed ./scripts/run-bench-13.3.sh
 
-compare-13.3:
+bench-13.3-rag:
+	FFQ_BENCH_MODE=embedded FFQ_BENCH_RAG_MATRIX="$${FFQ_BENCH_RAG_MATRIX:-1000,16,10,1.0;5000,32,10,0.8;10000,64,10,0.2}" ./scripts/run-bench-13.3.sh
+
+bench-13.3-compare:
 	@test -n "$$BASELINE" || (echo "BASELINE is required (json file or dir)" && exit 1)
 	@test -n "$$CANDIDATE" || (echo "CANDIDATE is required (json file or dir)" && exit 1)
 	./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}"
+
+compare-13.3:
+	$(MAKE) bench-13.3-compare BASELINE="$$BASELINE" CANDIDATE="$$CANDIDATE" THRESHOLD="$${THRESHOLD:-0.10}"
