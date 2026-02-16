@@ -20,6 +20,27 @@ Out of scope for this contract:
 2. Cross-machine comparability without hardware metadata.
 3. Full TPC-H query set beyond Q1/Q3 in v1.
 
+## Benchmark Tracks (Synthetic vs Official)
+
+FFQ v1 has two benchmark tracks with different goals:
+
+| Track | Dataset source | Primary use | Query scope | Speed | Reportability |
+|---|---|---|---|---|---|
+| Synthetic dev loop | `tests/bench/fixtures/tpch_sf1` + `rag_synth` | fast iteration and regression triage during development | TPC-H Q1/Q3 + RAG matrix | fastest to run | not for external reporting |
+| Official dbgen | `tests/bench/fixtures/tpch_dbgen_sf1_parquet` | reportable TPC-H numbers and release/perf signoff | TPC-H Q1/Q3 | slower | yes (v1 official path) |
+
+When to use each track:
+
+1. Use synthetic for daily PR checks, optimizer/runtime iteration, and quick performance comparisons.
+2. Use official dbgen before publishing numbers, before release cut, and whenever reproducibility assertions are required.
+3. Do not mix synthetic and official results in a single regression comparison baseline.
+
+Interpretation contract:
+
+1. Synthetic results are trend indicators only.
+2. Official results are authoritative for TPC-H Q1/Q3 in v1.
+3. If synthetic and official disagree on trend, treat official as the deciding signal.
+
 ## Official dbgen Integration (13.4.1)
 
 The repository includes tooling to build and run TPC-H `dbgen` and generate official-style SF1 `.tbl` data under:
@@ -318,6 +339,12 @@ Normalization controls (defaulted by `scripts/run-bench-13.3.sh`):
 
 Per-query output now includes `elapsed_stddev_ms` and `elapsed_cv_pct` to track variance.
 
+Synthetic track commands:
+
+1. `make bench-13.3-embedded`
+2. `make bench-13.3-rag`
+3. `FFQ_COORDINATOR_ENDPOINT=http://127.0.0.1:50051 make bench-13.3-distributed` (optional distributed synthetic check)
+
 Distributed mode:
 
 ```bash
@@ -357,6 +384,22 @@ Notes:
 4. Includes correctness gate (13.4.6): before timing Q1/Q3, runner validates query outputs against an
    independent parquet-derived baseline (group/join aggregate checks with float tolerance).
 5. Any mismatch marks the query as failed and the benchmark command exits non-zero.
+
+Official track commands:
+
+1. `make tpch-dbgen-sf1`
+2. `make tpch-dbgen-parquet`
+3. `make validate-tpch-dbgen-manifests`
+4. `make bench-13.4-official-embedded`
+5. `FFQ_COORDINATOR_ENDPOINT=http://127.0.0.1:50051 make bench-13.4-official-distributed`
+
+Recommended official sequence:
+
+1. regenerate `.tbl` and parquet fixtures,
+2. validate manifest contract,
+3. run embedded official benchmark,
+4. run distributed official benchmark (if distributed path is in scope),
+5. compare against official baseline artifact.
 
 ## Official Reproducibility Contract (13.4.7)
 
@@ -484,6 +527,19 @@ Recommended contributor flow:
 4. Compare candidate vs baseline:
    - `make bench-13.3-compare BASELINE=<baseline.json-or-dir> CANDIDATE=<candidate.json-or-dir> THRESHOLD=0.10`
 
+Recommended track-separated flow:
+
+1. Synthetic loop:
+   - `make bench-13.3-embedded`
+   - optional: `make bench-13.3-rag`
+   - optional: distributed synthetic check
+2. Official loop:
+   - `make tpch-dbgen-sf1`
+   - `make tpch-dbgen-parquet`
+   - `make validate-tpch-dbgen-manifests`
+   - `make bench-13.4-official-embedded`
+   - optional: `make bench-13.4-official-distributed`
+
 ### Important Environment Variables
 
 Core runner settings:
@@ -518,6 +574,17 @@ JSON (`tests/bench/results/*.json`):
 2. `results[]` is one row per query/variant tuple.
 3. `elapsed_ms` is mean latency across measured iterations.
 4. `elapsed_stddev_ms` and `elapsed_cv_pct` reflect variance.
+5. For official track runs, any correctness divergence appears as `success=false` with explicit mismatch details in `error`.
+
+How to interpret by track:
+
+1. Synthetic:
+   - use for relative change detection and quick bisecting,
+   - expect more frequent baseline refreshes.
+2. Official:
+   - use for changelog/release performance claims,
+   - baseline updates should be controlled and reviewed,
+   - failed correctness checks invalidate latency numbers for that run.
 5. `success=false` plus `error` indicates hard failure or variance gate failure.
 6. `rag_comparisons[]` contains brute-force vs qdrant deltas where both are present.
 
