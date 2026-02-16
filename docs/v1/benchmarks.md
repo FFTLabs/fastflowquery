@@ -56,6 +56,26 @@ Common overrides:
 4. `TPCH_DBGEN_OUTPUT_DIR` (where `.tbl` files are written)
 5. `TPCH_DBGEN_MACHINE` (for make, if auto-detect is unsuitable)
 
+Deterministic `.tbl` -> parquet conversion (tables needed for Q1/Q3):
+
+```bash
+make tpch-dbgen-parquet
+```
+
+Default output:
+
+1. `tests/bench/fixtures/tpch_dbgen_sf1_parquet/customer.parquet`
+2. `tests/bench/fixtures/tpch_dbgen_sf1_parquet/orders.parquet`
+3. `tests/bench/fixtures/tpch_dbgen_sf1_parquet/lineitem.parquet`
+4. `tests/bench/fixtures/tpch_dbgen_sf1_parquet/manifest.json`
+
+Conversion characteristics:
+
+1. Explicit schema mapping for `customer`, `orders`, `lineitem`.
+2. Stable file naming (`<table>.parquet`).
+3. Deterministic writer settings (uncompressed parquet).
+4. Manifest contains schema + row count per output file.
+
 ## Benchmark Modes
 
 Each benchmark result must declare one of:
@@ -259,6 +279,8 @@ To reduce noise/flakiness:
 8. `.github/workflows/bench-13_3.yml`
 9. `scripts/build-tpch-dbgen.sh`
 10. `scripts/generate-tpch-dbgen-sf1.sh`
+11. `scripts/convert-tpch-dbgen-parquet.sh`
+12. `crates/client/src/tpch_tbl.rs`
 
 ## Embedded Baseline Runner
 
@@ -323,6 +345,10 @@ Optional qdrant matrix variant (`--features qdrant`):
    - Optional qdrant env: `FFQ_BENCH_QDRANT_COLLECTION`, `FFQ_BENCH_QDRANT_ENDPOINT`.
 4. `make bench-13.3-compare BASELINE=<json-or-dir> CANDIDATE=<json-or-dir> [THRESHOLD=0.10]`
    - Compares candidate vs baseline and fails on threshold regression.
+5. `make tpch-dbgen-sf1`
+   - Generates official dbgen SF1 `.tbl` dataset.
+6. `make tpch-dbgen-parquet`
+   - Converts dbgen `.tbl` to deterministic parquet for FFQ benchmark paths.
 
 Legacy alias:
 

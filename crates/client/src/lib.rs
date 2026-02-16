@@ -7,6 +7,7 @@ pub mod bench_queries;
 pub mod dataframe;
 pub mod engine;
 pub mod expr;
+pub mod tpch_tbl;
 
 pub use dataframe::{DataFrame, WriteMode};
 pub use engine::Engine;

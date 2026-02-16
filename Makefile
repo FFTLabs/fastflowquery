@@ -22,6 +22,7 @@
 	bench-13.3-compare \
 	tpch-dbgen-build \
 	tpch-dbgen-sf1 \
+	tpch-dbgen-parquet \
 	compare-13.3
 
 clean:
@@ -108,6 +109,9 @@ tpch-dbgen-build:
 
 tpch-dbgen-sf1:
 	TPCH_SCALE=1 ./scripts/generate-tpch-dbgen-sf1.sh
+
+tpch-dbgen-parquet:
+	./scripts/convert-tpch-dbgen-parquet.sh
 
 compare-13.3:
 	$(MAKE) bench-13.3-compare BASELINE="$$BASELINE" CANDIDATE="$$CANDIDATE" THRESHOLD="$${THRESHOLD:-0.10}"
