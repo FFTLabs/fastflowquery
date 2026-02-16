@@ -49,18 +49,21 @@ Read these in sequence:
 6. `docs/learn/06-control-plane.md`
 7. `docs/learn/07-rpc-protocol.md`
 8. `docs/learn/08-correctness-distributed.md`
-9. `docs/v1/quickstart.md`
-10. `docs/v1/architecture.md`
-11. `docs/v1/client-runtime.md`
-12. `docs/v1/operators-core.md`
-13. `docs/v1/storage-catalog.md`
-14. `docs/v1/shuffle-stage-model.md`
-15. `docs/v1/distributed-runtime.md`
-16. `docs/v1/vector-rag.md`
-17. `docs/v1/writes-dml.md`
-18. `docs/v1/observability.md`
-19. `docs/v1/testing.md`
-20. `docs/v1/benchmarks.md`
+9. `docs/learn/09-storage-catalog.md`
+10. `docs/learn/10-vector-rag-internals.md`
+11. `docs/learn/11-writes-commit.md`
+12. `docs/v1/quickstart.md`
+13. `docs/v1/architecture.md`
+14. `docs/v1/client-runtime.md`
+15. `docs/v1/operators-core.md`
+16. `docs/v1/storage-catalog.md`
+17. `docs/v1/shuffle-stage-model.md`
+18. `docs/v1/distributed-runtime.md`
+19. `docs/v1/vector-rag.md`
+20. `docs/v1/writes-dml.md`
+21. `docs/v1/observability.md`
+22. `docs/v1/testing.md`
+23. `docs/v1/benchmarks.md`
 
 ## What You Will Understand At The End
 
@@ -74,7 +77,9 @@ After finishing this path, you should be able to explain:
 6. Why distributed outputs match embedded semantics for the same query.
 7. How storage/catalog metadata enables query resolution.
 8. How vector/rag routing decides between brute-force and index-backed execution.
-9. How to debug correctness/performance issues with metrics, traces, and benchmark artifacts.
+9. How qdrant rewrite preconditions, projection contracts, and filter pushdown subset control routing.
+10. How sink execution and commit semantics prevent partial writes and enable safe retries.
+11. How to debug correctness/performance issues with metrics, traces, and benchmark artifacts.
 
 ## Deep-Dive Topics (Planned Learner Chapters)
 
@@ -88,4 +93,7 @@ The learner track expands next into dedicated chapters:
 6. `docs/learn/06-control-plane.md` (state machine, pull scheduling, heartbeats, registry, blacklisting).
 7. `docs/learn/07-rpc-protocol.md` (RPC purposes, call sequences, and streamed byte exchange).
 8. `docs/learn/08-correctness-distributed.md` (semantic equivalence, normalization, and parity testing).
-9. Benchmark interpretation (synthetic vs official).
+9. `docs/learn/09-storage-catalog.md` (table metadata, catalog persistence, and provider behavior).
+10. `docs/learn/10-vector-rag-internals.md` (cosine kernels, top-k execution, qdrant rewrite and fallback).
+11. `docs/learn/11-writes-commit.md` (DML planning, sink execution, temp-then-commit, and failure cleanup).
+12. Benchmark interpretation (synthetic vs official).
