@@ -220,6 +220,7 @@ To reduce noise/flakiness:
 5. `tests/bench/queries/`
 6. `scripts/run-bench-13.3.sh`
 7. `crates/client/examples/run_bench_13_3.rs`
+8. `.github/workflows/bench-13_3.yml`
 
 ## Embedded Baseline Runner
 
@@ -288,3 +289,24 @@ Optional qdrant matrix variant (`--features qdrant`):
 Legacy alias:
 
 1. `make compare-13.3` forwards to `bench-13.3-compare`.
+
+## CI Workflow
+
+Workflow: `.github/workflows/bench-13_3.yml`
+
+Triggers:
+
+1. Pull requests (`opened`, `reopened`, `synchronize`): runs reduced matrix and uploads JSON/CSV artifacts.
+2. Manual (`workflow_dispatch`): choose reduced/full matrix and optional regression gate.
+
+Manual inputs:
+
+1. `matrix_size`: `reduced` or `full`
+2. `regression_gate`: boolean (only applies to reduced)
+3. `baseline_path`: repo-relative baseline JSON path (required when gate is enabled)
+4. `threshold`: regression threshold ratio (default `0.10`)
+
+Artifacts:
+
+1. Uploads `tests/bench/results/*.json` and `tests/bench/results/*.csv`.
+2. Artifact name pattern: `bench-13_3-<run_id>-<matrix_mode>`.
