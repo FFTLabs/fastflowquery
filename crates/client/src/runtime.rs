@@ -2122,11 +2122,20 @@ fn decode_record_batches_ipc(payload: &[u8]) -> Result<(SchemaRef, Vec<RecordBat
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{FixedSizeListBuilder, Float32Array, Float32Builder, Int64Array};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+    #[cfg(feature = "vector")]
+    use ffq_planner::{Expr, LiteralValue};
     use ffq_planner::VectorTopKExec;
     use ffq_storage::vector_index::{VectorIndexProvider, VectorTopKRow};
     use futures::future::BoxFuture;
 
-    use super::{rows_to_vector_topk_output, run_vector_topk_with_provider};
+    use super::{
+        rows_to_vector_topk_output, run_topk_by_score, run_vector_topk_with_provider, ExecOutput,
+    };
 
     struct MockVectorProvider;
 
@@ -2194,5 +2203,118 @@ mod tests {
         assert_eq!(b.schema().field(0).name(), "id");
         assert_eq!(b.schema().field(1).name(), "score");
         assert_eq!(b.schema().field(2).name(), "payload");
+    }
+
+    #[cfg(feature = "vector")]
+    fn sample_vector_output() -> ExecOutput {
+        let mut emb_builder = FixedSizeListBuilder::new(Float32Builder::new(), 3);
+        let rows = [
+            [1.0_f32, 0.0, 0.0], // id 10
+            [2.0_f32, 0.0, 0.0], // id 20 (cosine tie with id 10 vs [1,0,0])
+            [0.0_f32, 1.0, 0.0], // id 30
+        ];
+        for v in rows {
+            for x in v {
+                emb_builder.values().append_value(x);
+            }
+            emb_builder.append(true);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 3),
+                true,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![10_i64, 20, 30])),
+                Arc::new(emb_builder.finish()),
+            ],
+        )
+        .expect("batch");
+        ExecOutput {
+            schema,
+            batches: vec![batch],
+        }
+    }
+
+    #[cfg(feature = "vector")]
+    fn collect_ids(out: &ExecOutput) -> Vec<i64> {
+        out.batches
+            .iter()
+            .flat_map(|b| {
+                let ids = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id array");
+                (0..b.num_rows()).map(|i| ids.value(i)).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "vector")]
+    fn collect_scores(out: &ExecOutput) -> Vec<f32> {
+        let mut scores = Vec::new();
+        for b in &out.batches {
+            // rank tests below project full row, so score is computed from emb; we re-evaluate by query expr output not stored.
+            let emb = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::FixedSizeListArray>()
+                .expect("emb list");
+            let vals = emb
+                .values()
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("emb values");
+            for row in 0..b.num_rows() {
+                scores.push(vals.value(row * 3));
+            }
+        }
+        scores
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn topk_by_score_cosine_ranking_tie_is_deterministic() {
+        let input = sample_vector_output();
+        let expr = Expr::CosineSimilarity {
+            vector: Box::new(Expr::Column("emb".to_string())),
+            query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+        };
+        let out = run_topk_by_score(input, expr, 2).expect("topk");
+        // tie between id=10 and id=20; implementation is deterministic and keeps later row first
+        assert_eq!(collect_ids(&out), vec![20, 10]);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn topk_by_score_l2_ranking_order_matches_expected() {
+        let input = sample_vector_output();
+        let expr = Expr::L2Distance {
+            vector: Box::new(Expr::Column("emb".to_string())),
+            query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+        };
+        // TopKByScore is descending, so largest L2 distance first.
+        let out = run_topk_by_score(input, expr, 3).expect("topk");
+        assert_eq!(collect_ids(&out), vec![30, 20, 10]);
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn topk_by_score_dot_ranking_order_matches_expected() {
+        let input = sample_vector_output();
+        let expr = Expr::DotProduct {
+            vector: Box::new(Expr::Column("emb".to_string())),
+            query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+        };
+        let out = run_topk_by_score(input, expr, 3).expect("topk");
+        assert_eq!(collect_ids(&out), vec![20, 10, 30]);
+        let first_component_scores = collect_scores(&out);
+        assert_eq!(first_component_scores, vec![2.0, 1.0, 0.0]);
     }
 }
