@@ -591,52 +591,134 @@ fn extract_vector_literal(e: &Expr) -> Result<Vec<f32>> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Array, FixedSizeListBuilder, Float32Builder};
+    use arrow::array::{Array, FixedSizeListBuilder, Float32Array, Float32Builder, Int64Array};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
 
     use super::compile_expr;
     use ffq_planner::{Expr, LiteralValue};
 
-    #[test]
-    fn cosine_similarity_kernel_fixed_size_list_f32() {
-        let mut list_builder = FixedSizeListBuilder::new(Float32Builder::new(), 3);
-        list_builder.values().append_value(1.0);
-        list_builder.values().append_value(0.0);
-        list_builder.values().append_value(0.0);
-        list_builder.append(true);
-
-        list_builder.values().append_value(0.0);
-        list_builder.values().append_value(1.0);
-        list_builder.values().append_value(0.0);
-        list_builder.append(true);
-
-        list_builder.values().append_value(0.0);
-        list_builder.values().append_value(0.0);
-        list_builder.values().append_value(0.0);
-        list_builder.append(false);
-
-        let emb = Arc::new(list_builder.finish());
-        let schema = Arc::new(Schema::new(vec![Field::new(
+    fn vector_schema(dim: i32) -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new(
             "emb",
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 3),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), dim),
             true,
-        )]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![emb]).expect("batch");
+        )]))
+    }
+
+    fn vector_batch_3(rows: &[([f32; 3], bool)]) -> RecordBatch {
+        let mut list_builder = FixedSizeListBuilder::new(Float32Builder::new(), 3);
+        for (v, valid) in rows {
+            list_builder.values().append_value(v[0]);
+            list_builder.values().append_value(v[1]);
+            list_builder.values().append_value(v[2]);
+            list_builder.append(*valid);
+        }
+        let emb = Arc::new(list_builder.finish());
+        let schema = vector_schema(3);
+        RecordBatch::try_new(schema, vec![emb]).expect("batch")
+    }
+
+    fn eval(expr: Expr, batch: &RecordBatch) -> Float32Array {
+        let compiled = compile_expr(&expr, batch.schema_ref()).expect("compile");
+        let out = compiled.evaluate(batch).expect("evaluate");
+        out.as_any()
+            .downcast_ref::<Float32Array>()
+            .expect("float32 out")
+            .clone()
+    }
+
+    #[test]
+    fn cosine_similarity_numeric_and_edge_cases() {
+        let batch = vector_batch_3(&[
+            ([1.0, 0.0, 0.0], true),
+            ([0.0, 1.0, 0.0], true),
+            ([-1.0, 0.0, 0.0], true),
+            ([0.0, 0.0, 0.0], true), // zero vector row
+            ([0.0, 0.0, 0.0], false),
+        ]);
 
         let expr = Expr::CosineSimilarity {
             vector: Box::new(Expr::Column("emb".to_string())),
             query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
         };
-        let compiled = compile_expr(&expr, &schema).expect("compile");
-        let out = compiled.evaluate(&batch).expect("evaluate");
-        let out = out
-            .as_any()
-            .downcast_ref::<arrow::array::Float32Array>()
-            .expect("float32 out");
+        let out = eval(expr, &batch);
 
         assert!((out.value(0) - 1.0).abs() < 1e-6);
         assert!((out.value(1) - 0.0).abs() < 1e-6);
+        assert!((out.value(2) - (-1.0)).abs() < 1e-6);
+        assert!((out.value(3) - 0.0).abs() < 1e-6);
+        assert!(out.is_null(4));
+    }
+
+    #[test]
+    fn l2_distance_numeric_and_negative_values() {
+        let batch = vector_batch_3(&[([1.0, 2.0, 3.0], true), ([-1.0, 0.0, 0.0], true)]);
+        let expr = Expr::L2Distance {
+            vector: Box::new(Expr::Column("emb".to_string())),
+            query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+        };
+        let out = eval(expr, &batch);
+        // sqrt((1-1)^2 + (2-0)^2 + (3-0)^2) = sqrt(13)
+        assert!((out.value(0) - 13.0_f32.sqrt()).abs() < 1e-6);
+        // sqrt((-1-1)^2) = 2
+        assert!((out.value(1) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dot_product_numeric_and_nulls() {
+        let batch = vector_batch_3(&[
+            ([1.0, 2.0, 3.0], true),
+            ([-1.0, 0.5, 0.0], true),
+            ([0.0, 0.0, 0.0], false),
+        ]);
+        let expr = Expr::DotProduct {
+            vector: Box::new(Expr::Column("emb".to_string())),
+            query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, -1.0, 0.5]))),
+        };
+        let out = eval(expr, &batch);
+        // 1*1 + 2*(-1) + 3*0.5 = 0.5
+        assert!((out.value(0) - 0.5).abs() < 1e-6);
+        // -1*1 + 0.5*(-1) + 0*0.5 = -1.5
+        assert!((out.value(1) - (-1.5)).abs() < 1e-6);
         assert!(out.is_null(2));
+    }
+
+    #[test]
+    fn vector_dim_mismatch_returns_clear_error() {
+        let batch = vector_batch_3(&[([1.0, 0.0, 0.0], true)]);
+        let expr = Expr::CosineSimilarity {
+            vector: Box::new(Expr::Column("emb".to_string())),
+            query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0]))),
+        };
+        let compiled = compile_expr(&expr, batch.schema_ref()).expect("compile");
+        let err = compiled.evaluate(&batch).expect_err("dim mismatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("query vector dim 2 != column dim 3"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_fixed_size_list_vector_column_returns_clear_error() {
+        let schema = Arc::new(Schema::new(vec![Field::new("emb", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+        )
+        .expect("batch");
+
+        let expr = Expr::DotProduct {
+            vector: Box::new(Expr::Column("emb".to_string())),
+            query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+        };
+        let compiled = compile_expr(&expr, &schema).expect("compile");
+        let err = compiled.evaluate(&batch).expect_err("type mismatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("vector column must be FixedSizeList"),
+            "unexpected error: {msg}"
+        );
     }
 }
