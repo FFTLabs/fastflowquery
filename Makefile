@@ -19,6 +19,8 @@
 	bench-13.3-embedded \
 	bench-13.3-distributed \
 	bench-13.3-rag \
+	bench-13.4-official-embedded \
+	bench-13.4-official-distributed \
 	bench-13.3-compare \
 	tpch-dbgen-build \
 	tpch-dbgen-sf1 \
@@ -98,6 +100,12 @@ bench-13.3-distributed:
 
 bench-13.3-rag:
 	FFQ_BENCH_MODE=embedded FFQ_BENCH_RAG_MATRIX="$${FFQ_BENCH_RAG_MATRIX:-1000,16,10,1.0;5000,32,10,0.8;10000,64,10,0.2}" ./scripts/run-bench-13.3.sh
+
+bench-13.4-official-embedded:
+	FFQ_BENCH_MODE=embedded FFQ_BENCH_TPCH_SUBDIR="$${FFQ_BENCH_TPCH_SUBDIR:-tpch_dbgen_sf1_parquet}" ./scripts/run-bench-13.4-tpch-official.sh
+
+bench-13.4-official-distributed:
+	FFQ_BENCH_MODE=distributed FFQ_BENCH_TPCH_SUBDIR="$${FFQ_BENCH_TPCH_SUBDIR:-tpch_dbgen_sf1_parquet}" ./scripts/run-bench-13.4-tpch-official.sh
 
 bench-13.3-compare:
 	@test -n "$$BASELINE" || (echo "BASELINE is required (json file or dir)" && exit 1)

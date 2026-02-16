@@ -23,6 +23,7 @@ use serde::Serialize;
 struct CliOptions {
     mode: BenchMode,
     fixture_root: PathBuf,
+    tpch_subdir: String,
     query_root: PathBuf,
     out_dir: PathBuf,
     warmup: usize,
@@ -57,7 +58,7 @@ impl BenchMode {
 struct QuerySpec {
     id: BenchmarkQueryId,
     variant: &'static str,
-    dataset: &'static str,
+    dataset: String,
     params: HashMap<String, LiteralValue>,
 }
 
@@ -148,7 +149,7 @@ fn main() -> Result<()> {
     if opts.mode == BenchMode::Distributed {
         distributed_preflight()?;
     }
-    ensure_fixtures(&opts.fixture_root)?;
+    ensure_fixtures(&opts.fixture_root, &opts.tpch_subdir)?;
     fs::create_dir_all(&opts.out_dir)?;
     apply_normalization_env(&opts);
     prepare_spill_dir(&opts.spill_dir)?;
@@ -160,9 +161,9 @@ fn main() -> Result<()> {
     config.spill_dir = opts.spill_dir.display().to_string();
     let mut results = Vec::new();
     let engine = Engine::new(config.clone())?;
-    register_benchmark_tables(&engine, &opts.fixture_root)?;
+    register_benchmark_tables(&engine, &opts.fixture_root, &opts.tpch_subdir)?;
 
-    for spec in canonical_specs(opts.mode) {
+    for spec in canonical_specs(opts.mode, &opts.tpch_subdir) {
         let query = load_benchmark_query_from_root(&opts.query_root, spec.id)?;
         match execute_query(
             &engine,
@@ -178,7 +179,7 @@ fn main() -> Result<()> {
                             query_id: spec.id.stable_id().to_string(),
                             variant: spec.variant.to_string(),
                             runtime_tag: opts.mode.as_str().to_string(),
-                            dataset: spec.dataset.to_string(),
+                            dataset: spec.dataset.clone(),
                             backend: "sql_baseline".to_string(),
                             n_docs: None,
                             effective_dim: None,
@@ -204,7 +205,7 @@ fn main() -> Result<()> {
                     query_id: spec.id.stable_id().to_string(),
                     variant: spec.variant.to_string(),
                     runtime_tag: opts.mode.as_str().to_string(),
-                    dataset: spec.dataset.to_string(),
+                    dataset: spec.dataset.clone(),
                     backend: "sql_baseline".to_string(),
                     n_docs: None,
                     effective_dim: None,
@@ -226,7 +227,7 @@ fn main() -> Result<()> {
                     query_id: spec.id.stable_id().to_string(),
                     variant: spec.variant.to_string(),
                     runtime_tag: opts.mode.as_str().to_string(),
-                    dataset: spec.dataset.to_string(),
+                    dataset: spec.dataset.clone(),
                     backend: "sql_baseline".to_string(),
                     n_docs: None,
                     effective_dim: None,
@@ -306,6 +307,8 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
         .transpose()?
         .unwrap_or(BenchMode::Embedded);
     let mut fixture_root = default_benchmark_fixture_root();
+    let mut tpch_subdir =
+        env::var("FFQ_BENCH_TPCH_SUBDIR").unwrap_or_else(|_| "tpch_sf1".to_string());
     let mut query_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/bench/queries")
         .to_path_buf();
@@ -364,6 +367,10 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
             "--query-root" => {
                 i += 1;
                 query_root = PathBuf::from(require_arg(&args, i, "--query-root")?);
+            }
+            "--tpch-subdir" => {
+                i += 1;
+                tpch_subdir = require_arg(&args, i, "--tpch-subdir")?;
             }
             "--out-dir" => {
                 i += 1;
@@ -471,10 +478,16 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
             "--shuffle-partitions must be >= 1".to_string(),
         ));
     }
+    if tpch_subdir.trim().is_empty() {
+        return Err(FfqError::InvalidConfig(
+            "--tpch-subdir must not be empty".to_string(),
+        ));
+    }
 
     Ok(CliOptions {
         mode,
         fixture_root,
+        tpch_subdir,
         query_root,
         out_dir,
         warmup,
@@ -493,7 +506,7 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: run_bench_13_3 [--mode embedded|distributed] [--fixture-root PATH] [--query-root PATH] [--out-dir PATH] [--warmup N] [--iterations N] [--threads N] [--batch-size-rows N] [--mem-budget-bytes N] [--shuffle-partitions N] [--spill-dir PATH] [--keep-spill-dir] [--max-cv-pct N|--no-variance-check] [--rag-matrix \"N,dim,k,sel;...\"]"
+        "Usage: run_bench_13_3 [--mode embedded|distributed] [--fixture-root PATH] [--tpch-subdir NAME] [--query-root PATH] [--out-dir PATH] [--warmup N] [--iterations N] [--threads N] [--batch-size-rows N] [--mem-budget-bytes N] [--shuffle-partitions N] [--spill-dir PATH] [--keep-spill-dir] [--max-cv-pct N|--no-variance-check] [--rag-matrix \"N,dim,k,sel;...\"]"
     );
 }
 
@@ -544,24 +557,34 @@ fn require_arg(args: &[String], idx: usize, flag: &str) -> Result<String> {
     })
 }
 
-fn ensure_fixtures(root: &Path) -> Result<()> {
-    let required = [
-        root.join("tpch_sf1/lineitem.parquet"),
-        root.join("tpch_sf1/orders.parquet"),
-        root.join("tpch_sf1/customer.parquet"),
-        root.join("rag_synth/docs.parquet"),
+fn ensure_fixtures(root: &Path, tpch_subdir: &str) -> Result<()> {
+    let tpch_root = root.join(tpch_subdir);
+    #[allow(unused_mut)]
+    let mut required = vec![
+        tpch_root.join("lineitem.parquet"),
+        tpch_root.join("orders.parquet"),
+        tpch_root.join("customer.parquet"),
     ];
+    #[cfg(feature = "vector")]
+    required.push(root.join("rag_synth/docs.parquet"));
     if required.iter().all(|p| p.exists()) {
         return Ok(());
+    }
+    if tpch_subdir != "tpch_sf1" {
+        return Err(FfqError::InvalidConfig(format!(
+            "missing official tpch fixture files under '{}'; expected customer/orders/lineitem parquet files",
+            tpch_root.display()
+        )));
     }
     generate_default_benchmark_fixtures(root)
 }
 
-fn register_benchmark_tables(engine: &Engine, root: &Path) -> Result<()> {
+fn register_benchmark_tables(engine: &Engine, root: &Path, tpch_subdir: &str) -> Result<()> {
+    let tpch_root = root.join(tpch_subdir);
     register_parquet(
         engine,
         "lineitem",
-        &root.join("tpch_sf1/lineitem.parquet"),
+        &tpch_root.join("lineitem.parquet"),
         Schema::new(vec![
             Field::new("l_orderkey", DataType::Int64, false),
             Field::new("l_quantity", DataType::Float64, false),
@@ -576,7 +599,7 @@ fn register_benchmark_tables(engine: &Engine, root: &Path) -> Result<()> {
     register_parquet(
         engine,
         "orders",
-        &root.join("tpch_sf1/orders.parquet"),
+        &tpch_root.join("orders.parquet"),
         Schema::new(vec![
             Field::new("o_orderkey", DataType::Int64, false),
             Field::new("o_custkey", DataType::Int64, false),
@@ -587,12 +610,13 @@ fn register_benchmark_tables(engine: &Engine, root: &Path) -> Result<()> {
     register_parquet(
         engine,
         "customer",
-        &root.join("tpch_sf1/customer.parquet"),
+        &tpch_root.join("customer.parquet"),
         Schema::new(vec![
             Field::new("c_custkey", DataType::Int64, false),
             Field::new("c_mktsegment", DataType::Utf8, false),
         ]),
     )?;
+    #[cfg(feature = "vector")]
     register_parquet(
         engine,
         "docs",
@@ -642,19 +666,19 @@ fn register_parquet(engine: &Engine, name: &str, path: &Path, schema: Schema) ->
     Ok(())
 }
 
-fn canonical_specs(mode: BenchMode) -> Vec<QuerySpec> {
+fn canonical_specs(mode: BenchMode, tpch_subdir: &str) -> Vec<QuerySpec> {
     #[allow(unused_mut)]
     let mut specs = vec![
         QuerySpec {
             id: BenchmarkQueryId::TpchQ1,
             variant: "baseline",
-            dataset: "tpch_sf1",
+            dataset: tpch_subdir.to_string(),
             params: HashMap::new(),
         },
         QuerySpec {
             id: BenchmarkQueryId::TpchQ3,
             variant: "baseline",
-            dataset: "tpch_sf1",
+            dataset: tpch_subdir.to_string(),
             params: HashMap::new(),
         },
     ];

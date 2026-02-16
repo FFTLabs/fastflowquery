@@ -284,6 +284,7 @@ To reduce noise/flakiness:
 10. `scripts/generate-tpch-dbgen-sf1.sh`
 11. `scripts/convert-tpch-dbgen-parquet.sh`
 12. `crates/client/src/tpch_tbl.rs`
+13. `scripts/run-bench-13.4-tpch-official.sh`
 
 ## Embedded Baseline Runner
 
@@ -333,6 +334,27 @@ Optional qdrant matrix variant (`--features qdrant`):
 2. Optional `FFQ_BENCH_QDRANT_ENDPOINT` (default `http://127.0.0.1:6334`).
 3. JSON includes `rag_comparisons` rows for baseline-vs-qdrant where matching variant keys exist.
 
+## Official TPC-H SF1 Runner (13.4.5)
+
+Run official dbgen parquet benchmark flow (Q1/Q3 only):
+
+```bash
+make bench-13.4-official-embedded
+```
+
+Distributed mode:
+
+```bash
+FFQ_COORDINATOR_ENDPOINT=http://127.0.0.1:50051 \
+make bench-13.4-official-distributed
+```
+
+Notes:
+
+1. Requires converted official parquet files in `tests/bench/fixtures/tpch_dbgen_sf1_parquet/`.
+2. Uses canonical query files `tests/bench/queries/canonical/tpch_q1.sql` and `tests/bench/queries/canonical/tpch_q3.sql`.
+3. Writes JSON/CSV artifacts to `tests/bench/results/official_tpch/` by default.
+
 ## Make Command Matrix
 
 1. `make bench-13.3-embedded`
@@ -352,6 +374,10 @@ Optional qdrant matrix variant (`--features qdrant`):
    - Generates official dbgen SF1 `.tbl` dataset.
 6. `make tpch-dbgen-parquet`
    - Converts dbgen `.tbl` to deterministic parquet for FFQ benchmark paths.
+7. `make bench-13.4-official-embedded`
+   - Runs official SF1 parquet Q1/Q3 benchmark in embedded mode.
+8. `make bench-13.4-official-distributed`
+   - Runs official SF1 parquet Q1/Q3 benchmark in distributed mode (`FFQ_COORDINATOR_ENDPOINT` required).
 
 Legacy alias:
 
