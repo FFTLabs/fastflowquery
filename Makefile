@@ -15,7 +15,8 @@
 	bless-13.1-snapshots \
 	test-13.2-embedded \
 	test-13.2-distributed \
-	test-13.2-parity
+	test-13.2-parity \
+	bench-13.3-embedded
 
 clean:
 	cargo clean
@@ -81,3 +82,6 @@ test-13.2-parity:
 	trap 'docker compose -f docker/compose/ffq.yml down -v' EXIT; \
 	$(MAKE) test-13.2-embedded; \
 	$(MAKE) test-13.2-distributed
+
+bench-13.3-embedded:
+	./scripts/run-bench-13.3.sh

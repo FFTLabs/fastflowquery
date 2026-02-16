@@ -123,5 +123,8 @@ fn embedded_integration_runner_emits_normalized_vector_snapshot() {
     .expect("vector topk collect");
 
     let snapshot = support::snapshot_text(&batches, &["id"], 1e-9);
-    support::assert_or_bless_snapshot("tests/snapshots/integration/embedded_vector_topk.snap", &snapshot);
+    support::assert_or_bless_snapshot(
+        "tests/snapshots/integration/embedded_vector_topk.snap",
+        &snapshot,
+    );
 }

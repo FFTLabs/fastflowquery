@@ -1,0 +1,58 @@
+{
+  "run_id": "bench13_3_embedded_1771246898045",
+  "timestamp_unix_ms": 1771246898045,
+  "mode": "embedded",
+  "feature_flags": [
+    "vector"
+  ],
+  "fixture_root": "/Users/markolekic/Dev/fastflowquery/fastflowquery/tests/bench/fixtures",
+  "query_root": "/Users/markolekic/Dev/fastflowquery/fastflowquery/tests/bench/queries",
+  "runtime": {
+    "batch_size_rows": 8192,
+    "mem_budget_bytes": 536870912,
+    "shuffle_partitions": 64
+  },
+  "host": {
+    "os": "macos",
+    "arch": "aarch64",
+    "logical_cpus": 10
+  },
+  "results": [
+    {
+      "query_id": "tpch_q1",
+      "variant": "baseline",
+      "dataset": "tpch_sf1",
+      "iterations": 1,
+      "warmup_iterations": 0,
+      "elapsed_ms": 273.59441699999996,
+      "rows_out": 99,
+      "bytes_out": null,
+      "success": true,
+      "error": null
+    },
+    {
+      "query_id": "tpch_q3",
+      "variant": "baseline",
+      "dataset": "tpch_sf1",
+      "iterations": 1,
+      "warmup_iterations": 0,
+      "elapsed_ms": 4693.6134999999995,
+      "rows_out": 10,
+      "bytes_out": null,
+      "success": true,
+      "error": null
+    },
+    {
+      "query_id": "rag_topk_bruteforce",
+      "variant": "vector_bruteforce",
+      "dataset": "rag_synth",
+      "iterations": 1,
+      "warmup_iterations": 0,
+      "elapsed_ms": 93.397541,
+      "rows_out": 10,
+      "bytes_out": null,
+      "success": true,
+      "error": null
+    }
+  ]
+}

@@ -206,3 +206,15 @@ To reduce noise/flakiness:
 3. `Makefile`
 4. `.github/workflows/integration-13_2.yml`
 5. `tests/bench/queries/`
+6. `scripts/run-bench-13.3.sh`
+7. `crates/client/examples/run_bench_13_3.rs`
+
+## Embedded Baseline Runner
+
+Run:
+
+```bash
+./scripts/run-bench-13.3.sh
+```
+
+Outputs are written to `tests/bench/results/` as one JSON and one CSV file per run.

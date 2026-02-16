@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use ffq_client::bench_fixtures::{default_benchmark_fixture_root, generate_default_benchmark_fixtures};
+use ffq_client::bench_fixtures::{
+    default_benchmark_fixture_root, generate_default_benchmark_fixtures,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);

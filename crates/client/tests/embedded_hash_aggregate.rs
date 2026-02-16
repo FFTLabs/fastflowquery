@@ -163,9 +163,7 @@ fn hash_aggregate_deterministic_with_spill_and_non_spill_parity() {
     groups.sort();
     assert_eq!(
         groups,
-        vec![
-            "group_0", "group_1", "group_2", "group_3", "group_4", "group_5", "group_6"
-        ]
+        vec!["group_0", "group_1", "group_2", "group_3", "group_4", "group_5", "group_6"]
     );
     assert_eq!(seen, 840);
 

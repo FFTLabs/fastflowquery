@@ -100,8 +100,16 @@ fn benchmark_fixture_generation_is_deterministic() {
             let (rows2, schema2) = parquet_rows_and_schema(&p2);
             assert_eq!(rows1, rows2, "row count mismatch for {}", file.file);
             assert_eq!(schema1, schema2, "schema mismatch for {}", file.file);
-            assert_eq!(rows1 as i64, file.rows, "manifest row count mismatch for {}", file.file);
-            assert_eq!(schema1, file.schema, "manifest schema mismatch for {}", file.file);
+            assert_eq!(
+                rows1 as i64, file.rows,
+                "manifest row count mismatch for {}",
+                file.file
+            );
+            assert_eq!(
+                schema1, file.schema,
+                "manifest schema mismatch for {}",
+                file.file
+            );
         }
     }
 

@@ -252,7 +252,12 @@ fn schema_text(schema: &Schema) -> String {
 }
 
 fn field_text(field: &Field) -> String {
-    format!("{}:{:?}:{}", field.name(), field.data_type(), field.is_nullable())
+    format!(
+        "{}:{:?}:{}",
+        field.name(),
+        field.data_type(),
+        field.is_nullable()
+    )
 }
 
 fn extract_row(batch: &RecordBatch, row: usize, float_tolerance: f64) -> Vec<(String, String)> {

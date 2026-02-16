@@ -74,9 +74,7 @@ fn optimizer_snapshot(name: &str, plan: LogicalPlan, ctx: &TestCtx) {
             .optimize(plan, ctx, OptimizerConfig::default())
             .expect("optimize"),
     );
-    let snapshot = format!(
-        "# optimizer-golden: {name}\n\n## before\n{before}\n## after\n{after}"
-    );
+    let snapshot = format!("# optimizer-golden: {name}\n\n## before\n{before}\n## after\n{after}");
 
     let path = snapshot_path(name);
     if should_bless() {
@@ -227,7 +225,11 @@ fn golden_constant_folding_negative_non_literal_expr() {
             filters: vec![],
         }),
     };
-    optimizer_snapshot("constant_folding_negative_non_literal_expr", plan, &test_ctx());
+    optimizer_snapshot(
+        "constant_folding_negative_non_literal_expr",
+        plan,
+        &test_ctx(),
+    );
 }
 
 #[test]
@@ -304,7 +306,11 @@ fn golden_projection_pushdown_negative_over_aggregate() {
             }),
         }),
     };
-    optimizer_snapshot("projection_pushdown_negative_over_aggregate", plan, &test_ctx());
+    optimizer_snapshot(
+        "projection_pushdown_negative_over_aggregate",
+        plan,
+        &test_ctx(),
+    );
 }
 
 #[test]
@@ -432,7 +438,13 @@ fn vector_ctx(with_docs_index_option: bool) -> TestCtx {
             "qdrant",
             HashMap::new(),
         )
-        .with_table("docs", docs_schema, (Some(5000), Some(200)), "parquet", docs_opts)
+        .with_table(
+            "docs",
+            docs_schema,
+            (Some(5000), Some(200)),
+            "parquet",
+            docs_opts,
+        )
 }
 
 #[cfg(feature = "vector")]

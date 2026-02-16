@@ -1,0 +1,4 @@
+run_id,timestamp_unix_ms,mode,query_id,variant,dataset,iterations,warmup_iterations,elapsed_ms,rows_out,bytes_out,success,error
+bench13_3_embedded_1771246814894,1771246814894,embedded,tpch_q1,baseline,tpch_sf1,1,0,0.000,0,,false,unsupported: only a single ORDER BY expression is supported in v1
+bench13_3_embedded_1771246814894,1771246814894,embedded,tpch_q3,baseline,tpch_sf1,1,0,4713.735,10,,true,
+bench13_3_embedded_1771246814894,1771246814894,embedded,rag_topk_bruteforce,vector_bruteforce,rag_synth,1,0,104.394,10,,true,

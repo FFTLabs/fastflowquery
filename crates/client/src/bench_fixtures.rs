@@ -111,9 +111,17 @@ fn generate_tpch_fixture(root: &Path) -> Result<FixtureManifest> {
             .to_string(),
         deterministic_seed: RAG_SYNTH_SEED,
         files: vec![
-            file_manifest("customer.parquet", TPCH_CUSTOMER_ROWS, customer_schema.as_ref()),
+            file_manifest(
+                "customer.parquet",
+                TPCH_CUSTOMER_ROWS,
+                customer_schema.as_ref(),
+            ),
             file_manifest("orders.parquet", TPCH_ORDERS_ROWS, orders_schema.as_ref()),
-            file_manifest("lineitem.parquet", TPCH_LINEITEM_ROWS, lineitem_schema.as_ref()),
+            file_manifest(
+                "lineitem.parquet",
+                TPCH_LINEITEM_ROWS,
+                lineitem_schema.as_ref(),
+            ),
         ],
     })
 }
@@ -148,7 +156,13 @@ fn generate_rag_fixture(root: &Path) -> Result<FixtureManifest> {
 }
 
 fn build_customer_cols() -> Vec<ArrayRef> {
-    let segments = ["AUTOMOBILE", "BUILDING", "FURNITURE", "MACHINERY", "HOUSEHOLD"];
+    let segments = [
+        "AUTOMOBILE",
+        "BUILDING",
+        "FURNITURE",
+        "MACHINERY",
+        "HOUSEHOLD",
+    ];
     let keys = (1..=TPCH_CUSTOMER_ROWS).collect::<Vec<_>>();
     let segs = (1..=TPCH_CUSTOMER_ROWS)
         .map(|i| segments[(i as usize) % segments.len()])

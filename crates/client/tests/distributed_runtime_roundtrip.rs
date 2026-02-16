@@ -410,7 +410,8 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         "distributed and embedded join outputs differ"
     );
 
-    let dist_scan_norm = support::snapshot_text(&dist_scan_batches, &["l_orderkey", "l_partkey"], 1e-9);
+    let dist_scan_norm =
+        support::snapshot_text(&dist_scan_batches, &["l_orderkey", "l_partkey"], 1e-9);
     let emb_scan_norm =
         support::snapshot_text(&embedded_scan_batches, &["l_orderkey", "l_partkey"], 1e-9);
     assert_eq!(
@@ -423,7 +424,13 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     assert_eq!(dist_agg, emb_agg);
     assert_eq!(dist_agg, vec![(2, 2), (3, 3)]);
 
-    let expected_join = vec![(2, 20, 100), (2, 21, 100), (3, 30, 200), (3, 31, 200), (3, 32, 200)];
+    let expected_join = vec![
+        (2, 20, 100),
+        (2, 21, 100),
+        (3, 30, 200),
+        (3, 31, 200),
+        (3, 32, 200),
+    ];
     let dist_join = collect_join_rows(&dist_join_batches);
     let emb_join = collect_join_rows(&embedded_join_batches);
     assert_eq!(dist_join, emb_join);

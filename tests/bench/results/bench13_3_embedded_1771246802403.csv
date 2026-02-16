@@ -1,0 +1,4 @@
+run_id,timestamp_unix_ms,mode,query_id,variant,dataset,iterations,warmup_iterations,elapsed_ms,rows_out,bytes_out,success,error
+bench13_3_embedded_1771246802403,1771246802403,embedded,tpch_q1,baseline,tpch_sf1,1,0,0.000,0,,false,unsupported: COUNT(*) is not supported in v1 (use COUNT(1) or COUNT(col))
+bench13_3_embedded_1771246802403,1771246802403,embedded,tpch_q3,baseline,tpch_sf1,1,0,4670.202,10,,true,
+bench13_3_embedded_1771246802403,1771246802403,embedded,rag_topk_bruteforce,vector_bruteforce,rag_synth,1,0,112.121,10,,true,

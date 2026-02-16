@@ -25,8 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind = env_or_default("FFQ_COORDINATOR_BIND", "0.0.0.0:50051");
     let addr: SocketAddr = bind.parse()?;
     let shuffle_root = env_or_default("FFQ_SHUFFLE_ROOT", "/var/lib/ffq/shuffle");
-    let blacklist_failure_threshold =
-        env_u32_or_default("FFQ_BLACKLIST_FAILURE_THRESHOLD", 3);
+    let blacklist_failure_threshold = env_u32_or_default("FFQ_BLACKLIST_FAILURE_THRESHOLD", 3);
     std::fs::create_dir_all(&shuffle_root)?;
 
     let coordinator = Arc::new(Mutex::new(Coordinator::new(CoordinatorConfig {

@@ -91,7 +91,10 @@ async fn distributed_integration_runner_returns_expected_join_agg_results() {
     std::fs::create_dir_all(&tmp_dir).expect("create integration tmp dir");
     let catalog_path = tmp_dir.join("catalog.json");
     let _ = std::fs::remove_file(&catalog_path);
-    env::set_var("FFQ_CATALOG_PATH", catalog_path.to_string_lossy().to_string());
+    env::set_var(
+        "FFQ_CATALOG_PATH",
+        catalog_path.to_string_lossy().to_string(),
+    );
 
     let fixtures = support::ensure_integration_parquet_fixtures();
     let engine = Engine::new(EngineConfig::default()).expect("distributed engine");
@@ -170,7 +173,11 @@ async fn distributed_integration_runner_returns_expected_join_agg_results() {
     );
 
     for (name, sql, sort_by) in [
-        ("scan_filter_project", scan_sql, vec!["l_orderkey", "l_partkey"]),
+        (
+            "scan_filter_project",
+            scan_sql,
+            vec!["l_orderkey", "l_partkey"],
+        ),
         (
             "join_projection",
             join_sql,

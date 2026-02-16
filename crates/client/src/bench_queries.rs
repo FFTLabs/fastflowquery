@@ -90,7 +90,11 @@ mod tests {
         let queries = load_all_benchmark_queries().expect("load benchmark queries");
         assert_eq!(queries.len(), CANONICAL_BENCHMARK_QUERIES.len());
         for (id, sql) in queries {
-            assert!(!sql.is_empty(), "query {} must not be empty", id.stable_id());
+            assert!(
+                !sql.is_empty(),
+                "query {} must not be empty",
+                id.stable_id()
+            );
             parse_sql(&sql).unwrap_or_else(|e| panic!("{} failed to parse: {e}", id.stable_id()));
         }
     }

@@ -2127,9 +2127,9 @@ mod tests {
     use arrow::array::{FixedSizeListBuilder, Float32Array, Float32Builder, Int64Array};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
+    use ffq_planner::VectorTopKExec;
     #[cfg(feature = "vector")]
     use ffq_planner::{Expr, LiteralValue};
-    use ffq_planner::VectorTopKExec;
     use ffq_storage::vector_index::{VectorIndexProvider, VectorTopKRow};
     use futures::future::BoxFuture;
 

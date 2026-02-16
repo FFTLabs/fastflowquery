@@ -116,7 +116,11 @@ fn cosine_topk_tie_order_is_deterministic() {
     ]));
     // ids 1 and 2 tie on cosine score for query [1,0,0].
     let mut emb_builder = FixedSizeListBuilder::new(Float32Builder::new(), 3);
-    for v in [[1.0_f32, 0.0, 0.0], [2.0_f32, 0.0, 0.0], [0.0_f32, 1.0, 0.0]] {
+    for v in [
+        [1.0_f32, 0.0, 0.0],
+        [2.0_f32, 0.0, 0.0],
+        [0.0_f32, 1.0, 0.0],
+    ] {
         for x in v {
             emb_builder.values().append_value(x);
         }
@@ -163,13 +167,8 @@ fn cosine_topk_tie_order_is_deterministic() {
             .collect(),
     )
     .expect("collect1");
-    let b2 = futures::executor::block_on(
-        engine
-            .sql_with_params(q, params)
-            .expect("sql")
-            .collect(),
-    )
-    .expect("collect2");
+    let b2 = futures::executor::block_on(engine.sql_with_params(q, params).expect("sql").collect())
+        .expect("collect2");
     support::assert_batches_deterministic(&b1, &b2, &["id"], 1e-9);
 
     let ids = b1[0]
