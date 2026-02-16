@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
+use std::fs::File;
 use std::fs;
 #[cfg(feature = "distributed")]
 use std::net::{TcpStream, ToSocketAddrs};
@@ -8,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use arrow::array::{Float64Array, Int64Array, StringArray};
+use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use ffq_client::bench_fixtures::{
     default_benchmark_fixture_root, generate_default_benchmark_fixtures,
@@ -17,6 +20,7 @@ use ffq_client::Engine;
 use ffq_common::{EngineConfig, FfqError, Result};
 use ffq_planner::LiteralValue;
 use ffq_storage::{TableDef, TableStats};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::Serialize;
 
 #[derive(Debug, Clone)]
@@ -165,6 +169,36 @@ fn main() -> Result<()> {
 
     for spec in canonical_specs(opts.mode, &opts.tpch_subdir) {
         let query = load_benchmark_query_from_root(&opts.query_root, spec.id)?;
+        if let Err(err) = maybe_verify_official_tpch_correctness(
+            &engine,
+            &opts.fixture_root,
+            &opts.tpch_subdir,
+            spec.id,
+            &query,
+            &spec.params,
+        ) {
+            results.push(QueryResultRow {
+                query_id: spec.id.stable_id().to_string(),
+                variant: spec.variant.to_string(),
+                runtime_tag: opts.mode.as_str().to_string(),
+                dataset: spec.dataset.clone(),
+                backend: "sql_baseline".to_string(),
+                n_docs: None,
+                effective_dim: None,
+                top_k: None,
+                filter_selectivity: None,
+                iterations: opts.iterations,
+                warmup_iterations: opts.warmup,
+                elapsed_ms: 0.0,
+                elapsed_stddev_ms: None,
+                elapsed_cv_pct: None,
+                rows_out: 0,
+                bytes_out: None,
+                success: false,
+                error: Some(format!("correctness check failed: {err}")),
+            });
+            continue;
+        }
         match execute_query(
             &engine,
             &query,
@@ -1222,6 +1256,206 @@ fn execute_once(
     let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
     let rows = batches.iter().map(|b| b.num_rows() as u64).sum();
     Ok((elapsed_ms, rows))
+}
+
+fn maybe_verify_official_tpch_correctness(
+    engine: &Engine,
+    fixture_root: &Path,
+    tpch_subdir: &str,
+    query_id: BenchmarkQueryId,
+    sql: &str,
+    params: &HashMap<String, LiteralValue>,
+) -> Result<()> {
+    let is_official = tpch_subdir.contains("tpch_dbgen");
+    if !is_official {
+        return Ok(());
+    }
+    if !matches!(query_id, BenchmarkQueryId::TpchQ1 | BenchmarkQueryId::TpchQ3) {
+        return Ok(());
+    }
+
+    let actual = if params.is_empty() {
+        futures::executor::block_on(engine.sql(sql)?.collect())?
+    } else {
+        futures::executor::block_on(engine.sql_with_params(sql, params.clone())?.collect())?
+    };
+    let data_root = fixture_root.join(tpch_subdir);
+    match query_id {
+        BenchmarkQueryId::TpchQ1 => verify_tpch_q1(&actual, &data_root),
+        BenchmarkQueryId::TpchQ3 => verify_tpch_q3(&actual, &data_root),
+        _ => Ok(()),
+    }
+}
+
+fn verify_tpch_q1(actual: &[RecordBatch], tpch_root: &Path) -> Result<()> {
+    let mut expected: BTreeMap<String, (i64, f64)> = BTreeMap::new();
+    for batch in read_parquet_batches(&tpch_root.join("lineitem.parquet"))? {
+        let shipdate = as_utf8(batch.column(7), "l_shipdate")?;
+        let returnflag = as_utf8(batch.column(5), "l_returnflag")?;
+        let quantity = as_f64(batch.column(1), "l_quantity")?;
+        for row in 0..batch.num_rows() {
+            if shipdate.value(row) <= "1998-09-02" {
+                let key = returnflag.value(row).to_string();
+                let entry = expected.entry(key).or_insert((0_i64, 0.0_f64));
+                entry.0 += 1;
+                entry.1 += quantity.value(row);
+            }
+        }
+    }
+
+    let mut actual_map: BTreeMap<String, (i64, f64)> = BTreeMap::new();
+    for batch in actual {
+        let flag = as_utf8(batch.column(0), "l_returnflag")?;
+        let count = as_i64(batch.column(1), "count_order")?;
+        let sum_qty = as_f64(batch.column(2), "sum_qty")?;
+        for row in 0..batch.num_rows() {
+            actual_map.insert(
+                flag.value(row).to_string(),
+                (count.value(row), sum_qty.value(row)),
+            );
+        }
+    }
+
+    if actual_map.len() != expected.len() {
+        return Err(FfqError::Execution(format!(
+            "q1 row-count mismatch: actual groups={}, expected groups={}",
+            actual_map.len(),
+            expected.len()
+        )));
+    }
+
+    const EPS: f64 = 1e-6;
+    for (flag, (exp_count, exp_sum)) in expected {
+        let Some((act_count, act_sum)) = actual_map.get(&flag) else {
+            return Err(FfqError::Execution(format!(
+                "q1 missing group in result: {flag}"
+            )));
+        };
+        if *act_count != exp_count {
+            return Err(FfqError::Execution(format!(
+                "q1 count mismatch for {flag}: actual={}, expected={}",
+                act_count, exp_count
+            )));
+        }
+        if (act_sum - exp_sum).abs() > EPS {
+            return Err(FfqError::Execution(format!(
+                "q1 sum_qty mismatch for {flag}: actual={:.6}, expected={:.6}",
+                act_sum, exp_sum
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_tpch_q3(actual: &[RecordBatch], tpch_root: &Path) -> Result<()> {
+    let mut orders: HashMap<i64, (String, i64)> = HashMap::new();
+    for batch in read_parquet_batches(&tpch_root.join("orders.parquet"))? {
+        let orderkey = as_i64(batch.column(0), "o_orderkey")?;
+        let orderdate = as_utf8(batch.column(2), "o_orderdate")?;
+        let shippriority = as_i64(batch.column(3), "o_shippriority")?;
+        for row in 0..batch.num_rows() {
+            if orderdate.value(row) < "1995-03-15" {
+                orders.insert(
+                    orderkey.value(row),
+                    (orderdate.value(row).to_string(), shippriority.value(row)),
+                );
+            }
+        }
+    }
+
+    let mut expected_groups: HashMap<(i64, String, i64), f64> = HashMap::new();
+    for batch in read_parquet_batches(&tpch_root.join("lineitem.parquet"))? {
+        let orderkey = as_i64(batch.column(0), "l_orderkey")?;
+        let extendedprice = as_f64(batch.column(2), "l_extendedprice")?;
+        let shipdate = as_utf8(batch.column(7), "l_shipdate")?;
+        for row in 0..batch.num_rows() {
+            if shipdate.value(row) <= "1995-03-15" {
+                continue;
+            }
+            let key = orderkey.value(row);
+            if let Some((orderdate, shippriority)) = orders.get(&key) {
+                let group_key = (key, orderdate.clone(), *shippriority);
+                *expected_groups.entry(group_key).or_insert(0.0) += extendedprice.value(row);
+            }
+        }
+    }
+
+    let actual_rows: usize = actual.iter().map(|b| b.num_rows()).sum();
+    if actual_rows != 10 {
+        return Err(FfqError::Execution(format!(
+            "q3 row-count mismatch: actual={}, expected=10",
+            actual_rows
+        )));
+    }
+
+    const EPS: f64 = 1e-6;
+    for batch in actual {
+        let orderkey = as_i64(batch.column(0), "l_orderkey")?;
+        let revenue = as_f64(batch.column(1), "revenue")?;
+        let orderdate = as_utf8(batch.column(2), "o_orderdate")?;
+        let shippriority = as_i64(batch.column(3), "o_shippriority")?;
+        for row in 0..batch.num_rows() {
+            let key = (
+                orderkey.value(row),
+                orderdate.value(row).to_string(),
+                shippriority.value(row),
+            );
+            let Some(exp_revenue) = expected_groups.get(&key) else {
+                return Err(FfqError::Execution(format!(
+                    "q3 unexpected row: orderkey={}, orderdate={}, shippriority={}",
+                    key.0, key.1, key.2
+                )));
+            };
+            if (revenue.value(row) - exp_revenue).abs() > EPS {
+                return Err(FfqError::Execution(format!(
+                    "q3 revenue mismatch for orderkey={}, orderdate={}, shippriority={}: actual={:.6}, expected={:.6}",
+                    key.0,
+                    key.1,
+                    key.2,
+                    revenue.value(row),
+                    exp_revenue
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_parquet_batches(path: &Path) -> Result<Vec<RecordBatch>> {
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| FfqError::Execution(format!("open parquet {} failed: {e}", path.display())))?;
+    let reader = builder
+        .build()
+        .map_err(|e| FfqError::Execution(format!("build parquet reader {} failed: {e}", path.display())))?;
+    let mut out = Vec::new();
+    for batch in reader {
+        out.push(batch.map_err(|e| {
+            FfqError::Execution(format!("read parquet batch {} failed: {e}", path.display()))
+        })?);
+    }
+    Ok(out)
+}
+
+fn as_i64<'a>(array: &'a arrow::array::ArrayRef, name: &str) -> Result<&'a Int64Array> {
+    array
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| FfqError::Execution(format!("expected Int64 column: {name}")))
+}
+
+fn as_f64<'a>(array: &'a arrow::array::ArrayRef, name: &str) -> Result<&'a Float64Array> {
+    array
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .ok_or_else(|| FfqError::Execution(format!("expected Float64 column: {name}")))
+}
+
+fn as_utf8<'a>(array: &'a arrow::array::ArrayRef, name: &str) -> Result<&'a StringArray> {
+    array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| FfqError::Execution(format!("expected Utf8 column: {name}")))
 }
 
 fn now_millis() -> u128 {

@@ -354,6 +354,9 @@ Notes:
 1. Requires converted official parquet files in `tests/bench/fixtures/tpch_dbgen_sf1_parquet/`.
 2. Uses canonical query files `tests/bench/queries/canonical/tpch_q1.sql` and `tests/bench/queries/canonical/tpch_q3.sql`.
 3. Writes JSON/CSV artifacts to `tests/bench/results/official_tpch/` by default.
+4. Includes correctness gate (13.4.6): before timing Q1/Q3, runner validates query outputs against an
+   independent parquet-derived baseline (group/join aggregate checks with float tolerance).
+5. Any mismatch marks the query as failed and the benchmark command exits non-zero.
 
 ## Make Command Matrix
 
