@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+#[cfg(feature = "distributed")]
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "distributed")]
+use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arrow_schema::{DataType, Field, Schema};
@@ -17,11 +21,27 @@ use serde::Serialize;
 
 #[derive(Debug, Clone)]
 struct CliOptions {
+    mode: BenchMode,
     fixture_root: PathBuf,
     query_root: PathBuf,
     out_dir: PathBuf,
     warmup: usize,
     iterations: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchMode {
+    Embedded,
+    Distributed,
+}
+
+impl BenchMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Embedded => "embedded",
+            Self::Distributed => "distributed",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +70,7 @@ struct HostMeta {
 struct QueryResultRow {
     query_id: String,
     variant: String,
+    runtime_tag: String,
     dataset: String,
     iterations: usize,
     warmup_iterations: usize,
@@ -75,6 +96,9 @@ struct BenchmarkArtifact {
 
 fn main() -> Result<()> {
     let opts = parse_args(env::args().skip(1).collect())?;
+    if opts.mode == BenchMode::Distributed {
+        distributed_preflight()?;
+    }
     ensure_fixtures(&opts.fixture_root)?;
     fs::create_dir_all(&opts.out_dir)?;
 
@@ -83,7 +107,7 @@ fn main() -> Result<()> {
     let engine = Engine::new(config.clone())?;
     register_benchmark_tables(&engine, &opts.fixture_root)?;
 
-    for spec in canonical_specs() {
+    for spec in canonical_specs(opts.mode) {
         let query = load_benchmark_query_from_root(&opts.query_root, spec.id)?;
         match execute_query(
             &engine,
@@ -96,6 +120,7 @@ fn main() -> Result<()> {
                 results.push(QueryResultRow {
                     query_id: spec.id.stable_id().to_string(),
                     variant: spec.variant.to_string(),
+                    runtime_tag: opts.mode.as_str().to_string(),
                     dataset: spec.dataset.to_string(),
                     iterations: opts.iterations,
                     warmup_iterations: opts.warmup,
@@ -110,6 +135,7 @@ fn main() -> Result<()> {
                 results.push(QueryResultRow {
                     query_id: spec.id.stable_id().to_string(),
                     variant: spec.variant.to_string(),
+                    runtime_tag: opts.mode.as_str().to_string(),
                     dataset: spec.dataset.to_string(),
                     iterations: opts.iterations,
                     warmup_iterations: opts.warmup,
@@ -129,7 +155,7 @@ fn main() -> Result<()> {
     let artifact = BenchmarkArtifact {
         run_id: run_id.clone(),
         timestamp_unix_ms: now_millis(),
-        mode: "embedded".to_string(),
+        mode: opts.mode.as_str().to_string(),
         feature_flags: feature_flags(),
         fixture_root: opts.fixture_root.display().to_string(),
         query_root: opts.query_root.display().to_string(),
@@ -161,6 +187,12 @@ fn main() -> Result<()> {
 }
 
 fn parse_args(args: Vec<String>) -> Result<CliOptions> {
+    let mut mode = env::var("FFQ_BENCH_MODE")
+        .ok()
+        .as_deref()
+        .map(parse_mode)
+        .transpose()?
+        .unwrap_or(BenchMode::Embedded);
     let mut fixture_root = default_benchmark_fixture_root();
     let mut query_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/bench/queries")
@@ -174,6 +206,10 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
     let mut i = 0usize;
     while i < args.len() {
         match args[i].as_str() {
+            "--mode" => {
+                i += 1;
+                mode = parse_mode(&require_arg(&args, i, "--mode")?)?;
+            }
             "--fixture-root" => {
                 i += 1;
                 fixture_root = PathBuf::from(require_arg(&args, i, "--fixture-root")?);
@@ -220,6 +256,7 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
     }
 
     Ok(CliOptions {
+        mode,
         fixture_root,
         query_root,
         out_dir,
@@ -230,8 +267,18 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: run_bench_13_3 [--fixture-root PATH] [--query-root PATH] [--out-dir PATH] [--warmup N] [--iterations N]"
+        "Usage: run_bench_13_3 [--mode embedded|distributed] [--fixture-root PATH] [--query-root PATH] [--out-dir PATH] [--warmup N] [--iterations N]"
     );
+}
+
+fn parse_mode(raw: &str) -> Result<BenchMode> {
+    match raw.to_ascii_lowercase().as_str() {
+        "embedded" => Ok(BenchMode::Embedded),
+        "distributed" => Ok(BenchMode::Distributed),
+        other => Err(FfqError::InvalidConfig(format!(
+            "invalid benchmark mode '{other}'; expected embedded|distributed"
+        ))),
+    }
 }
 
 fn require_arg(args: &[String], idx: usize, flag: &str) -> Result<String> {
@@ -338,7 +385,8 @@ fn register_parquet(engine: &Engine, name: &str, path: &Path, schema: Schema) ->
     Ok(())
 }
 
-fn canonical_specs() -> Vec<QuerySpec> {
+fn canonical_specs(mode: BenchMode) -> Vec<QuerySpec> {
+    #[allow(unused_mut)]
     let mut specs = vec![
         QuerySpec {
             id: BenchmarkQueryId::TpchQ1,
@@ -355,14 +403,92 @@ fn canonical_specs() -> Vec<QuerySpec> {
     ];
     #[cfg(feature = "vector")]
     {
-        specs.push(QuerySpec {
-            id: BenchmarkQueryId::RagTopkBruteforce,
-            variant: "vector_bruteforce",
-            dataset: "rag_synth",
-            params: rag_query_params(),
-        });
+        if mode == BenchMode::Embedded {
+            specs.push(QuerySpec {
+                id: BenchmarkQueryId::RagTopkBruteforce,
+                variant: "vector_bruteforce",
+                dataset: "rag_synth",
+                params: rag_query_params(),
+            });
+        }
     }
+    #[cfg(not(feature = "vector"))]
+    let _ = mode;
     specs
+}
+
+fn distributed_preflight() -> Result<()> {
+    #[cfg(not(feature = "distributed"))]
+    {
+        return Err(FfqError::InvalidConfig(
+            "distributed mode requested but ffq-client was not built with 'distributed' feature"
+                .to_string(),
+        ));
+    }
+    #[cfg(feature = "distributed")]
+    {
+        let endpoint = env::var("FFQ_COORDINATOR_ENDPOINT").map_err(|_| {
+            FfqError::InvalidConfig(
+                "FFQ_COORDINATOR_ENDPOINT must be set for distributed benchmark mode".to_string(),
+            )
+        })?;
+        if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+            return Err(FfqError::InvalidConfig(
+                "FFQ_COORDINATOR_ENDPOINT must include scheme (http://...)".to_string(),
+            ));
+        }
+        wait_for_endpoint(&endpoint, std::time::Duration::from_secs(30))
+    }
+}
+
+#[cfg(feature = "distributed")]
+fn wait_for_endpoint(endpoint: &str, timeout: std::time::Duration) -> Result<()> {
+    let (host, port) = parse_endpoint_host_port(endpoint)?;
+    let start = Instant::now();
+    let mut last_err = String::new();
+    while start.elapsed() < timeout {
+        let addrs = (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|e| FfqError::Execution(format!("resolve endpoint failed: {e}")))?;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)) {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+        }
+        thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Err(FfqError::Execution(format!(
+        "coordinator endpoint not reachable within {}s ({endpoint}): {last_err}",
+        timeout.as_secs()
+    )))
+}
+
+#[cfg(feature = "distributed")]
+fn parse_endpoint_host_port(endpoint: &str) -> Result<(String, u16)> {
+    let (scheme, rest) = if let Some(x) = endpoint.strip_prefix("http://") {
+        ("http", x)
+    } else if let Some(x) = endpoint.strip_prefix("https://") {
+        ("https", x)
+    } else {
+        return Err(FfqError::InvalidConfig(format!(
+            "endpoint must start with http:// or https://: {endpoint}"
+        )));
+    };
+    let authority = rest
+        .split('/')
+        .next()
+        .ok_or_else(|| FfqError::InvalidConfig(format!("invalid endpoint: {endpoint}")))?;
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    if let Some((host, port_raw)) = authority.rsplit_once(':') {
+        let port = port_raw.parse::<u16>().map_err(|e| {
+            FfqError::InvalidConfig(format!("invalid endpoint port '{port_raw}': {e}"))
+        })?;
+        return Ok((host.to_string(), port));
+    }
+    Ok((authority.to_string(), default_port))
 }
 
 #[cfg(feature = "vector")]
@@ -456,17 +582,18 @@ fn csv_escape(s: &str) -> String {
 
 fn write_csv(path: &Path, artifact: &BenchmarkArtifact) -> Result<()> {
     let mut out = String::new();
-    out.push_str("run_id,timestamp_unix_ms,mode,query_id,variant,dataset,iterations,warmup_iterations,elapsed_ms,rows_out,bytes_out,success,error\n");
+    out.push_str("run_id,timestamp_unix_ms,mode,query_id,variant,runtime_tag,dataset,iterations,warmup_iterations,elapsed_ms,rows_out,bytes_out,success,error\n");
     for r in &artifact.results {
         let error = r.error.as_deref().unwrap_or("");
         let bytes_out = r.bytes_out.map_or_else(String::new, |v| v.to_string());
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{:.3},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{:.3},{},{},{},{}\n",
             csv_escape(&artifact.run_id),
             artifact.timestamp_unix_ms,
             csv_escape(&artifact.mode),
             csv_escape(&r.query_id),
             csv_escape(&r.variant),
+            csv_escape(&r.runtime_tag),
             csv_escape(&r.dataset),
             r.iterations,
             r.warmup_iterations,

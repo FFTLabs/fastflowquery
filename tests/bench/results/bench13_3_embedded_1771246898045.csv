@@ -1,4 +1,0 @@
-run_id,timestamp_unix_ms,mode,query_id,variant,dataset,iterations,warmup_iterations,elapsed_ms,rows_out,bytes_out,success,error
-bench13_3_embedded_1771246898045,1771246898045,embedded,tpch_q1,baseline,tpch_sf1,1,0,273.594,99,,true,
-bench13_3_embedded_1771246898045,1771246898045,embedded,tpch_q3,baseline,tpch_sf1,1,0,4693.613,10,,true,
-bench13_3_embedded_1771246898045,1771246898045,embedded,rag_topk_bruteforce,vector_bruteforce,rag_synth,1,0,93.398,10,,true,

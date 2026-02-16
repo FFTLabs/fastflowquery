@@ -16,7 +16,8 @@
 	test-13.2-embedded \
 	test-13.2-distributed \
 	test-13.2-parity \
-	bench-13.3-embedded
+	bench-13.3-embedded \
+	bench-13.3-distributed
 
 clean:
 	cargo clean
@@ -85,3 +86,6 @@ test-13.2-parity:
 
 bench-13.3-embedded:
 	./scripts/run-bench-13.3.sh
+
+bench-13.3-distributed:
+	FFQ_BENCH_MODE=distributed ./scripts/run-bench-13.3.sh

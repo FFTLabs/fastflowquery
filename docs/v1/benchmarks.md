@@ -218,3 +218,13 @@ Run:
 ```
 
 Outputs are written to `tests/bench/results/` as one JSON and one CSV file per run.
+
+Distributed mode:
+
+```bash
+FFQ_BENCH_MODE=distributed \
+FFQ_COORDINATOR_ENDPOINT=http://127.0.0.1:50051 \
+./scripts/run-bench-13.3.sh
+```
+
+In distributed mode, the runner performs endpoint readiness checks and executes the comparable TPC-H benchmark subset (`tpch_q1`, `tpch_q3`). Artifacts include `mode` and `runtime_tag` so embedded and distributed results can be compared with the same schema.
