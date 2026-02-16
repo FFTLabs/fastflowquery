@@ -1,47 +1,25 @@
 use std::collections::HashMap;
-use std::fs::File;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::Int64Array;
-use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use ffq_client::Engine;
 use ffq_common::EngineConfig;
 use ffq_storage::TableDef;
-use parquet::arrow::ArrowWriter;
-
-fn unique_path(prefix: &str, ext: &str) -> std::path::PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock before epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("{prefix}_{nanos}.{ext}"))
-}
-
-fn write_parquet(
-    path: &std::path::Path,
-    schema: Arc<Schema>,
-    cols: Vec<Arc<dyn arrow::array::Array>>,
-) {
-    let batch = RecordBatch::try_new(schema.clone(), cols).expect("build batch");
-    let file = File::create(path).expect("create parquet");
-    let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
-    writer.write(&batch).expect("write");
-    writer.close().expect("close");
-}
+#[path = "support/mod.rs"]
+mod support;
 
 #[test]
 fn hash_join_shuffle_with_spill() {
-    let left_path = unique_path("ffq_join_left", "parquet");
-    let right_path = unique_path("ffq_join_right", "parquet");
-    let spill_dir = unique_path("ffq_join_spill", "dir");
+    let left_path = support::unique_path("ffq_join_left", "parquet");
+    let right_path = support::unique_path("ffq_join_right", "parquet");
+    let spill_dir = support::unique_path("ffq_join_spill", "dir");
 
     let left_schema = Arc::new(Schema::new(vec![
         Field::new("o_orderkey", DataType::Int64, false),
         Field::new("o_custkey", DataType::Int64, false),
     ]));
-    write_parquet(
+    support::write_parquet(
         &left_path,
         left_schema.clone(),
         vec![
@@ -54,7 +32,7 @@ fn hash_join_shuffle_with_spill() {
         Field::new("l_orderkey", DataType::Int64, false),
         Field::new("l_qty", DataType::Int64, false),
     ]));
-    write_parquet(
+    support::write_parquet(
         &right_path,
         right_schema.clone(),
         vec![
@@ -103,6 +81,8 @@ fn hash_join_shuffle_with_spill() {
         .expect("join");
 
     let batches = futures::executor::block_on(joined.collect()).expect("collect");
+    let batches_again = futures::executor::block_on(joined.collect()).expect("collect again");
+    support::assert_batches_deterministic(&batches, &batches_again, &["o_orderkey"], 1e-9);
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 3);
 
@@ -113,15 +93,15 @@ fn hash_join_shuffle_with_spill() {
 
 #[test]
 fn hash_join_broadcast_strategy_and_result() {
-    let left_path = unique_path("ffq_join_bcast_left", "parquet");
-    let right_path = unique_path("ffq_join_bcast_right", "parquet");
-    let spill_dir = unique_path("ffq_join_bcast_spill", "dir");
+    let left_path = support::unique_path("ffq_join_bcast_left", "parquet");
+    let right_path = support::unique_path("ffq_join_bcast_right", "parquet");
+    let spill_dir = support::unique_path("ffq_join_bcast_spill", "dir");
 
     let left_schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Int64, false),
         Field::new("x", DataType::Int64, false),
     ]));
-    write_parquet(
+    support::write_parquet(
         &left_path,
         left_schema.clone(),
         vec![
@@ -134,7 +114,7 @@ fn hash_join_broadcast_strategy_and_result() {
         Field::new("k2", DataType::Int64, false),
         Field::new("y", DataType::Int64, false),
     ]));
-    write_parquet(
+    support::write_parquet(
         &right_path,
         right_schema.clone(),
         vec![
@@ -193,6 +173,8 @@ fn hash_join_broadcast_strategy_and_result() {
     assert!(explain.contains("strategy=broadcast_left"));
 
     let batches = futures::executor::block_on(joined.collect()).expect("collect");
+    let batches_again = futures::executor::block_on(joined.collect()).expect("collect again");
+    support::assert_batches_deterministic(&batches, &batches_again, &["k"], 1e-9);
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 1);
 

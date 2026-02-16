@@ -1,30 +1,20 @@
 use std::collections::HashMap;
-use std::fs::File;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{Int64Array, StringArray};
-use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use ffq_client::expr::col;
 use ffq_client::Engine;
 use ffq_common::EngineConfig;
 use ffq_planner::AggExpr;
 use ffq_storage::TableDef;
-use parquet::arrow::ArrowWriter;
-
-fn unique_path(prefix: &str, ext: &str) -> std::path::PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock before epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("{prefix}_{nanos}.{ext}"))
-}
+#[path = "support/mod.rs"]
+mod support;
 
 #[test]
 fn hash_aggregate_spills_and_merges() {
-    let parquet_path = unique_path("ffq_hash_agg", "parquet");
-    let spill_dir = unique_path("ffq_hash_agg_spill", "dir");
+    let parquet_path = support::unique_path("ffq_hash_agg", "parquet");
+    let spill_dir = support::unique_path("ffq_hash_agg_spill", "dir");
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("k", DataType::Utf8, false),
@@ -38,20 +28,14 @@ fn hash_aggregate_spills_and_merges() {
         values.push(1_i64);
     }
 
-    let batch = RecordBatch::try_new(
+    support::write_parquet(
+        &parquet_path,
         schema.clone(),
         vec![
             Arc::new(StringArray::from(keys)),
             Arc::new(Int64Array::from(values)),
         ],
-    )
-    .expect("build batch");
-
-    let file = File::create(&parquet_path).expect("create parquet file");
-    let mut writer =
-        ArrowWriter::try_new(file, schema.clone(), None).expect("create parquet writer");
-    writer.write(&batch).expect("write parquet");
-    writer.close().expect("close writer");
+    );
 
     let mut cfg = EngineConfig::default();
     cfg.mem_budget_bytes = 512;
@@ -82,8 +66,17 @@ fn hash_aggregate_spills_and_merges() {
         ]);
 
     let batches = futures::executor::block_on(df.collect()).expect("collect");
+    let batches_again = futures::executor::block_on(df.collect()).expect("collect again");
+    support::assert_batches_deterministic(&batches, &batches_again, &["k"], 1e-9);
     assert_eq!(batches.len(), 1);
     let batch = &batches[0];
+    let expected_schema = Schema::new(vec![
+        Field::new("k", DataType::Utf8, true),
+        Field::new("cnt", DataType::Int64, true),
+        Field::new("sum_v", DataType::Int64, true),
+        Field::new("avg_v", DataType::Float64, true),
+    ]);
+    support::assert_schema_eq(batch.schema().as_ref(), &expected_schema);
 
     let k = batch
         .column(0)
