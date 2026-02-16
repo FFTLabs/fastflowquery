@@ -10,6 +10,63 @@ This page is the v1 validation runbook. It defines test layers, key fixtures, co
 4. Verify write durability semantics (overwrite/append/restart/failure cleanup).
 5. Verify observability surfaces expose meaningful metrics.
 
+## Correctness Contract (v1)
+
+This section is the normative definition of "correct" for v1 tests.
+
+## Canonical sorting and normalization
+
+1. Any comparison of multi-row query output must be order-insensitive unless the query semantics guarantee order.
+2. Tests must normalize rows before comparison using explicit sort keys (for example `["id"]`, `["l_orderkey", "l_partkey"]`).
+3. Use shared normalization helpers from `crates/client/tests/support/mod.rs`:
+   - `snapshot_text(...)`
+   - `assert_batches_deterministic(...)`
+4. Never assert raw batch row order for hash join/aggregate/top-k internals unless the operator contract requires strict ordering.
+
+## Float tolerance policy
+
+1. Float comparisons must use tolerance; do not assert exact binary equality for computed metrics.
+2. Default tolerance for normalized snapshots is `1e-9` unless a test requires looser tolerance.
+3. For direct scalar checks, use absolute-difference assertions:
+   - `abs(actual - expected) < tolerance`
+4. If a test needs non-default tolerance, document the reason in the test body.
+
+## Null semantics policy
+
+1. Nulls are part of correctness and must be asserted explicitly in edge-case tests.
+2. Snapshot normalization encodes nulls as `NULL`; treat this as stable contract text.
+3. For vector/scoring paths, null input rows must remain null in output score arrays unless operator contract says otherwise.
+
+## Snapshot update policy
+
+1. Golden snapshots are authoritative expected outputs.
+2. Update snapshots only when behavior changes are intentional.
+3. Use blessed update flow:
+   - `BLESS=1 ...`
+   - or `UPDATE_SNAPSHOTS=1 ...`
+4. Required review rule:
+   - PRs that modify `*.snap` files must include a short explanation of why the change is expected.
+5. Never mix unrelated refactors with snapshot updates in one commit.
+
+## Flaky-test policy
+
+1. Correctness tests must be deterministic; flaky tests are treated as failures, not tolerated noise.
+2. If flakiness appears:
+   - capture and document repro conditions,
+   - fix determinism (sorting, stable fixtures, explicit tolerances, isolated temp dirs),
+   - re-enable only after deterministic reruns pass.
+3. Do not add retry loops inside assertions to hide nondeterminism.
+4. Distributed tests that require socket/network binding should be isolated and clearly labeled; failures due to sandbox or environment restrictions must be called out separately from product correctness failures.
+
+## Contributor checklist for new correctness tests
+
+1. Use fixed fixtures with deterministic seed/data.
+2. Normalize output with explicit sort keys.
+3. Use tolerance for floats and explicit checks for nulls.
+4. Add/maintain snapshots through bless flow when applicable.
+5. Ensure the test runs in the appropriate feature matrix (`core`, `vector`, `distributed`).
+6. Add the test command to the 13.1 matrix if it introduces a new coverage area.
+
 ## Test Strategy by Layer
 
 ## 1) Unit tests (`--lib`)
