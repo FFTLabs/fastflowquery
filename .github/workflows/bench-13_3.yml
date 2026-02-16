@@ -36,7 +36,7 @@ jobs:
       TZ: UTC
       LC_ALL: C
       TPCH_DBGEN_REPO: https://github.com/electrum/tpch-dbgen.git
-      TPCH_DBGEN_REF: f20ca9f
+      TPCH_DBGEN_REF: 32f1c1b92d1664dba542e927d23d86ffa57aa253
       TPCH_SCALE: "1"
     steps:
       - name: Checkout

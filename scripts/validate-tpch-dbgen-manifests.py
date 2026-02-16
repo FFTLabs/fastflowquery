@@ -15,7 +15,9 @@ TBL_MANIFEST = ROOT / "tests/bench/fixtures/tpch_dbgen_sf1/manifest.json"
 PARQUET_MANIFEST = ROOT / "tests/bench/fixtures/tpch_dbgen_sf1_parquet/manifest.json"
 
 EXPECTED_SOURCE_REPO = "https://github.com/electrum/tpch-dbgen.git"
-EXPECTED_SOURCE_REF = os.environ.get("TPCH_DBGEN_REF", "f20ca9f")
+EXPECTED_SOURCE_REF = os.environ.get(
+    "TPCH_DBGEN_REF", "32f1c1b92d1664dba542e927d23d86ffa57aa253"
+)
 
 EXPECTED_TBL_ROWS = {
     "customer.tbl": 150_000,

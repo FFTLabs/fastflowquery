@@ -7,7 +7,7 @@ cd "${ROOT_DIR}"
 # Electrum's tpch-dbgen mirror is commonly used for CI/dev automation.
 TPCH_DBGEN_REPO="${TPCH_DBGEN_REPO:-https://github.com/electrum/tpch-dbgen.git}"
 # Pinned ref for reproducibility. Override if needed.
-TPCH_DBGEN_REF="${TPCH_DBGEN_REF:-f20ca9f}" # short commit hash
+TPCH_DBGEN_REF="${TPCH_DBGEN_REF:-32f1c1b92d1664dba542e927d23d86ffa57aa253}"
 TPCH_DBGEN_SRC_DIR="${TPCH_DBGEN_SRC_DIR:-${ROOT_DIR}/target/tpch-dbgen-src}"
 
 if [[ ! -d "${TPCH_DBGEN_SRC_DIR}/.git" ]]; then
@@ -22,11 +22,11 @@ git -C "${TPCH_DBGEN_SRC_DIR}" checkout "${TPCH_DBGEN_REF}"
 MACHINE="${TPCH_DBGEN_MACHINE:-}"
 if [[ -z "${MACHINE}" ]]; then
   case "$(uname -s)" in
-    Darwin) MACHINE="MACOS" ;;
+    Darwin) MACHINE="MAC" ;;
     Linux) MACHINE="LINUX" ;;
     *)
       echo "Unsupported OS for automatic MACHINE mapping: $(uname -s)"
-      echo "Set TPCH_DBGEN_MACHINE manually (for example LINUX or MACOS)."
+      echo "Set TPCH_DBGEN_MACHINE manually (for example LINUX or MAC)."
       exit 1
       ;;
   esac

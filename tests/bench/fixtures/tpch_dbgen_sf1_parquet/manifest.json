@@ -1,0 +1,38 @@
+{
+  "fixture": "tpch_dbgen_sf1_parquet",
+  "source_format": "tpch_dbgen_tbl",
+  "files": [
+    {
+      "file": "customer.parquet",
+      "rows": 150000,
+      "schema": [
+        "c_custkey:Int64:false",
+        "c_mktsegment:Utf8:false"
+      ]
+    },
+    {
+      "file": "lineitem.parquet",
+      "rows": 6001215,
+      "schema": [
+        "l_orderkey:Int64:false",
+        "l_quantity:Float64:false",
+        "l_extendedprice:Float64:false",
+        "l_discount:Float64:false",
+        "l_tax:Float64:false",
+        "l_returnflag:Utf8:false",
+        "l_linestatus:Utf8:false",
+        "l_shipdate:Utf8:false"
+      ]
+    },
+    {
+      "file": "orders.parquet",
+      "rows": 1500000,
+      "schema": [
+        "o_orderkey:Int64:false",
+        "o_custkey:Int64:false",
+        "o_orderdate:Utf8:false",
+        "o_shippriority:Int64:false"
+      ]
+    }
+  ]
+}

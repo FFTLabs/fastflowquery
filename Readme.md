@@ -8,6 +8,12 @@ This is a v1 repo skeleton with feature-gated optional components:
 
 By default, `cargo build` builds the lightweight `ffq-client` crate (embedded-only).
 
+## Quick Start
+
+For a practical step-by-step v1 run guide (embedded, distributed, synthetic and official benchmarks):
+
+1. `docs/v1/quickstart.md`
+
 ## Environment
 
 - Copy `.env.example` to `.env` for local overrides.

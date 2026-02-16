@@ -15,6 +15,11 @@ if [[ ! -x "${DBGEN_BIN}" ]]; then
   echo "dbgen binary missing at ${DBGEN_BIN}"
   exit 1
 fi
+DISTS_FILE="${TPCH_DBGEN_SRC_DIR}/dists.dss"
+if [[ ! -f "${DISTS_FILE}" ]]; then
+  echo "dists file missing at ${DISTS_FILE}"
+  exit 1
+fi
 
 mkdir -p "${TPCH_DBGEN_OUTPUT_DIR}"
 rm -f "${TPCH_DBGEN_OUTPUT_DIR}"/*.tbl "${TPCH_DBGEN_OUTPUT_DIR}/manifest.json"
@@ -22,7 +27,7 @@ rm -f "${TPCH_DBGEN_OUTPUT_DIR}"/*.tbl "${TPCH_DBGEN_OUTPUT_DIR}/manifest.json"
 echo "Generating TPC-H SF${TPCH_SCALE} .tbl files into ${TPCH_DBGEN_OUTPUT_DIR}"
 (
   cd "${TPCH_DBGEN_OUTPUT_DIR}"
-  "${DBGEN_BIN}" -s "${TPCH_SCALE}" -f
+  "${DBGEN_BIN}" -b "${DISTS_FILE}" -s "${TPCH_SCALE}" -f
 )
 
 required_tables=(
@@ -66,7 +71,7 @@ manifest = {
     "generator": "dbgen",
     "scale_factor": float(scale),
     "source_repo": os.environ.get("TPCH_DBGEN_REPO", "https://github.com/electrum/tpch-dbgen.git"),
-    "source_ref": os.environ.get("TPCH_DBGEN_REF", "f20ca9f"),
+    "source_ref": os.environ.get("TPCH_DBGEN_REF", "32f1c1b92d1664dba542e927d23d86ffa57aa253"),
     "files": files,
 }
 

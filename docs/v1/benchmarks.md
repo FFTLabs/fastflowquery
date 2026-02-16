@@ -50,7 +50,7 @@ The repository includes tooling to build and run TPC-H `dbgen` and generate offi
 Pinned defaults:
 
 1. Source repo: `https://github.com/electrum/tpch-dbgen.git`
-2. Source ref: `f20ca9f` (override with `TPCH_DBGEN_REF`)
+2. Source ref: `32f1c1b92d1664dba542e927d23d86ffa57aa253` (override with `TPCH_DBGEN_REF`)
 3. Scale factor: `1` (SF1)
 
 One-command generation:
@@ -421,7 +421,7 @@ Recommended official sequence:
 Pinned generation inputs:
 
 1. dbgen repo: `https://github.com/electrum/tpch-dbgen.git`
-2. dbgen ref: `f20ca9f` (set via `TPCH_DBGEN_REF`, defaulted in tooling/CI)
+2. dbgen ref: `32f1c1b92d1664dba542e927d23d86ffa57aa253` (set via `TPCH_DBGEN_REF`, defaulted in tooling/CI)
 3. scale factor: `TPCH_SCALE=1`
 
 Environment assumptions for reproducible runs:
