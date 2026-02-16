@@ -1,0 +1,7 @@
+{
+  "fixture_set": "ffq_bench_v1",
+  "fixtures": [
+    "tpch_sf1",
+    "rag_synth"
+  ]
+}

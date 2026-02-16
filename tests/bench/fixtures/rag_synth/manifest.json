@@ -1,0 +1,17 @@
+{
+  "fixture": "rag_synth",
+  "description": "Deterministic synthetic RAG embeddings fixture for top-k benchmark paths.",
+  "deterministic_seed": 42,
+  "files": [
+    {
+      "file": "docs.parquet",
+      "rows": 10000,
+      "schema": [
+        "id:Int64:false",
+        "title:Utf8:false",
+        "lang:Utf8:false",
+        "emb:FixedSizeList(Field { name: \"item\", data_type: Float32, nullable: true, dict_id: 0, dict_is_ordered: false, metadata: {} }, 64):true"
+      ]
+    }
+  ]
+}

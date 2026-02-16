@@ -2,6 +2,7 @@ mod planner_facade;
 mod runtime;
 mod session;
 
+pub mod bench_fixtures;
 pub mod dataframe;
 pub mod engine;
 pub mod expr;
