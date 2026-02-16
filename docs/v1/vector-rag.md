@@ -13,7 +13,7 @@ This document describes the v1 vector retrieval path as currently implemented, i
 
 1. Embedding column type: Arrow `FixedSizeList<Float32>`.
 2. Query vector literal type: `LiteralValue::VectorF32(Vec<f32>)`.
-3. Scoring expression: `cosine_similarity(vector_col, query_vector_literal)` returns float score.
+3. Scoring expression used by SQL top-k rewrite path: `cosine_similarity(vector_col, query_vector_literal)` returns float score.
 
 ## SQL shape supported for top-k scoring
 
@@ -44,6 +44,11 @@ Behavior:
 2. Maintains a min-heap of top-k rows.
 3. Accepts `Float32` or `Float64` score arrays.
 4. Emits a compact result batch containing selected rows in descending score order.
+5. Tie order is deterministic in v1 test coverage through stable normalization/snapshot checks.
+
+Metric coverage note:
+1. SQL rewrite routing is currently cosine-based.
+2. L2 and dot ranking correctness is validated at operator/runtime test layer (not SQL rewrite matching).
 
 Failure/edge behavior:
 
@@ -183,6 +188,7 @@ With docs table vector options configured and qdrant index table registered, opt
 2. Brute-force top-k path:
    - `crates/client/src/runtime.rs`
    - `crates/client/tests/embedded_vector_topk.rs`
+   - includes cosine query-level ranking plus L2/dot operator-level ranking and tie handling checks
 3. Two-phase retrieval rewrite and execution:
    - `crates/planner/src/optimizer.rs`
    - `crates/client/tests/embedded_two_phase_retrieval.rs`

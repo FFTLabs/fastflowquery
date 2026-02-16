@@ -65,7 +65,17 @@ Status legend:
 | `12.2 Metrics (Prometheus)` | done | `crates/common/src/metrics.rs`, `crates/client/src/engine.rs`, `crates/distributed/src/coordinator.rs`, `crates/distributed/src/worker.rs` | `crates/common/src/metrics.rs` |
 | `12.3 Profiling hooks` | done | `crates/common/src/metrics_exporter.rs`, `crates/client/src/engine.rs`, `crates/client/src/runtime.rs`, `crates/distributed/src/worker.rs` | `crates/common/src/metrics_exporter.rs` |
 | `13) Test plan & benchmarks (v1)` | partial | `crates/client/tests`, `crates/planner/tests` | `crates/client/tests/embedded_hash_join.rs`, `crates/client/tests/distributed_runtime_roundtrip.rs` |
-| `13.1 Correctness` | done | `crates/planner/src/optimizer.rs`, `crates/client/src/runtime.rs` | `crates/client/tests/embedded_hash_aggregate.rs`, `crates/client/tests/embedded_vector_topk.rs` |
+| `13.1 Correctness` | done | `crates/planner/src/optimizer.rs`, `crates/client/src/runtime.rs`, `crates/client/tests/support/mod.rs`, `Makefile`, `.github/workflows/correctness-13_1.yml` | `crates/client/tests/embedded_hash_aggregate.rs`, `crates/client/tests/embedded_hash_join.rs`, `crates/client/tests/distributed_runtime_roundtrip.rs`, `crates/client/tests/embedded_vector_topk.rs`, `crates/planner/tests/optimizer_golden.rs` |
+| `Ticket 13.1.1 — Deterministic Test Harness Utilities` | done | `crates/client/tests/support/mod.rs` | `crates/client/tests/embedded_hash_join.rs`, `crates/client/tests/embedded_hash_aggregate.rs` |
+| `Ticket 13.1.2 — Optimizer Golden Snapshot Framework` | done | `crates/planner/tests/optimizer_golden.rs` | `crates/planner/tests/snapshots/optimizer/*.snap` |
+| `Ticket 13.1.3 — Golden Tests: Core Rule Coverage` | done | `crates/planner/tests/optimizer_golden.rs` | `crates/planner/tests/snapshots/optimizer/*.snap` |
+| `Ticket 13.1.4 — Join Correctness Determinism (Embedded)` | done | `crates/client/tests/support/mod.rs` | `crates/client/tests/embedded_hash_join.rs`, `crates/client/tests/snapshots/join/*.snap` |
+| `Ticket 13.1.5 — Aggregate Correctness Determinism (Embedded)` | done | `crates/client/tests/support/mod.rs` | `crates/client/tests/embedded_hash_aggregate.rs`, `crates/client/tests/snapshots/aggregate/*.snap` |
+| `Ticket 13.1.6 — Join/Agg Determinism Parity (Distributed vs Embedded)` | done | `crates/client/src/runtime.rs`, `crates/distributed/src/worker.rs` | `crates/client/tests/distributed_runtime_roundtrip.rs` |
+| `Ticket 13.1.7 — Vector Kernel Unit Tests (cosine/l2/dot)` | done | `crates/execution/src/expressions/mod.rs` | `crates/execution/src/expressions/mod.rs` |
+| `Ticket 13.1.8 — Vector Ranking Correctness Tests` | done | `crates/client/src/runtime.rs` | `crates/client/tests/embedded_vector_topk.rs` |
+| `Ticket 13.1.9 — CI/Command Matrix for Correctness Suite` | done | `Makefile`, `.github/workflows/correctness-13_1.yml` | `docs/v1/testing.md` |
+| `Ticket 13.1.10 — Correctness Contract Doc Page` | done | `docs/v1/testing.md` | `docs/v1/testing.md` |
 | `13.2 Integration` | partial | `crates/client/tests/distributed_runtime_roundtrip.rs` | `crates/client/tests/distributed_runtime_roundtrip.rs` |
 | `13.3 Bench` | not started | `Makefile` | `tickets/eng/Plan_v1.md` |
 | `14) Implementation as vertical slices (v1, aligned to the feature list)` | partial | `crates/client/src/engine.rs`, `crates/client/src/runtime.rs`, `crates/distributed/src/worker.rs` | `crates/client/tests/embedded_parquet_scan.rs`, `crates/client/tests/distributed_runtime_roundtrip.rs` |

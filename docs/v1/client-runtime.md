@@ -147,3 +147,4 @@ Distributed mode:
 4. `crates/client/src/runtime.rs`
 5. `crates/distributed/src/grpc.rs`
 6. `crates/distributed/src/worker.rs`
+7. `crates/client/tests/distributed_runtime_roundtrip.rs` (distributed vs embedded parity for join+agg and join projection)

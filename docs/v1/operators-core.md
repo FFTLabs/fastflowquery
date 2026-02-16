@@ -161,6 +161,7 @@ Outputs:
 Constraints:
 1. Score expression must evaluate to `Float32` or `Float64`.
 2. Uses min-heap top-k selection (does not require global sort operator).
+3. Ties are expected to be deterministic under the v1 correctness contract (stable normalized comparison and snapshots).
 
 Failure modes:
 1. Score expression evaluates to unsupported type -> execution error.

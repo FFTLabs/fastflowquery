@@ -205,3 +205,15 @@ This walkthrough describes the execution shape used by v1 integration tests.
 
 1. `crates/client/tests/distributed_runtime_roundtrip.rs`
 2. `crates/distributed/src/coordinator.rs` (unit tests for scheduling and blacklisting)
+
+## Distributed vs Embedded Parity Coverage
+
+v1 correctness suite includes explicit parity checks where the same fixtures and SQL are run in distributed and embedded modes, then normalized outputs are compared.
+
+Covered shapes:
+1. Join + aggregate parity.
+2. Raw join projection parity (same logical rows after normalization).
+3. Vector-gated two-phase retrieval parity where enabled.
+
+Primary test:
+1. `crates/client/tests/distributed_runtime_roundtrip.rs`

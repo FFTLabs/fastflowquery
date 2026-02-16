@@ -117,7 +117,7 @@ Approach:
 
 1. Temp parquet tables generated in tests (`std::env::temp_dir()` + unique names).
 2. Small deterministic row sets for join/aggregate correctness checks.
-3. Vector embedding fixtures (`FixedSizeList<Float32>`) for cosine similarity ranking.
+3. Vector embedding fixtures (`FixedSizeList<Float32>`) for cosine/L2/dot ranking validation.
 
 ## Catalog and write fixtures
 
@@ -250,7 +250,7 @@ Primary test:
 
 1. Hash aggregate returns correct grouped results and handles spill path.
 2. Hash join returns correct rows for broadcast and shuffle/spill scenarios.
-3. Vector top-k returns ordered best matches for cosine similarity queries.
+3. Vector top-k returns deterministic ordered best matches for cosine similarity queries and for L2/dot operator-level ranking tests.
 
 Primary tests:
 
@@ -260,13 +260,15 @@ Primary tests:
 
 ## Shuffle and distributed runtime
 
-1. Distributed collect returns same join/agg result as embedded baseline.
+1. Distributed collect returns same join/agg and join-projection results as embedded baseline.
 2. Coordinator/worker loop executes task assignment, completion, and result retrieval.
 3. Two-worker execution stays deterministic on test fixtures.
 
 Primary test:
 
 1. `crates/client/tests/distributed_runtime_roundtrip.rs`
+2. `crates/client/tests/snapshots/join/*.snap`
+3. `crates/client/tests/snapshots/aggregate/*.snap`
 
 ## Writes and commit semantics
 
@@ -292,6 +294,7 @@ Primary tests:
 1. `crates/client/tests/qdrant_routing.rs`
 2. `crates/client/tests/embedded_two_phase_retrieval.rs`
 3. `crates/client/tests/distributed_runtime_roundtrip.rs` (vector-gated test)
+4. `crates/client/tests/embedded_vector_topk.rs` (cosine query-level plus L2/dot operator-level ranking + tie determinism)
 
 ## Observability
 
