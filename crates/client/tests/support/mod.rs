@@ -107,6 +107,30 @@ pub fn snapshot_text(batches: &[RecordBatch], sort_by: &[&str], float_tolerance:
     out
 }
 
+pub fn assert_or_bless_snapshot(rel_path_from_client_crate: &str, actual: &str) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel_path_from_client_crate);
+    if should_bless() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create snapshot parent");
+        }
+        std::fs::write(&path, actual).expect("write snapshot");
+        return;
+    }
+    let expected = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!(
+            "missing snapshot at {}. Run tests with BLESS=1.",
+            path.display()
+        )
+    });
+    if expected != actual {
+        panic!(
+            "snapshot mismatch at {}\n\n{}\n\nRun with BLESS=1 to accept changes.",
+            path.display(),
+            unified_diff(&expected, actual)
+        );
+    }
+}
+
 fn schema_text(schema: &Schema) -> String {
     schema
         .fields()
@@ -227,4 +251,30 @@ fn format_float(v: f64, tol: f64) -> String {
     }
     let quantized = (v / tol).round() * tol;
     format!("{quantized:.12}")
+}
+
+fn should_bless() -> bool {
+    matches!(std::env::var("BLESS").as_deref(), Ok("1"))
+        || matches!(std::env::var("UPDATE_SNAPSHOTS").as_deref(), Ok("1"))
+}
+
+fn unified_diff(expected: &str, actual: &str) -> String {
+    let exp: Vec<&str> = expected.lines().collect();
+    let act: Vec<&str> = actual.lines().collect();
+    let mut out = String::new();
+    out.push_str("--- expected\n+++ actual\n");
+    let max = exp.len().max(act.len());
+    for i in 0..max {
+        match (exp.get(i), act.get(i)) {
+            (Some(e), Some(a)) if e == a => out.push_str(&format!(" {:04} {e}\n", i + 1)),
+            (Some(e), Some(a)) => {
+                out.push_str(&format!("-{:04} {e}\n", i + 1));
+                out.push_str(&format!("+{:04} {a}\n", i + 1));
+            }
+            (Some(e), None) => out.push_str(&format!("-{:04} {e}\n", i + 1)),
+            (None, Some(a)) => out.push_str(&format!("+{:04} {a}\n", i + 1)),
+            (None, None) => {}
+        }
+    }
+    out
 }

@@ -1,0 +1,3 @@
+schema:k:Int64:false,x:Int64:false,k2:Int64:false,y:Int64:false
+rows:
+k=2|x=200|k2=2|y=8

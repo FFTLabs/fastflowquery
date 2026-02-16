@@ -9,6 +9,15 @@ use ffq_storage::TableDef;
 #[path = "support/mod.rs"]
 mod support;
 
+fn col_i64_values(batch: &arrow::record_batch::RecordBatch, col_idx: usize) -> Vec<i64> {
+    let arr = batch
+        .column(col_idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Int64 column");
+    (0..batch.num_rows()).map(|i| arr.value(i)).collect()
+}
+
 #[test]
 fn hash_join_shuffle_with_spill() {
     let left_path = support::unique_path("ffq_join_left", "parquet");
@@ -83,8 +92,19 @@ fn hash_join_shuffle_with_spill() {
     let batches = futures::executor::block_on(joined.collect()).expect("collect");
     let batches_again = futures::executor::block_on(joined.collect()).expect("collect again");
     support::assert_batches_deterministic(&batches, &batches_again, &["o_orderkey"], 1e-9);
+    let snapshot = support::snapshot_text(&batches, &["o_orderkey", "l_qty"], 1e-9);
+    support::assert_or_bless_snapshot(
+        "tests/snapshots/join/hash_join_shuffle_with_spill.snap",
+        &snapshot,
+    );
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 3);
+    let mut keys = batches
+        .iter()
+        .flat_map(|b| col_i64_values(b, 0))
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(keys, vec![2, 2, 4]);
 
     let _ = std::fs::remove_file(left_path);
     let _ = std::fs::remove_file(right_path);
@@ -175,8 +195,18 @@ fn hash_join_broadcast_strategy_and_result() {
     let batches = futures::executor::block_on(joined.collect()).expect("collect");
     let batches_again = futures::executor::block_on(joined.collect()).expect("collect again");
     support::assert_batches_deterministic(&batches, &batches_again, &["k"], 1e-9);
+    let snapshot = support::snapshot_text(&batches, &["k"], 1e-9);
+    support::assert_or_bless_snapshot(
+        "tests/snapshots/join/hash_join_broadcast_strategy_and_result.snap",
+        &snapshot,
+    );
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 1);
+    let keys = batches
+        .iter()
+        .flat_map(|b| col_i64_values(b, 0))
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec![2]);
 
     let _ = std::fs::remove_file(left_path);
     let _ = std::fs::remove_file(right_path);
