@@ -1,6 +1,7 @@
 use arrow::util::pretty::pretty_format_batches;
 use ffq_client::Engine;
 use ffq_common::EngineConfig;
+use ffq_storage::Catalog;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -14,11 +15,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let opts = parse_query_opts(&args)?;
-    if let Some(catalog) = &opts.catalog {
-        std::env::set_var("FFQ_CATALOG_PATH", catalog);
-    }
-
     let engine = Engine::new(EngineConfig::default())?;
+    if let Some(catalog_path) = &opts.catalog {
+        let catalog = Catalog::load(catalog_path)?;
+        for table in catalog.tables() {
+            let name = table.name.clone();
+            engine.register_table(name, table);
+        }
+    }
     let df = engine.sql(&opts.sql)?;
 
     if opts.plan_only {

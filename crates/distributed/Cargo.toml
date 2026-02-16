@@ -42,6 +42,7 @@ tokio-stream = { version = "0.1", optional = true }
 
 [build-dependencies]
 tonic-build = "0.12"
+prost-build = "0.13"
 protoc-bin-vendored = "3"
 
 [dev-dependencies]

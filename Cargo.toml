@@ -13,9 +13,9 @@ members = [
 default-members = ["crates/client"]
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
-version = "0.1.0"
+version = "1.0.0"
 repository = "https://example.invalid/ffq" # TODO
 
 [workspace.dependencies]

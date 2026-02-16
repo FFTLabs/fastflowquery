@@ -544,17 +544,9 @@ fn print_usage() {
     );
 }
 
-fn apply_normalization_env(opts: &CliOptions) {
-    env::set_var("TZ", env::var("TZ").unwrap_or_else(|_| "UTC".to_string()));
-    env::set_var(
-        "LC_ALL",
-        env::var("LC_ALL")
-            .or_else(|_| env::var("LANG"))
-            .unwrap_or_else(|_| "C".to_string()),
-    );
-    env::set_var("FFQ_BENCH_THREADS", opts.threads.to_string());
-    env::set_var("TOKIO_WORKER_THREADS", opts.threads.to_string());
-    env::set_var("RAYON_NUM_THREADS", opts.threads.to_string());
+fn apply_normalization_env(_opts: &CliOptions) {
+    // Environment normalization is handled by wrapper scripts in v1.
+    // This binary reads env defaults but does not mutate process env.
 }
 
 fn prepare_spill_dir(spill_dir: &Path) -> Result<()> {
@@ -1465,6 +1457,7 @@ fn now_millis() -> u128 {
 }
 
 fn feature_flags() -> Vec<String> {
+    #[allow(unused_mut)]
     let mut out = Vec::new();
     #[cfg(feature = "distributed")]
     {

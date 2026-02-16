@@ -699,7 +699,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "ffq-client"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -722,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "ffq-common"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "axum",
  "prometheus",
@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "ffq-distributed"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -746,6 +746,7 @@ dependencies = [
  "futures",
  "parquet",
  "prost",
+ "prost-build",
  "protoc-bin-vendored",
  "serde",
  "serde_json",
@@ -758,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "ffq-execution"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -771,7 +772,7 @@ dependencies = [
 
 [[package]]
 name = "ffq-planner"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arrow-schema",
  "ffq-common",
@@ -783,7 +784,7 @@ dependencies = [
 
 [[package]]
 name = "ffq-shuffle"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arrow",
  "ffq-common",
@@ -794,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "ffq-sql"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ffq-common",
  "sqlparser",
@@ -802,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "ffq-storage"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "arrow",
  "arrow-schema",

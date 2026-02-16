@@ -330,11 +330,9 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         }
     });
 
-    let prev = std::env::var("FFQ_COORDINATOR_ENDPOINT").ok();
-    std::env::set_var("FFQ_COORDINATOR_ENDPOINT", &endpoint);
-
     let mut cfg = EngineConfig::default();
     cfg.spill_dir = spill_dir.to_string_lossy().to_string();
+    cfg.coordinator_endpoint = Some(endpoint.clone());
     let dist_engine = Engine::new(cfg.clone()).expect("distributed engine");
     register_tables(&dist_engine, &lineitem_path, &orders_path);
     let sql_scan = support::integration_queries::scan_filter_project();
@@ -361,11 +359,7 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         .await
         .expect("dist join collect");
 
-    if let Some(v) = prev {
-        std::env::set_var("FFQ_COORDINATOR_ENDPOINT", v);
-    } else {
-        std::env::remove_var("FFQ_COORDINATOR_ENDPOINT");
-    }
+    cfg.coordinator_endpoint = None;
 
     let embedded_engine = Engine::new(cfg).expect("embedded engine");
     register_tables(&embedded_engine, &lineitem_path, &orders_path);
@@ -585,10 +579,9 @@ async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
         }
     });
 
-    let prev = std::env::var("FFQ_COORDINATOR_ENDPOINT").ok();
-    std::env::set_var("FFQ_COORDINATOR_ENDPOINT", &endpoint);
     let mut cfg = EngineConfig::default();
     cfg.spill_dir = spill_dir.to_string_lossy().to_string();
+    cfg.coordinator_endpoint = Some(endpoint.clone());
     let dist_engine = Engine::new(cfg.clone()).expect("distributed engine");
     register_two_phase_tables(&dist_engine, &docs_path);
 
@@ -604,11 +597,7 @@ async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
         .collect()
         .await
         .expect("dist collect");
-    if let Some(v) = prev {
-        std::env::set_var("FFQ_COORDINATOR_ENDPOINT", v);
-    } else {
-        std::env::remove_var("FFQ_COORDINATOR_ENDPOINT");
-    }
+    cfg.coordinator_endpoint = None;
 
     let embedded_engine = Engine::new(cfg).expect("embedded engine");
     register_two_phase_tables(&embedded_engine, &docs_path);

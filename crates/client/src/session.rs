@@ -31,7 +31,11 @@ impl Session {
         let runtime: Arc<dyn Runtime> = {
             #[cfg(feature = "distributed")]
             {
-                if let Ok(endpoint) = std::env::var("FFQ_COORDINATOR_ENDPOINT") {
+                let endpoint = config
+                    .coordinator_endpoint
+                    .clone()
+                    .or_else(|| std::env::var("FFQ_COORDINATOR_ENDPOINT").ok());
+                if let Some(endpoint) = endpoint {
                     Arc::new(DistributedRuntime::new(endpoint))
                 } else {
                     Arc::new(EmbeddedRuntime::new())
@@ -42,8 +46,11 @@ impl Session {
                 Arc::new(EmbeddedRuntime::new())
             }
         };
-        let catalog_path =
-            env::var("FFQ_CATALOG_PATH").unwrap_or_else(|_| "./ffq_tables/tables.json".to_string());
+        let catalog_path = config
+            .catalog_path
+            .clone()
+            .or_else(|| env::var("FFQ_CATALOG_PATH").ok())
+            .unwrap_or_else(|| "./ffq_tables/tables.json".to_string());
         let catalog = if Path::new(&catalog_path).exists() {
             Catalog::load(&catalog_path)?
         } else {

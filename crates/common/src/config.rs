@@ -9,6 +9,8 @@ pub struct EngineConfig {
     pub broadcast_threshold_bytes: u64,
 
     pub spill_dir: String,
+    pub catalog_path: Option<String>,
+    pub coordinator_endpoint: Option<String>,
 }
 
 impl Default for EngineConfig {
@@ -19,6 +21,8 @@ impl Default for EngineConfig {
             shuffle_partitions: 64,
             broadcast_threshold_bytes: 64 * 1024 * 1024, // 64MB
             spill_dir: "./ffq_spill".to_string(),
+            catalog_path: None,
+            coordinator_endpoint: None,
         }
     }
 }

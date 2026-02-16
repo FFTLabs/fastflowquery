@@ -85,19 +85,16 @@ async fn distributed_integration_runner_returns_expected_join_agg_results() {
         "FFQ_COORDINATOR_ENDPOINT must include scheme (http://...)"
     );
 
-    let prev_catalog = env::var("FFQ_CATALOG_PATH").ok();
-    let prev_endpoint = env::var("FFQ_COORDINATOR_ENDPOINT").ok();
     let tmp_dir = integration_tmp_dir();
     std::fs::create_dir_all(&tmp_dir).expect("create integration tmp dir");
     let catalog_path = tmp_dir.join("catalog.json");
     let _ = std::fs::remove_file(&catalog_path);
-    env::set_var(
-        "FFQ_CATALOG_PATH",
-        catalog_path.to_string_lossy().to_string(),
-    );
+    let mut dist_cfg = EngineConfig::default();
+    dist_cfg.catalog_path = Some(catalog_path.to_string_lossy().to_string());
+    dist_cfg.coordinator_endpoint = Some(endpoint.clone());
 
     let fixtures = support::ensure_integration_parquet_fixtures();
-    let engine = Engine::new(EngineConfig::default()).expect("distributed engine");
+    let engine = Engine::new(dist_cfg).expect("distributed engine");
     support::register_parquet_table(
         &engine,
         "lineitem",
@@ -149,8 +146,9 @@ async fn distributed_integration_runner_returns_expected_join_agg_results() {
     );
 
     // Parity checks: execute the same shared suite in embedded mode and compare normalized outputs.
-    env::remove_var("FFQ_COORDINATOR_ENDPOINT");
-    let embedded_engine = Engine::new(EngineConfig::default()).expect("embedded engine");
+    let mut embedded_cfg = EngineConfig::default();
+    embedded_cfg.catalog_path = Some(catalog_path.to_string_lossy().to_string());
+    let embedded_engine = Engine::new(embedded_cfg).expect("embedded engine");
     support::register_parquet_table(
         &embedded_engine,
         "lineitem",
@@ -195,15 +193,5 @@ async fn distributed_integration_runner_returns_expected_join_agg_results() {
         );
     }
 
-    if let Some(prev) = prev_catalog {
-        env::set_var("FFQ_CATALOG_PATH", prev);
-    } else {
-        env::remove_var("FFQ_CATALOG_PATH");
-    }
-    if let Some(prev) = prev_endpoint {
-        env::set_var("FFQ_COORDINATOR_ENDPOINT", prev);
-    } else {
-        env::remove_var("FFQ_COORDINATOR_ENDPOINT");
-    }
     let _ = std::fs::remove_file(catalog_path);
 }

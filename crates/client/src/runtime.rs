@@ -2122,10 +2122,14 @@ fn decode_record_batches_ipc(payload: &[u8]) -> Result<(SchemaRef, Vec<RecordBat
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "vector")]
     use std::sync::Arc;
 
+    #[cfg(feature = "vector")]
     use arrow::array::{FixedSizeListBuilder, Float32Array, Float32Builder, Int64Array};
+    #[cfg(feature = "vector")]
     use arrow::record_batch::RecordBatch;
+    #[cfg(feature = "vector")]
     use arrow_schema::{DataType, Field, Schema};
     use ffq_planner::VectorTopKExec;
     #[cfg(feature = "vector")]
@@ -2133,9 +2137,9 @@ mod tests {
     use ffq_storage::vector_index::{VectorIndexProvider, VectorTopKRow};
     use futures::future::BoxFuture;
 
-    use super::{
-        rows_to_vector_topk_output, run_topk_by_score, run_vector_topk_with_provider, ExecOutput,
-    };
+    use super::{rows_to_vector_topk_output, run_vector_topk_with_provider};
+    #[cfg(feature = "vector")]
+    use super::{run_topk_by_score, ExecOutput};
 
     struct MockVectorProvider;
 

@@ -9,35 +9,21 @@ use ffq_storage::Catalog;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-struct EnvGuard {
-    prev_catalog: Option<String>,
-    prev_endpoint: Option<String>,
+struct CwdGuard {
     prev_cwd: PathBuf,
 }
 
-impl EnvGuard {
+impl CwdGuard {
     fn capture() -> Self {
         Self {
-            prev_catalog: env::var("FFQ_CATALOG_PATH").ok(),
-            prev_endpoint: env::var("FFQ_COORDINATOR_ENDPOINT").ok(),
             prev_cwd: env::current_dir().expect("current dir"),
         }
     }
 }
 
-impl Drop for EnvGuard {
+impl Drop for CwdGuard {
     fn drop(&mut self) {
         let _ = env::set_current_dir(&self.prev_cwd);
-        if let Some(value) = &self.prev_catalog {
-            env::set_var("FFQ_CATALOG_PATH", value);
-        } else {
-            env::remove_var("FFQ_CATALOG_PATH");
-        }
-        if let Some(value) = &self.prev_endpoint {
-            env::set_var("FFQ_COORDINATOR_ENDPOINT", value);
-        } else {
-            env::remove_var("FFQ_COORDINATOR_ENDPOINT");
-        }
     }
 }
 
@@ -73,14 +59,13 @@ fn run_catalog_profile_query_checks(profile_path: &Path) {
         );
         return;
     }
-    let _env_guard = EnvGuard::capture();
+    let _cwd_guard = CwdGuard::capture();
 
     let root = repo_root();
     env::set_current_dir(&root).expect("set current dir");
-    env::set_var("FFQ_CATALOG_PATH", profile_path.to_string_lossy().to_string());
-    env::remove_var("FFQ_COORDINATOR_ENDPOINT");
-
-    let engine = Engine::new(EngineConfig::default()).expect("engine");
+    let mut cfg = EngineConfig::default();
+    cfg.catalog_path = Some(profile_path.to_string_lossy().to_string());
+    let engine = Engine::new(cfg).expect("engine");
     let q1_batches = futures::executor::block_on(engine.sql(&q1_sql()).expect("q1 sql").collect())
         .expect("q1 collect");
     let q3_batches = futures::executor::block_on(engine.sql(&q3_sql()).expect("q3 sql").collect())
