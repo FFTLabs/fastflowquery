@@ -43,18 +43,21 @@ Read these in sequence:
 
 1. `docs/learn/01-query-lifecycle.md`
 2. `docs/learn/02-optimizer-internals.md`
-3. `docs/v1/quickstart.md`
-4. `docs/v1/architecture.md`
-5. `docs/v1/client-runtime.md`
-6. `docs/v1/operators-core.md`
-7. `docs/v1/storage-catalog.md`
-8. `docs/v1/shuffle-stage-model.md`
-9. `docs/v1/distributed-runtime.md`
-10. `docs/v1/vector-rag.md`
-11. `docs/v1/writes-dml.md`
-12. `docs/v1/observability.md`
-13. `docs/v1/testing.md`
-14. `docs/v1/benchmarks.md`
+3. `docs/learn/03-physical-planning.md`
+4. `docs/learn/04-execution-engine.md`
+5. `docs/learn/05-distributed-stages-shuffle.md`
+6. `docs/v1/quickstart.md`
+7. `docs/v1/architecture.md`
+8. `docs/v1/client-runtime.md`
+9. `docs/v1/operators-core.md`
+10. `docs/v1/storage-catalog.md`
+11. `docs/v1/shuffle-stage-model.md`
+12. `docs/v1/distributed-runtime.md`
+13. `docs/v1/vector-rag.md`
+14. `docs/v1/writes-dml.md`
+15. `docs/v1/observability.md`
+16. `docs/v1/testing.md`
+17. `docs/v1/benchmarks.md`
 
 ## What You Will Understand At The End
 
@@ -76,7 +79,9 @@ The learner track expands next into dedicated chapters:
 
 1. `docs/learn/01-query-lifecycle.md` (query lifecycle and plan lowering internals).
 2. `docs/learn/02-optimizer-internals.md` (optimizer rule-by-rule walkthrough).
-3. Distributed control plane and RPC sequences.
-4. Shuffle and stage execution correctness.
-5. Result correctness and determinism model.
-6. Benchmark interpretation (synthetic vs official).
+3. `docs/learn/03-physical-planning.md` (logical->physical mapping and operator contracts).
+4. `docs/learn/04-execution-engine.md` (streaming, memory budget, spill, determinism internals).
+5. `docs/learn/05-distributed-stages-shuffle.md` (stage cuts, shuffle paths, attempts, and TTL cleanup).
+6. Distributed control plane and RPC sequences.
+7. Result correctness and determinism model.
+8. Benchmark interpretation (synthetic vs official).
