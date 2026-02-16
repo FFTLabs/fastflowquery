@@ -17,7 +17,8 @@
 	test-13.2-distributed \
 	test-13.2-parity \
 	bench-13.3-embedded \
-	bench-13.3-distributed
+	bench-13.3-distributed \
+	compare-13.3
 
 clean:
 	cargo clean
@@ -89,3 +90,8 @@ bench-13.3-embedded:
 
 bench-13.3-distributed:
 	FFQ_BENCH_MODE=distributed ./scripts/run-bench-13.3.sh
+
+compare-13.3:
+	@test -n "$$BASELINE" || (echo "BASELINE is required (json file or dir)" && exit 1)
+	@test -n "$$CANDIDATE" || (echo "CANDIDATE is required (json file or dir)" && exit 1)
+	./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}"

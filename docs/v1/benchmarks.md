@@ -188,6 +188,18 @@ Comparator output contract:
 
 1. Print failing tuples with baseline/candidate values.
 2. Exit code `0` on pass, non-zero on fail.
+3. Script: `scripts/compare-bench-13.3.py`.
+
+Example:
+
+```bash
+./scripts/compare-bench-13.3.py \
+  --baseline tests/bench/results/baseline.json \
+  --candidate tests/bench/results/current.json \
+  --threshold 0.10
+```
+
+The comparator prints offending tuple/metric details (for example elapsed regression percentage) and exits non-zero on failure.
 
 ## Reproducibility Rules
 
