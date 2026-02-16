@@ -64,6 +64,7 @@ The pages below define the v1 implementation contract and operational behavior.
 | Observability and profiling | `docs/v1/observability.md` |
 | Testing and validation playbook | `docs/v1/testing.md` |
 | Integration runbook (13.2) | `docs/v1/integration-13.2.md` |
+| Benchmark contract (13.3) | `docs/v1/benchmarks.md` |
 | Known gaps and next steps | `docs/v1/known-gaps.md` |
 
 ## Scope Governance
