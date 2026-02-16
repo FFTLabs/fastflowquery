@@ -380,3 +380,9 @@ When optimizer cannot prove safety, it keeps the existing subtree (fallback).
 2. `crates/planner/src/explain.rs`
 3. `crates/planner/tests/optimizer_golden.rs`
 4. `crates/planner/src/physical_planner.rs`
+
+## Runnable command
+
+```bash
+cargo test -p ffq-planner --test optimizer_golden
+```

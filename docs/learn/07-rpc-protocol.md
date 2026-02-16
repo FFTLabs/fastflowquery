@@ -218,3 +218,9 @@ Fault-tolerance assumptions:
 1. clients/workers retry RPCs at call-site or next poll loop.
 2. coordinator in-memory state is authoritative for active query lifecycle.
 3. attempt-based keys prevent stale output confusion when retries occur.
+
+## Runnable command
+
+```bash
+cargo test -p ffq-client --test distributed_runtime_roundtrip --features distributed
+```

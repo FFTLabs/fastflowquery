@@ -169,3 +169,9 @@ FFQ distributed correctness is based on:
 2. same operator contracts,
 3. transport/scheduling layers that preserve key-partition correctness,
 4. parity tests that compare normalized logical outputs rather than unstable physical ordering.
+
+## Runnable command
+
+```bash
+make test-13.2-parity
+```

@@ -192,3 +192,9 @@ With `profiling`:
 4. `crates/client/src/runtime.rs`
 5. `crates/distributed/src/worker.rs`
 6. `crates/client/src/engine.rs`
+
+## Runnable command
+
+```bash
+cargo test -p ffq-common --features profiling metrics_handler_returns_prometheus_text
+```

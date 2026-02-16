@@ -181,3 +181,9 @@ Think of distributed shuffle as:
 4. retries create new attempt directories; stale attempts are ignored and later TTL-cleaned
 
 For a stricter reference contract, see `docs/v1/shuffle-stage-model.md`.
+
+## Runnable command
+
+```bash
+cargo test -p ffq-shuffle
+```

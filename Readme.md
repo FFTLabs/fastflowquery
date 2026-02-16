@@ -14,6 +14,10 @@ For a practical step-by-step v1 run guide (embedded, distributed, synthetic and 
 
 1. `docs/v1/quickstart.md`
 
+For a concept-first deep guide (architecture, optimizer, distributed control plane, labs, glossary, FAQ):
+
+1. `docs/learn/README.md`
+
 ## Environment
 
 - Copy `.env.example` to `.env` for local overrides.

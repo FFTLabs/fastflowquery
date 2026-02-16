@@ -151,3 +151,9 @@ When you expect index routing but see brute-force:
 5. Run explain and verify rewrite marker.
 
 If any item fails, fallback is expected behavior in v1.
+
+## Runnable command
+
+```bash
+cargo test -p ffq-client --test embedded_vector_topk --features vector
+```

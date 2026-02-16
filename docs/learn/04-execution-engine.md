@@ -231,3 +231,9 @@ For control-plane and stage execution details, see:
 
 1. `docs/v1/distributed-runtime.md`
 2. `docs/v1/shuffle-stage-model.md`
+
+## Runnable command
+
+```bash
+cargo test -p ffq-client --test embedded_hash_join
+```

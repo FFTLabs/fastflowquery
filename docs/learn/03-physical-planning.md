@@ -325,3 +325,9 @@ When a query misbehaves, inspect in this order:
 3. whether stage boundaries (`ShuffleRead`) are where expected
 4. operator input schema and output schema contract at failing node
 5. runtime mode differences (embedded vs distributed transport)
+
+## Runnable command
+
+```bash
+cargo test -p ffq-planner --test physical_plan_serde
+```

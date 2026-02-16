@@ -171,3 +171,9 @@ Retry case:
 7. `crates/client/src/dataframe.rs`
 8. `crates/storage/src/catalog.rs`
 9. `docs/v1/writes-dml.md`
+
+## Runnable command
+
+```bash
+cargo test -p ffq-client --test dataframe_write_api
+```

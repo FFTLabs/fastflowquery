@@ -68,6 +68,12 @@ The pages below define the v1 implementation contract and operational behavior.
 | Benchmark contract (13.3) | `docs/v1/benchmarks.md` |
 | Known gaps and next steps | `docs/v1/known-gaps.md` |
 
+## Learner Track
+
+For concept-first onboarding and hands-on labs, see:
+
+1. `docs/learn/README.md`
+
 ## Scope Governance
 
 1. Any behavior marked out of scope on this page is not a v1 correctness requirement.

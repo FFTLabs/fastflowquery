@@ -225,3 +225,9 @@ Relevant files:
 2. `crates/distributed/src/worker.rs`
 3. `crates/distributed/src/grpc.rs`
 4. `docs/v1/observability.md`
+
+## Runnable command
+
+```bash
+cargo test -p ffq-client --test distributed_runtime_roundtrip --features distributed
+```
