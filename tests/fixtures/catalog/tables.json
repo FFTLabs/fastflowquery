@@ -3,17 +3,108 @@
     {
       "name": "lineitem",
       "uri": "/data/parquet/lineitem.parquet",
-      "format": "parquet"
+      "format": "parquet",
+      "schema": {
+        "fields": [
+          {
+            "name": "l_orderkey",
+            "data_type": "Int64",
+            "nullable": false,
+            "dict_id": 0,
+            "dict_is_ordered": false,
+            "metadata": {}
+          },
+          {
+            "name": "l_partkey",
+            "data_type": "Int64",
+            "nullable": false,
+            "dict_id": 0,
+            "dict_is_ordered": false,
+            "metadata": {}
+          }
+        ],
+        "metadata": {}
+      }
     },
     {
       "name": "orders",
       "uri": "/data/parquet/orders.parquet",
-      "format": "parquet"
+      "format": "parquet",
+      "schema": {
+        "fields": [
+          {
+            "name": "o_orderkey",
+            "data_type": "Int64",
+            "nullable": false,
+            "dict_id": 0,
+            "dict_is_ordered": false,
+            "metadata": {}
+          },
+          {
+            "name": "o_custkey",
+            "data_type": "Int64",
+            "nullable": false,
+            "dict_id": 0,
+            "dict_is_ordered": false,
+            "metadata": {}
+          }
+        ],
+        "metadata": {}
+      }
     },
     {
       "name": "docs",
       "uri": "/data/parquet/docs.parquet",
       "format": "parquet",
+      "schema": {
+        "fields": [
+          {
+            "name": "id",
+            "data_type": "Int64",
+            "nullable": false,
+            "dict_id": 0,
+            "dict_is_ordered": false,
+            "metadata": {}
+          },
+          {
+            "name": "title",
+            "data_type": "Utf8",
+            "nullable": false,
+            "dict_id": 0,
+            "dict_is_ordered": false,
+            "metadata": {}
+          },
+          {
+            "name": "lang",
+            "data_type": "Utf8",
+            "nullable": false,
+            "dict_id": 0,
+            "dict_is_ordered": false,
+            "metadata": {}
+          },
+          {
+            "name": "emb",
+            "data_type": {
+              "FixedSizeList": [
+                {
+                  "name": "item",
+                  "data_type": "Float32",
+                  "nullable": true,
+                  "dict_id": 0,
+                  "dict_is_ordered": false,
+                  "metadata": {}
+                },
+                3
+              ]
+            },
+            "nullable": true,
+            "dict_id": 0,
+            "dict_is_ordered": false,
+            "metadata": {}
+          }
+        ],
+        "metadata": {}
+      },
       "options": {
         "vector.index_table": "docs_idx",
         "vector.id_column": "id",

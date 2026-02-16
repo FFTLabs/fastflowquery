@@ -58,9 +58,9 @@ fn collect_join_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64)> {
     out
 }
 
-#[test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires external coordinator + worker cluster; run with scripts/run-distributed-integration.sh"]
-fn distributed_integration_runner_returns_expected_join_agg_results() {
+async fn distributed_integration_runner_returns_expected_join_agg_results() {
     let endpoint = env::var("FFQ_COORDINATOR_ENDPOINT").expect(
         "FFQ_COORDINATOR_ENDPOINT must be set (example: http://127.0.0.1:50051). Start docker compose stack first.",
     );
@@ -96,20 +96,18 @@ fn distributed_integration_runner_returns_expected_join_agg_results() {
         TableStats::default(),
     );
 
-    let agg_batches = futures::executor::block_on(
-        engine
-            .sql(support::integration_queries::join_aggregate())
-            .expect("agg sql")
-            .collect(),
-    )
-    .expect("agg collect");
-    let join_batches = futures::executor::block_on(
-        engine
-            .sql(support::integration_queries::join_projection())
-            .expect("join sql")
-            .collect(),
-    )
-    .expect("join collect");
+    let agg_batches = engine
+        .sql(support::integration_queries::join_aggregate())
+        .expect("agg sql")
+        .collect()
+        .await
+        .expect("agg collect");
+    let join_batches = engine
+        .sql(support::integration_queries::join_projection())
+        .expect("join sql")
+        .collect()
+        .await
+        .expect("join collect");
 
     let agg_rows: usize = agg_batches.iter().map(|b| b.num_rows()).sum();
     let join_rows: usize = join_batches.iter().map(|b| b.num_rows()).sum();
