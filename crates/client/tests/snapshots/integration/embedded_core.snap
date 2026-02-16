@@ -1,0 +1,24 @@
+## scan_filter_project
+schema:l_orderkey:Int64:true,l_partkey:Int64:true
+rows:
+l_orderkey=1|l_partkey=10
+l_orderkey=2|l_partkey=20
+l_orderkey=2|l_partkey=21
+l_orderkey=3|l_partkey=30
+l_orderkey=3|l_partkey=31
+l_orderkey=3|l_partkey=32
+
+## join_projection
+schema:l_orderkey:Int64:true,l_partkey:Int64:true,o_custkey:Int64:true
+rows:
+l_orderkey=2|l_partkey=20|o_custkey=100
+l_orderkey=2|l_partkey=21|o_custkey=100
+l_orderkey=3|l_partkey=30|o_custkey=200
+l_orderkey=3|l_partkey=31|o_custkey=200
+l_orderkey=3|l_partkey=32|o_custkey=200
+
+## join_aggregate
+schema:l_orderkey:Int64:true,c:Int64:true
+rows:
+l_orderkey=2|c=2
+l_orderkey=3|c=3
