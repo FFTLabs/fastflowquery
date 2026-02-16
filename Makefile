@@ -13,7 +13,9 @@
 	test-13.1-distributed \
 	test-13.1 \
 	bless-13.1-snapshots \
-	test-13.2-distributed
+	test-13.2-embedded \
+	test-13.2-distributed \
+	test-13.2-parity
 
 clean:
 	cargo clean
@@ -68,3 +70,14 @@ bless-13.1-snapshots:
 
 test-13.2-distributed:
 	./scripts/run-distributed-integration.sh
+
+test-13.2-embedded:
+	cargo test -p ffq-client --test integration_parquet_fixtures
+	cargo test -p ffq-client --test integration_embedded
+
+test-13.2-parity:
+	@set -euo pipefail; \
+	docker compose -f docker/compose/ffq.yml up --build -d; \
+	trap 'docker compose -f docker/compose/ffq.yml down -v' EXIT; \
+	$(MAKE) test-13.2-embedded; \
+	$(MAKE) test-13.2-distributed

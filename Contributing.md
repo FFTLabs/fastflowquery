@@ -53,5 +53,13 @@ Notes:
 - script uses deterministic temp path `target/tmp/integration_distributed` and cleans it automatically
   (set `FFQ_KEEP_INTEGRATION_TMP=1` to keep artifacts).
 
+One-command 13.2 commands:
+
+```bash
+make test-13.2-embedded
+make test-13.2-distributed
+make test-13.2-parity
+```
+
 ## License of contributions
 By submitting a contribution, you agree that it will be licensed under the project’s license (Apache License 2.0), unless you explicitly state otherwise.
