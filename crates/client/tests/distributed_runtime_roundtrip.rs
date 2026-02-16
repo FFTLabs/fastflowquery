@@ -11,7 +11,6 @@ use arrow::array::Int64Array;
 use arrow::array::{FixedSizeListBuilder, Float32Builder, StringArray};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
-use ffq_client::expr::col;
 use ffq_client::Engine;
 use ffq_common::EngineConfig;
 use ffq_distributed::grpc::{
@@ -20,13 +19,14 @@ use ffq_distributed::grpc::{
 use ffq_distributed::{
     Coordinator, CoordinatorConfig, DefaultTaskExecutor, GrpcControlPlane, Worker, WorkerConfig,
 };
-use ffq_planner::AggExpr;
 #[cfg(feature = "vector")]
 use ffq_planner::LiteralValue;
 use ffq_storage::{TableDef, TableStats};
 use parquet::arrow::ArrowWriter;
 use tokio::sync::Mutex;
 use tonic::transport::Server;
+#[path = "support/mod.rs"]
+mod support;
 
 static DIST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -105,6 +105,32 @@ fn collect_group_counts(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
             .expect("c");
         for i in 0..batch.num_rows() {
             out.push((k.value(i), c.value(i)));
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+fn collect_join_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64)> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let k = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("l_orderkey");
+        let part = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("l_partkey");
+        let cust = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("o_custkey");
+        for i in 0..batch.num_rows() {
+            out.push((k.value(i), part.value(i), cust.value(i)));
         }
     }
     out.sort_unstable();
@@ -333,13 +359,22 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     cfg.spill_dir = spill_dir.to_string_lossy().to_string();
     let dist_engine = Engine::new(cfg.clone()).expect("distributed engine");
     register_tables(&dist_engine, &lineitem_path, &orders_path);
-    let sql = "SELECT l_orderkey, COUNT(l_partkey) AS c FROM lineitem INNER JOIN orders ON l_orderkey = o_orderkey GROUP BY l_orderkey";
-    let dist_batches = dist_engine
-        .sql(sql)
+    let sql_agg =
+        "SELECT l_orderkey, COUNT(l_partkey) AS c FROM lineitem INNER JOIN orders ON l_orderkey = o_orderkey GROUP BY l_orderkey";
+    let sql_join = "SELECT l_orderkey, l_partkey, o_custkey FROM lineitem INNER JOIN orders ON l_orderkey = o_orderkey";
+
+    let dist_agg_batches = dist_engine
+        .sql(sql_agg)
         .expect("dist sql")
         .collect()
         .await
-        .expect("dist collect");
+        .expect("dist agg collect");
+    let dist_join_batches = dist_engine
+        .sql(sql_join)
+        .expect("dist sql")
+        .collect()
+        .await
+        .expect("dist join collect");
 
     if let Some(v) = prev {
         std::env::set_var("FFQ_COORDINATOR_ENDPOINT", v);
@@ -349,24 +384,51 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
 
     let embedded_engine = Engine::new(cfg).expect("embedded engine");
     register_tables(&embedded_engine, &lineitem_path, &orders_path);
-    let embedded_batches = embedded_engine
-        .table("lineitem")
-        .expect("lineitem")
-        .join(
-            embedded_engine.table("orders").expect("orders"),
-            vec![("l_orderkey".to_string(), "o_orderkey".to_string())],
-        )
-        .expect("join")
-        .groupby(vec![col("l_orderkey")])
-        .agg(vec![(AggExpr::Count(col("l_partkey")), "c".to_string())])
+    let embedded_agg_batches = embedded_engine
+        .sql(sql_agg)
+        .expect("embedded agg sql")
         .collect()
         .await
-        .expect("embedded collect");
+        .expect("embedded agg collect");
+    let embedded_join_batches = embedded_engine
+        .sql(sql_join)
+        .expect("embedded join sql")
+        .collect()
+        .await
+        .expect("embedded join collect");
 
-    let dist = collect_group_counts(&dist_batches);
-    let emb = collect_group_counts(&embedded_batches);
-    assert_eq!(dist, emb);
-    assert_eq!(dist, vec![(2, 2), (3, 3)]);
+    let dist_agg_norm = support::snapshot_text(&dist_agg_batches, &["l_orderkey"], 1e-9);
+    let emb_agg_norm = support::snapshot_text(&embedded_agg_batches, &["l_orderkey"], 1e-9);
+    assert_eq!(
+        dist_agg_norm, emb_agg_norm,
+        "distributed and embedded aggregate outputs differ"
+    );
+
+    let dist_join_norm = support::snapshot_text(
+        &dist_join_batches,
+        &["l_orderkey", "l_partkey", "o_custkey"],
+        1e-9,
+    );
+    let emb_join_norm = support::snapshot_text(
+        &embedded_join_batches,
+        &["l_orderkey", "l_partkey", "o_custkey"],
+        1e-9,
+    );
+    assert_eq!(
+        dist_join_norm, emb_join_norm,
+        "distributed and embedded join outputs differ"
+    );
+
+    let dist_agg = collect_group_counts(&dist_agg_batches);
+    let emb_agg = collect_group_counts(&embedded_agg_batches);
+    assert_eq!(dist_agg, emb_agg);
+    assert_eq!(dist_agg, vec![(2, 2), (3, 3)]);
+
+    let expected_join = vec![(2, 20, 100), (2, 21, 100), (3, 30, 200), (3, 31, 200), (3, 32, 200)];
+    let dist_join = collect_join_rows(&dist_join_batches);
+    let emb_join = collect_join_rows(&embedded_join_batches);
+    assert_eq!(dist_join, emb_join);
+    assert_eq!(dist_join, expected_join);
 
     stop.store(true, Ordering::Relaxed);
     w1.abort();
