@@ -1,0 +1,13 @@
+# optimizer-golden: filter_merge_negative_single_filter
+
+## before
+Filter (id) Gt (Int64(10))
+  TableScan table=t
+    projection=None
+    pushed_filters=0
+
+## after
+TableScan table=t
+  projection=Some(["id"])
+  pushed_filters=1
+    (id) Gt (Int64(10))

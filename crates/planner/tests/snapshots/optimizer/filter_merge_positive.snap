@@ -1,4 +1,4 @@
-# optimizer-golden: filter_merge_and_projection_pushdown
+# optimizer-golden: filter_merge_positive
 
 ## before
 Projection

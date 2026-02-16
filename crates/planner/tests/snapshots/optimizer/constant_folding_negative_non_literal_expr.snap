@@ -1,0 +1,13 @@
+# optimizer-golden: constant_folding_negative_non_literal_expr
+
+## before
+Filter ((id) Plus (Int64(1))) Gt (Int64(5))
+  TableScan table=t
+    projection=None
+    pushed_filters=0
+
+## after
+TableScan table=t
+  projection=Some(["id"])
+  pushed_filters=1
+    ((id) Plus (Int64(1))) Gt (Int64(5))

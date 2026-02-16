@@ -145,7 +145,12 @@ fn test_ctx() -> TestCtx {
         Field::new("v", DataType::Int64, false),
     ]);
     let big_schema = Schema::new(vec![Field::new("k2", DataType::Int64, false)]);
+    let big2_schema = Schema::new(vec![Field::new("k3", DataType::Int64, false)]);
     let small_schema = Schema::new(vec![Field::new("k", DataType::Int64, false)]);
+    let agg_schema = Schema::new(vec![
+        Field::new("g", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, false),
+    ]);
     TestCtx::default()
         .with_table(
             "t",
@@ -162,16 +167,71 @@ fn test_ctx() -> TestCtx {
             HashMap::new(),
         )
         .with_table(
+            "big2",
+            big2_schema,
+            (Some(12_000_000), Some(2_500_000)),
+            "parquet",
+            HashMap::new(),
+        )
+        .with_table(
             "small",
             small_schema,
             (Some(100), Some(2)),
             "parquet",
             HashMap::new(),
         )
+        .with_table(
+            "agg_src",
+            agg_schema,
+            (Some(2_048), Some(200)),
+            "parquet",
+            HashMap::new(),
+        )
 }
 
 #[test]
-fn golden_filter_merge_and_projection_pushdown() {
+fn golden_constant_folding_positive() {
+    let plan = LogicalPlan::Filter {
+        predicate: Expr::And(
+            Box::new(Expr::Literal(ffq_planner::LiteralValue::Boolean(true))),
+            Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Literal(ffq_planner::LiteralValue::Int64(1))),
+                op: BinaryOp::Lt,
+                right: Box::new(Expr::Literal(ffq_planner::LiteralValue::Int64(2))),
+            }),
+        ),
+        input: Box::new(LogicalPlan::TableScan {
+            table: "t".to_string(),
+            projection: None,
+            filters: vec![],
+        }),
+    };
+    optimizer_snapshot("constant_folding_positive", plan, &test_ctx());
+}
+
+#[test]
+fn golden_constant_folding_negative_non_literal_expr() {
+    let plan = LogicalPlan::Filter {
+        predicate: Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Column("id".to_string())),
+                op: BinaryOp::Plus,
+                right: Box::new(Expr::Literal(ffq_planner::LiteralValue::Int64(1))),
+            }),
+            op: BinaryOp::Gt,
+            right: Box::new(Expr::Literal(ffq_planner::LiteralValue::Int64(5))),
+        },
+        input: Box::new(LogicalPlan::TableScan {
+            table: "t".to_string(),
+            projection: None,
+            filters: vec![],
+        }),
+    };
+    optimizer_snapshot("constant_folding_negative_non_literal_expr", plan, &test_ctx());
+}
+
+#[test]
+fn golden_filter_merge_positive() {
     let plan = LogicalPlan::Projection {
         exprs: vec![(Expr::Column("id".to_string()), "id".to_string())],
         input: Box::new(LogicalPlan::Filter {
@@ -194,7 +254,102 @@ fn golden_filter_merge_and_projection_pushdown() {
             }),
         }),
     };
-    optimizer_snapshot("filter_merge_and_projection_pushdown", plan, &test_ctx());
+    optimizer_snapshot("filter_merge_positive", plan, &test_ctx());
+}
+
+#[test]
+fn golden_filter_merge_negative_single_filter() {
+    let plan = LogicalPlan::Filter {
+        predicate: Expr::BinaryOp {
+            left: Box::new(Expr::Column("id".to_string())),
+            op: BinaryOp::Gt,
+            right: Box::new(Expr::Literal(ffq_planner::LiteralValue::Int64(10))),
+        },
+        input: Box::new(LogicalPlan::TableScan {
+            table: "t".to_string(),
+            projection: None,
+            filters: vec![],
+        }),
+    };
+    optimizer_snapshot("filter_merge_negative_single_filter", plan, &test_ctx());
+}
+
+#[test]
+fn golden_projection_pushdown_positive() {
+    let plan = LogicalPlan::Projection {
+        exprs: vec![(Expr::Column("id".to_string()), "id".to_string())],
+        input: Box::new(LogicalPlan::TableScan {
+            table: "t".to_string(),
+            projection: None,
+            filters: vec![],
+        }),
+    };
+    optimizer_snapshot("projection_pushdown_positive", plan, &test_ctx());
+}
+
+#[test]
+fn golden_projection_pushdown_negative_over_aggregate() {
+    let plan = LogicalPlan::Projection {
+        exprs: vec![(Expr::Column("g".to_string()), "g".to_string())],
+        input: Box::new(LogicalPlan::Aggregate {
+            group_exprs: vec![Expr::Column("g".to_string())],
+            aggr_exprs: vec![(
+                ffq_planner::AggExpr::Sum(Expr::Column("v".to_string())),
+                "sum_v".to_string(),
+            )],
+            input: Box::new(LogicalPlan::TableScan {
+                table: "agg_src".to_string(),
+                projection: None,
+                filters: vec![],
+            }),
+        }),
+    };
+    optimizer_snapshot("projection_pushdown_negative_over_aggregate", plan, &test_ctx());
+}
+
+#[test]
+fn golden_predicate_pushdown_positive() {
+    let plan = LogicalPlan::Filter {
+        predicate: Expr::BinaryOp {
+            left: Box::new(Expr::Column("id".to_string())),
+            op: BinaryOp::Gt,
+            right: Box::new(Expr::Literal(ffq_planner::LiteralValue::Int64(1))),
+        },
+        input: Box::new(LogicalPlan::TableScan {
+            table: "t".to_string(),
+            projection: None,
+            filters: vec![],
+        }),
+    };
+    optimizer_snapshot("predicate_pushdown_positive", plan, &test_ctx());
+}
+
+#[test]
+fn golden_predicate_pushdown_negative_over_aggregate_output() {
+    let plan = LogicalPlan::Filter {
+        predicate: Expr::BinaryOp {
+            left: Box::new(Expr::Column("sum_v".to_string())),
+            op: BinaryOp::Gt,
+            right: Box::new(Expr::Literal(ffq_planner::LiteralValue::Int64(10))),
+        },
+        input: Box::new(LogicalPlan::Aggregate {
+            group_exprs: vec![Expr::Column("g".to_string())],
+            aggr_exprs: vec![(
+                ffq_planner::AggExpr::Sum(Expr::Column("v".to_string())),
+                "sum_v".to_string(),
+            )],
+            input: Box::new(LogicalPlan::TableScan {
+                table: "agg_src".to_string(),
+                projection: None,
+                filters: vec![],
+            }),
+        }),
+    };
+    optimizer_snapshot(
+        "predicate_pushdown_negative_over_aggregate_output",
+        plan,
+        &test_ctx(),
+    );
 }
 
 #[test]
@@ -215,4 +370,183 @@ fn golden_join_strategy_hint_broadcast_left() {
         strategy_hint: JoinStrategyHint::Auto,
     };
     optimizer_snapshot("join_strategy_hint_broadcast_left", plan, &test_ctx());
+}
+
+#[test]
+fn golden_join_strategy_hint_negative_falls_back_to_shuffle() {
+    let plan = LogicalPlan::Join {
+        left: Box::new(LogicalPlan::TableScan {
+            table: "big".to_string(),
+            projection: None,
+            filters: vec![],
+        }),
+        right: Box::new(LogicalPlan::TableScan {
+            table: "big2".to_string(),
+            projection: None,
+            filters: vec![],
+        }),
+        on: vec![("k2".to_string(), "k3".to_string())],
+        join_type: ffq_planner::JoinType::Inner,
+        strategy_hint: JoinStrategyHint::Auto,
+    };
+    optimizer_snapshot(
+        "join_strategy_hint_negative_falls_back_to_shuffle",
+        plan,
+        &test_ctx(),
+    );
+}
+
+#[cfg(feature = "vector")]
+fn vector_ctx(with_docs_index_option: bool) -> TestCtx {
+    let emb_field = Field::new("item", DataType::Float32, true);
+    let docs_schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("title", DataType::Utf8, true),
+        Field::new("lang", DataType::Utf8, true),
+        Field::new(
+            "emb",
+            DataType::FixedSizeList(Arc::new(emb_field.clone()), 3),
+            true,
+        ),
+    ]);
+    let idx_schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("score", DataType::Float32, false),
+        Field::new("payload", DataType::Utf8, true),
+        Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+    ]);
+
+    let mut docs_opts = HashMap::new();
+    if with_docs_index_option {
+        docs_opts.insert("vector.index_table".to_string(), "docs_idx".to_string());
+    }
+    docs_opts.insert("vector.id_column".to_string(), "id".to_string());
+    docs_opts.insert("vector.embedding_column".to_string(), "emb".to_string());
+    docs_opts.insert("vector.prefetch_multiplier".to_string(), "3".to_string());
+
+    TestCtx::default()
+        .with_table(
+            "docs_idx",
+            idx_schema,
+            (Some(1000), Some(100)),
+            "qdrant",
+            HashMap::new(),
+        )
+        .with_table("docs", docs_schema, (Some(5000), Some(200)), "parquet", docs_opts)
+}
+
+#[cfg(feature = "vector")]
+#[test]
+fn golden_vector_rewrite_positive() {
+    let plan = LogicalPlan::Projection {
+        exprs: vec![
+            (Expr::Column("id".to_string()), "id".to_string()),
+            (Expr::Column("score".to_string()), "score".to_string()),
+            (Expr::Column("payload".to_string()), "payload".to_string()),
+        ],
+        input: Box::new(LogicalPlan::TopKByScore {
+            score_expr: Expr::CosineSimilarity {
+                vector: Box::new(Expr::Column("emb".to_string())),
+                query: Box::new(Expr::Literal(ffq_planner::LiteralValue::VectorF32(vec![
+                    1.0, 0.0, 0.0,
+                ]))),
+            },
+            k: 5,
+            input: Box::new(LogicalPlan::TableScan {
+                table: "docs_idx".to_string(),
+                projection: None,
+                filters: vec![],
+            }),
+        }),
+    };
+    optimizer_snapshot("vector_rewrite_positive", plan, &vector_ctx(true));
+}
+
+#[cfg(feature = "vector")]
+#[test]
+fn golden_vector_rewrite_negative_fallback_projection() {
+    let plan = LogicalPlan::Projection {
+        exprs: vec![(Expr::Column("title".to_string()), "title".to_string())],
+        input: Box::new(LogicalPlan::TopKByScore {
+            score_expr: Expr::CosineSimilarity {
+                vector: Box::new(Expr::Column("emb".to_string())),
+                query: Box::new(Expr::Literal(ffq_planner::LiteralValue::VectorF32(vec![
+                    1.0, 0.0, 0.0,
+                ]))),
+            },
+            k: 5,
+            input: Box::new(LogicalPlan::TableScan {
+                table: "docs_idx".to_string(),
+                projection: None,
+                filters: vec![],
+            }),
+        }),
+    };
+    optimizer_snapshot(
+        "vector_rewrite_negative_fallback_projection",
+        plan,
+        &vector_ctx(true),
+    );
+}
+
+#[cfg(feature = "vector")]
+#[test]
+fn golden_two_phase_rewrite_positive() {
+    let plan = LogicalPlan::Projection {
+        exprs: vec![
+            (Expr::Column("id".to_string()), "id".to_string()),
+            (Expr::Column("title".to_string()), "title".to_string()),
+        ],
+        input: Box::new(LogicalPlan::TopKByScore {
+            score_expr: Expr::CosineSimilarity {
+                vector: Box::new(Expr::Column("emb".to_string())),
+                query: Box::new(Expr::Literal(ffq_planner::LiteralValue::VectorF32(vec![
+                    1.0, 0.0, 0.0,
+                ]))),
+            },
+            k: 2,
+            input: Box::new(LogicalPlan::TableScan {
+                table: "docs".to_string(),
+                projection: None,
+                filters: vec![Expr::BinaryOp {
+                    left: Box::new(Expr::Column("lang".to_string())),
+                    op: BinaryOp::Eq,
+                    right: Box::new(Expr::Literal(ffq_planner::LiteralValue::Utf8(
+                        "en".to_string(),
+                    ))),
+                }],
+            }),
+        }),
+    };
+    optimizer_snapshot("two_phase_rewrite_positive", plan, &vector_ctx(true));
+}
+
+#[cfg(feature = "vector")]
+#[test]
+fn golden_two_phase_rewrite_negative_missing_index_option() {
+    let plan = LogicalPlan::Projection {
+        exprs: vec![
+            (Expr::Column("id".to_string()), "id".to_string()),
+            (Expr::Column("title".to_string()), "title".to_string()),
+        ],
+        input: Box::new(LogicalPlan::TopKByScore {
+            score_expr: Expr::CosineSimilarity {
+                vector: Box::new(Expr::Column("emb".to_string())),
+                query: Box::new(Expr::Literal(ffq_planner::LiteralValue::VectorF32(vec![
+                    1.0, 0.0, 0.0,
+                ]))),
+            },
+            k: 2,
+            input: Box::new(LogicalPlan::TableScan {
+                table: "docs".to_string(),
+                projection: None,
+                filters: vec![],
+            }),
+        }),
+    };
+    optimizer_snapshot(
+        "two_phase_rewrite_negative_missing_index_option",
+        plan,
+        &vector_ctx(false),
+    );
 }

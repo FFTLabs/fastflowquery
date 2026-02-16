@@ -1,0 +1,33 @@
+# optimizer-golden: two_phase_rewrite_positive
+
+## before
+Projection
+  id := id
+  title := title
+  TopKByScore k=2 score=cosine_similarity(emb, VectorF32([1.0, 0.0, 0.0])) rewrite=index_fallback
+    TableScan table=docs
+      projection=None
+      pushed_filters=1
+        (lang) Eq (Utf8("en"))
+
+## after
+Projection
+  id := id
+  title := title
+  TopKByScore k=2 score=cosine_similarity(emb, VectorF32([1.0, 0.0, 0.0])) rewrite=index_fallback
+    Filter (lang) Eq (Utf8("en"))
+      Projection
+        id := docs.id
+        title := docs.title
+        lang := docs.lang
+        emb := docs.emb
+        score := score
+        payload := payload
+        Join type=Inner strategy=broadcast_right
+          on=[("id", "id")]
+          left:
+            TableScan table=docs
+              projection=None
+              pushed_filters=0
+          right:
+            VectorTopK table=docs_idx k=6 query_dim=3 filter=None rewrite=index_applied
