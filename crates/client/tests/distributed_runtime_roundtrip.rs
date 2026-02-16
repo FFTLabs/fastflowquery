@@ -137,6 +137,27 @@ fn collect_join_rows(batches: &[RecordBatch]) -> Vec<(i64, i64, i64)> {
     out
 }
 
+fn collect_scan_rows(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    for batch in batches {
+        let orderkey = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("l_orderkey");
+        let partkey = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("l_partkey");
+        for i in 0..batch.num_rows() {
+            out.push((orderkey.value(i), partkey.value(i)));
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 #[cfg(feature = "vector")]
 fn write_docs_vector(path: &std::path::Path, schema: Arc<Schema>) {
     let mut emb = FixedSizeListBuilder::new(Float32Builder::new(), 3);
@@ -359,9 +380,16 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     cfg.spill_dir = spill_dir.to_string_lossy().to_string();
     let dist_engine = Engine::new(cfg.clone()).expect("distributed engine");
     register_tables(&dist_engine, &lineitem_path, &orders_path);
-    let sql_agg =
-        "SELECT l_orderkey, COUNT(l_partkey) AS c FROM lineitem INNER JOIN orders ON l_orderkey = o_orderkey GROUP BY l_orderkey";
-    let sql_join = "SELECT l_orderkey, l_partkey, o_custkey FROM lineitem INNER JOIN orders ON l_orderkey = o_orderkey";
+    let sql_scan = support::integration_queries::scan_filter_project();
+    let sql_agg = support::integration_queries::join_aggregate();
+    let sql_join = support::integration_queries::join_projection();
+
+    let dist_scan_batches = dist_engine
+        .sql(sql_scan)
+        .expect("dist sql")
+        .collect()
+        .await
+        .expect("dist scan collect");
 
     let dist_agg_batches = dist_engine
         .sql(sql_agg)
@@ -384,6 +412,12 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
 
     let embedded_engine = Engine::new(cfg).expect("embedded engine");
     register_tables(&embedded_engine, &lineitem_path, &orders_path);
+    let embedded_scan_batches = embedded_engine
+        .sql(sql_scan)
+        .expect("embedded scan sql")
+        .collect()
+        .await
+        .expect("embedded scan collect");
     let embedded_agg_batches = embedded_engine
         .sql(sql_agg)
         .expect("embedded agg sql")
@@ -419,6 +453,14 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         "distributed and embedded join outputs differ"
     );
 
+    let dist_scan_norm = support::snapshot_text(&dist_scan_batches, &["l_orderkey", "l_partkey"], 1e-9);
+    let emb_scan_norm =
+        support::snapshot_text(&embedded_scan_batches, &["l_orderkey", "l_partkey"], 1e-9);
+    assert_eq!(
+        dist_scan_norm, emb_scan_norm,
+        "distributed and embedded scan/filter/project outputs differ"
+    );
+
     let dist_agg = collect_group_counts(&dist_agg_batches);
     let emb_agg = collect_group_counts(&embedded_agg_batches);
     assert_eq!(dist_agg, emb_agg);
@@ -429,6 +471,12 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     let emb_join = collect_join_rows(&embedded_join_batches);
     assert_eq!(dist_join, emb_join);
     assert_eq!(dist_join, expected_join);
+
+    let expected_scan = vec![(2, 20), (2, 21), (3, 30), (3, 31), (3, 32)];
+    let dist_scan = collect_scan_rows(&dist_scan_batches);
+    let emb_scan = collect_scan_rows(&embedded_scan_batches);
+    assert_eq!(dist_scan, emb_scan);
+    assert_eq!(dist_scan, expected_scan);
 
     stop.store(true, Ordering::Relaxed);
     w1.abort();
@@ -584,8 +632,7 @@ async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
     let dist_engine = Engine::new(cfg.clone()).expect("distributed engine");
     register_two_phase_tables(&dist_engine, &docs_path);
 
-    let sql =
-        "SELECT id, title FROM docs WHERE lang = 'en' ORDER BY cosine_similarity(emb, :q) DESC LIMIT 1";
+    let sql = support::integration_queries::vector_two_phase_rerank();
     let mut params = HashMap::new();
     params.insert(
         "q".to_string(),

@@ -86,10 +86,7 @@ fn order_by_cosine_similarity_limit_uses_topk() {
 
     let batches = futures::executor::block_on(
         engine
-            .sql_with_params(
-                "SELECT id, title FROM docs ORDER BY cosine_similarity(emb, :q) DESC LIMIT 2",
-                params,
-            )
+            .sql_with_params(support::integration_queries::vector_topk_cosine(), params)
             .expect("sql")
             .collect(),
     )
@@ -158,7 +155,7 @@ fn cosine_topk_tie_order_is_deterministic() {
         LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]),
     );
 
-    let q = "SELECT id, title FROM docs ORDER BY cosine_similarity(emb, :q) DESC LIMIT 2";
+    let q = support::integration_queries::vector_topk_cosine();
     let b1 = futures::executor::block_on(
         engine
             .sql_with_params(q, params.clone())
@@ -216,10 +213,7 @@ fn parquet_vector_topk_uses_bruteforce_fallback_plan() {
         LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]),
     );
     let df = engine
-        .sql_with_params(
-            "SELECT id, title FROM docs ORDER BY cosine_similarity(emb, :q) DESC LIMIT 2",
-            params,
-        )
+        .sql_with_params(support::integration_queries::vector_topk_cosine(), params)
         .expect("sql");
     let explain = df.explain().expect("explain");
     assert!(explain.contains("TopKByScore"));

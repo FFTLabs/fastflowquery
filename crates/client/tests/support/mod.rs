@@ -16,6 +16,39 @@ use ffq_client::Engine;
 use ffq_storage::{TableDef, TableStats};
 use parquet::arrow::ArrowWriter;
 
+pub mod integration_queries {
+    const SCAN_FILTER_PROJECT_SQL: &str =
+        include_str!("../../../../tests/integration/queries/scan_filter_project.sql");
+    const JOIN_PROJECTION_SQL: &str =
+        include_str!("../../../../tests/integration/queries/join_projection.sql");
+    const JOIN_AGGREGATE_SQL: &str =
+        include_str!("../../../../tests/integration/queries/join_aggregate.sql");
+    const VECTOR_TOPK_COSINE_SQL: &str =
+        include_str!("../../../../tests/integration/queries/vector_topk_cosine.sql");
+    const VECTOR_TWO_PHASE_SQL: &str =
+        include_str!("../../../../tests/integration/queries/vector_two_phase_rerank.sql");
+
+    pub fn scan_filter_project() -> &'static str {
+        SCAN_FILTER_PROJECT_SQL.trim()
+    }
+
+    pub fn join_projection() -> &'static str {
+        JOIN_PROJECTION_SQL.trim()
+    }
+
+    pub fn join_aggregate() -> &'static str {
+        JOIN_AGGREGATE_SQL.trim()
+    }
+
+    pub fn vector_topk_cosine() -> &'static str {
+        VECTOR_TOPK_COSINE_SQL.trim()
+    }
+
+    pub fn vector_two_phase_rerank() -> &'static str {
+        VECTOR_TWO_PHASE_SQL.trim()
+    }
+}
+
 pub fn unique_path(prefix: &str, ext: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
