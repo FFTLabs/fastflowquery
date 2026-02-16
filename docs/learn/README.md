@@ -52,18 +52,22 @@ Read these in sequence:
 9. `docs/learn/09-storage-catalog.md`
 10. `docs/learn/10-vector-rag-internals.md`
 11. `docs/learn/11-writes-commit.md`
-12. `docs/v1/quickstart.md`
-13. `docs/v1/architecture.md`
-14. `docs/v1/client-runtime.md`
-15. `docs/v1/operators-core.md`
-16. `docs/v1/storage-catalog.md`
-17. `docs/v1/shuffle-stage-model.md`
-18. `docs/v1/distributed-runtime.md`
-19. `docs/v1/vector-rag.md`
-20. `docs/v1/writes-dml.md`
-21. `docs/v1/observability.md`
-22. `docs/v1/testing.md`
-23. `docs/v1/benchmarks.md`
+12. `docs/learn/12-observability-debugging.md`
+13. `docs/learn/labs/README.md`
+14. `docs/learn/glossary.md`
+15. `docs/learn/faq.md`
+16. `docs/v1/quickstart.md`
+17. `docs/v1/architecture.md`
+18. `docs/v1/client-runtime.md`
+19. `docs/v1/operators-core.md`
+20. `docs/v1/storage-catalog.md`
+21. `docs/v1/shuffle-stage-model.md`
+22. `docs/v1/distributed-runtime.md`
+23. `docs/v1/vector-rag.md`
+24. `docs/v1/writes-dml.md`
+25. `docs/v1/observability.md`
+26. `docs/v1/testing.md`
+27. `docs/v1/benchmarks.md`
 
 ## What You Will Understand At The End
 
@@ -79,7 +83,10 @@ After finishing this path, you should be able to explain:
 8. How vector/rag routing decides between brute-force and index-backed execution.
 9. How qdrant rewrite preconditions, projection contracts, and filter pushdown subset control routing.
 10. How sink execution and commit semantics prevent partial writes and enable safe retries.
-11. How to debug correctness/performance issues with metrics, traces, and benchmark artifacts.
+11. How to diagnose runtime issues from traces, Prometheus metrics, and profiling hooks.
+12. How to run end-to-end labs for embedded, distributed, vector routing, and official benchmarks.
+13. How to quickly resolve common failures using FAQ patterns and glossary terminology.
+14. How to debug correctness/performance issues with metrics, traces, and benchmark artifacts.
 
 ## Deep-Dive Topics (Planned Learner Chapters)
 
@@ -96,4 +103,8 @@ The learner track expands next into dedicated chapters:
 9. `docs/learn/09-storage-catalog.md` (table metadata, catalog persistence, and provider behavior).
 10. `docs/learn/10-vector-rag-internals.md` (cosine kernels, top-k execution, qdrant rewrite and fallback).
 11. `docs/learn/11-writes-commit.md` (DML planning, sink execution, temp-then-commit, and failure cleanup).
-12. Benchmark interpretation (synthetic vs official).
+12. `docs/learn/12-observability-debugging.md` (trace/metrics/profiling signals and debugging workflows).
+13. `docs/learn/labs/README.md` (hands-on exercises with expected outputs and troubleshooting).
+14. `docs/learn/glossary.md` (shared vocabulary and links into deeper chapters).
+15. `docs/learn/faq.md` (common failure diagnostics linked to root-cause chapters).
+16. Benchmark interpretation (synthetic vs official).
