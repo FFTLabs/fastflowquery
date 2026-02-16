@@ -310,3 +310,129 @@ Artifacts:
 
 1. Uploads `tests/bench/results/*.json` and `tests/bench/results/*.csv`.
 2. Artifact name pattern: `bench-13_3-<run_id>-<matrix_mode>`.
+
+## Runbook
+
+This section is the practical end-to-end guide for running and interpreting 13.3 benchmarks.
+
+### Prerequisites
+
+1. Rust toolchain installed (`stable`).
+2. Build dependencies available for Arrow/Parquet crates on your OS.
+3. Repo checked out with generated benchmark fixtures or permission to generate them.
+4. For distributed runs:
+   - running coordinator endpoint
+   - optional worker endpoints for readiness checks.
+5. For qdrant comparisons:
+   - qdrant instance reachable
+   - collection populated and configured.
+
+### Fixture Setup
+
+Generate deterministic fixtures:
+
+```bash
+./scripts/generate-bench-fixtures.sh
+```
+
+Expected artifacts:
+
+1. `tests/bench/fixtures/index.json`
+2. `tests/bench/fixtures/tpch_sf1/manifest.json`
+3. `tests/bench/fixtures/rag_synth/manifest.json`
+
+### Standard Run Flow
+
+Recommended contributor flow:
+
+1. Embedded baseline:
+   - `make bench-13.3-embedded`
+2. RAG matrix:
+   - `make bench-13.3-rag`
+3. Distributed (when cluster is available):
+   - `FFQ_COORDINATOR_ENDPOINT=http://127.0.0.1:50051 make bench-13.3-distributed`
+4. Compare candidate vs baseline:
+   - `make bench-13.3-compare BASELINE=<baseline.json-or-dir> CANDIDATE=<candidate.json-or-dir> THRESHOLD=0.10`
+
+### Important Environment Variables
+
+Core runner settings:
+
+1. `FFQ_BENCH_WARMUP`
+2. `FFQ_BENCH_ITERATIONS`
+3. `FFQ_BENCH_THREADS`
+4. `FFQ_BENCH_BATCH_SIZE_ROWS`
+5. `FFQ_BENCH_MEM_BUDGET_BYTES`
+6. `FFQ_BENCH_SHUFFLE_PARTITIONS`
+7. `FFQ_BENCH_SPILL_DIR`
+8. `FFQ_BENCH_KEEP_SPILL`
+9. `FFQ_BENCH_MAX_CV_PCT`
+
+Mode-specific settings:
+
+1. Distributed:
+   - `FFQ_COORDINATOR_ENDPOINT` (required)
+   - `FFQ_WORKER1_ENDPOINT` (optional)
+   - `FFQ_WORKER2_ENDPOINT` (optional)
+2. RAG:
+   - `FFQ_BENCH_RAG_MATRIX`
+3. Qdrant:
+   - `FFQ_BENCH_QDRANT_COLLECTION` (required to enable qdrant variants)
+   - `FFQ_BENCH_QDRANT_ENDPOINT` (optional)
+
+### Artifact Interpretation
+
+JSON (`tests/bench/results/*.json`):
+
+1. `runtime` records normalization controls used in the run.
+2. `results[]` is one row per query/variant tuple.
+3. `elapsed_ms` is mean latency across measured iterations.
+4. `elapsed_stddev_ms` and `elapsed_cv_pct` reflect variance.
+5. `success=false` plus `error` indicates hard failure or variance gate failure.
+6. `rag_comparisons[]` contains brute-force vs qdrant deltas where both are present.
+
+CSV (`tests/bench/results/*.csv`):
+
+1. Flat row view for spreadsheet/chart workflows.
+2. Includes query identifiers and matrix dimensions (`n_docs`, `effective_dim`, `top_k`, `filter_selectivity`).
+
+### Baseline Update Policy
+
+Use this policy when updating benchmark baselines:
+
+1. Only update baseline after functional correctness is stable and green.
+2. Record baseline from at least two clean runs with comparable CV%.
+3. Prefer reduced matrix for routine gating and full matrix for periodic snapshots.
+4. Keep threshold conservative (`0.10` default) unless justified by a known environment shift.
+5. In PRs that intentionally change performance, include:
+   - old vs new artifact references
+   - rationale for threshold or baseline updates
+   - impacted query keys.
+
+### Troubleshooting
+
+If embedded run fails:
+
+1. Check fixture files exist under `tests/bench/fixtures/`.
+2. Re-generate fixtures with `./scripts/generate-bench-fixtures.sh`.
+3. Verify query files under `tests/bench/queries/`.
+4. Re-run with lower matrix size and fewer iterations for quick diagnosis.
+
+If distributed run fails:
+
+1. Verify `FFQ_COORDINATOR_ENDPOINT` has `http://` scheme.
+2. Confirm coordinator/worker endpoints are reachable.
+3. Re-run with reduced warmup/iterations for faster feedback.
+
+If variance gate fails:
+
+1. Inspect `elapsed_cv_pct` in result rows.
+2. Increase `FFQ_BENCH_ITERATIONS` to smooth noise.
+3. Reduce background load and keep thread count fixed.
+4. Temporarily disable gate with `--no-variance-check` (or clear `FFQ_BENCH_MAX_CV_PCT`) only for diagnosis, not final CI policy.
+
+If comparator fails:
+
+1. Confirm baseline/candidate point to intended artifact files.
+2. Review offending tuple in comparator output.
+3. Distinguish true regression from row-shape mismatch (`rows_out` mismatch).
