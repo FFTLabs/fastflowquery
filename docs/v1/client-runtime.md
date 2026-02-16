@@ -8,6 +8,42 @@ This page documents how the client selects runtime mode and how `engine.sql(...)
 2. `Engine::sql(query)` -> parses SQL and returns `DataFrame`.
 3. `DataFrame::collect().await` -> executes plan and returns `Vec<RecordBatch>`.
 
+## CLI Query Path
+
+`ffq-client` also exposes a small CLI query interface in `crates/client/src/main.rs`.
+
+Supported forms:
+
+1. `ffq-client query --sql "<SQL>" [--catalog PATH] [--plan]`
+2. legacy compatibility:
+   - `ffq-client "<SQL>"`
+   - `ffq-client --plan "<SQL>"`
+
+Examples:
+
+```bash
+cargo run -p ffq-client -- query --sql "SELECT 1"
+```
+
+```bash
+cargo run -p ffq-client -- query \
+  --catalog tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json \
+  --sql "SELECT l_orderkey, l_quantity FROM lineitem LIMIT 5"
+```
+
+```bash
+cargo run -p ffq-client -- query \
+  --catalog tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json \
+  --sql "SELECT l_orderkey FROM lineitem LIMIT 5" \
+  --plan
+```
+
+Behavior:
+
+1. `--catalog` sets `FFQ_CATALOG_PATH` for that process before `Engine::new`.
+2. `--plan` prints logical plan and skips execution.
+3. execution mode (without `--plan`) collects and pretty-prints result batches.
+
 Primary files:
 1. `crates/client/src/engine.rs`
 2. `crates/client/src/session.rs`

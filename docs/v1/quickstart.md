@@ -41,6 +41,38 @@ Success signals:
 1. Integration tests pass.
 2. Benchmark JSON/CSV artifacts are created under `tests/bench/results/`.
 
+## Run SQL from Command Line (Parquet)
+
+Use the new CLI subcommand form:
+
+```bash
+cargo run -p ffq-client -- query --sql "SELECT 1"
+```
+
+Query parquet tables through a catalog profile:
+
+```bash
+cargo run -p ffq-client -- query \
+  --catalog tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json \
+  --sql "SELECT l_orderkey, l_quantity FROM lineitem LIMIT 5"
+```
+
+Plan-only mode:
+
+```bash
+cargo run -p ffq-client -- query \
+  --catalog tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json \
+  --sql "SELECT l_orderkey FROM lineitem LIMIT 5" \
+  --plan
+```
+
+Notes:
+
+1. `--catalog` sets `FFQ_CATALOG_PATH` for that CLI process.
+2. Legacy invocation still works:
+   - `cargo run -p ffq-client -- "SELECT 1"`
+   - `cargo run -p ffq-client -- --plan "SELECT 1"`
+
 ## Distributed Smoke Path
 
 1. Start cluster:
