@@ -13,3 +13,6 @@ By default, `cargo build` builds the lightweight `ffq-client` crate (embedded-on
 - Copy `.env.example` to `.env` for local overrides.
 - `ffq-client` loads `.env` automatically (best-effort) on session creation.
 - For distributed mode, set `FFQ_COORDINATOR_ENDPOINT`, e.g. `http://127.0.0.1:50051`.
+
+## License
+Licensed under the Apache License, Version 2.0. See LICENSE.
