@@ -155,24 +155,26 @@ Recommended (when available):
 Every benchmark artifact must include:
 
 1. `run_id` (stable unique id for one invocation)
-2. `timestamp_utc` (ISO-8601)
-3. `git_commit` (or `unknown`)
-4. `mode` (`embedded`/`distributed`)
-5. `feature_flags` (list)
-6. `dataset` metadata:
-   - `name` (`tpch_sf1` / `rag_synth`)
-   - `seed` (for synthetic data)
-   - `scale_or_n` (SF1 or doc count)
-   - `dimension` (for vector)
+2. `timestamp_unix_ms` (UTC epoch millis)
+3. `mode` (`embedded`/`distributed`)
+4. `feature_flags` (list)
+5. `fixture_root`
+6. `query_root`
 7. `runtime` metadata:
+   - `threads`
    - `batch_size_rows`
    - `mem_budget_bytes`
-   - `cpu_slots` (if applicable)
+   - `shuffle_partitions`
+   - `spill_dir`
+   - `max_cv_pct`
+   - `tz`
+   - `locale`
 8. `host` metadata:
    - `os`
    - `arch`
-   - `cpu_model` (best effort)
    - `logical_cpus`
+9. `results[]` rows with query-level metrics/status
+10. `rag_comparisons[]` (optional; present when comparable brute-force and qdrant rows exist)
 
 ## JSON Output Schema (Contract)
 
@@ -181,45 +183,49 @@ Runner JSON artifact shape:
 ```json
 {
   "run_id": "string",
-  "timestamp_utc": "2026-02-16T10:00:00Z",
-  "git_commit": "string",
+  "timestamp_unix_ms": 1771246767734,
   "mode": "embedded",
   "feature_flags": ["distributed", "vector"],
-  "dataset": {
-    "name": "tpch_sf1",
-    "seed": 42,
-    "scale_or_n": "sf1",
-    "dimension": null
-  },
+  "fixture_root": "tests/bench/fixtures",
+  "query_root": "tests/bench/queries",
   "runtime": {
+    "threads": 1,
     "batch_size_rows": 8192,
     "mem_budget_bytes": 67108864,
-    "cpu_slots": 2
+    "shuffle_partitions": 64,
+    "spill_dir": "target/tmp/bench_spill",
+    "max_cv_pct": 30.0,
+    "tz": "UTC",
+    "locale": "C"
   },
   "host": {
     "os": "linux",
     "arch": "x86_64",
-    "cpu_model": "string",
     "logical_cpus": 8
   },
   "results": [
     {
       "query_id": "tpch_q1",
       "variant": "baseline",
+      "runtime_tag": "embedded",
+      "dataset": "tpch_sf1",
+      "backend": "sql_baseline",
+      "n_docs": null,
+      "effective_dim": null,
+      "top_k": null,
+      "filter_selectivity": null,
       "iterations": 5,
       "warmup_iterations": 1,
       "elapsed_ms": 1234.56,
+      "elapsed_stddev_ms": 42.5,
+      "elapsed_cv_pct": 3.44,
       "rows_out": 4,
-      "bytes_out": 256,
-      "rows_per_sec": 3240.1,
-      "bytes_per_sec": 207.3,
-      "spill_bytes": 0,
-      "shuffle_bytes_read": null,
-      "shuffle_bytes_written": null,
+      "bytes_out": null,
       "success": true,
       "error": null
     }
-  ]
+  ],
+  "rag_comparisons": []
 }
 ```
 
@@ -228,17 +234,26 @@ Runner JSON artifact shape:
 CSV must be one row per query result with at least:
 
 1. `run_id`
-2. `timestamp_utc`
+2. `timestamp_unix_ms`
 3. `mode`
 4. `query_id`
 5. `variant`
-6. `iterations`
-7. `warmup_iterations`
-8. `elapsed_ms`
-9. `rows_out`
-10. `bytes_out`
-11. `success`
-12. `error`
+6. `runtime_tag`
+7. `dataset`
+8. `backend`
+9. `n_docs`
+10. `effective_dim`
+11. `top_k`
+12. `filter_selectivity`
+13. `iterations`
+14. `warmup_iterations`
+15. `elapsed_ms`
+16. `elapsed_stddev_ms`
+17. `elapsed_cv_pct`
+18. `rows_out`
+19. `bytes_out`
+20. `success`
+21. `error`
 
 Optional columns may be appended but required columns must remain stable.
 
@@ -486,7 +501,7 @@ Artifacts:
 
 ## Runbook
 
-This section is the practical end-to-end guide for running and interpreting 13.3 benchmarks.
+This section is the practical end-to-end guide for running and interpreting 13.3/13.4 benchmarks.
 
 ### Prerequisites
 
@@ -502,7 +517,7 @@ This section is the practical end-to-end guide for running and interpreting 13.3
 
 ### Fixture Setup
 
-Generate deterministic fixtures:
+Generate deterministic synthetic fixtures:
 
 ```bash
 ./scripts/generate-bench-fixtures.sh
@@ -513,6 +528,19 @@ Expected artifacts:
 1. `tests/bench/fixtures/index.json`
 2. `tests/bench/fixtures/tpch_sf1/manifest.json`
 3. `tests/bench/fixtures/rag_synth/manifest.json`
+
+Generate/validate official fixtures:
+
+```bash
+make tpch-dbgen-sf1
+make tpch-dbgen-parquet
+make validate-tpch-dbgen-manifests
+```
+
+Expected official artifacts:
+
+1. `tests/bench/fixtures/tpch_dbgen_sf1/manifest.json`
+2. `tests/bench/fixtures/tpch_dbgen_sf1_parquet/manifest.json`
 
 ### Standard Run Flow
 
@@ -585,8 +613,8 @@ How to interpret by track:
    - use for changelog/release performance claims,
    - baseline updates should be controlled and reviewed,
    - failed correctness checks invalidate latency numbers for that run.
-5. `success=false` plus `error` indicates hard failure or variance gate failure.
-6. `rag_comparisons[]` contains brute-force vs qdrant deltas where both are present.
+3. `success=false` plus `error` indicates hard failure, correctness failure, or variance gate failure.
+4. `rag_comparisons[]` contains brute-force vs qdrant deltas where both are present.
 
 CSV (`tests/bench/results/*.csv`):
 
@@ -611,9 +639,10 @@ Use this policy when updating benchmark baselines:
 If embedded run fails:
 
 1. Check fixture files exist under `tests/bench/fixtures/`.
-2. Re-generate fixtures with `./scripts/generate-bench-fixtures.sh`.
-3. Verify query files under `tests/bench/queries/`.
-4. Re-run with lower matrix size and fewer iterations for quick diagnosis.
+2. For synthetic track, re-generate fixtures with `./scripts/generate-bench-fixtures.sh`.
+3. For official track, run `make tpch-dbgen-sf1 && make tpch-dbgen-parquet` and then `make validate-tpch-dbgen-manifests`.
+4. Verify query files under `tests/bench/queries/`.
+5. Re-run with lower matrix size and fewer iterations for quick diagnosis.
 
 If distributed run fails:
 

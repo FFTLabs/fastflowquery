@@ -20,7 +20,7 @@ Each gap includes impact, workaround, and a proposed follow-up ticket.
 | Vector rewrite contract is strict (`id, score, payload` projection only) | Useful projections can fall back to brute-force unexpectedly. | Use supported projection or two-phase retrieval path. | `V2-VECTOR-01` Support projection enrichment from payload/doc lookup in rewrite path. |
 | Qdrant filter pushdown supports only equality + `AND` | Range/OR/complex predicates skip index rewrite and can degrade performance. | Keep filter subset simple or accept brute-force fallback. | `V2-VECTOR-02` Extend predicate translator to broader qdrant filter subset. |
 | Qdrant UUID IDs are unsupported | Some index datasets cannot be queried through current connector. | Use numeric point IDs for v1 collections. | `V2-VECTOR-03` Add UUID id support in `VectorTopK` data contract and connector. |
-| Benchmarks are not yet implemented as a first-class harness | Performance regressions may be detected late. | Use ad hoc timing and targeted test runs. | `V2-PERF-01` Add benchmark suite (TPC-H SF1 + vector workloads) with baseline tracking. |
+| Official benchmark scope is limited to TPC-H Q1/Q3 | Release/perf reporting does not yet cover broader official TPC-H query families. | Use current official Q1/Q3 path for v1, and run synthetic matrices for broader stress coverage. | `V2-PERF-01` Extend official benchmark suite beyond Q1/Q3 with deterministic contracts. |
 | Metrics label cardinality includes query/task IDs | Long-running environments can produce high-cardinality Prometheus series. | Use short retention and selective scrape environments for v1. | `V2-OBS-01` Add configurable metrics cardinality controls/sampling. |
 | Security and multi-tenant hardening are minimal | Distributed runtime is not suitable for untrusted/multi-tenant production use. | Run in trusted network and controlled environments only. | `V2-SEC-01` Add authn/authz, TLS, quotas, and tenant isolation controls. |
 
@@ -28,7 +28,7 @@ Each gap includes impact, workaround, and a proposed follow-up ticket.
 
 1. Highest near-term operational risk: distributed scheduler/coordinator hardening and numeric query-id coupling.
 2. Highest product-surface risk: limited SQL + global sort absence for non-vector analytical workflows.
-3. Highest scale risk: missing benchmark harness and high-cardinality metrics defaults.
+3. Highest scale risk: limited official benchmark coverage (Q1/Q3 only) and high-cardinality metrics defaults.
 
 ## Suggested Sequencing (v2)
 

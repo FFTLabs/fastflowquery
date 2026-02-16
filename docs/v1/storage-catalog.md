@@ -202,6 +202,26 @@ Operational guidance:
 2. Use `.json` or `.toml` extension explicitly.
 3. Treat catalog file as source of truth for table registration continuity.
 
+## Official TPC-H Catalog Profiles (13.4.3)
+
+Host-local catalog profiles for official dbgen parquet fixtures are provided under:
+
+1. `tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json`
+2. `tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.toml`
+
+These profiles predeclare `customer`, `orders`, and `lineitem` with required schemas/options so
+Q1/Q3 can run without manual `register_table(...)` calls.
+
+Usage pattern:
+
+1. Set `FFQ_CATALOG_PATH` to one of the profile files.
+2. Start the engine/session.
+3. Execute canonical benchmark queries directly.
+
+Validation coverage:
+
+1. `crates/client/tests/tpch_catalog_profiles.rs` verifies profile load/parsing and Q1/Q3 execution flow.
+
 ## Relevant Code References
 
 1. `crates/storage/src/provider.rs`

@@ -76,8 +76,9 @@ Status legend:
 | `Ticket 13.1.8 — Vector Ranking Correctness Tests` | done | `crates/client/src/runtime.rs` | `crates/client/tests/embedded_vector_topk.rs` |
 | `Ticket 13.1.9 — CI/Command Matrix for Correctness Suite` | done | `Makefile`, `.github/workflows/correctness-13_1.yml` | `docs/v1/testing.md` |
 | `Ticket 13.1.10 — Correctness Contract Doc Page` | done | `docs/v1/testing.md` | `docs/v1/testing.md` |
-| `13.2 Integration` | partial | `crates/client/tests/distributed_runtime_roundtrip.rs` | `crates/client/tests/distributed_runtime_roundtrip.rs` |
-| `13.3 Bench` | not started | `Makefile` | `tickets/eng/Plan_v1.md` |
+| `13.2 Integration` | done | `crates/client/tests/integration_embedded.rs`, `crates/client/tests/integration_distributed.rs`, `scripts/run-distributed-integration.sh`, `docker/compose/ffq.yml`, `.github/workflows/integration-13_2.yml` | `crates/client/tests/integration_parquet_fixtures.rs`, `crates/client/tests/integration_embedded.rs`, `crates/client/tests/integration_distributed.rs` |
+| `13.3 Bench` | done | `crates/client/examples/run_bench_13_3.rs`, `crates/client/src/bench_queries.rs`, `scripts/run-bench-13.3.sh`, `scripts/compare-bench-13.3.py`, `.github/workflows/bench-13_3.yml`, `docs/v1/benchmarks.md` | `crates/client/tests/benchmark_fixtures_deterministic.rs`, `crates/client/src/bench_queries.rs` |
+| `13.4 Official Benchmarks` | done | `scripts/build-tpch-dbgen.sh`, `scripts/generate-tpch-dbgen-sf1.sh`, `scripts/convert-tpch-dbgen-parquet.sh`, `crates/client/src/tpch_tbl.rs`, `scripts/run-bench-13.4-tpch-official.sh`, `scripts/validate-tpch-dbgen-manifests.py` | `crates/client/tests/tpch_tbl_parquet_deterministic.rs`, `crates/client/tests/tpch_catalog_profiles.rs` |
 | `14) Implementation as vertical slices (v1, aligned to the feature list)` | partial | `crates/client/src/engine.rs`, `crates/client/src/runtime.rs`, `crates/distributed/src/worker.rs` | `crates/client/tests/embedded_parquet_scan.rs`, `crates/client/tests/distributed_runtime_roundtrip.rs` |
 | `Slice 1: Engine core + embedded execution` | done | `crates/client/src/engine.rs`, `crates/client/src/runtime.rs`, `crates/storage/src/parquet_provider.rs` | `crates/client/tests/embedded_parquet_scan.rs` |
 | `Slice 2: Aggregation + join (embedded)` | done | `crates/client/src/runtime.rs` | `crates/client/tests/embedded_hash_aggregate.rs`, `crates/client/tests/embedded_hash_join.rs` |
@@ -88,4 +89,4 @@ Status legend:
 ## Notes
 
 1. This matrix is tied to current repository state and is intended to be updated as part of each new ticket.
-2. `13.3 Bench` is marked `not started` because there is no dedicated benchmark harness/page/target yet.
+2. `13.2`/`13.3`/`13.4` statuses reflect implemented integration runners, benchmark harness, official dbgen pipeline, and documentation/runbook updates.
