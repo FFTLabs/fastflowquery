@@ -23,8 +23,8 @@ impl BenchmarkQueryId {
 
     pub fn file_name(self) -> &'static str {
         match self {
-            Self::TpchQ1 => "tpch_q1.sql",
-            Self::TpchQ3 => "tpch_q3.sql",
+            Self::TpchQ1 => "canonical/tpch_q1.sql",
+            Self::TpchQ3 => "canonical/tpch_q3.sql",
             Self::RagTopkBruteforce => "rag_topk_bruteforce.sql",
             Self::RagTopkQdrant => "rag_topk_qdrant.sql",
         }

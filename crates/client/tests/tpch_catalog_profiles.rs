@@ -1,8 +1,8 @@
 use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use ffq_client::bench_queries::{load_benchmark_query, BenchmarkQueryId};
 use ffq_client::Engine;
 use ffq_common::EngineConfig;
 use ffq_storage::Catalog;
@@ -49,13 +49,11 @@ fn repo_root() -> PathBuf {
 }
 
 fn q1_sql() -> String {
-    fs::read_to_string(repo_root().join("tests/bench/queries/tpch_q1.sql"))
-        .expect("read tpch q1 sql")
+    load_benchmark_query(BenchmarkQueryId::TpchQ1).expect("load canonical tpch q1")
 }
 
 fn q3_sql() -> String {
-    fs::read_to_string(repo_root().join("tests/bench/queries/tpch_q3.sql"))
-        .expect("read tpch q3 sql")
+    load_benchmark_query(BenchmarkQueryId::TpchQ3).expect("load canonical tpch q3")
 }
 
 fn tpch_parquet_ready() -> bool {

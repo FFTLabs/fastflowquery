@@ -99,12 +99,15 @@ Logical benchmark query ids:
 
 Canonical SQL file paths:
 
-1. `tests/bench/queries/tpch_q1.sql`
-2. `tests/bench/queries/tpch_q3.sql`
+1. `tests/bench/queries/canonical/tpch_q1.sql`
+2. `tests/bench/queries/canonical/tpch_q3.sql`
 3. `tests/bench/queries/rag_topk_bruteforce.sql`
 4. `tests/bench/queries/rag_topk_qdrant.sql`
 
 The IDs are stable reporting keys. Benchmark runners must load SQL from these files rather than embedding inline SQL strings.
+
+TPC-H Q1/Q3 files include explicit FFQ v1 adaptation notes in SQL comments; those notes are part of
+the canonical query contract and apply to both embedded and distributed benchmark modes.
 
 ## Required Metrics
 
