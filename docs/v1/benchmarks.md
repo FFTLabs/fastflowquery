@@ -20,6 +20,42 @@ Out of scope for this contract:
 2. Cross-machine comparability without hardware metadata.
 3. Full TPC-H query set beyond Q1/Q3 in v1.
 
+## Official dbgen Integration (13.4.1)
+
+The repository includes tooling to build and run TPC-H `dbgen` and generate official-style SF1 `.tbl` data under:
+
+1. `tests/bench/fixtures/tpch_dbgen_sf1/`
+
+Pinned defaults:
+
+1. Source repo: `https://github.com/electrum/tpch-dbgen.git`
+2. Source ref: `f20ca9f` (override with `TPCH_DBGEN_REF`)
+3. Scale factor: `1` (SF1)
+
+One-command generation:
+
+```bash
+make tpch-dbgen-sf1
+```
+
+This runs:
+
+1. `scripts/build-tpch-dbgen.sh`
+2. `scripts/generate-tpch-dbgen-sf1.sh`
+
+Generation output:
+
+1. all required `*.tbl` files for SF1
+2. `manifest.json` with rows, bytes, sha256 per file and source metadata
+
+Common overrides:
+
+1. `TPCH_DBGEN_REPO` (alternate clone URL)
+2. `TPCH_DBGEN_REF` (pinned commit/tag)
+3. `TPCH_DBGEN_SRC_DIR` (local source/build dir)
+4. `TPCH_DBGEN_OUTPUT_DIR` (where `.tbl` files are written)
+5. `TPCH_DBGEN_MACHINE` (for make, if auto-detect is unsuitable)
+
 ## Benchmark Modes
 
 Each benchmark result must declare one of:
@@ -221,6 +257,8 @@ To reduce noise/flakiness:
 6. `scripts/run-bench-13.3.sh`
 7. `crates/client/examples/run_bench_13_3.rs`
 8. `.github/workflows/bench-13_3.yml`
+9. `scripts/build-tpch-dbgen.sh`
+10. `scripts/generate-tpch-dbgen-sf1.sh`
 
 ## Embedded Baseline Runner
 

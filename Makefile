@@ -20,6 +20,8 @@
 	bench-13.3-distributed \
 	bench-13.3-rag \
 	bench-13.3-compare \
+	tpch-dbgen-build \
+	tpch-dbgen-sf1 \
 	compare-13.3
 
 clean:
@@ -100,6 +102,12 @@ bench-13.3-compare:
 	@test -n "$$BASELINE" || (echo "BASELINE is required (json file or dir)" && exit 1)
 	@test -n "$$CANDIDATE" || (echo "CANDIDATE is required (json file or dir)" && exit 1)
 	./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}"
+
+tpch-dbgen-build:
+	./scripts/build-tpch-dbgen.sh
+
+tpch-dbgen-sf1:
+	TPCH_SCALE=1 ./scripts/generate-tpch-dbgen-sf1.sh
 
 compare-13.3:
 	$(MAKE) bench-13.3-compare BASELINE="$$BASELINE" CANDIDATE="$$CANDIDATE" THRESHOLD="$${THRESHOLD:-0.10}"
