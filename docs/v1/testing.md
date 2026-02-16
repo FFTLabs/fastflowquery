@@ -84,6 +84,35 @@ Approach:
 
 Run from repo root.
 
+## 13.1 single-checklist commands (local + CI)
+
+Local one-shot:
+
+```bash
+make test-13.1
+```
+
+Or run grouped phases:
+
+```bash
+make test-13.1-core
+make test-13.1-vector
+make test-13.1-distributed
+```
+
+Snapshot maintenance for optimizer goldens:
+
+```bash
+make bless-13.1-snapshots
+```
+
+CI uses the same grouped commands via:
+
+1. `.github/workflows/correctness-13_1.yml`
+2. `make test-13.1-core`
+3. `make test-13.1-vector`
+4. `make test-13.1-distributed`
+
 ## Baseline (embedded default)
 
 ```bash

@@ -1,4 +1,18 @@
-.PHONY: build
+.PHONY: \
+	clean \
+	build \
+	build-vector \
+	run \
+	plan \
+	tree \
+	test-planner \
+	test-unit \
+	test \
+	test-13.1-core \
+	test-13.1-vector \
+	test-13.1-distributed \
+	test-13.1 \
+	bless-13.1-snapshots
 
 clean:
 	cargo clean
@@ -26,3 +40,27 @@ test-unit:
 
 test:
 	cargo test
+
+# -----------------------------
+# 13.1 Correctness suite
+# -----------------------------
+
+test-13.1-core:
+	cargo test -p ffq-planner --test optimizer_golden
+	cargo test -p ffq-client --test embedded_hash_join
+	cargo test -p ffq-client --test embedded_hash_aggregate
+
+test-13.1-vector:
+	cargo test -p ffq-planner --test optimizer_golden --features vector
+	cargo test -p ffq-execution --features vector
+	cargo test -p ffq-client --features vector --lib
+	cargo test -p ffq-client --features vector --test embedded_vector_topk
+
+test-13.1-distributed:
+	cargo test -p ffq-client --test distributed_runtime_roundtrip --features distributed
+
+test-13.1: test-13.1-core test-13.1-vector test-13.1-distributed
+
+bless-13.1-snapshots:
+	BLESS=1 cargo test -p ffq-planner --test optimizer_golden
+	BLESS=1 cargo test -p ffq-planner --test optimizer_golden --features vector
