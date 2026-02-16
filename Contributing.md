@@ -48,5 +48,10 @@ Run distributed integration runner against the compose endpoint:
 FFQ_COORDINATOR_ENDPOINT=http://127.0.0.1:50051 ./scripts/run-distributed-integration.sh
 ```
 
+Notes:
+- script waits for coordinator + both worker shuffle endpoints before running tests.
+- script uses deterministic temp path `target/tmp/integration_distributed` and cleans it automatically
+  (set `FFQ_KEEP_INTEGRATION_TMP=1` to keep artifacts).
+
 ## License of contributions
 By submitting a contribution, you agree that it will be licensed under the project’s license (Apache License 2.0), unless you explicitly state otherwise.

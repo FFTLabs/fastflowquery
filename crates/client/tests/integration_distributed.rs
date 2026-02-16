@@ -1,6 +1,7 @@
 #![cfg(feature = "distributed")]
 
 use std::env;
+use std::path::PathBuf;
 
 use arrow::array::Int64Array;
 use arrow::record_batch::RecordBatch;
@@ -67,6 +68,12 @@ async fn run_query(engine: &Engine, sql: &str) -> Vec<RecordBatch> {
         .expect("collect")
 }
 
+fn integration_tmp_dir() -> PathBuf {
+    env::var("FFQ_INTEGRATION_TMP_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./target/tmp/integration_distributed"))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires external coordinator + worker cluster; run with scripts/run-distributed-integration.sh"]
 async fn distributed_integration_runner_returns_expected_join_agg_results() {
@@ -79,7 +86,11 @@ async fn distributed_integration_runner_returns_expected_join_agg_results() {
     );
 
     let prev_catalog = env::var("FFQ_CATALOG_PATH").ok();
-    let catalog_path = support::unique_path("ffq_integration_distributed_catalog", "json");
+    let prev_endpoint = env::var("FFQ_COORDINATOR_ENDPOINT").ok();
+    let tmp_dir = integration_tmp_dir();
+    std::fs::create_dir_all(&tmp_dir).expect("create integration tmp dir");
+    let catalog_path = tmp_dir.join("catalog.json");
+    let _ = std::fs::remove_file(&catalog_path);
     env::set_var("FFQ_CATALOG_PATH", catalog_path.to_string_lossy().to_string());
 
     let fixtures = support::ensure_integration_parquet_fixtures();
@@ -181,6 +192,11 @@ async fn distributed_integration_runner_returns_expected_join_agg_results() {
         env::set_var("FFQ_CATALOG_PATH", prev);
     } else {
         env::remove_var("FFQ_CATALOG_PATH");
+    }
+    if let Some(prev) = prev_endpoint {
+        env::set_var("FFQ_COORDINATOR_ENDPOINT", prev);
+    } else {
+        env::remove_var("FFQ_COORDINATOR_ENDPOINT");
     }
     let _ = std::fs::remove_file(catalog_path);
 }
