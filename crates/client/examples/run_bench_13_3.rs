@@ -27,6 +27,8 @@ struct CliOptions {
     out_dir: PathBuf,
     warmup: usize,
     iterations: usize,
+    #[cfg(feature = "vector")]
+    rag_matrix: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +74,11 @@ struct QueryResultRow {
     variant: String,
     runtime_tag: String,
     dataset: String,
+    backend: String,
+    n_docs: Option<usize>,
+    effective_dim: Option<usize>,
+    top_k: Option<usize>,
+    filter_selectivity: Option<f32>,
     iterations: usize,
     warmup_iterations: usize,
     elapsed_ms: f64,
@@ -92,6 +99,26 @@ struct BenchmarkArtifact {
     runtime: RuntimeMeta,
     host: HostMeta,
     results: Vec<QueryResultRow>,
+    rag_comparisons: Vec<RagComparisonRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct RagComparisonRow {
+    effective_dim: usize,
+    top_k: usize,
+    filter_selectivity: f32,
+    brute_force_elapsed_ms: f64,
+    qdrant_elapsed_ms: f64,
+    qdrant_speedup_x: f64,
+}
+
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, Copy)]
+struct RagVariant {
+    n_docs: usize,
+    effective_dim: usize,
+    k: usize,
+    filter_selectivity: f32,
 }
 
 fn main() -> Result<()> {
@@ -122,6 +149,11 @@ fn main() -> Result<()> {
                     variant: spec.variant.to_string(),
                     runtime_tag: opts.mode.as_str().to_string(),
                     dataset: spec.dataset.to_string(),
+                    backend: "sql_baseline".to_string(),
+                    n_docs: None,
+                    effective_dim: None,
+                    top_k: None,
+                    filter_selectivity: None,
                     iterations: opts.iterations,
                     warmup_iterations: opts.warmup,
                     elapsed_ms,
@@ -137,6 +169,11 @@ fn main() -> Result<()> {
                     variant: spec.variant.to_string(),
                     runtime_tag: opts.mode.as_str().to_string(),
                     dataset: spec.dataset.to_string(),
+                    backend: "sql_baseline".to_string(),
+                    n_docs: None,
+                    effective_dim: None,
+                    top_k: None,
+                    filter_selectivity: None,
                     iterations: opts.iterations,
                     warmup_iterations: opts.warmup,
                     elapsed_ms: 0.0,
@@ -148,9 +185,14 @@ fn main() -> Result<()> {
             }
         }
     }
+    #[cfg(feature = "vector")]
+    if opts.mode == BenchMode::Embedded {
+        run_rag_matrix(&engine, &opts, &mut results)?;
+    }
 
     futures::executor::block_on(engine.shutdown())?;
 
+    let rag_comparisons = build_rag_comparisons(&results);
     let run_id = format!("bench13_3_embedded_{}", now_millis());
     let artifact = BenchmarkArtifact {
         run_id: run_id.clone(),
@@ -170,6 +212,7 @@ fn main() -> Result<()> {
             logical_cpus: std::thread::available_parallelism().map_or(1, usize::from),
         },
         results,
+        rag_comparisons,
     };
 
     let json_path = opts.out_dir.join(format!("{run_id}.json"));
@@ -202,6 +245,9 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
         .to_path_buf();
     let mut warmup = 1usize;
     let mut iterations = 3usize;
+    #[cfg(feature = "vector")]
+    let mut rag_matrix = env::var("FFQ_BENCH_RAG_MATRIX")
+        .unwrap_or_else(|_| "1000,16,10,1.0;5000,32,10,0.8;10000,64,10,0.2".to_string());
 
     let mut i = 0usize;
     while i < args.len() {
@@ -236,6 +282,11 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
                     FfqError::InvalidConfig(format!("invalid --iterations '{raw}': {e}"))
                 })?;
             }
+            #[cfg(feature = "vector")]
+            "--rag-matrix" => {
+                i += 1;
+                rag_matrix = require_arg(&args, i, "--rag-matrix")?;
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -262,12 +313,14 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
         out_dir,
         warmup,
         iterations,
+        #[cfg(feature = "vector")]
+        rag_matrix,
     })
 }
 
 fn print_usage() {
     eprintln!(
-        "Usage: run_bench_13_3 [--mode embedded|distributed] [--fixture-root PATH] [--query-root PATH] [--out-dir PATH] [--warmup N] [--iterations N]"
+        "Usage: run_bench_13_3 [--mode embedded|distributed] [--fixture-root PATH] [--query-root PATH] [--out-dir PATH] [--warmup N] [--iterations N] [--rag-matrix \"N,dim,k,sel;...\"]"
     );
 }
 
@@ -401,18 +454,6 @@ fn canonical_specs(mode: BenchMode) -> Vec<QuerySpec> {
             params: HashMap::new(),
         },
     ];
-    #[cfg(feature = "vector")]
-    {
-        if mode == BenchMode::Embedded {
-            specs.push(QuerySpec {
-                id: BenchmarkQueryId::RagTopkBruteforce,
-                variant: "vector_bruteforce",
-                dataset: "rag_synth",
-                params: rag_query_params(),
-            });
-        }
-    }
-    #[cfg(not(feature = "vector"))]
     let _ = mode;
     specs
 }
@@ -492,13 +533,321 @@ fn parse_endpoint_host_port(endpoint: &str) -> Result<(String, u16)> {
 }
 
 #[cfg(feature = "vector")]
-fn rag_query_params() -> HashMap<String, LiteralValue> {
+fn rag_query_params(effective_dim: usize) -> Result<HashMap<String, LiteralValue>> {
+    if effective_dim == 0 || effective_dim > 64 {
+        return Err(FfqError::InvalidConfig(format!(
+            "effective_dim must be in 1..=64, got {effective_dim}"
+        )));
+    }
     let mut params = HashMap::new();
     let mut q = vec![0.0_f32; 64];
-    q[0] = 1.0;
-    q[1] = 0.5;
+    for (i, item) in q.iter_mut().enumerate().take(effective_dim) {
+        *item = if i % 2 == 0 { 1.0 } else { 0.5 };
+    }
     params.insert("q".to_string(), LiteralValue::VectorF32(q));
-    params
+    Ok(params)
+}
+
+#[cfg(feature = "vector")]
+fn run_rag_matrix(
+    engine: &Engine,
+    opts: &CliOptions,
+    results: &mut Vec<QueryResultRow>,
+) -> Result<()> {
+    let variants = parse_rag_matrix(&opts.rag_matrix)?;
+    let brute_template = fs::read_to_string(
+        opts.query_root.join("rag_topk_bruteforce.template.sql"),
+    )
+    .map_err(|e| {
+        FfqError::Io(std::io::Error::new(
+            e.kind(),
+            format!("read rag brute-force template failed: {e}"),
+        ))
+    })?;
+
+    #[cfg(feature = "qdrant")]
+    let mut qdrant_engine_registered = false;
+    #[cfg(feature = "qdrant")]
+    let qdrant_template = fs::read_to_string(opts.query_root.join("rag_topk_qdrant.template.sql"))
+        .map_err(|e| {
+            FfqError::Io(std::io::Error::new(
+                e.kind(),
+                format!("read rag qdrant template failed: {e}"),
+            ))
+        })?;
+
+    for variant in variants {
+        let where_clause = format!(
+            "WHERE id <= {}",
+            ((variant.n_docs as f32) * variant.filter_selectivity).floor() as usize
+        );
+        let brute_sql = render_rag_template(&brute_template, "docs", &where_clause, variant.k);
+        let params = rag_query_params(variant.effective_dim)?;
+        match execute_query(engine, &brute_sql, params, opts.warmup, opts.iterations) {
+            Ok((elapsed_ms, rows_out)) => results.push(QueryResultRow {
+                query_id: BenchmarkQueryId::RagTopkBruteforce.stable_id().to_string(),
+                variant: format!(
+                    "n{}_d{}_k{}_s{:.2}",
+                    variant.n_docs, variant.effective_dim, variant.k, variant.filter_selectivity
+                ),
+                runtime_tag: opts.mode.as_str().to_string(),
+                dataset: "rag_synth".to_string(),
+                backend: "vector_bruteforce".to_string(),
+                n_docs: Some(variant.n_docs),
+                effective_dim: Some(variant.effective_dim),
+                top_k: Some(variant.k),
+                filter_selectivity: Some(variant.filter_selectivity),
+                iterations: opts.iterations,
+                warmup_iterations: opts.warmup,
+                elapsed_ms,
+                rows_out,
+                bytes_out: None,
+                success: true,
+                error: None,
+            }),
+            Err(err) => results.push(QueryResultRow {
+                query_id: BenchmarkQueryId::RagTopkBruteforce.stable_id().to_string(),
+                variant: format!(
+                    "n{}_d{}_k{}_s{:.2}",
+                    variant.n_docs, variant.effective_dim, variant.k, variant.filter_selectivity
+                ),
+                runtime_tag: opts.mode.as_str().to_string(),
+                dataset: "rag_synth".to_string(),
+                backend: "vector_bruteforce".to_string(),
+                n_docs: Some(variant.n_docs),
+                effective_dim: Some(variant.effective_dim),
+                top_k: Some(variant.k),
+                filter_selectivity: Some(variant.filter_selectivity),
+                iterations: opts.iterations,
+                warmup_iterations: opts.warmup,
+                elapsed_ms: 0.0,
+                rows_out: 0,
+                bytes_out: None,
+                success: false,
+                error: Some(err.to_string()),
+            }),
+        }
+
+        #[cfg(feature = "qdrant")]
+        {
+            if qdrant_config_present() {
+                if !qdrant_engine_registered {
+                    register_qdrant_table(engine)?;
+                    qdrant_engine_registered = true;
+                }
+                let qdrant_where = qdrant_lang_where_for_selectivity(variant.filter_selectivity);
+                let qdrant_sql =
+                    render_rag_template(&qdrant_template, "docs_idx", &qdrant_where, variant.k);
+                let qparams = rag_query_params(variant.effective_dim)?;
+                match execute_query(engine, &qdrant_sql, qparams, opts.warmup, opts.iterations) {
+                    Ok((elapsed_ms, rows_out)) => results.push(QueryResultRow {
+                        query_id: BenchmarkQueryId::RagTopkQdrant.stable_id().to_string(),
+                        variant: format!(
+                            "n{}_d{}_k{}_s{:.2}",
+                            variant.n_docs,
+                            variant.effective_dim,
+                            variant.k,
+                            variant.filter_selectivity
+                        ),
+                        runtime_tag: opts.mode.as_str().to_string(),
+                        dataset: "rag_synth".to_string(),
+                        backend: "vector_qdrant".to_string(),
+                        n_docs: Some(variant.n_docs),
+                        effective_dim: Some(variant.effective_dim),
+                        top_k: Some(variant.k),
+                        filter_selectivity: Some(variant.filter_selectivity),
+                        iterations: opts.iterations,
+                        warmup_iterations: opts.warmup,
+                        elapsed_ms,
+                        rows_out,
+                        bytes_out: None,
+                        success: true,
+                        error: None,
+                    }),
+                    Err(err) => results.push(QueryResultRow {
+                        query_id: BenchmarkQueryId::RagTopkQdrant.stable_id().to_string(),
+                        variant: format!(
+                            "n{}_d{}_k{}_s{:.2}",
+                            variant.n_docs,
+                            variant.effective_dim,
+                            variant.k,
+                            variant.filter_selectivity
+                        ),
+                        runtime_tag: opts.mode.as_str().to_string(),
+                        dataset: "rag_synth".to_string(),
+                        backend: "vector_qdrant".to_string(),
+                        n_docs: Some(variant.n_docs),
+                        effective_dim: Some(variant.effective_dim),
+                        top_k: Some(variant.k),
+                        filter_selectivity: Some(variant.filter_selectivity),
+                        iterations: opts.iterations,
+                        warmup_iterations: opts.warmup,
+                        elapsed_ms: 0.0,
+                        rows_out: 0,
+                        bytes_out: None,
+                        success: false,
+                        error: Some(err.to_string()),
+                    }),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vector")]
+fn parse_rag_matrix(raw: &str) -> Result<Vec<RagVariant>> {
+    let mut out = Vec::new();
+    for item in raw.split(';').filter(|s| !s.trim().is_empty()) {
+        let parts = item.split(',').map(str::trim).collect::<Vec<_>>();
+        if parts.len() != 4 {
+            return Err(FfqError::InvalidConfig(format!(
+                "invalid rag matrix item '{item}'; expected N,dim,k,selectivity"
+            )));
+        }
+        let n_docs = parts[0]
+            .parse::<usize>()
+            .map_err(|e| FfqError::InvalidConfig(format!("invalid N '{}': {e}", parts[0])))?;
+        let effective_dim = parts[1]
+            .parse::<usize>()
+            .map_err(|e| FfqError::InvalidConfig(format!("invalid dim '{}': {e}", parts[1])))?;
+        let k = parts[2]
+            .parse::<usize>()
+            .map_err(|e| FfqError::InvalidConfig(format!("invalid k '{}': {e}", parts[2])))?;
+        let filter_selectivity = parts[3].parse::<f32>().map_err(|e| {
+            FfqError::InvalidConfig(format!("invalid selectivity '{}': {e}", parts[3]))
+        })?;
+        if !(0.0..=1.0).contains(&filter_selectivity) {
+            return Err(FfqError::InvalidConfig(format!(
+                "selectivity must be in [0,1], got {}",
+                filter_selectivity
+            )));
+        }
+        out.push(RagVariant {
+            n_docs,
+            effective_dim,
+            k,
+            filter_selectivity,
+        });
+    }
+    if out.is_empty() {
+        return Err(FfqError::InvalidConfig(
+            "rag matrix is empty; provide at least one variant".to_string(),
+        ));
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "vector")]
+fn render_rag_template(template: &str, table: &str, where_clause: &str, k: usize) -> String {
+    template
+        .replace("{{table}}", table)
+        .replace("{{where_clause}}", where_clause)
+        .replace("{{k}}", &k.to_string())
+}
+
+fn build_rag_comparisons(results: &[QueryResultRow]) -> Vec<RagComparisonRow> {
+    let mut out = Vec::new();
+    let mut brute_by_key: HashMap<(usize, usize, u32), f64> = HashMap::new();
+    let mut qdrant_by_key: HashMap<(usize, usize, u32), f64> = HashMap::new();
+    for row in results {
+        let (Some(dim), Some(k), Some(sel)) =
+            (row.effective_dim, row.top_k, row.filter_selectivity)
+        else {
+            continue;
+        };
+        if !row.success {
+            continue;
+        }
+        let key = (dim, k, (sel * 1000.0).round() as u32);
+        match row.backend.as_str() {
+            "vector_bruteforce" => {
+                brute_by_key.insert(key, row.elapsed_ms);
+            }
+            "vector_qdrant" => {
+                qdrant_by_key.insert(key, row.elapsed_ms);
+            }
+            _ => {}
+        }
+    }
+    for (key, brute_ms) in brute_by_key {
+        if let Some(qdrant_ms) = qdrant_by_key.get(&key) {
+            let speedup = if *qdrant_ms > 0.0 {
+                brute_ms / *qdrant_ms
+            } else {
+                0.0
+            };
+            out.push(RagComparisonRow {
+                effective_dim: key.0,
+                top_k: key.1,
+                filter_selectivity: (key.2 as f32) / 1000.0,
+                brute_force_elapsed_ms: brute_ms,
+                qdrant_elapsed_ms: *qdrant_ms,
+                qdrant_speedup_x: speedup,
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        a.effective_dim
+            .cmp(&b.effective_dim)
+            .then_with(|| a.top_k.cmp(&b.top_k))
+            .then_with(|| a.filter_selectivity.total_cmp(&b.filter_selectivity))
+    });
+    out
+}
+
+#[cfg(feature = "qdrant")]
+fn qdrant_config_present() -> bool {
+    env::var("FFQ_BENCH_QDRANT_COLLECTION").is_ok()
+}
+
+#[cfg(feature = "qdrant")]
+fn register_qdrant_table(engine: &Engine) -> Result<()> {
+    let collection = env::var("FFQ_BENCH_QDRANT_COLLECTION").map_err(|_| {
+        FfqError::InvalidConfig("FFQ_BENCH_QDRANT_COLLECTION must be set".to_string())
+    })?;
+    let endpoint = env::var("FFQ_BENCH_QDRANT_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:6334".to_string());
+    let mut options = HashMap::new();
+    options.insert("qdrant.endpoint".to_string(), endpoint);
+    options.insert("qdrant.collection".to_string(), collection.clone());
+    options.insert("qdrant.with_payload".to_string(), "true".to_string());
+    let emb_item = Field::new("item", DataType::Float32, true);
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("lang", DataType::Utf8, true),
+        Field::new("payload", DataType::Utf8, true),
+        Field::new("score", DataType::Float32, true),
+        Field::new(
+            "emb",
+            DataType::FixedSizeList(std::sync::Arc::new(emb_item), 64),
+            true,
+        ),
+    ]);
+    engine.register_table(
+        "docs_idx",
+        TableDef {
+            name: "docs_idx".to_string(),
+            uri: collection,
+            paths: Vec::new(),
+            format: "qdrant".to_string(),
+            schema: Some(schema),
+            stats: TableStats::default(),
+            options,
+        },
+    );
+    Ok(())
+}
+
+#[cfg(feature = "qdrant")]
+fn qdrant_lang_where_for_selectivity(sel: f32) -> String {
+    if sel <= 0.3 {
+        "WHERE lang = 'de'".to_string()
+    } else if sel <= 0.85 {
+        "WHERE lang = 'en'".to_string()
+    } else {
+        String::new()
+    }
 }
 
 fn execute_query(
@@ -582,12 +931,12 @@ fn csv_escape(s: &str) -> String {
 
 fn write_csv(path: &Path, artifact: &BenchmarkArtifact) -> Result<()> {
     let mut out = String::new();
-    out.push_str("run_id,timestamp_unix_ms,mode,query_id,variant,runtime_tag,dataset,iterations,warmup_iterations,elapsed_ms,rows_out,bytes_out,success,error\n");
+    out.push_str("run_id,timestamp_unix_ms,mode,query_id,variant,runtime_tag,dataset,backend,n_docs,effective_dim,top_k,filter_selectivity,iterations,warmup_iterations,elapsed_ms,rows_out,bytes_out,success,error\n");
     for r in &artifact.results {
         let error = r.error.as_deref().unwrap_or("");
         let bytes_out = r.bytes_out.map_or_else(String::new, |v| v.to_string());
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{:.3},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{},{},{}\n",
             csv_escape(&artifact.run_id),
             artifact.timestamp_unix_ms,
             csv_escape(&artifact.mode),
@@ -595,6 +944,12 @@ fn write_csv(path: &Path, artifact: &BenchmarkArtifact) -> Result<()> {
             csv_escape(&r.variant),
             csv_escape(&r.runtime_tag),
             csv_escape(&r.dataset),
+            csv_escape(&r.backend),
+            r.n_docs.map_or_else(String::new, |v| v.to_string()),
+            r.effective_dim.map_or_else(String::new, |v| v.to_string()),
+            r.top_k.map_or_else(String::new, |v| v.to_string()),
+            r.filter_selectivity
+                .map_or_else(String::new, |v| format!("{v:.3}")),
             r.iterations,
             r.warmup_iterations,
             r.elapsed_ms,
@@ -609,7 +964,7 @@ fn write_csv(path: &Path, artifact: &BenchmarkArtifact) -> Result<()> {
 }
 
 fn print_summary(artifact: &BenchmarkArtifact, json_path: &Path, csv_path: &Path) {
-    println!("Embedded benchmark run: {}", artifact.run_id);
+    println!("Benchmark run: {} ({})", artifact.run_id, artifact.mode);
     println!(
         "Queries: {}, warmup: {}, iterations: {}",
         artifact.results.len(),
@@ -624,6 +979,20 @@ fn print_summary(artifact: &BenchmarkArtifact, json_path: &Path, csv_path: &Path
         );
         if let Some(err) = &row.error {
             println!("  error: {err}");
+        }
+    }
+    if !artifact.rag_comparisons.is_empty() {
+        println!("RAG baseline vs qdrant:");
+        for c in &artifact.rag_comparisons {
+            println!(
+                "- dim={} k={} sel={:.2}: brute={:.3}ms qdrant={:.3}ms speedup={:.2}x",
+                c.effective_dim,
+                c.top_k,
+                c.filter_selectivity,
+                c.brute_force_elapsed_ms,
+                c.qdrant_elapsed_ms,
+                c.qdrant_speedup_x
+            );
         }
     }
     println!("JSON: {}", json_path.display());

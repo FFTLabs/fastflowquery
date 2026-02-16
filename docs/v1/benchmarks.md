@@ -219,6 +219,16 @@ Run:
 
 Outputs are written to `tests/bench/results/` as one JSON and one CSV file per run.
 
+RAG matrix configuration (embedded/vector path):
+
+1. `FFQ_BENCH_RAG_MATRIX` with format:
+   - `"N,dim,k,selectivity;N,dim,k,selectivity;..."`
+   - example: `"1000,16,5,1.0;5000,32,10,0.5;10000,64,20,0.2"`
+2. `N` controls candidate set (`id <= floor(N * selectivity)` on synthetic fixture).
+3. `dim` controls effective query-vector dimensions (`<=64` for current fixture).
+4. `k` controls top-k limit.
+5. `selectivity` must be in `[0,1]`.
+
 Distributed mode:
 
 ```bash
@@ -228,3 +238,9 @@ FFQ_COORDINATOR_ENDPOINT=http://127.0.0.1:50051 \
 ```
 
 In distributed mode, the runner performs endpoint readiness checks and executes the comparable TPC-H benchmark subset (`tpch_q1`, `tpch_q3`). Artifacts include `mode` and `runtime_tag` so embedded and distributed results can be compared with the same schema.
+
+Optional qdrant matrix variant (`--features qdrant`):
+
+1. Set `FFQ_BENCH_QDRANT_COLLECTION` (required to enable qdrant variant runs).
+2. Optional `FFQ_BENCH_QDRANT_ENDPOINT` (default `http://127.0.0.1:6334`).
+3. JSON includes `rag_comparisons` rows for baseline-vs-qdrant where matching variant keys exist.

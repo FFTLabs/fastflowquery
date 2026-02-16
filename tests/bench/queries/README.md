@@ -6,5 +6,7 @@ Canonical benchmark SQL files:
 2. `tpch_q3.sql`
 3. `rag_topk_bruteforce.sql`
 4. `rag_topk_qdrant.sql` (optional qdrant path)
+5. `rag_topk_bruteforce.template.sql` (RAG matrix variants)
+6. `rag_topk_qdrant.template.sql` (optional qdrant matrix variants)
 
 Benchmark runners should load these files directly so query text stays centralized and versioned.
