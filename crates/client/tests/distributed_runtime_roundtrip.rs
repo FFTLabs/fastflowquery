@@ -1,10 +1,11 @@
 #![cfg(feature = "distributed")]
 
 use std::collections::HashMap;
+#[cfg(feature = "vector")]
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use arrow::array::Int64Array;
 #[cfg(feature = "vector")]
@@ -22,6 +23,7 @@ use ffq_distributed::{
 #[cfg(feature = "vector")]
 use ffq_planner::LiteralValue;
 use ffq_storage::{TableDef, TableStats};
+#[cfg(feature = "vector")]
 use parquet::arrow::ArrowWriter;
 use tokio::sync::Mutex;
 use tonic::transport::Server;
@@ -29,26 +31,6 @@ use tonic::transport::Server;
 mod support;
 
 static DIST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn unique_path(prefix: &str, ext: &str) -> std::path::PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock before epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("{prefix}_{nanos}.{ext}"))
-}
-
-fn write_parquet(
-    path: &std::path::Path,
-    schema: Arc<Schema>,
-    cols: Vec<Arc<dyn arrow::array::Array>>,
-) {
-    let batch = RecordBatch::try_new(schema.clone(), cols).expect("build batch");
-    let file = File::create(path).expect("create parquet");
-    let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
-    writer.write(&batch).expect("write");
-    writer.close().expect("close");
-}
 
 fn register_tables(
     engine: &Engine,
@@ -243,37 +225,12 @@ fn register_two_phase_tables(engine: &Engine, docs_path: &std::path::Path) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     let _lock = DIST_TEST_LOCK.lock().expect("dist test lock");
-    let lineitem_path = unique_path("ffq_client_dist_lineitem", "parquet");
-    let orders_path = unique_path("ffq_client_dist_orders", "parquet");
-    let spill_dir = unique_path("ffq_client_dist_spill", "dir");
-    let shuffle_root = unique_path("ffq_client_dist_shuffle", "dir");
+    let fixtures = support::ensure_integration_parquet_fixtures();
+    let lineitem_path = fixtures.lineitem;
+    let orders_path = fixtures.orders;
+    let spill_dir = support::unique_path("ffq_client_dist_spill", "dir");
+    let shuffle_root = support::unique_path("ffq_client_dist_shuffle", "dir");
     let _ = std::fs::create_dir_all(&shuffle_root);
-
-    let lineitem_schema = Arc::new(Schema::new(vec![
-        Field::new("l_orderkey", DataType::Int64, false),
-        Field::new("l_partkey", DataType::Int64, false),
-    ]));
-    write_parquet(
-        &lineitem_path,
-        lineitem_schema,
-        vec![
-            Arc::new(Int64Array::from(vec![1_i64, 2, 2, 3, 3, 3])),
-            Arc::new(Int64Array::from(vec![10_i64, 20, 21, 30, 31, 32])),
-        ],
-    );
-
-    let orders_schema = Arc::new(Schema::new(vec![
-        Field::new("o_orderkey", DataType::Int64, false),
-        Field::new("o_custkey", DataType::Int64, false),
-    ]));
-    write_parquet(
-        &orders_path,
-        orders_schema,
-        vec![
-            Arc::new(Int64Array::from(vec![2_i64, 3, 4])),
-            Arc::new(Int64Array::from(vec![100_i64, 200, 300])),
-        ],
-    );
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -483,8 +440,6 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     w2.abort();
     server_handle.abort();
 
-    let _ = std::fs::remove_file(&lineitem_path);
-    let _ = std::fs::remove_file(&orders_path);
     let _ = std::fs::remove_dir_all(&spill_dir);
     let _ = std::fs::remove_dir_all(&shuffle_root);
 }
@@ -493,9 +448,9 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
     let _lock = DIST_TEST_LOCK.lock().expect("dist test lock");
-    let docs_path = unique_path("ffq_client_dist_docs", "parquet");
-    let spill_dir = unique_path("ffq_client_dist_vec_spill", "dir");
-    let shuffle_root = unique_path("ffq_client_dist_vec_shuffle", "dir");
+    let docs_path = support::unique_path("ffq_client_dist_docs", "parquet");
+    let spill_dir = support::unique_path("ffq_client_dist_vec_spill", "dir");
+    let shuffle_root = support::unique_path("ffq_client_dist_vec_shuffle", "dir");
     let _ = std::fs::create_dir_all(&shuffle_root);
 
     let emb_field = Field::new("item", DataType::Float32, true);

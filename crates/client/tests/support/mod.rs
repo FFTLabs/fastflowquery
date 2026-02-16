@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    StringArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, FixedSizeListBuilder, Float32Array, Float32Builder,
+    Float64Array, Int32Array, Int64Array, StringArray, UInt32Array, UInt64Array,
 };
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
@@ -46,6 +46,84 @@ pub mod integration_queries {
 
     pub fn vector_two_phase_rerank() -> &'static str {
         VECTOR_TWO_PHASE_SQL.trim()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IntegrationParquetFixtures {
+    pub lineitem: PathBuf,
+    pub orders: PathBuf,
+    pub docs: PathBuf,
+}
+
+pub fn ensure_integration_parquet_fixtures() -> IntegrationParquetFixtures {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/parquet");
+    std::fs::create_dir_all(&root).expect("create integration fixture dir");
+
+    let lineitem = root.join("lineitem.parquet");
+    let orders = root.join("orders.parquet");
+    let docs = root.join("docs.parquet");
+
+    let lineitem_schema = Arc::new(Schema::new(vec![
+        Field::new("l_orderkey", DataType::Int64, false),
+        Field::new("l_partkey", DataType::Int64, false),
+    ]));
+    write_parquet(
+        &lineitem,
+        lineitem_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 2, 3, 3, 3])),
+            Arc::new(Int64Array::from(vec![10_i64, 20, 21, 30, 31, 32])),
+        ],
+    );
+
+    let orders_schema = Arc::new(Schema::new(vec![
+        Field::new("o_orderkey", DataType::Int64, false),
+        Field::new("o_custkey", DataType::Int64, false),
+    ]));
+    write_parquet(
+        &orders,
+        orders_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![2_i64, 3, 4])),
+            Arc::new(Int64Array::from(vec![100_i64, 200, 300])),
+        ],
+    );
+
+    let emb_field = Field::new("item", DataType::Float32, true);
+    let docs_schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("title", DataType::Utf8, false),
+        Field::new("lang", DataType::Utf8, false),
+        Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+    ]));
+    let mut emb_builder = FixedSizeListBuilder::new(Float32Builder::new(), 3);
+    let vectors = [
+        [1.0_f32, 0.0, 0.0],
+        [0.8_f32, 0.2, 0.0],
+        [0.0_f32, 1.0, 0.0],
+    ];
+    for v in vectors {
+        for x in v {
+            emb_builder.values().append_value(x);
+        }
+        emb_builder.append(true);
+    }
+    write_parquet(
+        &docs,
+        docs_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(StringArray::from(vec!["doc-1", "doc-2", "doc-3"])),
+            Arc::new(StringArray::from(vec!["en", "en", "de"])),
+            Arc::new(emb_builder.finish()),
+        ],
+    );
+
+    IntegrationParquetFixtures {
+        lineitem,
+        orders,
+        docs,
     }
 }
 
