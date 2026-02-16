@@ -41,7 +41,14 @@ Logical benchmark query ids:
 3. `rag_topk_bruteforce`
 4. `rag_topk_qdrant` (optional/feature-gated)
 
-The runner may map each id to SQL file paths, but IDs are the stable reporting keys.
+Canonical SQL file paths:
+
+1. `tests/bench/queries/tpch_q1.sql`
+2. `tests/bench/queries/tpch_q3.sql`
+3. `tests/bench/queries/rag_topk_bruteforce.sql`
+4. `tests/bench/queries/rag_topk_qdrant.sql`
+
+The IDs are stable reporting keys. Benchmark runners must load SQL from these files rather than embedding inline SQL strings.
 
 ## Required Metrics
 
@@ -198,3 +205,4 @@ To reduce noise/flakiness:
 2. `docs/v1/integration-13.2.md`
 3. `Makefile`
 4. `.github/workflows/integration-13_2.yml`
+5. `tests/bench/queries/`

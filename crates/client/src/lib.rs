@@ -3,6 +3,7 @@ mod runtime;
 mod session;
 
 pub mod bench_fixtures;
+pub mod bench_queries;
 pub mod dataframe;
 pub mod engine;
 pub mod expr;
