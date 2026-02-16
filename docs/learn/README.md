@@ -46,18 +46,21 @@ Read these in sequence:
 3. `docs/learn/03-physical-planning.md`
 4. `docs/learn/04-execution-engine.md`
 5. `docs/learn/05-distributed-stages-shuffle.md`
-6. `docs/v1/quickstart.md`
-7. `docs/v1/architecture.md`
-8. `docs/v1/client-runtime.md`
-9. `docs/v1/operators-core.md`
-10. `docs/v1/storage-catalog.md`
-11. `docs/v1/shuffle-stage-model.md`
-12. `docs/v1/distributed-runtime.md`
-13. `docs/v1/vector-rag.md`
-14. `docs/v1/writes-dml.md`
-15. `docs/v1/observability.md`
-16. `docs/v1/testing.md`
-17. `docs/v1/benchmarks.md`
+6. `docs/learn/06-control-plane.md`
+7. `docs/learn/07-rpc-protocol.md`
+8. `docs/learn/08-correctness-distributed.md`
+9. `docs/v1/quickstart.md`
+10. `docs/v1/architecture.md`
+11. `docs/v1/client-runtime.md`
+12. `docs/v1/operators-core.md`
+13. `docs/v1/storage-catalog.md`
+14. `docs/v1/shuffle-stage-model.md`
+15. `docs/v1/distributed-runtime.md`
+16. `docs/v1/vector-rag.md`
+17. `docs/v1/writes-dml.md`
+18. `docs/v1/observability.md`
+19. `docs/v1/testing.md`
+20. `docs/v1/benchmarks.md`
 
 ## What You Will Understand At The End
 
@@ -82,6 +85,7 @@ The learner track expands next into dedicated chapters:
 3. `docs/learn/03-physical-planning.md` (logical->physical mapping and operator contracts).
 4. `docs/learn/04-execution-engine.md` (streaming, memory budget, spill, determinism internals).
 5. `docs/learn/05-distributed-stages-shuffle.md` (stage cuts, shuffle paths, attempts, and TTL cleanup).
-6. Distributed control plane and RPC sequences.
-7. Result correctness and determinism model.
-8. Benchmark interpretation (synthetic vs official).
+6. `docs/learn/06-control-plane.md` (state machine, pull scheduling, heartbeats, registry, blacklisting).
+7. `docs/learn/07-rpc-protocol.md` (RPC purposes, call sequences, and streamed byte exchange).
+8. `docs/learn/08-correctness-distributed.md` (semantic equivalence, normalization, and parity testing).
+9. Benchmark interpretation (synthetic vs official).
