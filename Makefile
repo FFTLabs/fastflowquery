@@ -12,7 +12,8 @@
 	test-13.1-vector \
 	test-13.1-distributed \
 	test-13.1 \
-	bless-13.1-snapshots
+	bless-13.1-snapshots \
+	test-13.2-distributed
 
 clean:
 	cargo clean
@@ -64,3 +65,6 @@ test-13.1: test-13.1-core test-13.1-vector test-13.1-distributed
 bless-13.1-snapshots:
 	BLESS=1 cargo test -p ffq-planner --test optimizer_golden
 	BLESS=1 cargo test -p ffq-planner --test optimizer_golden --features vector
+
+test-13.2-distributed:
+	./scripts/run-distributed-integration.sh

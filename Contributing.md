@@ -42,5 +42,11 @@ Cleanup:
 docker compose -f docker/compose/ffq.yml down -v
 ```
 
+Run distributed integration runner against the compose endpoint:
+
+```bash
+FFQ_COORDINATOR_ENDPOINT=http://127.0.0.1:50051 ./scripts/run-distributed-integration.sh
+```
+
 ## License of contributions
 By submitting a contribution, you agree that it will be licensed under the project’s license (Apache License 2.0), unless you explicitly state otherwise.
