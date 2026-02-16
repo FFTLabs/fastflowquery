@@ -229,6 +229,18 @@ RAG matrix configuration (embedded/vector path):
 4. `k` controls top-k limit.
 5. `selectivity` must be in `[0,1]`.
 
+Normalization controls (defaulted by `scripts/run-bench-13.3.sh`):
+
+1. `FFQ_BENCH_THREADS` (also exported to `TOKIO_WORKER_THREADS` and `RAYON_NUM_THREADS`)
+2. `FFQ_BENCH_BATCH_SIZE_ROWS`
+3. `FFQ_BENCH_MEM_BUDGET_BYTES`
+4. `FFQ_BENCH_SHUFFLE_PARTITIONS`
+5. `FFQ_BENCH_SPILL_DIR` (cleaned before run; removed after run unless `FFQ_BENCH_KEEP_SPILL=1`)
+6. `FFQ_BENCH_MAX_CV_PCT` variance gate (`--no-variance-check` to disable in direct CLI usage)
+7. `TZ=UTC` and `LC_ALL=C`
+
+Per-query output now includes `elapsed_stddev_ms` and `elapsed_cv_pct` to track variance.
+
 Distributed mode:
 
 ```bash

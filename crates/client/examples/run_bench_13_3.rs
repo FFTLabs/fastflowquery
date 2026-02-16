@@ -27,6 +27,13 @@ struct CliOptions {
     out_dir: PathBuf,
     warmup: usize,
     iterations: usize,
+    threads: usize,
+    batch_size_rows: usize,
+    mem_budget_bytes: usize,
+    shuffle_partitions: usize,
+    spill_dir: PathBuf,
+    keep_spill_dir: bool,
+    max_cv_pct: Option<f64>,
     #[cfg(feature = "vector")]
     rag_matrix: String,
 }
@@ -56,9 +63,14 @@ struct QuerySpec {
 
 #[derive(Debug, Serialize)]
 struct RuntimeMeta {
+    threads: usize,
     batch_size_rows: usize,
     mem_budget_bytes: usize,
     shuffle_partitions: usize,
+    spill_dir: String,
+    max_cv_pct: Option<f64>,
+    tz: String,
+    locale: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +94,8 @@ struct QueryResultRow {
     iterations: usize,
     warmup_iterations: usize,
     elapsed_ms: f64,
+    elapsed_stddev_ms: Option<f64>,
+    elapsed_cv_pct: Option<f64>,
     rows_out: u64,
     bytes_out: Option<u64>,
     success: bool,
@@ -112,6 +126,14 @@ struct RagComparisonRow {
     qdrant_speedup_x: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct QueryRunStats {
+    elapsed_avg_ms: f64,
+    elapsed_stddev_ms: f64,
+    elapsed_cv_pct: f64,
+    rows_out: u64,
+}
+
 #[cfg(feature = "vector")]
 #[derive(Debug, Clone, Copy)]
 struct RagVariant {
@@ -128,8 +150,14 @@ fn main() -> Result<()> {
     }
     ensure_fixtures(&opts.fixture_root)?;
     fs::create_dir_all(&opts.out_dir)?;
+    apply_normalization_env(&opts);
+    prepare_spill_dir(&opts.spill_dir)?;
 
-    let config = EngineConfig::default();
+    let mut config = EngineConfig::default();
+    config.batch_size_rows = opts.batch_size_rows;
+    config.mem_budget_bytes = opts.mem_budget_bytes;
+    config.shuffle_partitions = opts.shuffle_partitions;
+    config.spill_dir = opts.spill_dir.display().to_string();
     let mut results = Vec::new();
     let engine = Engine::new(config.clone())?;
     register_benchmark_tables(&engine, &opts.fixture_root)?;
@@ -143,7 +171,35 @@ fn main() -> Result<()> {
             opts.warmup,
             opts.iterations,
         ) {
-            Ok((elapsed_ms, rows_out)) => {
+            Ok(stats) => {
+                if let Some(max_cv) = opts.max_cv_pct {
+                    if opts.iterations >= 2 && stats.elapsed_cv_pct > max_cv {
+                        results.push(QueryResultRow {
+                            query_id: spec.id.stable_id().to_string(),
+                            variant: spec.variant.to_string(),
+                            runtime_tag: opts.mode.as_str().to_string(),
+                            dataset: spec.dataset.to_string(),
+                            backend: "sql_baseline".to_string(),
+                            n_docs: None,
+                            effective_dim: None,
+                            top_k: None,
+                            filter_selectivity: None,
+                            iterations: opts.iterations,
+                            warmup_iterations: opts.warmup,
+                            elapsed_ms: stats.elapsed_avg_ms,
+                            elapsed_stddev_ms: Some(stats.elapsed_stddev_ms),
+                            elapsed_cv_pct: Some(stats.elapsed_cv_pct),
+                            rows_out: stats.rows_out,
+                            bytes_out: None,
+                            success: false,
+                            error: Some(format!(
+                                "variance check failed: cv_pct={:.2} > max_cv_pct={:.2}",
+                                stats.elapsed_cv_pct, max_cv
+                            )),
+                        });
+                        continue;
+                    }
+                }
                 results.push(QueryResultRow {
                     query_id: spec.id.stable_id().to_string(),
                     variant: spec.variant.to_string(),
@@ -156,8 +212,10 @@ fn main() -> Result<()> {
                     filter_selectivity: None,
                     iterations: opts.iterations,
                     warmup_iterations: opts.warmup,
-                    elapsed_ms,
-                    rows_out,
+                    elapsed_ms: stats.elapsed_avg_ms,
+                    elapsed_stddev_ms: Some(stats.elapsed_stddev_ms),
+                    elapsed_cv_pct: Some(stats.elapsed_cv_pct),
+                    rows_out: stats.rows_out,
                     bytes_out: None,
                     success: true,
                     error: None,
@@ -177,6 +235,8 @@ fn main() -> Result<()> {
                     iterations: opts.iterations,
                     warmup_iterations: opts.warmup,
                     elapsed_ms: 0.0,
+                    elapsed_stddev_ms: None,
+                    elapsed_cv_pct: None,
                     rows_out: 0,
                     bytes_out: None,
                     success: false,
@@ -193,7 +253,7 @@ fn main() -> Result<()> {
     futures::executor::block_on(engine.shutdown())?;
 
     let rag_comparisons = build_rag_comparisons(&results);
-    let run_id = format!("bench13_3_embedded_{}", now_millis());
+    let run_id = format!("bench13_3_{}_{}", opts.mode.as_str(), now_millis());
     let artifact = BenchmarkArtifact {
         run_id: run_id.clone(),
         timestamp_unix_ms: now_millis(),
@@ -202,9 +262,16 @@ fn main() -> Result<()> {
         fixture_root: opts.fixture_root.display().to_string(),
         query_root: opts.query_root.display().to_string(),
         runtime: RuntimeMeta {
+            threads: opts.threads,
             batch_size_rows: config.batch_size_rows,
             mem_budget_bytes: config.mem_budget_bytes,
             shuffle_partitions: config.shuffle_partitions,
+            spill_dir: config.spill_dir.clone(),
+            max_cv_pct: opts.max_cv_pct,
+            tz: env::var("TZ").unwrap_or_else(|_| "UTC".to_string()),
+            locale: env::var("LC_ALL")
+                .or_else(|_| env::var("LANG"))
+                .unwrap_or_else(|_| "C".to_string()),
         },
         host: HostMeta {
             os: std::env::consts::OS.to_string(),
@@ -222,10 +289,12 @@ fn main() -> Result<()> {
     print_summary(&artifact, &json_path, &csv_path);
 
     if artifact.results.iter().any(|r| !r.success) {
+        cleanup_spill_dir(&opts)?;
         return Err(FfqError::Execution(
             "one or more benchmark queries failed; see JSON output".to_string(),
         ));
     }
+    cleanup_spill_dir(&opts)?;
     Ok(())
 }
 
@@ -245,6 +314,38 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
         .to_path_buf();
     let mut warmup = 1usize;
     let mut iterations = 3usize;
+    let mut threads = env::var("FFQ_BENCH_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1);
+    let mut batch_size_rows = env::var("FFQ_BENCH_BATCH_SIZE_ROWS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(8192);
+    let mut mem_budget_bytes = env::var("FFQ_BENCH_MEM_BUDGET_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(512 * 1024 * 1024);
+    let mut shuffle_partitions = env::var("FFQ_BENCH_SHUFFLE_PARTITIONS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(64);
+    let mut spill_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/tmp/bench_spill")
+        .to_path_buf();
+    let mut keep_spill_dir = env::var("FFQ_BENCH_KEEP_SPILL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut max_cv_pct = env::var("FFQ_BENCH_MAX_CV_PCT")
+        .ok()
+        .and_then(|s| {
+            if s.trim().is_empty() {
+                None
+            } else {
+                s.parse::<f64>().ok()
+            }
+        })
+        .or(Some(30.0));
     #[cfg(feature = "vector")]
     let mut rag_matrix = env::var("FFQ_BENCH_RAG_MATRIX")
         .unwrap_or_else(|_| "1000,16,10,1.0;5000,32,10,0.8;10000,64,10,0.2".to_string());
@@ -282,6 +383,51 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
                     FfqError::InvalidConfig(format!("invalid --iterations '{raw}': {e}"))
                 })?;
             }
+            "--threads" => {
+                i += 1;
+                let raw = require_arg(&args, i, "--threads")?;
+                threads = raw.parse::<usize>().map_err(|e| {
+                    FfqError::InvalidConfig(format!("invalid --threads '{raw}': {e}"))
+                })?;
+            }
+            "--batch-size-rows" => {
+                i += 1;
+                let raw = require_arg(&args, i, "--batch-size-rows")?;
+                batch_size_rows = raw.parse::<usize>().map_err(|e| {
+                    FfqError::InvalidConfig(format!("invalid --batch-size-rows '{raw}': {e}"))
+                })?;
+            }
+            "--mem-budget-bytes" => {
+                i += 1;
+                let raw = require_arg(&args, i, "--mem-budget-bytes")?;
+                mem_budget_bytes = raw.parse::<usize>().map_err(|e| {
+                    FfqError::InvalidConfig(format!("invalid --mem-budget-bytes '{raw}': {e}"))
+                })?;
+            }
+            "--shuffle-partitions" => {
+                i += 1;
+                let raw = require_arg(&args, i, "--shuffle-partitions")?;
+                shuffle_partitions = raw.parse::<usize>().map_err(|e| {
+                    FfqError::InvalidConfig(format!("invalid --shuffle-partitions '{raw}': {e}"))
+                })?;
+            }
+            "--spill-dir" => {
+                i += 1;
+                spill_dir = PathBuf::from(require_arg(&args, i, "--spill-dir")?);
+            }
+            "--keep-spill-dir" => {
+                keep_spill_dir = true;
+            }
+            "--max-cv-pct" => {
+                i += 1;
+                let raw = require_arg(&args, i, "--max-cv-pct")?;
+                max_cv_pct = Some(raw.parse::<f64>().map_err(|e| {
+                    FfqError::InvalidConfig(format!("invalid --max-cv-pct '{raw}': {e}"))
+                })?);
+            }
+            "--no-variance-check" => {
+                max_cv_pct = None;
+            }
             #[cfg(feature = "vector")]
             "--rag-matrix" => {
                 i += 1;
@@ -305,6 +451,26 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
             "--iterations must be >= 1".to_string(),
         ));
     }
+    if threads == 0 {
+        return Err(FfqError::InvalidConfig(
+            "--threads must be >= 1".to_string(),
+        ));
+    }
+    if batch_size_rows == 0 {
+        return Err(FfqError::InvalidConfig(
+            "--batch-size-rows must be >= 1".to_string(),
+        ));
+    }
+    if mem_budget_bytes == 0 {
+        return Err(FfqError::InvalidConfig(
+            "--mem-budget-bytes must be >= 1".to_string(),
+        ));
+    }
+    if shuffle_partitions == 0 {
+        return Err(FfqError::InvalidConfig(
+            "--shuffle-partitions must be >= 1".to_string(),
+        ));
+    }
 
     Ok(CliOptions {
         mode,
@@ -313,6 +479,13 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
         out_dir,
         warmup,
         iterations,
+        threads,
+        batch_size_rows,
+        mem_budget_bytes,
+        shuffle_partitions,
+        spill_dir,
+        keep_spill_dir,
+        max_cv_pct,
         #[cfg(feature = "vector")]
         rag_matrix,
     })
@@ -320,8 +493,39 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: run_bench_13_3 [--mode embedded|distributed] [--fixture-root PATH] [--query-root PATH] [--out-dir PATH] [--warmup N] [--iterations N] [--rag-matrix \"N,dim,k,sel;...\"]"
+        "Usage: run_bench_13_3 [--mode embedded|distributed] [--fixture-root PATH] [--query-root PATH] [--out-dir PATH] [--warmup N] [--iterations N] [--threads N] [--batch-size-rows N] [--mem-budget-bytes N] [--shuffle-partitions N] [--spill-dir PATH] [--keep-spill-dir] [--max-cv-pct N|--no-variance-check] [--rag-matrix \"N,dim,k,sel;...\"]"
     );
+}
+
+fn apply_normalization_env(opts: &CliOptions) {
+    env::set_var("TZ", env::var("TZ").unwrap_or_else(|_| "UTC".to_string()));
+    env::set_var(
+        "LC_ALL",
+        env::var("LC_ALL")
+            .or_else(|_| env::var("LANG"))
+            .unwrap_or_else(|_| "C".to_string()),
+    );
+    env::set_var("FFQ_BENCH_THREADS", opts.threads.to_string());
+    env::set_var("TOKIO_WORKER_THREADS", opts.threads.to_string());
+    env::set_var("RAYON_NUM_THREADS", opts.threads.to_string());
+}
+
+fn prepare_spill_dir(spill_dir: &Path) -> Result<()> {
+    if spill_dir.exists() {
+        fs::remove_dir_all(spill_dir)?;
+    }
+    fs::create_dir_all(spill_dir)?;
+    Ok(())
+}
+
+fn cleanup_spill_dir(opts: &CliOptions) -> Result<()> {
+    if opts.keep_spill_dir {
+        return Ok(());
+    }
+    if opts.spill_dir.exists() {
+        fs::remove_dir_all(&opts.spill_dir)?;
+    }
+    Ok(())
 }
 
 fn parse_mode(raw: &str) -> Result<BenchMode> {
@@ -584,27 +788,68 @@ fn run_rag_matrix(
         let brute_sql = render_rag_template(&brute_template, "docs", &where_clause, variant.k);
         let params = rag_query_params(variant.effective_dim)?;
         match execute_query(engine, &brute_sql, params, opts.warmup, opts.iterations) {
-            Ok((elapsed_ms, rows_out)) => results.push(QueryResultRow {
-                query_id: BenchmarkQueryId::RagTopkBruteforce.stable_id().to_string(),
-                variant: format!(
-                    "n{}_d{}_k{}_s{:.2}",
-                    variant.n_docs, variant.effective_dim, variant.k, variant.filter_selectivity
-                ),
-                runtime_tag: opts.mode.as_str().to_string(),
-                dataset: "rag_synth".to_string(),
-                backend: "vector_bruteforce".to_string(),
-                n_docs: Some(variant.n_docs),
-                effective_dim: Some(variant.effective_dim),
-                top_k: Some(variant.k),
-                filter_selectivity: Some(variant.filter_selectivity),
-                iterations: opts.iterations,
-                warmup_iterations: opts.warmup,
-                elapsed_ms,
-                rows_out,
-                bytes_out: None,
-                success: true,
-                error: None,
-            }),
+            Ok(stats) => {
+                if let Some(max_cv) = opts.max_cv_pct {
+                    if opts.iterations >= 2 && stats.elapsed_cv_pct > max_cv {
+                        results.push(QueryResultRow {
+                            query_id: BenchmarkQueryId::RagTopkBruteforce.stable_id().to_string(),
+                            variant: format!(
+                                "n{}_d{}_k{}_s{:.2}",
+                                variant.n_docs,
+                                variant.effective_dim,
+                                variant.k,
+                                variant.filter_selectivity
+                            ),
+                            runtime_tag: opts.mode.as_str().to_string(),
+                            dataset: "rag_synth".to_string(),
+                            backend: "vector_bruteforce".to_string(),
+                            n_docs: Some(variant.n_docs),
+                            effective_dim: Some(variant.effective_dim),
+                            top_k: Some(variant.k),
+                            filter_selectivity: Some(variant.filter_selectivity),
+                            iterations: opts.iterations,
+                            warmup_iterations: opts.warmup,
+                            elapsed_ms: stats.elapsed_avg_ms,
+                            elapsed_stddev_ms: Some(stats.elapsed_stddev_ms),
+                            elapsed_cv_pct: Some(stats.elapsed_cv_pct),
+                            rows_out: stats.rows_out,
+                            bytes_out: None,
+                            success: false,
+                            error: Some(format!(
+                                "variance check failed: cv_pct={:.2} > max_cv_pct={:.2}",
+                                stats.elapsed_cv_pct, max_cv
+                            )),
+                        });
+                        continue;
+                    }
+                }
+                results.push(QueryResultRow {
+                    query_id: BenchmarkQueryId::RagTopkBruteforce.stable_id().to_string(),
+                    variant: format!(
+                        "n{}_d{}_k{}_s{:.2}",
+                        variant.n_docs,
+                        variant.effective_dim,
+                        variant.k,
+                        variant.filter_selectivity
+                    ),
+                    runtime_tag: opts.mode.as_str().to_string(),
+                    dataset: "rag_synth".to_string(),
+                    backend: "vector_bruteforce".to_string(),
+                    n_docs: Some(variant.n_docs),
+                    effective_dim: Some(variant.effective_dim),
+                    top_k: Some(variant.k),
+                    filter_selectivity: Some(variant.filter_selectivity),
+                    iterations: opts.iterations,
+                    warmup_iterations: opts.warmup,
+                    elapsed_ms: stats.elapsed_avg_ms,
+                    elapsed_stddev_ms: Some(stats.elapsed_stddev_ms),
+                    elapsed_cv_pct: Some(stats.elapsed_cv_pct),
+                    rows_out: stats.rows_out,
+                    bytes_out: None,
+                    success: true,
+                    error: None,
+                });
+            }
             Err(err) => results.push(QueryResultRow {
                 query_id: BenchmarkQueryId::RagTopkBruteforce.stable_id().to_string(),
                 variant: format!(
@@ -621,6 +866,8 @@ fn run_rag_matrix(
                 iterations: opts.iterations,
                 warmup_iterations: opts.warmup,
                 elapsed_ms: 0.0,
+                elapsed_stddev_ms: None,
+                elapsed_cv_pct: None,
                 rows_out: 0,
                 bytes_out: None,
                 success: false,
@@ -640,30 +887,70 @@ fn run_rag_matrix(
                     render_rag_template(&qdrant_template, "docs_idx", &qdrant_where, variant.k);
                 let qparams = rag_query_params(variant.effective_dim)?;
                 match execute_query(engine, &qdrant_sql, qparams, opts.warmup, opts.iterations) {
-                    Ok((elapsed_ms, rows_out)) => results.push(QueryResultRow {
-                        query_id: BenchmarkQueryId::RagTopkQdrant.stable_id().to_string(),
-                        variant: format!(
-                            "n{}_d{}_k{}_s{:.2}",
-                            variant.n_docs,
-                            variant.effective_dim,
-                            variant.k,
-                            variant.filter_selectivity
-                        ),
-                        runtime_tag: opts.mode.as_str().to_string(),
-                        dataset: "rag_synth".to_string(),
-                        backend: "vector_qdrant".to_string(),
-                        n_docs: Some(variant.n_docs),
-                        effective_dim: Some(variant.effective_dim),
-                        top_k: Some(variant.k),
-                        filter_selectivity: Some(variant.filter_selectivity),
-                        iterations: opts.iterations,
-                        warmup_iterations: opts.warmup,
-                        elapsed_ms,
-                        rows_out,
-                        bytes_out: None,
-                        success: true,
-                        error: None,
-                    }),
+                    Ok(stats) => {
+                        if let Some(max_cv) = opts.max_cv_pct {
+                            if opts.iterations >= 2 && stats.elapsed_cv_pct > max_cv {
+                                results.push(QueryResultRow {
+                                    query_id: BenchmarkQueryId::RagTopkQdrant
+                                        .stable_id()
+                                        .to_string(),
+                                    variant: format!(
+                                        "n{}_d{}_k{}_s{:.2}",
+                                        variant.n_docs,
+                                        variant.effective_dim,
+                                        variant.k,
+                                        variant.filter_selectivity
+                                    ),
+                                    runtime_tag: opts.mode.as_str().to_string(),
+                                    dataset: "rag_synth".to_string(),
+                                    backend: "vector_qdrant".to_string(),
+                                    n_docs: Some(variant.n_docs),
+                                    effective_dim: Some(variant.effective_dim),
+                                    top_k: Some(variant.k),
+                                    filter_selectivity: Some(variant.filter_selectivity),
+                                    iterations: opts.iterations,
+                                    warmup_iterations: opts.warmup,
+                                    elapsed_ms: stats.elapsed_avg_ms,
+                                    elapsed_stddev_ms: Some(stats.elapsed_stddev_ms),
+                                    elapsed_cv_pct: Some(stats.elapsed_cv_pct),
+                                    rows_out: stats.rows_out,
+                                    bytes_out: None,
+                                    success: false,
+                                    error: Some(format!(
+                                        "variance check failed: cv_pct={:.2} > max_cv_pct={:.2}",
+                                        stats.elapsed_cv_pct, max_cv
+                                    )),
+                                });
+                                continue;
+                            }
+                        }
+                        results.push(QueryResultRow {
+                            query_id: BenchmarkQueryId::RagTopkQdrant.stable_id().to_string(),
+                            variant: format!(
+                                "n{}_d{}_k{}_s{:.2}",
+                                variant.n_docs,
+                                variant.effective_dim,
+                                variant.k,
+                                variant.filter_selectivity
+                            ),
+                            runtime_tag: opts.mode.as_str().to_string(),
+                            dataset: "rag_synth".to_string(),
+                            backend: "vector_qdrant".to_string(),
+                            n_docs: Some(variant.n_docs),
+                            effective_dim: Some(variant.effective_dim),
+                            top_k: Some(variant.k),
+                            filter_selectivity: Some(variant.filter_selectivity),
+                            iterations: opts.iterations,
+                            warmup_iterations: opts.warmup,
+                            elapsed_ms: stats.elapsed_avg_ms,
+                            elapsed_stddev_ms: Some(stats.elapsed_stddev_ms),
+                            elapsed_cv_pct: Some(stats.elapsed_cv_pct),
+                            rows_out: stats.rows_out,
+                            bytes_out: None,
+                            success: true,
+                            error: None,
+                        });
+                    }
                     Err(err) => results.push(QueryResultRow {
                         query_id: BenchmarkQueryId::RagTopkQdrant.stable_id().to_string(),
                         variant: format!(
@@ -683,6 +970,8 @@ fn run_rag_matrix(
                         iterations: opts.iterations,
                         warmup_iterations: opts.warmup,
                         elapsed_ms: 0.0,
+                        elapsed_stddev_ms: None,
+                        elapsed_cv_pct: None,
                         rows_out: 0,
                         bytes_out: None,
                         success: false,
@@ -856,19 +1145,43 @@ fn execute_query(
     params: HashMap<String, LiteralValue>,
     warmup: usize,
     iterations: usize,
-) -> Result<(f64, u64)> {
+) -> Result<QueryRunStats> {
     for _ in 0..warmup {
         execute_once(engine, sql, params.clone())?;
     }
 
-    let mut total_ms = 0.0_f64;
+    let mut samples_ms = Vec::with_capacity(iterations);
     let mut rows_out = 0_u64;
     for _ in 0..iterations {
         let (elapsed_ms, rows) = execute_once(engine, sql, params.clone())?;
-        total_ms += elapsed_ms;
+        samples_ms.push(elapsed_ms);
         rows_out = rows;
     }
-    Ok((total_ms / (iterations as f64), rows_out))
+    let avg = samples_ms.iter().sum::<f64>() / (iterations as f64);
+    let variance = if iterations >= 2 {
+        samples_ms
+            .iter()
+            .map(|x| {
+                let d = *x - avg;
+                d * d
+            })
+            .sum::<f64>()
+            / (iterations as f64)
+    } else {
+        0.0
+    };
+    let stddev = variance.sqrt();
+    let cv_pct = if avg > 0.0 {
+        (stddev / avg) * 100.0
+    } else {
+        0.0
+    };
+    Ok(QueryRunStats {
+        elapsed_avg_ms: avg,
+        elapsed_stddev_ms: stddev,
+        elapsed_cv_pct: cv_pct,
+        rows_out,
+    })
 }
 
 fn execute_once(
@@ -931,12 +1244,12 @@ fn csv_escape(s: &str) -> String {
 
 fn write_csv(path: &Path, artifact: &BenchmarkArtifact) -> Result<()> {
     let mut out = String::new();
-    out.push_str("run_id,timestamp_unix_ms,mode,query_id,variant,runtime_tag,dataset,backend,n_docs,effective_dim,top_k,filter_selectivity,iterations,warmup_iterations,elapsed_ms,rows_out,bytes_out,success,error\n");
+    out.push_str("run_id,timestamp_unix_ms,mode,query_id,variant,runtime_tag,dataset,backend,n_docs,effective_dim,top_k,filter_selectivity,iterations,warmup_iterations,elapsed_ms,elapsed_stddev_ms,elapsed_cv_pct,rows_out,bytes_out,success,error\n");
     for r in &artifact.results {
         let error = r.error.as_deref().unwrap_or("");
         let bytes_out = r.bytes_out.map_or_else(String::new, |v| v.to_string());
         out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{},{},{}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{},{},{},{},{}\n",
             csv_escape(&artifact.run_id),
             artifact.timestamp_unix_ms,
             csv_escape(&artifact.mode),
@@ -953,6 +1266,10 @@ fn write_csv(path: &Path, artifact: &BenchmarkArtifact) -> Result<()> {
             r.iterations,
             r.warmup_iterations,
             r.elapsed_ms,
+            r.elapsed_stddev_ms
+                .map_or_else(String::new, |v| format!("{v:.3}")),
+            r.elapsed_cv_pct
+                .map_or_else(String::new, |v| format!("{v:.3}")),
             r.rows_out,
             bytes_out,
             r.success,
@@ -974,8 +1291,15 @@ fn print_summary(artifact: &BenchmarkArtifact, json_path: &Path, csv_path: &Path
     for row in &artifact.results {
         let status = if row.success { "ok" } else { "failed" };
         println!(
-            "- {:<22} {:<18} {:>10.3} ms avg  rows_out={}  {}",
-            row.query_id, row.variant, row.elapsed_ms, row.rows_out, status
+            "- {:<22} {:<18} {:>10.3} ms avg  cv={:>6}  rows_out={}  {}",
+            row.query_id,
+            row.variant,
+            row.elapsed_ms,
+            row.elapsed_cv_pct
+                .map(|v| format!("{v:.2}%"))
+                .unwrap_or_else(|| "-".to_string()),
+            row.rows_out,
+            status
         );
         if let Some(err) = &row.error {
             println!("  error: {err}");
