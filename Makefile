@@ -25,6 +25,7 @@
 	tpch-dbgen-build \
 	tpch-dbgen-sf1 \
 	tpch-dbgen-parquet \
+	validate-tpch-dbgen-manifests \
 	compare-13.3
 
 clean:
@@ -120,6 +121,9 @@ tpch-dbgen-sf1:
 
 tpch-dbgen-parquet:
 	./scripts/convert-tpch-dbgen-parquet.sh
+
+validate-tpch-dbgen-manifests:
+	./scripts/validate-tpch-dbgen-manifests.py
 
 compare-13.3:
 	$(MAKE) bench-13.3-compare BASELINE="$$BASELINE" CANDIDATE="$$CANDIDATE" THRESHOLD="$${THRESHOLD:-0.10}"

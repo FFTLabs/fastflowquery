@@ -358,6 +358,34 @@ Notes:
    independent parquet-derived baseline (group/join aggregate checks with float tolerance).
 5. Any mismatch marks the query as failed and the benchmark command exits non-zero.
 
+## Official Reproducibility Contract (13.4.7)
+
+Pinned generation inputs:
+
+1. dbgen repo: `https://github.com/electrum/tpch-dbgen.git`
+2. dbgen ref: `f20ca9f` (set via `TPCH_DBGEN_REF`, defaulted in tooling/CI)
+3. scale factor: `TPCH_SCALE=1`
+
+Environment assumptions for reproducible runs:
+
+1. `TZ=UTC`
+2. `LC_ALL=C`
+3. deterministic fixture paths under `tests/bench/fixtures/`
+4. deterministic parquet writer settings from converter (`UNCOMPRESSED`, stable file naming)
+
+Compiler/container assumptions:
+
+1. CI validates on `ubuntu-latest` with `rust-toolchain@stable`
+2. benchmark runtime and conversion tooling are executed in that pinned CI image context
+
+Manifest contract validation:
+
+1. `make validate-tpch-dbgen-manifests` validates:
+   - expected SF1 `.tbl` table set + row counts,
+   - pinned source repo/ref metadata,
+   - converted parquet file set + row counts + schema signatures.
+2. CI runs generation + validation twice and compares manifests byte-for-byte to detect drift.
+
 ## Make Command Matrix
 
 1. `make bench-13.3-embedded`
@@ -394,6 +422,12 @@ Triggers:
 
 1. Pull requests (`opened`, `reopened`, `synchronize`): runs reduced matrix and uploads JSON/CSV artifacts.
 2. Manual (`workflow_dispatch`): choose reduced/full matrix and optional regression gate.
+
+Additional CI validation in the same workflow:
+
+1. `official-fixture-contract` job regenerates official SF1 `.tbl` and parquet fixtures.
+2. It runs manifest contract validation and reruns generation to detect reproducibility drift.
+3. It uploads generated official manifests as artifacts for audit/debug.
 
 Manual inputs:
 

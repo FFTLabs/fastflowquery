@@ -30,6 +30,54 @@ on:
         type: string
 
 jobs:
+  official-fixture-contract:
+    runs-on: ubuntu-latest
+    env:
+      TZ: UTC
+      LC_ALL: C
+      TPCH_DBGEN_REPO: https://github.com/electrum/tpch-dbgen.git
+      TPCH_DBGEN_REF: f20ca9f
+      TPCH_SCALE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Generate official TPC-H fixtures and parquet
+        shell: bash
+        run: |
+          set -euo pipefail
+          make tpch-dbgen-sf1
+          make tpch-dbgen-parquet
+          make validate-tpch-dbgen-manifests
+
+      - name: Re-run generation to detect drift
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp tests/bench/fixtures/tpch_dbgen_sf1/manifest.json /tmp/tpch_tbl_manifest_run1.json
+          cp tests/bench/fixtures/tpch_dbgen_sf1_parquet/manifest.json /tmp/tpch_parquet_manifest_run1.json
+          make tpch-dbgen-sf1
+          make tpch-dbgen-parquet
+          make validate-tpch-dbgen-manifests
+          cmp -s /tmp/tpch_tbl_manifest_run1.json tests/bench/fixtures/tpch_dbgen_sf1/manifest.json
+          cmp -s /tmp/tpch_parquet_manifest_run1.json tests/bench/fixtures/tpch_dbgen_sf1_parquet/manifest.json
+
+      - name: Upload official fixture manifests
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-tpch-fixture-manifests-${{ github.run_id }}
+          path: |
+            tests/bench/fixtures/tpch_dbgen_sf1/manifest.json
+            tests/bench/fixtures/tpch_dbgen_sf1_parquet/manifest.json
+          if-no-files-found: error
+          retention-days: 30
+
   embedded:
     runs-on: ubuntu-latest
     env:
