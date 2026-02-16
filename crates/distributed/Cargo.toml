@@ -4,6 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "ffq-coordinator"
+path = "src/bin/ffq-coordinator.rs"
+required-features = ["grpc"]
+
+[[bin]]
+name = "ffq-worker"
+path = "src/bin/ffq-worker.rs"
+required-features = ["grpc"]
+
 [features]
 default = []
 grpc = ["dep:tokio", "dep:tonic", "dep:prost", "dep:tokio-stream"]

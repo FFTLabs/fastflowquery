@@ -1,0 +1,33 @@
+{
+  "tables": [
+    {
+      "name": "lineitem",
+      "uri": "/data/parquet/lineitem.parquet",
+      "format": "parquet"
+    },
+    {
+      "name": "orders",
+      "uri": "/data/parquet/orders.parquet",
+      "format": "parquet"
+    },
+    {
+      "name": "docs",
+      "uri": "/data/parquet/docs.parquet",
+      "format": "parquet",
+      "options": {
+        "vector.index_table": "docs_idx",
+        "vector.id_column": "id",
+        "vector.embedding_column": "emb",
+        "vector.prefetch_multiplier": "3"
+      }
+    },
+    {
+      "name": "docs_idx",
+      "uri": "docs_idx",
+      "format": "qdrant",
+      "options": {
+        "vector.mock_rows_json": "[{\"id\":2,\"score\":0.99,\"payload\":\"{\\\"source\\\":\\\"idx\\\"}\"},{\"id\":1,\"score\":0.95,\"payload\":\"{\\\"source\\\":\\\"idx\\\"}\"},{\"id\":3,\"score\":0.10,\"payload\":\"{\\\"source\\\":\\\"idx\\\"}\"}]"
+      }
+    }
+  ]
+}

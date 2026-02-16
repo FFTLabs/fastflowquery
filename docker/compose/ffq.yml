@@ -1,0 +1,93 @@
+name: ffq-distributed
+
+services:
+  coordinator:
+    build:
+      context: ../..
+      dockerfile: docker/ffq-distributed.Dockerfile
+    command: ["/usr/local/bin/ffq-coordinator"]
+    environment:
+      FFQ_COORDINATOR_BIND: 0.0.0.0:50051
+      FFQ_SHUFFLE_ROOT: /var/lib/ffq/shuffle
+      FFQ_BLACKLIST_FAILURE_THRESHOLD: "3"
+    ports:
+      - "50051:50051"
+    volumes:
+      - ffq_shuffle:/var/lib/ffq/shuffle
+      - ../../tests/fixtures/parquet:/data/parquet:ro
+      - ../../tests/fixtures/catalog:/data/catalog:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 50051"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  worker-1:
+    build:
+      context: ../..
+      dockerfile: docker/ffq-distributed.Dockerfile
+    command: ["/usr/local/bin/ffq-worker"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    environment:
+      FFQ_WORKER_ID: worker-1
+      FFQ_COORDINATOR_ENDPOINT: http://coordinator:50051
+      FFQ_WORKER_SHUFFLE_BIND: 0.0.0.0:50061
+      FFQ_WORKER_CPU_SLOTS: "2"
+      FFQ_WORKER_MEM_BUDGET_BYTES: "67108864"
+      FFQ_WORKER_SPILL_DIR: /var/lib/ffq/spill/worker-1
+      FFQ_SHUFFLE_ROOT: /var/lib/ffq/shuffle
+      FFQ_WORKER_CATALOG_PATH: /data/catalog/tables.json
+      FFQ_WORKER_POLL_MS: "20"
+    ports:
+      - "50061:50061"
+    volumes:
+      - ffq_shuffle:/var/lib/ffq/shuffle
+      - ffq_spill_worker1:/var/lib/ffq/spill/worker-1
+      - ../../tests/fixtures/parquet:/data/parquet:ro
+      - ../../tests/fixtures/catalog:/data/catalog:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 50061"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  worker-2:
+    build:
+      context: ../..
+      dockerfile: docker/ffq-distributed.Dockerfile
+    command: ["/usr/local/bin/ffq-worker"]
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    environment:
+      FFQ_WORKER_ID: worker-2
+      FFQ_COORDINATOR_ENDPOINT: http://coordinator:50051
+      FFQ_WORKER_SHUFFLE_BIND: 0.0.0.0:50062
+      FFQ_WORKER_CPU_SLOTS: "2"
+      FFQ_WORKER_MEM_BUDGET_BYTES: "67108864"
+      FFQ_WORKER_SPILL_DIR: /var/lib/ffq/spill/worker-2
+      FFQ_SHUFFLE_ROOT: /var/lib/ffq/shuffle
+      FFQ_WORKER_CATALOG_PATH: /data/catalog/tables.json
+      FFQ_WORKER_POLL_MS: "20"
+    ports:
+      - "50062:50062"
+    volumes:
+      - ffq_shuffle:/var/lib/ffq/shuffle
+      - ffq_spill_worker2:/var/lib/ffq/spill/worker-2
+      - ../../tests/fixtures/parquet:/data/parquet:ro
+      - ../../tests/fixtures/catalog:/data/catalog:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 50062"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+volumes:
+  ffq_shuffle:
+  ffq_spill_worker1:
+  ffq_spill_worker2:

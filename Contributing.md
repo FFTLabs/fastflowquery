@@ -27,5 +27,20 @@ Open an issue describing:
 - Update docs/README if you change usage.
 - Be respectful in review discussions.
 
+## Distributed Compose Smoke Test
+Use the v1 coordinator + 2 worker topology:
+
+```bash
+docker compose -f docker/compose/ffq.yml up --build -d
+docker compose -f docker/compose/ffq.yml ps
+docker compose -f docker/compose/ffq.yml logs -f coordinator worker-1 worker-2
+```
+
+Cleanup:
+
+```bash
+docker compose -f docker/compose/ffq.yml down -v
+```
+
 ## License of contributions
 By submitting a contribution, you agree that it will be licensed under the project’s license (Apache License 2.0), unless you explicitly state otherwise.
