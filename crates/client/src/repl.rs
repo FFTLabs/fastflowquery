@@ -88,10 +88,7 @@ pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        if !sql_buffer.is_empty() {
-            sql_buffer.push('\n');
-        }
-        sql_buffer.push_str(raw);
+        append_sql_line(&mut sql_buffer, raw);
 
         if !statement_terminated(&sql_buffer) {
             continue;
@@ -150,6 +147,13 @@ fn repl_history_path() -> PathBuf {
 
 fn statement_terminated(sql: &str) -> bool {
     sql.trim_end().ends_with(';')
+}
+
+fn append_sql_line(sql_buffer: &mut String, raw: &str) {
+    if !sql_buffer.is_empty() {
+        sql_buffer.push('\n');
+    }
+    sql_buffer.push_str(raw);
 }
 
 fn is_write_statement(sql: &str) -> bool {
@@ -435,9 +439,16 @@ fn unsupported_hint(msg: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::fs::File;
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
+    use arrow::array::{ArrayRef, Int64Array};
     use arrow_schema::Schema;
+    use ffq_common::Result;
+    use ffq_storage::{TableDef, TableStats};
+    use parquet::arrow::ArrowWriter;
 
     #[test]
     fn write_statement_detection_is_case_insensitive() {
@@ -452,5 +463,163 @@ mod tests {
 
         let empty_batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
         assert!(is_empty_sink_result(&[empty_batch]));
+    }
+
+    #[test]
+    fn command_dispatch_toggles_modes_and_handles_invalid_command() {
+        let engine = Engine::new(EngineConfig::default()).expect("engine");
+        let mut plan_enabled = false;
+        let mut timing_enabled = false;
+        let mut output_mode = OutputMode::Table;
+
+        let result = handle_command(
+            "\\plan on",
+            &engine,
+            &mut plan_enabled,
+            &mut timing_enabled,
+            &mut output_mode,
+        );
+        assert!(matches!(result, CommandResult::Continue));
+        assert!(plan_enabled);
+
+        let result = handle_command(
+            "\\timing on",
+            &engine,
+            &mut plan_enabled,
+            &mut timing_enabled,
+            &mut output_mode,
+        );
+        assert!(matches!(result, CommandResult::Continue));
+        assert!(timing_enabled);
+
+        let result = handle_command(
+            "\\mode json",
+            &engine,
+            &mut plan_enabled,
+            &mut timing_enabled,
+            &mut output_mode,
+        );
+        assert!(matches!(result, CommandResult::Continue));
+        assert_eq!(output_mode, OutputMode::Json);
+
+        let result = handle_command(
+            "\\mode invalid",
+            &engine,
+            &mut plan_enabled,
+            &mut timing_enabled,
+            &mut output_mode,
+        );
+        assert!(matches!(result, CommandResult::Continue));
+        assert_eq!(output_mode, OutputMode::Json);
+
+        let result = handle_command(
+            "\\doesnotexist",
+            &engine,
+            &mut plan_enabled,
+            &mut timing_enabled,
+            &mut output_mode,
+        );
+        assert!(matches!(result, CommandResult::Continue));
+
+        let result = handle_command(
+            "\\q",
+            &engine,
+            &mut plan_enabled,
+            &mut timing_enabled,
+            &mut output_mode,
+        );
+        assert!(matches!(result, CommandResult::Exit));
+    }
+
+    #[test]
+    fn multiline_sql_accumulation_preserves_newlines_and_termination() {
+        let mut sql_buffer = String::new();
+        append_sql_line(&mut sql_buffer, "SELECT a");
+        assert!(!statement_terminated(&sql_buffer));
+
+        append_sql_line(&mut sql_buffer, "FROM t");
+        assert!(!statement_terminated(&sql_buffer));
+        assert_eq!(sql_buffer, "SELECT a\nFROM t");
+
+        append_sql_line(&mut sql_buffer, "WHERE a > 1;");
+        assert!(statement_terminated(&sql_buffer));
+        assert_eq!(sql_buffer, "SELECT a\nFROM t\nWHERE a > 1;");
+    }
+
+    #[test]
+    fn sql_dispatch_executes_against_fixture_table() {
+        let parquet_path = unique_temp_path("ffq_repl_core", "parquet");
+        write_test_parquet(
+            &parquet_path,
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef],
+        )
+        .expect("write parquet");
+
+        let engine = Engine::new(EngineConfig::default()).expect("engine");
+        engine.register_table(
+            "t",
+            TableDef {
+                name: "t".to_string(),
+                uri: parquet_path.to_string_lossy().to_string(),
+                paths: Vec::new(),
+                format: "parquet".to_string(),
+                schema: Some(Schema::new(vec![arrow_schema::Field::new(
+                    "a",
+                    arrow_schema::DataType::Int64,
+                    false,
+                )])),
+                stats: TableStats::default(),
+                options: HashMap::new(),
+            },
+        );
+
+        let batches = futures::executor::block_on(
+            engine
+                .sql("SELECT a FROM t")
+                .expect("sql")
+                .collect(),
+        )
+        .expect("collect");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 3);
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64");
+        assert_eq!(col.value(0), 1);
+        assert_eq!(col.value(1), 2);
+        assert_eq!(col.value(2), 3);
+
+        let _ = std::fs::remove_file(parquet_path);
+    }
+
+    fn write_test_parquet(path: &std::path::Path, cols: Vec<ArrayRef>) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![arrow_schema::Field::new(
+            "a",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), cols)
+            .map_err(|e| FfqError::Execution(format!("build test batch failed: {e}")))?;
+        let file = File::create(path)?;
+        let mut writer = ArrowWriter::try_new(file, schema, None)
+            .map_err(|e| FfqError::Execution(format!("open parquet writer failed: {e}")))?;
+        writer
+            .write(&batch)
+            .map_err(|e| FfqError::Execution(format!("write parquet failed: {e}")))?;
+        writer
+            .close()
+            .map_err(|e| FfqError::Execution(format!("close parquet writer failed: {e}")))?;
+        Ok(())
+    }
+
+    fn unique_temp_path(prefix: &str, ext: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}_{nanos}.{ext}"))
     }
 }
