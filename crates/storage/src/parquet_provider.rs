@@ -7,13 +7,14 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::{FfqError, Result};
 use ffq_execution::{ExecNode, SendableRecordBatchStream, StreamAdapter, TaskContext};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use serde::{Deserialize, Serialize};
 
 use crate::catalog::TableDef;
 use crate::provider::{Stats, StorageExecNode, StorageProvider};
 
 pub struct ParquetProvider;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFingerprint {
     pub path: String,
     pub size_bytes: u64,

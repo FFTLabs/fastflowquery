@@ -2,11 +2,12 @@ use std::collections::HashMap;
 #[cfg(feature = "profiling")]
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_schema::Schema;
 use ffq_common::{EngineConfig, Result};
 use ffq_planner::LiteralValue;
-use ffq_storage::parquet_provider::ParquetProvider;
+use ffq_storage::parquet_provider::{FileFingerprint, ParquetProvider};
 use ffq_storage::TableDef;
 
 use crate::session::{Session, SharedSession};
@@ -93,12 +94,51 @@ impl Engine {
 pub(crate) fn maybe_infer_table_schema_on_register(
     infer_on_register: bool,
     table: &mut TableDef,
-) -> Result<()> {
+) -> Result<bool> {
     if !infer_on_register || !table.format.eq_ignore_ascii_case("parquet") || table.schema.is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let paths = table.data_paths()?;
+    let fingerprint = ParquetProvider::fingerprint_paths(&paths)?;
     let schema = ParquetProvider::infer_parquet_schema(&paths)?;
     table.schema = Some(schema);
+    annotate_schema_inference_metadata(table, &fingerprint)?;
+    Ok(true)
+}
+
+pub(crate) fn annotate_schema_inference_metadata(
+    table: &mut TableDef,
+    fingerprint: &[FileFingerprint],
+) -> Result<()> {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    table.options.insert(
+        "schema.inferred_at".to_string(),
+        now_secs.to_string(),
+    );
+    table.options.insert(
+        "schema.fingerprint".to_string(),
+        serde_json::to_string(fingerprint).map_err(|e| {
+            ffq_common::FfqError::InvalidConfig(format!(
+                "failed to encode schema fingerprint metadata: {e}"
+            ))
+        })?,
+    );
     Ok(())
+}
+
+pub(crate) fn read_schema_fingerprint_metadata(
+    table: &TableDef,
+) -> Result<Option<Vec<FileFingerprint>>> {
+    let Some(raw) = table.options.get("schema.fingerprint") else {
+        return Ok(None);
+    };
+    let fp: Vec<FileFingerprint> = serde_json::from_str(raw).map_err(|e| {
+        ffq_common::FfqError::InvalidConfig(format!(
+            "invalid schema fingerprint metadata for table '{}': {e}",
+            table.name
+        ))
+    })?;
+    Ok(Some(fp))
 }

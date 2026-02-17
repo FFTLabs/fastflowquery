@@ -68,9 +68,14 @@ impl Session {
             Catalog::new()
         };
         if config.infer_on_register {
+            let mut changed = false;
             for mut table in catalog.tables() {
-                maybe_infer_table_schema_on_register(true, &mut table)?;
+                let inferred = maybe_infer_table_schema_on_register(true, &mut table)?;
+                changed |= inferred;
                 catalog.register_table(table);
+            }
+            if changed && config.schema_writeback {
+                catalog.save(&catalog_path)?;
             }
         }
 

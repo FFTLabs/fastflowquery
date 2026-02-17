@@ -10,6 +10,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::engine::{annotate_schema_inference_metadata, read_schema_fingerprint_metadata};
 use crate::runtime::QueryContext;
 use crate::session::SchemaCacheEntry;
 use crate::session::SharedSession;
@@ -262,50 +263,81 @@ impl DataFrame {
             return Ok(());
         }
 
-        let mut catalog = self.session.catalog.write().expect("catalog lock poisoned");
-        for name in names {
-            let Some(mut table) = catalog.get(&name).ok().cloned() else {
-                continue;
-            };
-            if !table.format.eq_ignore_ascii_case("parquet") {
-                continue;
-            }
-            let paths = table.data_paths()?;
-            let fingerprint = ParquetProvider::fingerprint_paths(&paths)?;
-            let mut cache = self
-                .session
-                .schema_cache
-                .write()
-                .expect("schema cache lock poisoned");
-
-            let schema = if let Some(entry) = cache.get(&name) {
-                if entry.fingerprint == fingerprint {
-                    entry.schema.clone()
-                } else if self.session.config.fail_on_schema_drift {
-                    return Err(FfqError::InvalidConfig(format!(
-                        "schema drift detected for table '{}'; file fingerprint changed",
-                        name
-                    )));
-                } else {
-                    ParquetProvider::infer_parquet_schema(&paths)?
+        let mut catalog_changed = false;
+        {
+            let mut catalog = self.session.catalog.write().expect("catalog lock poisoned");
+            for name in names {
+                let Some(mut table) = catalog.get(&name).ok().cloned() else {
+                    continue;
+                };
+                if !table.format.eq_ignore_ascii_case("parquet") {
+                    continue;
                 }
-            } else if let Some(existing) = &table.schema {
-                existing.clone()
-            } else {
-                ParquetProvider::infer_parquet_schema(&paths)?
-            };
+                let paths = table.data_paths()?;
+                let fingerprint = ParquetProvider::fingerprint_paths(&paths)?;
+                let mut cache = self
+                    .session
+                    .schema_cache
+                    .write()
+                    .expect("schema cache lock poisoned");
 
-            cache.insert(
-                name.clone(),
-                SchemaCacheEntry {
-                    schema: schema.clone(),
-                    fingerprint,
-                },
-            );
-            if table.schema.as_ref() != Some(&schema) {
-                table.schema = Some(schema);
+                let mut refreshed = false;
+                let schema = if let Some(entry) = cache.get(&name) {
+                    if entry.fingerprint == fingerprint {
+                        entry.schema.clone()
+                    } else if self.session.config.fail_on_schema_drift {
+                        return Err(FfqError::InvalidConfig(format!(
+                            "schema drift detected for table '{}'; file fingerprint changed",
+                            name
+                        )));
+                    } else {
+                        refreshed = true;
+                        ParquetProvider::infer_parquet_schema(&paths)?
+                    }
+                } else if let Some(existing) = &table.schema {
+                    let stored_fingerprint = read_schema_fingerprint_metadata(&table)?;
+                    if let Some(stored) = stored_fingerprint {
+                        if stored != fingerprint {
+                            if self.session.config.fail_on_schema_drift {
+                                return Err(FfqError::InvalidConfig(format!(
+                                    "schema drift detected for table '{}'; file fingerprint changed",
+                                    name
+                                )));
+                            }
+                            refreshed = true;
+                            ParquetProvider::infer_parquet_schema(&paths)?
+                        } else {
+                            existing.clone()
+                        }
+                    } else {
+                        existing.clone()
+                    }
+                } else {
+                    refreshed = true;
+                    ParquetProvider::infer_parquet_schema(&paths)?
+                };
+
+                cache.insert(
+                    name.clone(),
+                    SchemaCacheEntry {
+                        schema: schema.clone(),
+                        fingerprint: fingerprint.clone(),
+                    },
+                );
+                if table.schema.as_ref() != Some(&schema) {
+                    table.schema = Some(schema);
+                    refreshed = true;
+                }
+                if refreshed {
+                    annotate_schema_inference_metadata(&mut table, &fingerprint)?;
+                    catalog_changed = true;
+                }
+                catalog.register_table(table);
             }
-            catalog.register_table(table);
+        }
+
+        if catalog_changed && self.session.config.schema_writeback {
+            self.session.persist_catalog()?;
         }
         Ok(())
     }

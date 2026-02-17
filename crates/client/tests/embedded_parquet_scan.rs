@@ -276,6 +276,54 @@ fn schema_cache_can_fail_on_drift_when_configured() {
     let _ = std::fs::remove_file(parquet_path);
 }
 
+#[test]
+fn inferred_schema_writeback_persists_across_restart() {
+    let parquet_path = unique_path("parquet");
+    write_id_name_parquet(&parquet_path);
+    let catalog_path = unique_path("json");
+
+    let mut catalog = ffq_storage::Catalog::new();
+    catalog.register_table(TableDef {
+        name: "t".to_string(),
+        uri: parquet_path.to_string_lossy().to_string(),
+        paths: Vec::new(),
+        format: "parquet".to_string(),
+        schema: None,
+        stats: ffq_storage::TableStats::default(),
+        options: HashMap::new(),
+    });
+    catalog
+        .save(catalog_path.to_str().expect("catalog path utf8"))
+        .expect("save catalog");
+
+    let mut cfg = EngineConfig::default();
+    cfg.catalog_path = Some(catalog_path.to_string_lossy().to_string());
+    cfg.infer_on_register = false;
+    cfg.schema_writeback = true;
+    let engine = Engine::new(cfg.clone()).expect("engine");
+
+    let rows = futures::executor::block_on(
+        engine
+            .sql("SELECT id, name FROM t")
+            .expect("sql")
+            .collect(),
+    )
+    .expect("collect");
+    assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+
+    let saved = std::fs::read_to_string(&catalog_path).expect("read catalog");
+    assert!(saved.contains("schema.inferred_at"), "missing inferred_at marker");
+    assert!(saved.contains("schema.fingerprint"), "missing fingerprint marker");
+    assert!(saved.contains("\"schema\""), "missing persisted schema");
+
+    let restarted = Engine::new(cfg).expect("restart engine");
+    let persisted_schema = restarted.table_schema("t").expect("table schema");
+    assert!(persisted_schema.is_some(), "schema should be loaded from writeback");
+
+    let _ = std::fs::remove_file(parquet_path);
+    let _ = std::fs::remove_file(catalog_path);
+}
+
 fn write_id_name_parquet(path: &std::path::Path) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
