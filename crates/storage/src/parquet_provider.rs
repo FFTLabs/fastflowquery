@@ -2,7 +2,7 @@ use std::fs::File;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::SchemaRef;
 use ffq_common::{FfqError, Result};
 use ffq_execution::{ExecNode, SendableRecordBatchStream, StreamAdapter, TaskContext};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -15,6 +15,42 @@ pub struct ParquetProvider;
 impl ParquetProvider {
     pub fn new() -> Self {
         Self
+    }
+
+    pub fn infer_parquet_schema(paths: &[String]) -> Result<arrow_schema::Schema> {
+        if paths.is_empty() {
+            return Err(FfqError::InvalidConfig(
+                "cannot infer parquet schema from empty path list".to_string(),
+            ));
+        }
+
+        let mut inferred: Option<arrow_schema::Schema> = None;
+        for path in paths {
+            let file = File::open(path)?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+                FfqError::Execution(format!(
+                    "parquet schema inference reader build failed for '{path}': {e}"
+                ))
+            })?;
+            let schema = builder.schema().as_ref().clone();
+
+            match &inferred {
+                None => inferred = Some(schema),
+                Some(existing) if existing == &schema => {}
+                Some(existing) => {
+                    return Err(FfqError::InvalidConfig(format!(
+                        "incompatible parquet schemas across table paths; '{}' does not match first schema (first={:?}, current={:?})",
+                        path,
+                        existing,
+                        schema
+                    )));
+                }
+            }
+        }
+
+        inferred.ok_or_else(|| {
+            FfqError::InvalidConfig("failed to infer parquet schema from input paths".to_string())
+        })
     }
 }
 
@@ -39,13 +75,15 @@ impl StorageProvider for ParquetProvider {
             )));
         }
 
+        let paths = table.data_paths()?;
+        let schema = match &table.schema {
+            Some(s) => Arc::new(s.clone()),
+            None => Arc::new(Self::infer_parquet_schema(&paths)?),
+        };
+
         Ok(Arc::new(ParquetScanNode {
-            paths: table.data_paths()?,
-            schema: table
-                .schema
-                .clone()
-                .map(Arc::new)
-                .unwrap_or_else(|| Arc::new(Schema::empty())),
+            paths,
+            schema,
             projection,
             filters,
         }))
@@ -91,5 +129,63 @@ impl ExecNode for ParquetScanNode {
             self.schema.clone(),
             futures::stream::iter(out),
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use arrow_schema::DataType;
+
+    use super::*;
+    use crate::TableStats;
+
+    fn fixture_path(file: &str) -> String {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        root.join("../../tests/fixtures/parquet")
+            .join(file)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    #[test]
+    fn infer_parquet_schema_from_fixture_file() {
+        let paths = vec![fixture_path("lineitem.parquet")];
+        let schema = ParquetProvider::infer_parquet_schema(&paths).expect("infer schema");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "l_orderkey");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(1).name(), "l_partkey");
+        assert_eq!(schema.field(1).data_type(), &DataType::Int64);
+    }
+
+    #[test]
+    fn parquet_scan_infers_schema_when_missing_in_catalog() {
+        let provider = ParquetProvider::new();
+        let table = TableDef {
+            name: "lineitem".to_string(),
+            uri: fixture_path("lineitem.parquet"),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: None,
+            stats: TableStats::default(),
+            options: HashMap::new(),
+        };
+        let node = provider
+            .scan(&table, None, Vec::new())
+            .expect("scan should infer schema");
+        let schema = node.schema();
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "l_orderkey");
+    }
+
+    #[test]
+    fn infer_parquet_schema_rejects_incompatible_files() {
+        let paths = vec![fixture_path("lineitem.parquet"), fixture_path("orders.parquet")];
+        let err = ParquetProvider::infer_parquet_schema(&paths).expect_err("must reject");
+        let msg = format!("{err}");
+        assert!(msg.contains("incompatible parquet schemas"));
     }
 }
