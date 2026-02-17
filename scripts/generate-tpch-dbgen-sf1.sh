@@ -30,6 +30,10 @@ echo "Generating TPC-H SF${TPCH_SCALE} .tbl files into ${TPCH_DBGEN_OUTPUT_DIR}"
   "${DBGEN_BIN}" -b "${DISTS_FILE}" -s "${TPCH_SCALE}" -f
 )
 
+# Normalize permissions for CI runners where generated files may be non-readable
+# to subsequent manifest/validation steps.
+find "${TPCH_DBGEN_OUTPUT_DIR}" -maxdepth 1 -type f -name "*.tbl" -exec chmod u+rw {} +
+
 required_tables=(
   customer
   lineitem

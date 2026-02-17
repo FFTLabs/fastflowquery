@@ -52,6 +52,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 022
           make tpch-dbgen-sf1
           make tpch-dbgen-parquet
           make validate-tpch-dbgen-manifests
@@ -60,6 +61,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 022
           cp tests/bench/fixtures/tpch_dbgen_sf1/manifest.json /tmp/tpch_tbl_manifest_run1.json
           cp tests/bench/fixtures/tpch_dbgen_sf1_parquet/manifest.json /tmp/tpch_parquet_manifest_run1.json
           make tpch-dbgen-sf1

@@ -1,3 +1,5 @@
+SHELL := /usr/bin/bash
+
 .PHONY: \
 	clean \
 	build \
@@ -8,6 +10,8 @@
 	test-planner \
 	test-unit \
 	test \
+	test-fast \
+	test-slow-official \
 	test-13.1-core \
 	test-13.1-vector \
 	test-13.1-distributed \
@@ -21,6 +25,7 @@
 	bench-13.3-rag \
 	bench-13.4-official-embedded \
 	bench-13.4-official-distributed \
+	bench-13.4-official \
 	bench-13.3-compare \
 	tpch-dbgen-build \
 	tpch-dbgen-sf1 \
@@ -54,6 +59,11 @@ test-unit:
 
 test:
 	cargo test
+
+test-fast: test
+
+test-slow-official:
+	cargo test -p ffq-client --test tpch_catalog_profiles -- --ignored --nocapture
 
 # -----------------------------
 # 13.1 Correctness suite
@@ -107,6 +117,8 @@ bench-13.4-official-embedded:
 
 bench-13.4-official-distributed:
 	FFQ_BENCH_MODE=distributed FFQ_BENCH_TPCH_SUBDIR="$${FFQ_BENCH_TPCH_SUBDIR:-tpch_dbgen_sf1_parquet}" ./scripts/run-bench-13.4-tpch-official.sh
+
+bench-13.4-official: bench-13.4-official-embedded
 
 bench-13.3-compare:
 	@test -n "$$BASELINE" || (echo "BASELINE is required (json file or dir)" && exit 1)

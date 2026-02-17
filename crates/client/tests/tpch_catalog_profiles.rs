@@ -78,6 +78,7 @@ fn run_catalog_profile_query_checks(profile_path: &Path) {
 }
 
 #[test]
+#[ignore = "slow official SF1 Q1/Q3 profile validation"]
 fn tpch_official_catalog_profile_json_runs_q1_q3_without_manual_registration() {
     let profile =
         repo_root().join("tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json");
@@ -85,6 +86,7 @@ fn tpch_official_catalog_profile_json_runs_q1_q3_without_manual_registration() {
 }
 
 #[test]
+#[ignore = "slow official SF1 Q1/Q3 profile validation"]
 fn tpch_official_catalog_profile_toml_runs_q1_q3_without_manual_registration() {
     let profile =
         repo_root().join("tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.toml");
