@@ -5,7 +5,7 @@ pub mod metrics;
 #[cfg(feature = "profiling")]
 pub mod metrics_exporter;
 
-pub use config::EngineConfig;
+pub use config::{EngineConfig, SchemaDriftPolicy, SchemaInferencePolicy};
 pub use error::{FfqError, Result};
 pub use ids::*;
 pub use metrics::MetricsRegistry;

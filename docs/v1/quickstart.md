@@ -82,6 +82,16 @@ cargo run -p ffq-client -- repl \
   --catalog tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json
 ```
 
+Start REPL with explicit schema policies:
+
+```bash
+cargo run -p ffq-client -- repl \
+  --catalog tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json \
+  --schema-inference on \
+  --schema-writeback true \
+  --schema-drift-policy refresh
+```
+
 Inside REPL, run:
 
 ```sql
@@ -103,6 +113,12 @@ Expected behavior:
 4. `\mode csv` changes rendering mode for next queries.
 5. `\timing on` shows elapsed time after each query.
 6. `\q` exits the REPL.
+
+Policy/env equivalents:
+
+1. `FFQ_SCHEMA_INFERENCE=off|on|strict|permissive`
+2. `FFQ_SCHEMA_WRITEBACK=true|false`
+3. `FFQ_SCHEMA_DRIFT_POLICY=fail|refresh`
 
 ## Distributed Smoke Path
 

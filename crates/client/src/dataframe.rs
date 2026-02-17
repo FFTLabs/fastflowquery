@@ -273,6 +273,10 @@ impl DataFrame {
                 if !table.format.eq_ignore_ascii_case("parquet") {
                     continue;
                 }
+                if !self.session.config.schema_inference.allows_inference() && table.schema.is_none()
+                {
+                    continue;
+                }
                 let paths = table.data_paths()?;
                 let fingerprint = ParquetProvider::fingerprint_paths(&paths)?;
                 let mut cache = self
@@ -285,27 +289,39 @@ impl DataFrame {
                 let schema = if let Some(entry) = cache.get(&name) {
                     if entry.fingerprint == fingerprint {
                         entry.schema.clone()
-                    } else if self.session.config.fail_on_schema_drift {
+                    } else if matches!(
+                        self.session.config.schema_drift_policy,
+                        ffq_common::SchemaDriftPolicy::Fail
+                    ) {
                         return Err(FfqError::InvalidConfig(format!(
                             "schema drift detected for table '{}'; file fingerprint changed",
                             name
                         )));
                     } else {
                         refreshed = true;
-                        ParquetProvider::infer_parquet_schema(&paths)?
+                        ParquetProvider::infer_parquet_schema_with_policy(
+                            &paths,
+                            self.session.config.schema_inference.is_permissive_merge(),
+                        )?
                     }
                 } else if let Some(existing) = &table.schema {
                     let stored_fingerprint = read_schema_fingerprint_metadata(&table)?;
                     if let Some(stored) = stored_fingerprint {
                         if stored != fingerprint {
-                            if self.session.config.fail_on_schema_drift {
+                            if matches!(
+                                self.session.config.schema_drift_policy,
+                                ffq_common::SchemaDriftPolicy::Fail
+                            ) {
                                 return Err(FfqError::InvalidConfig(format!(
                                     "schema drift detected for table '{}'; file fingerprint changed",
                                     name
                                 )));
                             }
                             refreshed = true;
-                            ParquetProvider::infer_parquet_schema(&paths)?
+                            ParquetProvider::infer_parquet_schema_with_policy(
+                                &paths,
+                                self.session.config.schema_inference.is_permissive_merge(),
+                            )?
                         } else {
                             existing.clone()
                         }
@@ -314,7 +330,10 @@ impl DataFrame {
                     }
                 } else {
                     refreshed = true;
-                    ParquetProvider::infer_parquet_schema(&paths)?
+                    ParquetProvider::infer_parquet_schema_with_policy(
+                        &paths,
+                        self.session.config.schema_inference.is_permissive_merge(),
+                    )?
                 };
 
                 cache.insert(

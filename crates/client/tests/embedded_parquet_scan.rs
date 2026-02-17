@@ -6,10 +6,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::Duration;
 
 use arrow::array::{Int64Array, StringArray};
+use arrow::array::Int32Array;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use ffq_client::Engine;
-use ffq_common::EngineConfig;
+use ffq_common::{EngineConfig, SchemaDriftPolicy, SchemaInferencePolicy};
 use ffq_storage::TableDef;
 use parquet::arrow::ArrowWriter;
 
@@ -139,7 +140,7 @@ fn register_table_checked_infers_schema_immediately_when_enabled() {
     writer.close().expect("close parquet writer");
 
     let mut cfg = EngineConfig::default();
-    cfg.infer_on_register = true;
+    cfg.schema_inference = SchemaInferencePolicy::On;
     let engine = Engine::new(cfg).expect("engine");
     engine
         .register_table_checked(
@@ -167,7 +168,7 @@ fn register_table_checked_infers_schema_immediately_when_enabled() {
 #[test]
 fn register_table_checked_fails_early_for_bad_parquet_path_when_enabled() {
     let mut cfg = EngineConfig::default();
-    cfg.infer_on_register = true;
+    cfg.schema_inference = SchemaInferencePolicy::On;
     let engine = Engine::new(cfg).expect("engine");
 
     let err = engine
@@ -197,8 +198,8 @@ fn schema_cache_refreshes_on_drift_when_policy_allows_refresh() {
     write_id_name_parquet(&parquet_path);
 
     let mut cfg = EngineConfig::default();
-    cfg.infer_on_register = false;
-    cfg.fail_on_schema_drift = false;
+    cfg.schema_inference = SchemaInferencePolicy::On;
+    cfg.schema_drift_policy = SchemaDriftPolicy::Refresh;
     let engine = Engine::new(cfg).expect("engine");
     engine.register_table(
         "t",
@@ -240,8 +241,8 @@ fn schema_cache_can_fail_on_drift_when_configured() {
     write_id_name_parquet(&parquet_path);
 
     let mut cfg = EngineConfig::default();
-    cfg.infer_on_register = false;
-    cfg.fail_on_schema_drift = true;
+    cfg.schema_inference = SchemaInferencePolicy::On;
+    cfg.schema_drift_policy = SchemaDriftPolicy::Fail;
     let engine = Engine::new(cfg).expect("engine");
     engine.register_table(
         "t",
@@ -298,7 +299,7 @@ fn inferred_schema_writeback_persists_across_restart() {
 
     let mut cfg = EngineConfig::default();
     cfg.catalog_path = Some(catalog_path.to_string_lossy().to_string());
-    cfg.infer_on_register = false;
+    cfg.schema_inference = SchemaInferencePolicy::On;
     cfg.schema_writeback = true;
     let engine = Engine::new(cfg.clone()).expect("engine");
 
@@ -322,6 +323,110 @@ fn inferred_schema_writeback_persists_across_restart() {
 
     let _ = std::fs::remove_file(parquet_path);
     let _ = std::fs::remove_file(catalog_path);
+}
+
+#[test]
+fn schema_inference_off_requires_predeclared_schema() {
+    let parquet_path = unique_path("parquet");
+    write_id_name_parquet(&parquet_path);
+
+    let mut cfg = EngineConfig::default();
+    cfg.schema_inference = SchemaInferencePolicy::Off;
+    let engine = Engine::new(cfg).expect("engine");
+    engine.register_table(
+        "t",
+        TableDef {
+            name: "ignored".to_string(),
+            uri: parquet_path.to_string_lossy().to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: None,
+            stats: ffq_storage::TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+
+    let err = futures::executor::block_on(
+        engine
+            .sql("SELECT id FROM t")
+            .expect("sql")
+            .collect(),
+    )
+    .expect_err("must fail without schema inference");
+    assert!(format!("{err}").contains("has no schema"));
+
+    let _ = std::fs::remove_file(parquet_path);
+}
+
+#[test]
+fn schema_inference_strict_rejects_numeric_widening_across_files() {
+    let p1 = unique_path("parquet");
+    let p2 = unique_path("parquet");
+    write_single_numeric_parquet_i32(&p1);
+    write_single_numeric_parquet_i64(&p2);
+
+    let mut cfg = EngineConfig::default();
+    cfg.schema_inference = SchemaInferencePolicy::Strict;
+    let engine = Engine::new(cfg).expect("engine");
+    let err = engine
+        .register_table_checked(
+        "t",
+        TableDef {
+            name: "ignored".to_string(),
+            uri: String::new(),
+            paths: vec![
+                p1.to_string_lossy().to_string(),
+                p2.to_string_lossy().to_string(),
+            ],
+            format: "parquet".to_string(),
+            schema: None,
+            stats: ffq_storage::TableStats::default(),
+            options: HashMap::new(),
+        },
+    )
+        .expect_err("strict should fail registration");
+    assert!(format!("{err}").contains("strict policy"));
+
+    let _ = std::fs::remove_file(p1);
+    let _ = std::fs::remove_file(p2);
+}
+
+#[test]
+fn schema_inference_permissive_allows_numeric_widening_across_files() {
+    let p1 = unique_path("parquet");
+    let p2 = unique_path("parquet");
+    write_single_numeric_parquet_i32(&p1);
+    write_single_numeric_parquet_i64(&p2);
+
+    let mut cfg = EngineConfig::default();
+    cfg.schema_inference = SchemaInferencePolicy::Permissive;
+    let engine = Engine::new(cfg).expect("engine");
+    engine
+        .register_table_checked(
+            "t",
+            TableDef {
+                name: "ignored".to_string(),
+                uri: String::new(),
+                paths: vec![
+                    p1.to_string_lossy().to_string(),
+                    p2.to_string_lossy().to_string(),
+                ],
+                format: "parquet".to_string(),
+                schema: None,
+                stats: ffq_storage::TableStats::default(),
+                options: HashMap::new(),
+            },
+        )
+        .expect("permissive should allow registration");
+    let schema = engine
+        .table_schema("t")
+        .expect("schema fetch")
+        .expect("inferred schema");
+    assert_eq!(schema.field(0).name(), "v");
+    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+
+    let _ = std::fs::remove_file(p1);
+    let _ = std::fs::remove_file(p2);
 }
 
 fn write_id_name_parquet(path: &std::path::Path) {
@@ -364,6 +469,26 @@ fn write_id_name_city_parquet(path: &std::path::Path) {
     let file = File::create(path).expect("create parquet file");
     let mut writer =
         ArrowWriter::try_new(file, schema.clone(), None).expect("create parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_single_numeric_parquet_i32(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1_i32, 2]))])
+        .expect("build batch");
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("create parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_single_numeric_parquet_i64(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![3_i64, 4]))])
+        .expect("build batch");
+    let file = File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("create parquet writer");
     writer.write(&batch).expect("write parquet batch");
     writer.close().expect("close parquet writer");
 }

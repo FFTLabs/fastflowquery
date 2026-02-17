@@ -1,5 +1,43 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SchemaInferencePolicy {
+    Off,
+    On,
+    Strict,
+    Permissive,
+}
+
+impl Default for SchemaInferencePolicy {
+    fn default() -> Self {
+        Self::On
+    }
+}
+
+impl SchemaInferencePolicy {
+    pub fn allows_inference(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn is_permissive_merge(self) -> bool {
+        matches!(self, Self::On | Self::Permissive)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SchemaDriftPolicy {
+    Fail,
+    Refresh,
+}
+
+impl Default for SchemaDriftPolicy {
+    fn default() -> Self {
+        Self::Refresh
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     pub batch_size_rows: usize,
@@ -11,10 +49,10 @@ pub struct EngineConfig {
     pub spill_dir: String,
     pub catalog_path: Option<String>,
     pub coordinator_endpoint: Option<String>,
-    #[serde(default = "default_infer_on_register")]
-    pub infer_on_register: bool,
     #[serde(default)]
-    pub fail_on_schema_drift: bool,
+    pub schema_inference: SchemaInferencePolicy,
+    #[serde(default)]
+    pub schema_drift_policy: SchemaDriftPolicy,
     #[serde(default)]
     pub schema_writeback: bool,
 }
@@ -29,13 +67,9 @@ impl Default for EngineConfig {
             spill_dir: "./ffq_spill".to_string(),
             catalog_path: None,
             coordinator_endpoint: None,
-            infer_on_register: default_infer_on_register(),
-            fail_on_schema_drift: false,
+            schema_inference: SchemaInferencePolicy::default(),
+            schema_drift_policy: SchemaDriftPolicy::default(),
             schema_writeback: false,
         }
     }
-}
-
-const fn default_infer_on_register() -> bool {
-    true
 }

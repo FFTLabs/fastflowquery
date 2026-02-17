@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_schema::Schema;
-use ffq_common::{EngineConfig, Result};
+use ffq_common::{EngineConfig, Result, SchemaInferencePolicy};
 use ffq_planner::LiteralValue;
 use ffq_storage::parquet_provider::{FileFingerprint, ParquetProvider};
 use ffq_storage::TableDef;
@@ -33,7 +33,7 @@ impl Engine {
 
     pub fn register_table_checked(&self, name: impl Into<String>, mut table: TableDef) -> Result<()> {
         table.name = name.into();
-        maybe_infer_table_schema_on_register(self.session.config.infer_on_register, &mut table)?;
+        maybe_infer_table_schema_on_register(self.session.config.schema_inference, &mut table)?;
         self.session
             .catalog
             .write()
@@ -92,15 +92,21 @@ impl Engine {
 }
 
 pub(crate) fn maybe_infer_table_schema_on_register(
-    infer_on_register: bool,
+    inference_policy: SchemaInferencePolicy,
     table: &mut TableDef,
 ) -> Result<bool> {
-    if !infer_on_register || !table.format.eq_ignore_ascii_case("parquet") || table.schema.is_some() {
+    if !inference_policy.allows_inference()
+        || !table.format.eq_ignore_ascii_case("parquet")
+        || table.schema.is_some()
+    {
         return Ok(false);
     }
     let paths = table.data_paths()?;
     let fingerprint = ParquetProvider::fingerprint_paths(&paths)?;
-    let schema = ParquetProvider::infer_parquet_schema(&paths)?;
+    let schema = ParquetProvider::infer_parquet_schema_with_policy(
+        &paths,
+        inference_policy.is_permissive_merge(),
+    )?;
     table.schema = Some(schema);
     annotate_schema_inference_metadata(table, &fingerprint)?;
     Ok(true)

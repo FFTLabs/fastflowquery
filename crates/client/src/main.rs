@@ -1,7 +1,7 @@
 use arrow::util::pretty::pretty_format_batches;
 use ffq_client::Engine;
 use ffq_client::repl::{run_repl, ReplOptions};
-use ffq_common::EngineConfig;
+use ffq_common::{EngineConfig, SchemaDriftPolicy, SchemaInferencePolicy};
 use ffq_storage::Catalog;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -185,6 +185,23 @@ fn parse_repl_opts(args: &[String]) -> Result<ReplOpts, Box<dyn std::error::Erro
                     .parse()
                     .map_err(|_| "invalid value for --broadcast-threshold-bytes")?;
             }
+            "--schema-inference" => {
+                i += 1;
+                let raw = args.get(i).ok_or("missing value for --schema-inference")?;
+                config.schema_inference = parse_schema_inference_policy(raw)?;
+            }
+            "--schema-writeback" => {
+                i += 1;
+                let raw = args.get(i).ok_or("missing value for --schema-writeback")?;
+                config.schema_writeback = parse_bool(raw, "--schema-writeback")?;
+            }
+            "--schema-drift-policy" => {
+                i += 1;
+                let raw = args
+                    .get(i)
+                    .ok_or("missing value for --schema-drift-policy")?;
+                config.schema_drift_policy = parse_schema_drift_policy(raw)?;
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -202,6 +219,41 @@ fn print_usage() {
     eprintln!("  ffq-client --plan \"<SQL>\"");
     eprintln!("  ffq-client query --sql \"<SQL>\" [--catalog PATH] [--plan]");
     eprintln!(
-        "  ffq-client repl [--catalog PATH] [--coordinator-endpoint URL] [--batch-size-rows N] [--mem-budget-bytes N] [--spill-dir PATH] [--shuffle-partitions N] [--broadcast-threshold-bytes N]"
+        "  ffq-client repl [--catalog PATH] [--coordinator-endpoint URL] [--batch-size-rows N] [--mem-budget-bytes N] [--spill-dir PATH] [--shuffle-partitions N] [--broadcast-threshold-bytes N] [--schema-inference off|on|strict|permissive] [--schema-writeback true|false] [--schema-drift-policy fail|refresh]"
     );
+}
+
+fn parse_schema_inference_policy(raw: &str) -> Result<SchemaInferencePolicy, Box<dyn std::error::Error>> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "off" => Ok(SchemaInferencePolicy::Off),
+        "on" => Ok(SchemaInferencePolicy::On),
+        "strict" => Ok(SchemaInferencePolicy::Strict),
+        "permissive" => Ok(SchemaInferencePolicy::Permissive),
+        other => Err(format!(
+            "invalid value for --schema-inference: {other} (expected off|on|strict|permissive)"
+        )
+        .into()),
+    }
+}
+
+fn parse_schema_drift_policy(raw: &str) -> Result<SchemaDriftPolicy, Box<dyn std::error::Error>> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "fail" => Ok(SchemaDriftPolicy::Fail),
+        "refresh" => Ok(SchemaDriftPolicy::Refresh),
+        other => Err(format!(
+            "invalid value for --schema-drift-policy: {other} (expected fail|refresh)"
+        )
+        .into()),
+    }
+}
+
+fn parse_bool(raw: &str, flag: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!(
+            "invalid value for {flag}: {other} (expected true|false)"
+        )
+        .into()),
+    }
 }

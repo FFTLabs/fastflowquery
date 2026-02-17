@@ -105,7 +105,7 @@ Field intent:
 1. `name`: table identifier in SQL/API.
 2. `uri`/`paths`: physical location(s); `paths` takes precedence.
 3. `format`: storage format/provider selector (`parquet`, `qdrant`, etc.).
-4. `schema`: optional persisted Arrow schema; required for analyzer-driven SQL paths.
+4. `schema`: optional persisted Arrow schema; if missing for parquet, inference policy controls whether planning can infer it.
 5. `stats`: optional lightweight stats (`rows`, `bytes`) for planning heuristics.
 6. `options`: provider-specific options (for example qdrant connection metadata).
 
@@ -201,6 +201,30 @@ Operational guidance:
 1. Keep `FFQ_CATALOG_PATH` stable across restarts.
 2. Use `.json` or `.toml` extension explicitly.
 3. Treat catalog file as source of truth for table registration continuity.
+
+## Schema Inference Policies (SCH-08)
+
+`EngineConfig` now exposes three explicit schema policy controls:
+
+1. `schema_inference = off|on|strict|permissive`
+2. `schema_writeback = true|false`
+3. `schema_drift_policy = fail|refresh`
+
+Environment override surface:
+
+1. `FFQ_SCHEMA_INFERENCE`
+2. `FFQ_SCHEMA_WRITEBACK`
+3. `FFQ_SCHEMA_DRIFT_POLICY`
+
+Behavior contract:
+
+1. `off`: parquet tables without `schema` do not infer and later planning fails with a clear missing-schema error.
+2. `on`: inference enabled, permissive merge behavior for compatible numeric widening.
+3. `strict`: inference enabled, but schema mismatches across files fail early (no numeric widening).
+4. `permissive`: inference enabled with permissive merge behavior (nullable + allowed numeric widening).
+5. `schema_writeback=true`: inferred schema + fingerprint metadata is persisted to catalog file.
+6. `schema_drift_policy=fail`: cached fingerprint mismatch fails query.
+7. `schema_drift_policy=refresh`: cached fingerprint mismatch triggers schema refresh.
 
 ## Official TPC-H Catalog Profiles (13.4.3)
 

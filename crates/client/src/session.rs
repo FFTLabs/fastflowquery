@@ -5,7 +5,9 @@ use std::sync::{Arc, RwLock};
 use std::{env, path::Path, path::PathBuf};
 
 use arrow_schema::Schema;
-use ffq_common::{EngineConfig, MetricsRegistry, Result};
+use ffq_common::{
+    EngineConfig, MetricsRegistry, Result, SchemaDriftPolicy, SchemaInferencePolicy,
+};
 use ffq_storage::Catalog;
 use ffq_storage::parquet_provider::FileFingerprint;
 
@@ -38,6 +40,8 @@ impl Session {
     pub fn new(config: EngineConfig) -> Result<Self> {
         // Best-effort local env loading for FFQ_COORDINATOR_ENDPOINT and other dev vars.
         let _ = dotenvy::dotenv();
+        let mut config = config;
+        apply_schema_policy_env_overrides(&mut config)?;
 
         let runtime: Arc<dyn Runtime> = {
             #[cfg(feature = "distributed")]
@@ -67,10 +71,11 @@ impl Session {
         } else {
             Catalog::new()
         };
-        if config.infer_on_register {
+        if config.schema_inference.allows_inference() {
             let mut changed = false;
             for mut table in catalog.tables() {
-                let inferred = maybe_infer_table_schema_on_register(true, &mut table)?;
+                let inferred =
+                    maybe_infer_table_schema_on_register(config.schema_inference, &mut table)?;
                 changed |= inferred;
                 catalog.register_table(table);
             }
@@ -111,5 +116,50 @@ impl Session {
         ffq_common::run_metrics_exporter(addr)
             .await
             .map_err(Into::into)
+    }
+}
+
+fn apply_schema_policy_env_overrides(config: &mut EngineConfig) -> Result<()> {
+    if let Ok(raw) = env::var("FFQ_SCHEMA_INFERENCE") {
+        config.schema_inference = parse_schema_inference_policy(&raw)?;
+    }
+    if let Ok(raw) = env::var("FFQ_SCHEMA_WRITEBACK") {
+        config.schema_writeback = parse_bool_flag(&raw, "FFQ_SCHEMA_WRITEBACK")?;
+    }
+    if let Ok(raw) = env::var("FFQ_SCHEMA_DRIFT_POLICY") {
+        config.schema_drift_policy = parse_schema_drift_policy(&raw)?;
+    }
+    Ok(())
+}
+
+fn parse_schema_inference_policy(raw: &str) -> Result<SchemaInferencePolicy> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "off" => Ok(SchemaInferencePolicy::Off),
+        "on" => Ok(SchemaInferencePolicy::On),
+        "strict" => Ok(SchemaInferencePolicy::Strict),
+        "permissive" => Ok(SchemaInferencePolicy::Permissive),
+        other => Err(ffq_common::FfqError::InvalidConfig(format!(
+            "invalid FFQ_SCHEMA_INFERENCE='{other}'; expected off|on|strict|permissive"
+        ))),
+    }
+}
+
+fn parse_schema_drift_policy(raw: &str) -> Result<SchemaDriftPolicy> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "fail" => Ok(SchemaDriftPolicy::Fail),
+        "refresh" => Ok(SchemaDriftPolicy::Refresh),
+        other => Err(ffq_common::FfqError::InvalidConfig(format!(
+            "invalid FFQ_SCHEMA_DRIFT_POLICY='{other}'; expected fail|refresh"
+        ))),
+    }
+}
+
+fn parse_bool_flag(raw: &str, key: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(ffq_common::FfqError::InvalidConfig(format!(
+            "invalid {key}='{other}'; expected true|false"
+        ))),
     }
 }

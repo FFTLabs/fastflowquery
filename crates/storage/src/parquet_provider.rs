@@ -27,6 +27,13 @@ impl ParquetProvider {
     }
 
     pub fn infer_parquet_schema(paths: &[String]) -> Result<arrow_schema::Schema> {
+        Self::infer_parquet_schema_with_policy(paths, true)
+    }
+
+    pub fn infer_parquet_schema_with_policy(
+        paths: &[String],
+        permissive_merge: bool,
+    ) -> Result<arrow_schema::Schema> {
         if paths.is_empty() {
             return Err(FfqError::InvalidConfig(
                 "cannot infer parquet schema from empty path list".to_string(),
@@ -45,7 +52,9 @@ impl ParquetProvider {
 
             match &inferred {
                 None => inferred = Some(schema),
-                Some(existing) => inferred = Some(merge_schemas(existing, &schema, path)?),
+                Some(existing) => {
+                    inferred = Some(merge_schemas(existing, &schema, path, permissive_merge)?)
+                }
             };
         }
 
@@ -83,7 +92,7 @@ impl ParquetProvider {
     }
 }
 
-fn merge_schemas(base: &Schema, next: &Schema, path: &str) -> Result<Schema> {
+fn merge_schemas(base: &Schema, next: &Schema, path: &str, permissive_merge: bool) -> Result<Schema> {
     if base.fields().len() != next.fields().len() {
         return Err(FfqError::InvalidConfig(format!(
             "incompatible parquet schemas across table paths; '{}' has {} fields but expected {}",
@@ -95,13 +104,25 @@ fn merge_schemas(base: &Schema, next: &Schema, path: &str) -> Result<Schema> {
 
     let mut fields = Vec::with_capacity(base.fields().len());
     for (idx, (left, right)) in base.fields().iter().zip(next.fields().iter()).enumerate() {
-        fields.push(merge_field(left.as_ref(), right.as_ref(), idx, path)?);
+        fields.push(merge_field(
+            left.as_ref(),
+            right.as_ref(),
+            idx,
+            path,
+            permissive_merge,
+        )?);
     }
 
     Ok(Schema::new_with_metadata(fields, base.metadata().clone()))
 }
 
-fn merge_field(left: &Field, right: &Field, idx: usize, path: &str) -> Result<Field> {
+fn merge_field(
+    left: &Field,
+    right: &Field,
+    idx: usize,
+    path: &str,
+    permissive_merge: bool,
+) -> Result<Field> {
     if left.name() != right.name() {
         return Err(FfqError::InvalidConfig(format!(
             "incompatible parquet schemas at field {idx}; '{}' has name '{}' but expected '{}' from first schema",
@@ -111,14 +132,39 @@ fn merge_field(left: &Field, right: &Field, idx: usize, path: &str) -> Result<Fi
         )));
     }
 
-    let dt = merge_data_types(left.data_type(), right.data_type(), left.name(), path)?;
+    let dt = merge_data_types(
+        left.data_type(),
+        right.data_type(),
+        left.name(),
+        path,
+        permissive_merge,
+    )?;
     let nullable = left.is_nullable() || right.is_nullable();
     Ok(Field::new(left.name(), dt, nullable).with_metadata(left.metadata().clone()))
 }
 
-fn merge_data_types(left: &DataType, right: &DataType, field: &str, path: &str) -> Result<DataType> {
+fn merge_data_types(
+    left: &DataType,
+    right: &DataType,
+    field: &str,
+    path: &str,
+    permissive_merge: bool,
+) -> Result<DataType> {
     if left == right {
         return Ok(left.clone());
+    }
+
+    if permissive_merge {
+        if let Some(widened) = widen_numeric_type(left, right) {
+            return Ok(widened);
+        }
+    }
+
+    if !permissive_merge {
+        return Err(FfqError::InvalidConfig(format!(
+            "incompatible parquet schemas at field '{field}' under strict policy; '{}' has type {:?} but expected {:?}",
+            path, right, left
+        )));
     }
 
     if let Some(widened) = widen_numeric_type(left, right) {
