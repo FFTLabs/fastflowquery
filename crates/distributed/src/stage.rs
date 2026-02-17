@@ -154,6 +154,7 @@ mod tests {
     fn single_stage_without_shuffle() {
         let physical = PhysicalPlan::ParquetScan(ffq_planner::ParquetScanExec {
             table: "t".to_string(),
+            schema: None,
             projection: None,
             filters: vec![],
         });

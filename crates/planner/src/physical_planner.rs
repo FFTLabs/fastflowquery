@@ -33,6 +33,7 @@ pub fn create_physical_plan(
             filters,
         } => Ok(PhysicalPlan::ParquetScan(ParquetScanExec {
             table: table.clone(),
+            schema: None,
             projection: projection.clone(),
             filters: filters.clone(),
         })),

@@ -1,4 +1,5 @@
 use crate::logical_plan::{AggExpr, Expr, JoinStrategyHint, JoinType};
+use arrow_schema::Schema;
 use serde::{Deserialize, Serialize};
 
 /// The physical operator graph.
@@ -52,6 +53,9 @@ impl PhysicalPlan {
 pub struct ParquetScanExec {
     /// Table name from the catalog (v1).
     pub table: String,
+    /// Resolved schema attached by planner/coordinator for deterministic worker execution.
+    #[serde(default)]
+    pub schema: Option<Schema>,
     /// Column names (pushdown) if known.
     pub projection: Option<Vec<String>>,
     /// Pushdown-able predicates (best-effort; execution decides how much it can push).

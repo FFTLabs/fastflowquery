@@ -62,13 +62,18 @@ Implementation: `crates/distributed/src/coordinator.rs`.
 
 Responsibilities:
 1. Accept submitted physical plan bytes.
-2. Build stage DAG (`build_stage_dag`) from shuffle boundaries.
-3. Track query state and task state.
-4. Assign tasks via pull API (`GetTask`).
-5. Store map output metadata registry.
-6. Serve shuffle fetch for registered attempts.
-7. Track and expose stage/task metrics.
-8. Blacklist repeatedly failing workers.
+2. Resolve parquet scan schemas once at submit time (from coordinator catalog, with parquet inference when schema is missing).
+3. Build stage DAG (`build_stage_dag`) from shuffle boundaries.
+4. Track query state and task state.
+5. Assign tasks via pull API (`GetTask`).
+6. Store map output metadata registry.
+7. Serve shuffle fetch for registered attempts.
+8. Track and expose stage/task metrics.
+9. Blacklist repeatedly failing workers.
+
+Coordinator catalog note:
+1. Set `FFQ_COORDINATOR_CATALOG_PATH` so coordinator can resolve/infer parquet schemas and embed them in task plans.
+2. Workers then rely on schema carried in each `ParquetScanExec` assignment, which keeps schema consistent across workers.
 
 ### Query state machine
 

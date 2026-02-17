@@ -10,6 +10,7 @@ services:
       FFQ_COORDINATOR_BIND: 0.0.0.0:50051
       FFQ_SHUFFLE_ROOT: /var/lib/ffq/shuffle
       FFQ_BLACKLIST_FAILURE_THRESHOLD: "3"
+      FFQ_COORDINATOR_CATALOG_PATH: /data/catalog/tables.json
     ports:
       - "50051:50051"
     volumes:

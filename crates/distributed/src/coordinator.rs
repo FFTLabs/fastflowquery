@@ -3,9 +3,11 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ffq_common::metrics::global_metrics;
-use ffq_common::{FfqError, Result};
-use ffq_planner::PhysicalPlan;
+use ffq_common::{FfqError, Result, SchemaInferencePolicy};
+use ffq_planner::{ExchangeExec, PhysicalPlan};
 use ffq_shuffle::ShuffleReader;
+use ffq_storage::parquet_provider::ParquetProvider;
+use ffq_storage::Catalog;
 use tracing::{debug, info, warn};
 
 use crate::stage::{build_stage_dag, StageDag};
@@ -14,6 +16,7 @@ use crate::stage::{build_stage_dag, StageDag};
 pub struct CoordinatorConfig {
     pub blacklist_failure_threshold: u32,
     pub shuffle_root: PathBuf,
+    pub schema_inference: SchemaInferencePolicy,
 }
 
 impl Default for CoordinatorConfig {
@@ -21,6 +24,7 @@ impl Default for CoordinatorConfig {
         Self {
             blacklist_failure_threshold: 3,
             shuffle_root: PathBuf::from("."),
+            schema_inference: SchemaInferencePolicy::On,
         }
     }
 }
@@ -119,6 +123,7 @@ struct QueryRuntime {
 #[derive(Debug, Default)]
 pub struct Coordinator {
     config: CoordinatorConfig,
+    catalog: Catalog,
     queries: HashMap<String, QueryRuntime>,
     map_outputs: HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>,
     query_results: HashMap<String, Vec<u8>>,
@@ -130,6 +135,15 @@ impl Coordinator {
     pub fn new(config: CoordinatorConfig) -> Self {
         Self {
             config,
+            catalog: Catalog::new(),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_catalog(config: CoordinatorConfig, catalog: Catalog) -> Self {
+        Self {
+            config,
+            catalog,
             ..Self::default()
         }
     }
@@ -144,8 +158,11 @@ impl Coordinator {
                 "query '{query_id}' already exists"
             )));
         }
-        let plan: PhysicalPlan = serde_json::from_slice(physical_plan_json)
+        let mut plan: PhysicalPlan = serde_json::from_slice(physical_plan_json)
             .map_err(|e| FfqError::Planning(format!("invalid physical plan json: {e}")))?;
+        self.resolve_parquet_scan_schemas(&mut plan)?;
+        let resolved_plan_json = serde_json::to_vec(&plan)
+            .map_err(|e| FfqError::Planning(format!("encode resolved physical plan failed: {e}")))?;
         let dag = build_stage_dag(&plan);
         info!(
             query_id = %query_id,
@@ -153,9 +170,64 @@ impl Coordinator {
             operator = "CoordinatorSubmit",
             "query submitted"
         );
-        let qr = build_query_runtime(&query_id, dag, physical_plan_json)?;
+        let qr = build_query_runtime(&query_id, dag, &resolved_plan_json)?;
         self.queries.insert(query_id, qr);
         Ok(QueryState::Queued)
+    }
+
+    fn resolve_parquet_scan_schemas(&mut self, plan: &mut PhysicalPlan) -> Result<()> {
+        match plan {
+            PhysicalPlan::ParquetScan(scan) => {
+                if scan.schema.is_some() {
+                    return Ok(());
+                }
+                let Ok(mut table) = self.catalog.get(&scan.table).cloned() else {
+                    // Backward-compatible fallback: if coordinator does not have the table,
+                    // leave scan schema unresolved and let worker-side catalog drive execution.
+                    return Ok(());
+                };
+                if !table.format.eq_ignore_ascii_case("parquet") {
+                    return Ok(());
+                }
+                if let Some(schema) = table.schema.clone() {
+                    scan.schema = Some(schema);
+                    return Ok(());
+                }
+                if !self.config.schema_inference.allows_inference() {
+                    return Err(FfqError::InvalidConfig(format!(
+                        "table '{}' has no schema and coordinator schema inference is disabled",
+                        table.name
+                    )));
+                }
+                let paths = table.data_paths()?;
+                let inferred = ParquetProvider::infer_parquet_schema_with_policy(
+                    &paths,
+                    self.config.schema_inference.is_permissive_merge(),
+                )?;
+                scan.schema = Some(inferred.clone());
+                table.schema = Some(inferred);
+                self.catalog.register_table(table);
+                Ok(())
+            }
+            PhysicalPlan::ParquetWrite(x) => self.resolve_parquet_scan_schemas(&mut x.input),
+            PhysicalPlan::Filter(x) => self.resolve_parquet_scan_schemas(&mut x.input),
+            PhysicalPlan::Project(x) => self.resolve_parquet_scan_schemas(&mut x.input),
+            PhysicalPlan::CoalesceBatches(x) => self.resolve_parquet_scan_schemas(&mut x.input),
+            PhysicalPlan::PartialHashAggregate(x) => self.resolve_parquet_scan_schemas(&mut x.input),
+            PhysicalPlan::FinalHashAggregate(x) => self.resolve_parquet_scan_schemas(&mut x.input),
+            PhysicalPlan::HashJoin(x) => {
+                self.resolve_parquet_scan_schemas(&mut x.left)?;
+                self.resolve_parquet_scan_schemas(&mut x.right)
+            }
+            PhysicalPlan::Exchange(x) => match x {
+                ExchangeExec::ShuffleWrite(e) => self.resolve_parquet_scan_schemas(&mut e.input),
+                ExchangeExec::ShuffleRead(e) => self.resolve_parquet_scan_schemas(&mut e.input),
+                ExchangeExec::Broadcast(e) => self.resolve_parquet_scan_schemas(&mut e.input),
+            },
+            PhysicalPlan::Limit(x) => self.resolve_parquet_scan_schemas(&mut x.input),
+            PhysicalPlan::TopKByScore(x) => self.resolve_parquet_scan_schemas(&mut x.input),
+            PhysicalPlan::VectorTopK(_) => Ok(()),
+        }
     }
 
     pub fn get_task(&mut self, worker_id: &str, capacity: u32) -> Result<Vec<TaskAssignment>> {
@@ -530,6 +602,7 @@ fn now_ms() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::Schema;
     use ffq_planner::{ParquetScanExec, PhysicalPlan};
 
     #[test]
@@ -537,6 +610,7 @@ mod tests {
         let mut c = Coordinator::new(CoordinatorConfig::default());
         let plan = serde_json::to_vec(&PhysicalPlan::ParquetScan(ParquetScanExec {
             table: "t".to_string(),
+            schema: Some(Schema::empty()),
             projection: None,
             filters: vec![],
         }))
@@ -568,9 +642,11 @@ mod tests {
         let mut c = Coordinator::new(CoordinatorConfig {
             blacklist_failure_threshold: 2,
             shuffle_root: PathBuf::from("."),
+            ..CoordinatorConfig::default()
         });
         let plan = serde_json::to_vec(&PhysicalPlan::ParquetScan(ParquetScanExec {
             table: "t".to_string(),
+            schema: Some(Schema::empty()),
             projection: None,
             filters: vec![],
         }))

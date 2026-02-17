@@ -620,7 +620,10 @@ fn eval_plan_for_stage(
     .entered();
     let eval = match plan {
         PhysicalPlan::ParquetScan(scan) => {
-            let table = catalog.get(&scan.table)?.clone();
+            let mut table = catalog.get(&scan.table)?.clone();
+            if let Some(schema) = &scan.schema {
+                table.schema = Some(schema.clone());
+            }
             let provider = ParquetProvider::new();
             let node = provider.scan(
                 &table,
@@ -2655,26 +2658,45 @@ mod tests {
             ],
         );
 
-        let mut catalog = Catalog::new();
-        catalog.register_table(TableDef {
+        let mut coordinator_catalog = Catalog::new();
+        coordinator_catalog.register_table(TableDef {
             name: "lineitem".to_string(),
             uri: lineitem_path.to_string_lossy().to_string(),
             paths: Vec::new(),
             format: "parquet".to_string(),
-            schema: Some((*lineitem_schema).clone()),
+            schema: None,
             stats: TableStats::default(),
             options: HashMap::new(),
         });
-        catalog.register_table(TableDef {
+        coordinator_catalog.register_table(TableDef {
             name: "orders".to_string(),
             uri: orders_path.to_string_lossy().to_string(),
             paths: Vec::new(),
             format: "parquet".to_string(),
-            schema: Some((*orders_schema).clone()),
+            schema: None,
             stats: TableStats::default(),
             options: HashMap::new(),
         });
-        let catalog = Arc::new(catalog);
+        let mut worker_catalog = Catalog::new();
+        worker_catalog.register_table(TableDef {
+            name: "lineitem".to_string(),
+            uri: lineitem_path.to_string_lossy().to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: None,
+            stats: TableStats::default(),
+            options: HashMap::new(),
+        });
+        worker_catalog.register_table(TableDef {
+            name: "orders".to_string(),
+            uri: orders_path.to_string_lossy().to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: None,
+            stats: TableStats::default(),
+            options: HashMap::new(),
+        });
+        let worker_catalog = Arc::new(worker_catalog);
 
         let physical = create_physical_plan(
             &LogicalPlan::Aggregate {
@@ -2704,7 +2726,10 @@ mod tests {
         .expect("physical plan");
         let physical_json = serde_json::to_vec(&physical).expect("physical json");
 
-        let coordinator = Arc::new(Mutex::new(Coordinator::default()));
+        let coordinator = Arc::new(Mutex::new(Coordinator::with_catalog(
+            CoordinatorConfig::default(),
+            coordinator_catalog,
+        )));
         {
             let mut c = coordinator.lock().await;
             c.submit_query("1001".to_string(), &physical_json)
@@ -2712,7 +2737,7 @@ mod tests {
         }
 
         let control = Arc::new(InProcessControlPlane::new(Arc::clone(&coordinator)));
-        let exec = Arc::new(DefaultTaskExecutor::new(Arc::clone(&catalog)));
+        let exec = Arc::new(DefaultTaskExecutor::new(Arc::clone(&worker_catalog)));
         let worker1 = Worker::new(
             WorkerConfig {
                 worker_id: "w1".to_string(),
@@ -2813,6 +2838,7 @@ mod tests {
             table: "dst".to_string(),
             input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
                 table: "src".to_string(),
+                schema: None,
                 projection: Some(vec!["a".to_string(), "b".to_string()]),
                 filters: vec![],
             })),
@@ -2822,6 +2848,7 @@ mod tests {
         let coordinator = Arc::new(Mutex::new(Coordinator::new(CoordinatorConfig {
             blacklist_failure_threshold: 3,
             shuffle_root: out_dir.clone(),
+            ..CoordinatorConfig::default()
         })));
         {
             let mut c = coordinator.lock().await;

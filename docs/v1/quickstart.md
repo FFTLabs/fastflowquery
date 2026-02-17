@@ -135,6 +135,9 @@ docker compose -f docker/compose/ffq.yml ps
 FFQ_COORDINATOR_ENDPOINT=http://127.0.0.1:50051 make test-13.2-distributed
 ```
 
+Coordinator note:
+1. Ensure coordinator has table metadata via `FFQ_COORDINATOR_CATALOG_PATH` (the default compose file sets this to `/data/catalog/tables.json`).
+
 3. Optional distributed benchmark:
 
 ```bash

@@ -237,10 +237,33 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     drop(listener);
     let endpoint = format!("http://{addr}");
 
-    let coordinator = Arc::new(Mutex::new(Coordinator::new(CoordinatorConfig {
-        blacklist_failure_threshold: 3,
-        shuffle_root: shuffle_root.clone(),
-    })));
+    let mut coordinator_catalog = ffq_storage::Catalog::new();
+    coordinator_catalog.register_table(TableDef {
+        name: "lineitem".to_string(),
+        uri: lineitem_path.to_string_lossy().to_string(),
+        paths: Vec::new(),
+        format: "parquet".to_string(),
+        schema: None,
+        stats: TableStats::default(),
+        options: HashMap::new(),
+    });
+    coordinator_catalog.register_table(TableDef {
+        name: "orders".to_string(),
+        uri: orders_path.to_string_lossy().to_string(),
+        paths: Vec::new(),
+        format: "parquet".to_string(),
+        schema: None,
+        stats: TableStats::default(),
+        options: HashMap::new(),
+    });
+    let coordinator = Arc::new(Mutex::new(Coordinator::with_catalog(
+        CoordinatorConfig {
+            blacklist_failure_threshold: 3,
+            shuffle_root: shuffle_root.clone(),
+            ..CoordinatorConfig::default()
+        },
+        coordinator_catalog,
+    )));
     let services = CoordinatorServices::from_shared(Arc::clone(&coordinator));
     let server_handle = tokio::spawn(async move {
         Server::builder()
@@ -253,32 +276,26 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut catalog = ffq_storage::Catalog::new();
-    catalog.register_table(TableDef {
+    let mut worker_catalog = ffq_storage::Catalog::new();
+    worker_catalog.register_table(TableDef {
         name: "lineitem".to_string(),
         uri: lineitem_path.to_string_lossy().to_string(),
         paths: Vec::new(),
         format: "parquet".to_string(),
-        schema: Some(Schema::new(vec![
-            Field::new("l_orderkey", DataType::Int64, false),
-            Field::new("l_partkey", DataType::Int64, false),
-        ])),
+        schema: None,
         stats: TableStats::default(),
         options: HashMap::new(),
     });
-    catalog.register_table(TableDef {
+    worker_catalog.register_table(TableDef {
         name: "orders".to_string(),
         uri: orders_path.to_string_lossy().to_string(),
         paths: Vec::new(),
         format: "parquet".to_string(),
-        schema: Some(Schema::new(vec![
-            Field::new("o_orderkey", DataType::Int64, false),
-            Field::new("o_custkey", DataType::Int64, false),
-        ])),
+        schema: None,
         stats: TableStats::default(),
         options: HashMap::new(),
     });
-    let executor = Arc::new(DefaultTaskExecutor::new(Arc::new(catalog)));
+    let executor = Arc::new(DefaultTaskExecutor::new(Arc::new(worker_catalog)));
 
     let cp1 = Arc::new(
         GrpcControlPlane::connect(&endpoint)
@@ -469,6 +486,7 @@ async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
     let coordinator = Arc::new(Mutex::new(Coordinator::new(CoordinatorConfig {
         blacklist_failure_threshold: 3,
         shuffle_root: shuffle_root.clone(),
+        ..CoordinatorConfig::default()
     })));
     let services = CoordinatorServices::from_shared(Arc::clone(&coordinator));
     let server_handle = tokio::spawn(async move {
