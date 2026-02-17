@@ -14,6 +14,18 @@ For a practical step-by-step v1 run guide (embedded, distributed, synthetic and 
 
 1. `docs/v1/quickstart.md`
 
+Quick REPL start:
+
+```bash
+cargo run -p ffq-client -- repl --catalog tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json
+```
+
+Then run:
+
+```sql
+SELECT l_orderkey, l_quantity FROM lineitem LIMIT 5;
+```
+
 For a concept-first deep guide (architecture, optimizer, distributed control plane, labs, glossary, FAQ):
 
 1. `docs/learn/README.md`

@@ -37,6 +37,21 @@ What this means in plain terms:
 3. Distributed mode adds orchestration (coordinator/workers/shuffle), not a different SQL meaning.
 4. Results come back as Arrow `RecordBatch` streams in both modes.
 
+## Start Interactive SQL Quickly
+
+Launch REPL with a catalog profile:
+
+```bash
+cargo run -p ffq-client -- repl \
+  --catalog tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json
+```
+
+First query:
+
+```sql
+SELECT l_orderkey, l_quantity FROM lineitem LIMIT 5;
+```
+
 ## Recommended Reading Order
 
 Read these in sequence:

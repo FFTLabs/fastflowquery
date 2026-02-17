@@ -73,6 +73,37 @@ Notes:
    - `cargo run -p ffq-client -- "SELECT 1"`
    - `cargo run -p ffq-client -- --plan "SELECT 1"`
 
+## Run SQL in REPL (Interactive)
+
+Start REPL with catalog:
+
+```bash
+cargo run -p ffq-client -- repl \
+  --catalog tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json
+```
+
+Inside REPL, run:
+
+```sql
+\tables
+SELECT l_orderkey, l_quantity FROM lineitem LIMIT 5;
+\schema lineitem
+\mode csv
+SELECT l_orderkey FROM lineitem LIMIT 3;
+\timing on
+SELECT COUNT(*) AS c FROM lineitem;
+\q
+```
+
+Expected behavior:
+
+1. `\tables` lists registered catalog tables.
+2. `SELECT ...;` prints rows immediately.
+3. `\schema lineitem` prints field names and types.
+4. `\mode csv` changes rendering mode for next queries.
+5. `\timing on` shows elapsed time after each query.
+6. `\q` exits the REPL.
+
 ## Distributed Smoke Path
 
 1. Start cluster:
