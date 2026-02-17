@@ -1,10 +1,12 @@
-use std::io::Write;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use arrow::util::pretty::pretty_format_batches;
 use arrow::util::display::array_value_to_string;
 use arrow::record_batch::RecordBatch;
 use ffq_common::{EngineConfig, FfqError};
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 use serde_json::{Map, Value};
 
 use crate::Engine;
@@ -16,26 +18,52 @@ pub struct ReplOptions {
 
 pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::new(opts.config)?;
+    let mut rl = DefaultEditor::new()?;
+    let history_path = repl_history_path();
+    if let Err(err) = rl.load_history(&history_path) {
+        if !matches!(err, ReadlineError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound)
+        {
+            eprintln!(
+                "warning: failed to load history '{}': {err}",
+                history_path.display()
+            );
+        }
+    }
+
     let mut plan_enabled = false;
     let mut timing_enabled = false;
     let mut output_mode = OutputMode::Table;
     let mut sql_buffer = String::new();
 
     eprintln!("FFQ REPL (type \\q to quit)");
-    let stdin = std::io::stdin();
-    let mut line = String::new();
     loop {
         let prompt = if sql_buffer.is_empty() { "ffq> " } else { " ...> " };
-        print!("{prompt}");
-        std::io::stdout().flush()?;
-        line.clear();
-        // Ctrl+D => EOF => exit
-        if stdin.read_line(&mut line)? == 0 {
-            if !sql_buffer.trim().is_empty() {
-                eprintln!("error: unterminated SQL statement (missing ';')");
+        let line = match rl.readline(prompt) {
+            Ok(line) => {
+                if !line.trim().is_empty() {
+                    let _ = rl.add_history_entry(line.as_str());
+                }
+                line
             }
-            break;
-        }
+            Err(ReadlineError::Interrupted) => {
+                if !sql_buffer.trim().is_empty() {
+                    eprintln!("error: statement cancelled");
+                    sql_buffer.clear();
+                }
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                if !sql_buffer.trim().is_empty() {
+                    eprintln!("error: unterminated SQL statement (missing ';')");
+                }
+                break;
+            }
+            Err(err) => {
+                eprintln!("error: readline failed: {err}");
+                break;
+            }
+        };
+
         let raw = line.trim();
         if raw.is_empty() {
             continue;
@@ -103,8 +131,21 @@ pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("time: {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
         }
     }
+    if let Err(err) = rl.save_history(&history_path) {
+        eprintln!(
+            "warning: failed to save history '{}': {err}",
+            history_path.display()
+        );
+    }
     let _ = futures::executor::block_on(engine.shutdown());
     Ok(())
+}
+
+fn repl_history_path() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".ffq_history");
+    }
+    PathBuf::from(".ffq_history")
 }
 
 fn statement_terminated(sql: &str) -> bool {

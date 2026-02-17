@@ -39,6 +39,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 dotenvy = "0.15"
+rustyline = "14"
 
 [dev-dependencies]
 tonic = "0.12"
