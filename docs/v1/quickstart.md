@@ -96,6 +96,8 @@ cargo run -p ffq-client -- query \
 
 ## Run SQL in REPL (Interactive)
 
+For complete REPL command/flag/error reference, see `docs/v1/repl.md`.
+
 Start REPL with catalog:
 
 ```bash

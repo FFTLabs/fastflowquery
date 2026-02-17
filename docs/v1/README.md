@@ -54,6 +54,7 @@ The pages below define the v1 implementation contract and operational behavior.
 |---|---|
 | Plan-to-code implementation status | `docs/v1/status-matrix.md` |
 | Quick start (run in minutes) | `docs/v1/quickstart.md` |
+| REPL full reference | `docs/v1/repl.md` |
 | System architecture (as built) | `docs/v1/architecture.md` |
 | Storage and catalog | `docs/v1/storage-catalog.md` |
 | Core operators and execution semantics | `docs/v1/operators-core.md` |

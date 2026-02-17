@@ -26,6 +26,10 @@ Then run:
 SELECT l_orderkey, l_quantity FROM lineitem LIMIT 5;
 ```
 
+Full REPL reference:
+
+1. `docs/v1/repl.md`
+
 For a concept-first deep guide (architecture, optimizer, distributed control plane, labs, glossary, FAQ):
 
 1. `docs/learn/README.md`
