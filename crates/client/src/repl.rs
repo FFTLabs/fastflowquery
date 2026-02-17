@@ -4,7 +4,7 @@ use std::time::Instant;
 use arrow::util::pretty::pretty_format_batches;
 use arrow::util::display::array_value_to_string;
 use arrow::record_batch::RecordBatch;
-use ffq_common::EngineConfig;
+use ffq_common::{EngineConfig, FfqError};
 use serde_json::{Map, Value};
 
 use crate::Engine;
@@ -86,13 +86,15 @@ pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
                         if batches.is_empty() {
                             println!("OK: 0 rows");
                         } else {
-                            print_batches(&batches, output_mode)?;
+                            if let Err(e) = print_batches(&batches, output_mode) {
+                                print_repl_error("render", &e);
+                            }
                         }
                     }
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => print_repl_error("execution", &e),
                 }
             }
-            Err(e) => eprintln!("error: {e}"),
+            Err(e) => print_repl_error("planning", &e),
         }
         if timing_enabled {
             eprintln!("time: {:.3} ms", started.elapsed().as_secs_f64() * 1000.0);
@@ -162,7 +164,7 @@ fn handle_command(
                 Ok(None) => {
                     eprintln!("error: table '{}' has no schema", parts[1]);
                 }
-                Err(e) => eprintln!("error: {e}"),
+                Err(e) => print_repl_error("schema", &e),
             }
             CommandResult::Continue
         }
@@ -222,10 +224,11 @@ fn print_help() {
 fn print_batches(
     batches: &[RecordBatch],
     mode: OutputMode,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), FfqError> {
     match mode {
         OutputMode::Table => {
-            let rendered = pretty_format_batches(batches)?;
+            let rendered = pretty_format_batches(batches)
+                .map_err(|e| FfqError::Execution(format!("table render failed: {e}")))?;
             println!("{rendered}");
         }
         OutputMode::Csv => {
@@ -238,7 +241,7 @@ fn print_batches(
     Ok(())
 }
 
-fn print_batches_csv(batches: &[RecordBatch]) -> Result<(), Box<dyn std::error::Error>> {
+fn print_batches_csv(batches: &[RecordBatch]) -> Result<(), FfqError> {
     if batches.is_empty() {
         return Ok(());
     }
@@ -255,7 +258,8 @@ fn print_batches_csv(batches: &[RecordBatch]) -> Result<(), Box<dyn std::error::
             let mut cols = Vec::with_capacity(batch.num_columns());
             for col in 0..batch.num_columns() {
                 let arr = batch.column(col);
-                let v = array_value_to_string(arr, row)?;
+                let v = array_value_to_string(arr, row)
+                    .map_err(|e| FfqError::Execution(format!("csv render failed: {e}")))?;
                 cols.push(csv_escape(&v));
             }
             println!("{}", cols.join(","));
@@ -264,7 +268,7 @@ fn print_batches_csv(batches: &[RecordBatch]) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-fn print_batches_json(batches: &[RecordBatch]) -> Result<(), Box<dyn std::error::Error>> {
+fn print_batches_json(batches: &[RecordBatch]) -> Result<(), FfqError> {
     let mut rows = Vec::<Value>::new();
     for batch in batches {
         let schema = batch.schema();
@@ -276,14 +280,19 @@ fn print_batches_json(batches: &[RecordBatch]) -> Result<(), Box<dyn std::error:
                 if arr.is_null(row) {
                     obj.insert(key, Value::Null);
                 } else {
-                    let v = array_value_to_string(arr, row)?;
+                    let v = array_value_to_string(arr, row)
+                        .map_err(|e| FfqError::Execution(format!("json render failed: {e}")))?;
                     obj.insert(key, Value::String(v));
                 }
             }
             rows.push(Value::Object(obj));
         }
     }
-    println!("{}", serde_json::to_string_pretty(&rows)?);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&rows)
+            .map_err(|e| FfqError::Execution(format!("json encode failed: {e}")))?
+    );
     Ok(())
 }
 
@@ -293,4 +302,77 @@ fn csv_escape(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+fn print_repl_error(stage: &str, err: &FfqError) {
+    let (category, hint) = classify_error(err);
+    eprintln!("[{category}] {stage}: {err}");
+    if let Some(hint) = hint {
+        eprintln!("hint: {hint}");
+    }
+}
+
+fn classify_error(err: &FfqError) -> (&'static str, Option<&'static str>) {
+    match err {
+        FfqError::Planning(msg) => ("planning", planning_hint(msg)),
+        FfqError::Execution(msg) => ("execution", execution_hint(msg)),
+        FfqError::InvalidConfig(msg) => ("config", config_hint(msg)),
+        FfqError::Io(_) => (
+            "io",
+            Some("check file paths/permissions and that fixture/catalog files exist"),
+        ),
+        FfqError::Unsupported(msg) => ("unsupported", unsupported_hint(msg)),
+    }
+}
+
+fn planning_hint(msg: &str) -> Option<&'static str> {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("unknown table") {
+        return Some("register the table first; try \\tables to inspect current session tables");
+    }
+    if m.contains("join key") {
+        return Some("verify table schemas include join columns and names match query references");
+    }
+    None
+}
+
+fn execution_hint(msg: &str) -> Option<&'static str> {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("connect coordinator failed")
+        || m.contains("transport error")
+        || m.contains("coordinator")
+    {
+        return Some(
+            "check --coordinator-endpoint and ensure coordinator/worker services are reachable",
+        );
+    }
+    if m.contains("query vector dim") {
+        return Some("ensure query vector length matches embedding column fixed-size list dimension");
+    }
+    None
+}
+
+fn config_hint(msg: &str) -> Option<&'static str> {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("schema") {
+        return Some("define table schema in catalog/TableDef before querying");
+    }
+    if m.contains("uri or paths") {
+        return Some("set table uri or paths in catalog entry");
+    }
+    if m.contains("catalog") {
+        return Some("verify --catalog path exists and has .json/.toml extension");
+    }
+    None
+}
+
+fn unsupported_hint(msg: &str) -> Option<&'static str> {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("order by") {
+        return Some("v1 supports ORDER BY only for cosine_similarity(...) DESC LIMIT k pattern");
+    }
+    if m.contains("qdrant") {
+        return Some("enable required feature flags (vector/qdrant) or use brute-force fallback shape");
+    }
+    None
 }
