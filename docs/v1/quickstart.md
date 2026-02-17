@@ -73,6 +73,27 @@ Notes:
    - `cargo run -p ffq-client -- "SELECT 1"`
    - `cargo run -p ffq-client -- --plan "SELECT 1"`
 
+Manual-schema vs inferred-schema quick modes:
+
+1. Manual schema:
+   - use a catalog with explicit `schema` per parquet table.
+2. Inferred schema:
+   - omit `schema` for parquet table entries and set:
+     - `FFQ_SCHEMA_INFERENCE=on`
+     - `FFQ_SCHEMA_DRIFT_POLICY=refresh`
+   - optional persistence:
+     - `FFQ_SCHEMA_WRITEBACK=true`
+
+Example inferred-schema one-shot CLI run:
+
+```bash
+FFQ_SCHEMA_INFERENCE=on \
+FFQ_SCHEMA_DRIFT_POLICY=refresh \
+cargo run -p ffq-client -- query \
+  --catalog tests/fixtures/catalog/tables.json \
+  --sql "SELECT l_orderkey FROM lineitem LIMIT 5"
+```
+
 ## Run SQL in REPL (Interactive)
 
 Start REPL with catalog:
@@ -216,6 +237,18 @@ Success signals:
 7. `incompatible parquet files`:
    - table references parquet files with incompatible schemas.
    - align schemas or split files into separate tables.
+
+## Schema Migration (Quick)
+
+To migrate an existing manual-schema catalog incrementally:
+
+1. Enable:
+   - `FFQ_SCHEMA_INFERENCE=on`
+   - `FFQ_SCHEMA_DRIFT_POLICY=refresh`
+2. Remove `schema` from one parquet table entry.
+3. Run a query and `\schema <table>` in REPL to verify origin is `inferred`.
+4. Enable `FFQ_SCHEMA_WRITEBACK=true` to persist inferred schema.
+5. Repeat per table.
 
 ## Next Docs
 

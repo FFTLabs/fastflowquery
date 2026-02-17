@@ -37,19 +37,21 @@ Key fields:
 2. else if `uri` is non-empty, use `[uri]`
 3. else error (`table must define either uri or paths`)
 
-### 2.2 Schema requirement in v1
+### 2.2 Schema in v1: manual and inferred flows
 
-Although `schema` is optional in struct shape, v1 planning/analyzer requires schema for column resolution.
+`schema` is optional in `TableDef` shape for parquet tables and can be inferred by policy.
 
-`TableDef::schema_ref()`:
+`TableDef::schema_ref()` still requires an effective schema at analysis time:
 
-1. returns schema when present
-2. errors when absent (`v1 analyzer needs a schema to resolve columns`)
+1. manual flow: schema already present in catalog/register call
+2. inferred flow: schema populated from parquet footer before analysis
 
-Practical consequence:
+Inference policy controls whether missing parquet schema is resolved:
 
-1. register tables with explicit schema for reliable planning
-2. missing schema may only surface later as planning/analyzer failure
+1. `schema_inference=off`: no inference, missing schema fails
+2. `schema_inference=on`: inference with permissive merge
+3. `schema_inference=strict`: inference with strict merge (no numeric widening)
+4. `schema_inference=permissive`: explicit permissive merge mode
 
 ## 3) Catalog Load/Save Model
 
@@ -105,6 +107,12 @@ Session persistence:
 
 1. `Session::persist_catalog()` writes current catalog to configured file
 2. write APIs (`save_as_table`) update catalog then persist
+
+Schema inference-related session options:
+
+1. `FFQ_SCHEMA_INFERENCE=off|on|strict|permissive`
+2. `FFQ_SCHEMA_WRITEBACK=true|false`
+3. `FFQ_SCHEMA_DRIFT_POLICY=fail|refresh`
 
 Managed-table path convention:
 
@@ -187,23 +195,41 @@ This is useful for benchmark/integration repeatability.
 
 For predictable v1 behavior:
 
-1. always provide schema in `TableDef`
+1. choose one strategy per environment:
+   - manual schema everywhere, or
+   - inference enabled with explicit policy
 2. ensure `uri`/`paths` are valid in the execution environment
 3. keep `FFQ_CATALOG_PATH` stable across restarts if you expect persisted tables
 4. set meaningful `stats` when you want optimizer join strategy decisions to be realistic
 5. keep `format` and `options` accurate for provider/rewrite routing
+6. if using inference with frequent file updates, prefer `schema_drift_policy=refresh`
+7. if using strict reproducibility CI, prefer `schema_drift_policy=fail`
 
 ## 10) Typical Misconfigurations and Symptoms
 
 Common issues:
 
-1. missing schema -> analyzer/planning failures on column resolution
+1. missing schema with inference off -> analyzer/planning failures on column resolution
 2. empty `uri` and `paths` -> config error from `data_paths()`
 3. wrong catalog extension -> load/save rejected
 4. incorrect runtime paths in profile manifest -> file IO errors at scan time
 5. format mismatch (`format != parquet` with parquet provider path) -> unsupported format error
+6. `schema inference failed` -> parquet file inaccessible/invalid
+7. `schema drift detected` -> files changed vs cached fingerprint (use refresh policy)
+8. `incompatible parquet files` -> referenced files have incompatible schemas
 
-## 11) Mental Model Summary
+## 11) Migration Pattern (Manual -> Inferred)
+
+Safe incremental migration:
+
+1. set `schema_inference=on`, `schema_drift_policy=refresh`
+2. remove schema from one parquet table
+3. run that table’s existing queries/tests
+4. optionally enable `schema_writeback=true` to persist inferred schema
+5. repeat table-by-table
+6. optionally tighten to `schema_inference=strict` later
+
+## 12) Mental Model Summary
 
 Think of storage/catalog in FFQ as:
 

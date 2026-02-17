@@ -137,7 +137,7 @@ Save behavior:
 
 ## Registration and Query Examples
 
-### Example 1: register parquet table and query immediately
+### Example 1: manual-schema flow (explicit schema in catalog/register)
 
 ```rust
 use ffq_client::Engine;
@@ -153,7 +153,9 @@ engine.register_table(
         uri: "./data/lineitem.parquet".to_string(),
         paths: vec![],
         format: "parquet".to_string(),
-        schema: None, // for robust SQL analysis, provide schema when available
+        schema: Some(Schema::new(vec![
+            Field::new("l_orderkey", DataType::Int64, false),
+        ])),
         stats: Default::default(),
         options: Default::default(),
     },
@@ -165,7 +167,34 @@ let rows = engine
     .await?;
 ```
 
-### Example 2: multi-file parquet table via `paths`
+### Example 2: inferred-schema flow (schema omitted)
+
+```rust
+let mut cfg = EngineConfig::default();
+cfg.schema_inference = ffq_common::SchemaInferencePolicy::On;
+cfg.schema_drift_policy = ffq_common::SchemaDriftPolicy::Refresh;
+let engine = Engine::new(cfg)?;
+
+engine.register_table(
+    "lineitem",
+    TableDef {
+        name: "lineitem".to_string(),
+        uri: "./data/lineitem.parquet".to_string(),
+        paths: vec![],
+        format: "parquet".to_string(),
+        schema: None, // inferred from parquet footer
+        stats: Default::default(),
+        options: Default::default(),
+    },
+);
+
+let rows = engine
+    .sql("SELECT l_orderkey FROM lineitem LIMIT 10")?
+    .collect()
+    .await?;
+```
+
+### Example 3: multi-file parquet table via `paths`
 
 ```rust
 engine.register_table(
@@ -225,6 +254,48 @@ Behavior contract:
 5. `schema_writeback=true`: inferred schema + fingerprint metadata is persisted to catalog file.
 6. `schema_drift_policy=fail`: cached fingerprint mismatch fails query.
 7. `schema_drift_policy=refresh`: cached fingerprint mismatch triggers schema refresh.
+
+Recommended policy sets:
+
+1. Development:
+   - `schema_inference=on`
+   - `schema_drift_policy=refresh`
+   - optional `schema_writeback=true`
+2. Strict reproducibility/CI:
+   - `schema_inference=strict`
+   - `schema_drift_policy=fail`
+   - optional `schema_writeback=true`
+
+## Migration Guide: Manual Schema -> Inference
+
+If your catalogs were fully manual-schema and you want to adopt inference:
+
+1. Start with `schema_inference=on` and `schema_drift_policy=refresh`.
+2. Remove `schema` from selected parquet tables in `tables.json/toml`.
+3. Run existing query/integration tests.
+4. Enable `schema_writeback=true` to persist inferred schema and fingerprints.
+5. After stabilization, consider `schema_inference=strict` for tighter multi-file controls.
+
+Rollback path:
+
+1. Set `schema_inference=off`.
+2. Restore explicit `schema` entries in catalog for affected tables.
+
+## Schema Troubleshooting
+
+Common inference/drift failures and actions:
+
+1. `schema inference failed ...`:
+   - verify parquet file paths and read permissions
+   - verify files are valid parquet
+   - if inference intentionally disabled, set `schema` manually or enable inference
+2. `schema drift detected ...`:
+   - data files changed vs cached fingerprint
+   - use `schema_drift_policy=refresh` to refresh automatically
+   - keep `fail` for strict reproducibility
+3. `incompatible parquet files ...`:
+   - table points to parquet files with incompatible schemas
+   - align file schemas or split into separate tables
 
 ## Official TPC-H Catalog Profiles (13.4.3)
 
