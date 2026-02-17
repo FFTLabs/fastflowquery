@@ -74,6 +74,7 @@ pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
         if sql.is_empty() {
             continue;
         }
+        let is_write_stmt = is_write_statement(&sql);
 
         let started = Instant::now();
         match engine.sql(&sql) {
@@ -83,7 +84,9 @@ pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 match futures::executor::block_on(df.collect()) {
                     Ok(batches) => {
-                        if batches.is_empty() {
+                        if is_write_stmt && is_empty_sink_result(&batches) {
+                            println!("OK");
+                        } else if batches.is_empty() {
                             println!("OK: 0 rows");
                         } else {
                             if let Err(e) = print_batches(&batches, output_mode) {
@@ -106,6 +109,17 @@ pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
 
 fn statement_terminated(sql: &str) -> bool {
     sql.trim_end().ends_with(';')
+}
+
+fn is_write_statement(sql: &str) -> bool {
+    sql.split_whitespace()
+        .next()
+        .map(|token| token.eq_ignore_ascii_case("insert"))
+        .unwrap_or(false)
+}
+
+fn is_empty_sink_result(batches: &[RecordBatch]) -> bool {
+    batches.is_empty() || batches.iter().all(|batch| batch.num_rows() == 0)
 }
 
 enum CommandResult {
@@ -375,4 +389,27 @@ fn unsupported_hint(msg: &str) -> Option<&'static str> {
         return Some("enable required feature flags (vector/qdrant) or use brute-force fallback shape");
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow_schema::Schema;
+
+    #[test]
+    fn write_statement_detection_is_case_insensitive() {
+        assert!(is_write_statement("INSERT INTO t SELECT * FROM s"));
+        assert!(is_write_statement("insert into t select * from s"));
+        assert!(!is_write_statement("SELECT * FROM t"));
+    }
+
+    #[test]
+    fn empty_sink_result_detects_empty_batches() {
+        assert!(is_empty_sink_result(&[]));
+
+        let empty_batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        assert!(is_empty_sink_result(&[empty_batch]));
+    }
 }
