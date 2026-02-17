@@ -6,6 +6,7 @@ use std::{env, path::Path, path::PathBuf};
 use ffq_common::{EngineConfig, MetricsRegistry, Result};
 use ffq_storage::Catalog;
 
+use crate::engine::maybe_infer_table_schema_on_register;
 use crate::planner_facade::PlannerFacade;
 #[cfg(feature = "distributed")]
 use crate::runtime::DistributedRuntime;
@@ -51,11 +52,17 @@ impl Session {
             .clone()
             .or_else(|| env::var("FFQ_CATALOG_PATH").ok())
             .unwrap_or_else(|| "./ffq_tables/tables.json".to_string());
-        let catalog = if Path::new(&catalog_path).exists() {
+        let mut catalog = if Path::new(&catalog_path).exists() {
             Catalog::load(&catalog_path)?
         } else {
             Catalog::new()
         };
+        if config.infer_on_register {
+            for mut table in catalog.tables() {
+                maybe_infer_table_schema_on_register(true, &mut table)?;
+                catalog.register_table(table);
+            }
+        }
 
         Ok(Self {
             config,

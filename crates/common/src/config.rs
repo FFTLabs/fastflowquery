@@ -11,6 +11,8 @@ pub struct EngineConfig {
     pub spill_dir: String,
     pub catalog_path: Option<String>,
     pub coordinator_endpoint: Option<String>,
+    #[serde(default = "default_infer_on_register")]
+    pub infer_on_register: bool,
 }
 
 impl Default for EngineConfig {
@@ -23,6 +25,11 @@ impl Default for EngineConfig {
             spill_dir: "./ffq_spill".to_string(),
             catalog_path: None,
             coordinator_endpoint: None,
+            infer_on_register: default_infer_on_register(),
         }
     }
+}
+
+const fn default_infer_on_register() -> bool {
+    true
 }

@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let catalog = Catalog::load(catalog_path)?;
         for table in catalog.tables() {
             let name = table.name.clone();
-            engine.register_table(name, table);
+            engine.register_table_checked(name, table)?;
         }
     }
     let df = engine.sql(&opts.sql)?;

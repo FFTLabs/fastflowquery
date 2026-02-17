@@ -114,3 +114,77 @@ fn sql_collect_works_when_parquet_schema_is_missing_in_catalog() {
 
     let _ = std::fs::remove_file(parquet_path);
 }
+
+#[test]
+fn register_table_checked_infers_schema_immediately_when_enabled() {
+    let parquet_path = unique_path("parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .expect("build batch");
+    let file = File::create(&parquet_path).expect("create parquet file");
+    let mut writer =
+        ArrowWriter::try_new(file, schema.clone(), None).expect("create parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+
+    let mut cfg = EngineConfig::default();
+    cfg.infer_on_register = true;
+    let engine = Engine::new(cfg).expect("engine");
+    engine
+        .register_table_checked(
+            "t",
+            TableDef {
+                name: "ignored".to_string(),
+                uri: parquet_path.to_string_lossy().into_owned(),
+                paths: Vec::new(),
+                format: "parquet".to_string(),
+                schema: None,
+                stats: ffq_storage::TableStats::default(),
+                options: HashMap::new(),
+            },
+        )
+        .expect("register table");
+
+    let inferred = engine.table_schema("t").expect("table schema");
+    let inferred = inferred.expect("inferred schema");
+    assert_eq!(inferred.field(0).name(), "id");
+    assert_eq!(inferred.field(1).name(), "name");
+
+    let _ = std::fs::remove_file(parquet_path);
+}
+
+#[test]
+fn register_table_checked_fails_early_for_bad_parquet_path_when_enabled() {
+    let mut cfg = EngineConfig::default();
+    cfg.infer_on_register = true;
+    let engine = Engine::new(cfg).expect("engine");
+
+    let err = engine
+        .register_table_checked(
+            "bad",
+            TableDef {
+                name: "ignored".to_string(),
+                uri: "/definitely/missing/path.parquet".to_string(),
+                paths: Vec::new(),
+                format: "parquet".to_string(),
+                schema: None,
+                stats: ffq_storage::TableStats::default(),
+                options: HashMap::new(),
+            },
+        )
+        .expect_err("must fail early");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("No such file") || msg.contains("cannot find") || msg.contains("missing"),
+        "unexpected error message: {msg}"
+    );
+}
