@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::time::UNIX_EPOCH;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
@@ -11,6 +12,13 @@ use crate::catalog::TableDef;
 use crate::provider::{Stats, StorageExecNode, StorageProvider};
 
 pub struct ParquetProvider;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileFingerprint {
+    pub path: String,
+    pub size_bytes: u64,
+    pub mtime_ns: u128,
+}
 
 impl ParquetProvider {
     pub fn new() -> Self {
@@ -43,6 +51,34 @@ impl ParquetProvider {
         inferred.ok_or_else(|| {
             FfqError::InvalidConfig("failed to infer parquet schema from input paths".to_string())
         })
+    }
+
+    pub fn fingerprint_paths(paths: &[String]) -> Result<Vec<FileFingerprint>> {
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            let md = std::fs::metadata(path)?;
+            let modified = md.modified().map_err(|e| {
+                FfqError::InvalidConfig(format!(
+                    "failed to read modified time for '{}': {e}",
+                    path
+                ))
+            })?;
+            let mtime_ns = modified
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| {
+                    FfqError::InvalidConfig(format!(
+                        "invalid modified time for '{}': {e}",
+                        path
+                    ))
+                })?
+                .as_nanos();
+            out.push(FileFingerprint {
+                path: path.clone(),
+                size_bytes: md.len(),
+                mtime_ns,
+            });
+        }
+        Ok(out)
     }
 }
 

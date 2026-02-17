@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::runtime::QueryContext;
+use crate::session::SchemaCacheEntry;
 use crate::session::SharedSession;
 
 struct CatalogProvider<'a> {
@@ -266,12 +267,44 @@ impl DataFrame {
             let Some(mut table) = catalog.get(&name).ok().cloned() else {
                 continue;
             };
-            if !table.format.eq_ignore_ascii_case("parquet") || table.schema.is_some() {
+            if !table.format.eq_ignore_ascii_case("parquet") {
                 continue;
             }
             let paths = table.data_paths()?;
-            let schema = ParquetProvider::infer_parquet_schema(&paths)?;
-            table.schema = Some(schema);
+            let fingerprint = ParquetProvider::fingerprint_paths(&paths)?;
+            let mut cache = self
+                .session
+                .schema_cache
+                .write()
+                .expect("schema cache lock poisoned");
+
+            let schema = if let Some(entry) = cache.get(&name) {
+                if entry.fingerprint == fingerprint {
+                    entry.schema.clone()
+                } else if self.session.config.fail_on_schema_drift {
+                    return Err(FfqError::InvalidConfig(format!(
+                        "schema drift detected for table '{}'; file fingerprint changed",
+                        name
+                    )));
+                } else {
+                    ParquetProvider::infer_parquet_schema(&paths)?
+                }
+            } else if let Some(existing) = &table.schema {
+                existing.clone()
+            } else {
+                ParquetProvider::infer_parquet_schema(&paths)?
+            };
+
+            cache.insert(
+                name.clone(),
+                SchemaCacheEntry {
+                    schema: schema.clone(),
+                    fingerprint,
+                },
+            );
+            if table.schema.as_ref() != Some(&schema) {
+                table.schema = Some(schema);
+            }
             catalog.register_table(table);
         }
         Ok(())

@@ -13,6 +13,8 @@ pub struct EngineConfig {
     pub coordinator_endpoint: Option<String>,
     #[serde(default = "default_infer_on_register")]
     pub infer_on_register: bool,
+    #[serde(default)]
+    pub fail_on_schema_drift: bool,
 }
 
 impl Default for EngineConfig {
@@ -26,6 +28,7 @@ impl Default for EngineConfig {
             catalog_path: None,
             coordinator_endpoint: None,
             infer_on_register: default_infer_on_register(),
+            fail_on_schema_drift: false,
         }
     }
 }

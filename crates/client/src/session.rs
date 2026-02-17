@@ -1,10 +1,13 @@
 #[cfg(feature = "profiling")]
 use std::net::SocketAddr;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::{env, path::Path, path::PathBuf};
 
+use arrow_schema::Schema;
 use ffq_common::{EngineConfig, MetricsRegistry, Result};
 use ffq_storage::Catalog;
+use ffq_storage::parquet_provider::FileFingerprint;
 
 use crate::engine::maybe_infer_table_schema_on_register;
 use crate::planner_facade::PlannerFacade;
@@ -14,6 +17,12 @@ use crate::runtime::{EmbeddedRuntime, Runtime};
 
 pub type SharedSession = Arc<Session>;
 
+#[derive(Debug, Clone)]
+pub(crate) struct SchemaCacheEntry {
+    pub schema: Schema,
+    pub fingerprint: Vec<FileFingerprint>,
+}
+
 #[derive(Debug)]
 pub struct Session {
     pub config: EngineConfig,
@@ -22,6 +31,7 @@ pub struct Session {
     pub metrics: MetricsRegistry,
     pub planner: PlannerFacade,
     pub runtime: Arc<dyn Runtime>,
+    pub(crate) schema_cache: RwLock<HashMap<String, SchemaCacheEntry>>,
 }
 
 impl Session {
@@ -71,6 +81,7 @@ impl Session {
             metrics: MetricsRegistry::new(),
             planner: PlannerFacade::new(),
             runtime,
+            schema_cache: RwLock::new(HashMap::new()),
         })
     }
 

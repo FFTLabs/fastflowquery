@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Arc;
+use std::thread::sleep;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
@@ -187,4 +189,133 @@ fn register_table_checked_fails_early_for_bad_parquet_path_when_enabled() {
         msg.contains("No such file") || msg.contains("cannot find") || msg.contains("missing"),
         "unexpected error message: {msg}"
     );
+}
+
+#[test]
+fn schema_cache_refreshes_on_drift_when_policy_allows_refresh() {
+    let parquet_path = unique_path("parquet");
+    write_id_name_parquet(&parquet_path);
+
+    let mut cfg = EngineConfig::default();
+    cfg.infer_on_register = false;
+    cfg.fail_on_schema_drift = false;
+    let engine = Engine::new(cfg).expect("engine");
+    engine.register_table(
+        "t",
+        TableDef {
+            name: "ignored".to_string(),
+            uri: parquet_path.to_string_lossy().into_owned(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: None,
+            stats: ffq_storage::TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+
+    let first = futures::executor::block_on(
+        engine.sql("SELECT id FROM t").expect("sql").collect(),
+    )
+    .expect("collect first");
+    assert_eq!(first.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+
+    sleep(Duration::from_millis(2));
+    write_id_name_city_parquet(&parquet_path);
+
+    let second = futures::executor::block_on(
+        engine
+            .sql("SELECT city FROM t")
+            .expect("sql second")
+            .collect(),
+    )
+    .expect("collect second");
+    assert_eq!(second.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+
+    let _ = std::fs::remove_file(parquet_path);
+}
+
+#[test]
+fn schema_cache_can_fail_on_drift_when_configured() {
+    let parquet_path = unique_path("parquet");
+    write_id_name_parquet(&parquet_path);
+
+    let mut cfg = EngineConfig::default();
+    cfg.infer_on_register = false;
+    cfg.fail_on_schema_drift = true;
+    let engine = Engine::new(cfg).expect("engine");
+    engine.register_table(
+        "t",
+        TableDef {
+            name: "ignored".to_string(),
+            uri: parquet_path.to_string_lossy().into_owned(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: None,
+            stats: ffq_storage::TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+
+    let _ = futures::executor::block_on(
+        engine.sql("SELECT id FROM t").expect("sql").collect(),
+    )
+    .expect("collect first");
+
+    sleep(Duration::from_millis(2));
+    write_id_name_city_parquet(&parquet_path);
+
+    let err = futures::executor::block_on(
+        engine
+            .sql("SELECT id FROM t")
+            .expect("sql second")
+            .collect(),
+    )
+    .expect_err("expected drift error");
+    assert!(format!("{err}").contains("schema drift detected"));
+
+    let _ = std::fs::remove_file(parquet_path);
+}
+
+fn write_id_name_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .expect("build batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer =
+        ArrowWriter::try_new(file, schema.clone(), None).expect("create parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
+
+fn write_id_name_city_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("city", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            Arc::new(StringArray::from(vec!["x", "y", "z"])),
+        ],
+    )
+    .expect("build batch");
+
+    let file = File::create(path).expect("create parquet file");
+    let mut writer =
+        ArrowWriter::try_new(file, schema.clone(), None).expect("create parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
 }
