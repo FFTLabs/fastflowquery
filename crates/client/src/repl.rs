@@ -9,6 +9,7 @@ use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use serde_json::{Map, Value};
 
+use crate::engine::TableSchemaOrigin;
 use crate::Engine;
 
 #[derive(Debug, Clone)]
@@ -209,8 +210,15 @@ fn handle_command(
                 eprintln!("error: usage: \\schema <table>");
                 return CommandResult::Continue;
             }
-            match engine.table_schema(parts[1]) {
-                Ok(Some(schema)) => {
+            match engine.table_schema_with_origin(parts[1]) {
+                Ok(Some((schema, origin))) => {
+                    println!(
+                        "origin: {}",
+                        match origin {
+                            TableSchemaOrigin::CatalogDefined => "catalog-defined",
+                            TableSchemaOrigin::Inferred => "inferred",
+                        }
+                    );
                     for field in schema.fields() {
                         println!(
                             "{}: {:?}{}",
@@ -397,6 +405,21 @@ fn planning_hint(msg: &str) -> Option<&'static str> {
 
 fn execution_hint(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
+    if m.contains("schema inference failed") {
+        return Some(
+            "check parquet path(s) exist/readable and set schema policy (--schema-inference on|strict|permissive)",
+        );
+    }
+    if m.contains("schema drift detected") {
+        return Some(
+            "data files changed since cached schema; use --schema-drift-policy refresh (or FFQ_SCHEMA_DRIFT_POLICY=refresh)",
+        );
+    }
+    if m.contains("incompatible parquet files") {
+        return Some(
+            "table points to parquet files with incompatible schemas; align file schemas or use a separate table per schema",
+        );
+    }
     if m.contains("connect coordinator failed")
         || m.contains("transport error")
         || m.contains("coordinator")
@@ -413,6 +436,26 @@ fn execution_hint(msg: &str) -> Option<&'static str> {
 
 fn config_hint(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
+    if m.contains("schema inference failed") {
+        return Some(
+            "schema inference failed: verify parquet files exist and are readable; or set schema explicitly in catalog",
+        );
+    }
+    if m.contains("schema drift detected") {
+        return Some(
+            "set --schema-drift-policy refresh to auto-refresh on file changes, or keep fail for strict reproducibility",
+        );
+    }
+    if m.contains("incompatible parquet files") {
+        return Some(
+            "all parquet files in one table must have compatible schema; split mismatched files into separate tables",
+        );
+    }
+    if m.contains("has no schema") {
+        return Some(
+            "define table schema in catalog or enable inference (--schema-inference on|strict|permissive)",
+        );
+    }
     if m.contains("schema") {
         return Some("define table schema in catalog/TableDef before querying");
     }

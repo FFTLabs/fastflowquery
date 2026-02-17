@@ -110,9 +110,10 @@ Expected behavior:
 1. `\tables` lists registered catalog tables.
 2. `SELECT ...;` prints rows immediately.
 3. `\schema lineitem` prints field names and types.
-4. `\mode csv` changes rendering mode for next queries.
-5. `\timing on` shows elapsed time after each query.
-6. `\q` exits the REPL.
+4. `\schema <table>` also prints schema origin as `catalog-defined` or `inferred`.
+5. `\mode csv` changes rendering mode for next queries.
+6. `\timing on` shows elapsed time after each query.
+7. `\q` exits the REPL.
 
 Policy/env equivalents:
 
@@ -206,6 +207,15 @@ Success signals:
      - `make tpch-dbgen-sf1`
      - `make tpch-dbgen-parquet`
      - `make validate-tpch-dbgen-manifests`
+5. `schema inference failed`:
+   - verify parquet file paths and permissions.
+   - if inference is disabled, enable with `FFQ_SCHEMA_INFERENCE=on` (or `strict`/`permissive`).
+6. `schema drift detected`:
+   - files changed after schema cache/writeback.
+   - use `FFQ_SCHEMA_DRIFT_POLICY=refresh` to auto-refresh.
+7. `incompatible parquet files`:
+   - table references parquet files with incompatible schemas.
+   - align schemas or split files into separate tables.
 
 ## Next Docs
 

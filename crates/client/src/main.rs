@@ -1,10 +1,18 @@
 use arrow::util::pretty::pretty_format_batches;
 use ffq_client::Engine;
 use ffq_client::repl::{run_repl, ReplOptions};
-use ffq_common::{EngineConfig, SchemaDriftPolicy, SchemaInferencePolicy};
+use ffq_common::{EngineConfig, FfqError, SchemaDriftPolicy, SchemaInferencePolicy};
 use ffq_storage::Catalog;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Err(err) = run() {
+        print_cli_error(&*err);
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args
         .first()
@@ -256,4 +264,98 @@ fn parse_bool(raw: &str, flag: &str) -> Result<bool, Box<dyn std::error::Error>>
         )
         .into()),
     }
+}
+
+fn print_cli_error(err: &(dyn std::error::Error + 'static)) {
+    if let Some(ffq) = err.downcast_ref::<FfqError>() {
+        let (category, hint) = classify_ffq_error(ffq);
+        eprintln!("[{category}] {ffq}");
+        if let Some(hint) = hint {
+            eprintln!("hint: {hint}");
+        }
+        return;
+    }
+    let msg = err.to_string();
+    eprintln!("[error] {msg}");
+    if msg.to_ascii_lowercase().contains("incompatible parquet files") {
+        eprintln!("hint: table points to parquet files with incompatible schemas; align schemas or split into separate tables");
+    }
+}
+
+fn classify_ffq_error(err: &FfqError) -> (&'static str, Option<&'static str>) {
+    match err {
+        FfqError::Planning(msg) => ("planning", planning_hint(msg)),
+        FfqError::Execution(msg) => ("execution", execution_hint(msg)),
+        FfqError::InvalidConfig(msg) => ("config", config_hint(msg)),
+        FfqError::Io(_) => (
+            "io",
+            Some("check file paths/permissions and that fixture/catalog files exist"),
+        ),
+        FfqError::Unsupported(msg) => ("unsupported", unsupported_hint(msg)),
+    }
+}
+
+fn planning_hint(msg: &str) -> Option<&'static str> {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("unknown table") {
+        return Some("table is not registered; pass --catalog or register it before querying");
+    }
+    if m.contains("join key") {
+        return Some("verify schemas include join columns and names match query references");
+    }
+    None
+}
+
+fn execution_hint(msg: &str) -> Option<&'static str> {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("schema inference failed") {
+        return Some(
+            "check parquet path(s) exist/readable and set schema policy (--schema-inference on|strict|permissive)",
+        );
+    }
+    if m.contains("schema drift detected") {
+        return Some(
+            "data files changed since cached schema; set FFQ_SCHEMA_DRIFT_POLICY=refresh (or --schema-drift-policy refresh in REPL)",
+        );
+    }
+    if m.contains("incompatible parquet files") {
+        return Some(
+            "table points to parquet files with incompatible schemas; align file schemas or split into separate tables",
+        );
+    }
+    if m.contains("connect coordinator failed")
+        || m.contains("transport error")
+        || m.contains("coordinator")
+    {
+        return Some("check FFQ_COORDINATOR_ENDPOINT and ensure coordinator/worker services are reachable");
+    }
+    None
+}
+
+fn config_hint(msg: &str) -> Option<&'static str> {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("schema inference failed") {
+        return Some("verify parquet files exist and are readable; or define schema explicitly in catalog");
+    }
+    if m.contains("schema drift detected") {
+        return Some("set FFQ_SCHEMA_DRIFT_POLICY=refresh to auto-refresh schema on file changes");
+    }
+    if m.contains("incompatible parquet files") {
+        return Some("all parquet files in one table must have compatible schema; split mismatched files into separate tables");
+    }
+    if m.contains("has no schema") {
+        return Some("define table schema in catalog or enable inference with FFQ_SCHEMA_INFERENCE=on|strict|permissive");
+    }
+    if m.contains("catalog") {
+        return Some("verify --catalog path exists and has .json/.toml extension");
+    }
+    None
+}
+
+fn unsupported_hint(msg: &str) -> Option<&'static str> {
+    let m = msg.to_ascii_lowercase();
+    if m.contains("qdrant") {
+        return Some("enable required feature flags (vector/qdrant) or use brute-force fallback shape");
+    }
+    None
 }

@@ -95,7 +95,7 @@ impl ParquetProvider {
 fn merge_schemas(base: &Schema, next: &Schema, path: &str, permissive_merge: bool) -> Result<Schema> {
     if base.fields().len() != next.fields().len() {
         return Err(FfqError::InvalidConfig(format!(
-            "incompatible parquet schemas across table paths; '{}' has {} fields but expected {}",
+            "incompatible parquet files: schema mismatch across table paths; '{}' has {} fields but expected {}",
             path,
             next.fields().len(),
             base.fields().len()
@@ -125,7 +125,7 @@ fn merge_field(
 ) -> Result<Field> {
     if left.name() != right.name() {
         return Err(FfqError::InvalidConfig(format!(
-            "incompatible parquet schemas at field {idx}; '{}' has name '{}' but expected '{}' from first schema",
+            "incompatible parquet files: field-name mismatch at field {idx}; '{}' has name '{}' but expected '{}' from first schema",
             path,
             right.name(),
             left.name()
@@ -162,7 +162,7 @@ fn merge_data_types(
 
     if !permissive_merge {
         return Err(FfqError::InvalidConfig(format!(
-            "incompatible parquet schemas at field '{field}' under strict policy; '{}' has type {:?} but expected {:?}",
+            "incompatible parquet files: field-type mismatch at '{field}' under strict policy; '{}' has type {:?} but expected {:?}",
             path, right, left
         )));
     }
@@ -172,7 +172,7 @@ fn merge_data_types(
     }
 
     Err(FfqError::InvalidConfig(format!(
-        "incompatible parquet schemas at field '{field}'; '{}' has type {:?} but expected {:?}",
+        "incompatible parquet files: field-type mismatch at '{field}'; '{}' has type {:?} but expected {:?}",
         path, right, left
     )))
 }
@@ -385,7 +385,7 @@ mod tests {
         let paths = vec![fixture_path("lineitem.parquet"), fixture_path("orders.parquet")];
         let err = ParquetProvider::infer_parquet_schema(&paths).expect_err("must reject");
         let msg = format!("{err}");
-        assert!(msg.contains("incompatible parquet schemas"));
+        assert!(msg.contains("incompatible parquet files"));
         assert!(msg.contains("field 0"));
     }
 

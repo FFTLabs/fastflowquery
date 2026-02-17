@@ -18,6 +18,12 @@ pub struct Engine {
     session: SharedSession,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableSchemaOrigin {
+    CatalogDefined,
+    Inferred,
+}
+
 impl Engine {
     pub fn new(config: EngineConfig) -> Result<Self> {
         let session = Arc::new(Session::new(config)?);
@@ -77,6 +83,22 @@ impl Engine {
         Ok(table.schema.clone())
     }
 
+    pub fn table_schema_with_origin(&self, name: &str) -> Result<Option<(Schema, TableSchemaOrigin)>> {
+        let cat = self.session.catalog.read().expect("catalog lock poisoned");
+        let table = cat.get(name)?;
+        let Some(schema) = table.schema.clone() else {
+            return Ok(None);
+        };
+        let origin = if table.options.contains_key("schema.inferred_at")
+            || table.options.contains_key("schema.fingerprint")
+        {
+            TableSchemaOrigin::Inferred
+        } else {
+            TableSchemaOrigin::CatalogDefined
+        };
+        Ok(Some((schema, origin)))
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         self.session.runtime.shutdown().await
     }
@@ -106,7 +128,13 @@ pub(crate) fn maybe_infer_table_schema_on_register(
     let schema = ParquetProvider::infer_parquet_schema_with_policy(
         &paths,
         inference_policy.is_permissive_merge(),
-    )?;
+    )
+    .map_err(|e| {
+        ffq_common::FfqError::InvalidConfig(format!(
+            "schema inference failed for table '{}': {e}",
+            table.name
+        ))
+    })?;
     table.schema = Some(schema);
     annotate_schema_inference_metadata(table, &fingerprint)?;
     Ok(true)

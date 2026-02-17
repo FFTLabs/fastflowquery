@@ -203,7 +203,13 @@ impl Coordinator {
                 let inferred = ParquetProvider::infer_parquet_schema_with_policy(
                     &paths,
                     self.config.schema_inference.is_permissive_merge(),
-                )?;
+                )
+                .map_err(|e| {
+                    FfqError::InvalidConfig(format!(
+                        "schema inference failed for table '{}' on coordinator: {e}",
+                        table.name
+                    ))
+                })?;
                 scan.schema = Some(inferred.clone());
                 table.schema = Some(inferred);
                 self.catalog.register_table(table);

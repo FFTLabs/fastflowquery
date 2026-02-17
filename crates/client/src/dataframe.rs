@@ -302,7 +302,13 @@ impl DataFrame {
                         ParquetProvider::infer_parquet_schema_with_policy(
                             &paths,
                             self.session.config.schema_inference.is_permissive_merge(),
-                        )?
+                        )
+                        .map_err(|e| {
+                            FfqError::InvalidConfig(format!(
+                                "schema inference failed for table '{}': {e}",
+                                name
+                            ))
+                        })?
                     }
                 } else if let Some(existing) = &table.schema {
                     let stored_fingerprint = read_schema_fingerprint_metadata(&table)?;
@@ -321,7 +327,13 @@ impl DataFrame {
                             ParquetProvider::infer_parquet_schema_with_policy(
                                 &paths,
                                 self.session.config.schema_inference.is_permissive_merge(),
-                            )?
+                            )
+                            .map_err(|e| {
+                                FfqError::InvalidConfig(format!(
+                                    "schema inference failed for table '{}': {e}",
+                                    name
+                                ))
+                            })?
                         } else {
                             existing.clone()
                         }
@@ -333,7 +345,13 @@ impl DataFrame {
                     ParquetProvider::infer_parquet_schema_with_policy(
                         &paths,
                         self.session.config.schema_inference.is_permissive_merge(),
-                    )?
+                    )
+                    .map_err(|e| {
+                        FfqError::InvalidConfig(format!(
+                            "schema inference failed for table '{}': {e}",
+                            name
+                        ))
+                    })?
                 };
 
                 cache.insert(
