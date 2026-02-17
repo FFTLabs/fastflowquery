@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use arrow_schema::Schema;
 use ffq_common::{EngineConfig, Result};
 use ffq_planner::LiteralValue;
 use ffq_storage::TableDef;
@@ -48,6 +49,23 @@ impl Engine {
 
     pub fn table(&self, name: &str) -> Result<DataFrame> {
         Ok(DataFrame::table(self.session.clone(), name))
+    }
+
+    pub fn list_tables(&self) -> Vec<String> {
+        self.session
+            .catalog
+            .read()
+            .expect("catalog lock poisoned")
+            .tables()
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    }
+
+    pub fn table_schema(&self, name: &str) -> Result<Option<Schema>> {
+        let cat = self.session.catalog.read().expect("catalog lock poisoned");
+        let table = cat.get(name)?;
+        Ok(table.schema.clone())
     }
 
     pub async fn shutdown(&self) -> Result<()> {
