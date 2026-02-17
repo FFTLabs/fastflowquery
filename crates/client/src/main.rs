@@ -17,9 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.first().map(|a| a.as_str()) == Some("repl") {
         let opts = parse_repl_opts(&args)?;
-        return run_repl(ReplOptions {
-            catalog: opts.catalog,
-        });
+        return run_repl(ReplOptions { config: opts.config });
     }
 
     let opts = parse_query_opts(&args)?;
@@ -58,7 +56,7 @@ struct QueryOpts {
 
 #[derive(Debug, Clone)]
 struct ReplOpts {
-    catalog: Option<String>,
+    config: EngineConfig,
 }
 
 fn parse_query_opts(args: &[String]) -> Result<QueryOpts, Box<dyn std::error::Error>> {
@@ -128,17 +126,64 @@ fn parse_query_opts(args: &[String]) -> Result<QueryOpts, Box<dyn std::error::Er
 }
 
 fn parse_repl_opts(args: &[String]) -> Result<ReplOpts, Box<dyn std::error::Error>> {
-    let mut catalog = None;
+    let mut config = EngineConfig::default();
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
             "--catalog" => {
                 i += 1;
-                catalog = Some(
+                config.catalog_path = Some(
                     args.get(i)
                         .cloned()
                         .ok_or("missing value for --catalog")?,
                 );
+            }
+            "--coordinator-endpoint" => {
+                i += 1;
+                config.coordinator_endpoint = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or("missing value for --coordinator-endpoint")?,
+                );
+            }
+            "--batch-size-rows" => {
+                i += 1;
+                config.batch_size_rows = args
+                    .get(i)
+                    .ok_or("missing value for --batch-size-rows")?
+                    .parse()
+                    .map_err(|_| "invalid value for --batch-size-rows")?;
+            }
+            "--mem-budget-bytes" => {
+                i += 1;
+                config.mem_budget_bytes = args
+                    .get(i)
+                    .ok_or("missing value for --mem-budget-bytes")?
+                    .parse()
+                    .map_err(|_| "invalid value for --mem-budget-bytes")?;
+            }
+            "--spill-dir" => {
+                i += 1;
+                config.spill_dir = args
+                    .get(i)
+                    .cloned()
+                    .ok_or("missing value for --spill-dir")?;
+            }
+            "--shuffle-partitions" => {
+                i += 1;
+                config.shuffle_partitions = args
+                    .get(i)
+                    .ok_or("missing value for --shuffle-partitions")?
+                    .parse()
+                    .map_err(|_| "invalid value for --shuffle-partitions")?;
+            }
+            "--broadcast-threshold-bytes" => {
+                i += 1;
+                config.broadcast_threshold_bytes = args
+                    .get(i)
+                    .ok_or("missing value for --broadcast-threshold-bytes")?
+                    .parse()
+                    .map_err(|_| "invalid value for --broadcast-threshold-bytes")?;
             }
             "--help" | "-h" => {
                 print_usage();
@@ -148,7 +193,7 @@ fn parse_repl_opts(args: &[String]) -> Result<ReplOpts, Box<dyn std::error::Erro
         }
         i += 1;
     }
-    Ok(ReplOpts { catalog })
+    Ok(ReplOpts { config })
 }
 
 fn print_usage() {
@@ -156,5 +201,7 @@ fn print_usage() {
     eprintln!("  ffq-client \"<SQL>\"");
     eprintln!("  ffq-client --plan \"<SQL>\"");
     eprintln!("  ffq-client query --sql \"<SQL>\" [--catalog PATH] [--plan]");
-    eprintln!("  ffq-client repl [--catalog PATH]");
+    eprintln!(
+        "  ffq-client repl [--catalog PATH] [--coordinator-endpoint URL] [--batch-size-rows N] [--mem-budget-bytes N] [--spill-dir PATH] [--shuffle-partitions N] [--broadcast-threshold-bytes N]"
+    );
 }

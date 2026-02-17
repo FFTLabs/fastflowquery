@@ -2,24 +2,16 @@ use std::io::Write;
 
 use arrow::util::pretty::pretty_format_batches;
 use ffq_common::EngineConfig;
-use ffq_storage::Catalog;
 
 use crate::Engine;
 
 #[derive(Debug, Clone)]
 pub struct ReplOptions {
-    pub catalog: Option<String>,
+    pub config: EngineConfig,
 }
 
 pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
-    let engine = Engine::new(EngineConfig::default())?;
-    if let Some(catalog_path) = &opts.catalog {
-        let catalog = Catalog::load(catalog_path)?;
-        for table in catalog.tables() {
-            let name = table.name.clone();
-            engine.register_table(name, table);
-        }
-    }
+    let engine = Engine::new(opts.config)?;
 
     eprintln!("FFQ REPL (type \\q to quit)");
     let stdin = std::io::stdin();
