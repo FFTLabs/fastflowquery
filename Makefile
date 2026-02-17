@@ -1,4 +1,4 @@
-SHELL := /usr/bin/bash
+SHELL := /bin/bash
 
 .PHONY: \
 	clean \
@@ -31,7 +31,9 @@ SHELL := /usr/bin/bash
 	tpch-dbgen-sf1 \
 	tpch-dbgen-parquet \
 	validate-tpch-dbgen-manifests \
-	compare-13.3
+	compare-13.3 \
+	repl \
+	repl-smoke
 
 clean:
 	cargo clean
@@ -139,3 +141,13 @@ validate-tpch-dbgen-manifests:
 
 compare-13.3:
 	$(MAKE) bench-13.3-compare BASELINE="$$BASELINE" CANDIDATE="$$CANDIDATE" THRESHOLD="$${THRESHOLD:-0.10}"
+
+repl:
+	@if [ -n "$$CATALOG" ]; then \
+		cargo run -p ffq-client -- repl --catalog "$$CATALOG"; \
+	else \
+		cargo run -p ffq-client -- repl; \
+	fi
+
+repl-smoke:
+	./scripts/run-repl-smoke.sh
