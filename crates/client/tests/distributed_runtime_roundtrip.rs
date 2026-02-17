@@ -72,6 +72,37 @@ fn register_tables(
     );
 }
 
+fn register_tables_without_schema(
+    engine: &Engine,
+    lineitem_path: &std::path::Path,
+    orders_path: &std::path::Path,
+) {
+    engine.register_table(
+        "lineitem",
+        TableDef {
+            name: "lineitem".to_string(),
+            uri: lineitem_path.to_string_lossy().to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: None,
+            stats: TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+    engine.register_table(
+        "orders",
+        TableDef {
+            name: "orders".to_string(),
+            uri: orders_path.to_string_lossy().to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: None,
+            stats: TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+}
+
 fn collect_group_counts(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
     let mut out = Vec::new();
     for batch in batches {
@@ -224,7 +255,7 @@ fn register_two_phase_tables(engine: &Engine, docs_path: &std::path::Path) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
-    let _lock = DIST_TEST_LOCK.lock().expect("dist test lock");
+    let _lock = DIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fixtures = support::ensure_integration_parquet_fixtures();
     let lineitem_path = fixtures.lineitem;
     let orders_path = fixtures.orders;
@@ -460,10 +491,172 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     let _ = std::fs::remove_dir_all(&shuffle_root);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn distributed_runtime_no_schema_parity_matches_embedded() {
+    let _lock = DIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let fixtures = support::ensure_integration_parquet_fixtures();
+    let lineitem_path = fixtures.lineitem;
+    let orders_path = fixtures.orders;
+    let spill_dir = support::unique_path("ffq_client_dist_spill_noschema", "dir");
+    let shuffle_root = support::unique_path("ffq_client_dist_shuffle_noschema", "dir");
+    let _ = std::fs::create_dir_all(&shuffle_root);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener);
+    let endpoint = format!("http://{addr}");
+
+    let mut coordinator_catalog = ffq_storage::Catalog::new();
+    coordinator_catalog.register_table(TableDef {
+        name: "lineitem".to_string(),
+        uri: lineitem_path.to_string_lossy().to_string(),
+        paths: Vec::new(),
+        format: "parquet".to_string(),
+        schema: None,
+        stats: TableStats::default(),
+        options: HashMap::new(),
+    });
+    coordinator_catalog.register_table(TableDef {
+        name: "orders".to_string(),
+        uri: orders_path.to_string_lossy().to_string(),
+        paths: Vec::new(),
+        format: "parquet".to_string(),
+        schema: None,
+        stats: TableStats::default(),
+        options: HashMap::new(),
+    });
+    let coordinator = Arc::new(Mutex::new(Coordinator::with_catalog(
+        CoordinatorConfig {
+            blacklist_failure_threshold: 3,
+            shuffle_root: shuffle_root.clone(),
+            ..CoordinatorConfig::default()
+        },
+        coordinator_catalog,
+    )));
+    let services = CoordinatorServices::from_shared(Arc::clone(&coordinator));
+    let server_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(ControlPlaneServer::new(services.clone()))
+            .add_service(ShuffleServiceServer::new(services.clone()))
+            .add_service(HeartbeatServiceServer::new(services))
+            .serve(addr)
+            .await
+            .expect("grpc server");
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut worker_catalog = ffq_storage::Catalog::new();
+    worker_catalog.register_table(TableDef {
+        name: "lineitem".to_string(),
+        uri: lineitem_path.to_string_lossy().to_string(),
+        paths: Vec::new(),
+        format: "parquet".to_string(),
+        schema: None,
+        stats: TableStats::default(),
+        options: HashMap::new(),
+    });
+    worker_catalog.register_table(TableDef {
+        name: "orders".to_string(),
+        uri: orders_path.to_string_lossy().to_string(),
+        paths: Vec::new(),
+        format: "parquet".to_string(),
+        schema: None,
+        stats: TableStats::default(),
+        options: HashMap::new(),
+    });
+    let executor = Arc::new(DefaultTaskExecutor::new(Arc::new(worker_catalog)));
+
+    let cp1 = Arc::new(
+        GrpcControlPlane::connect(&endpoint)
+            .await
+            .expect("cp1 connect"),
+    );
+    let cp2 = Arc::new(
+        GrpcControlPlane::connect(&endpoint)
+            .await
+            .expect("cp2 connect"),
+    );
+
+    let worker1 = Worker::new(
+        WorkerConfig {
+            worker_id: "w1".to_string(),
+            cpu_slots: 1,
+            per_task_memory_budget_bytes: 1024 * 1024,
+            spill_dir: spill_dir.clone(),
+            shuffle_root: shuffle_root.clone(),
+        },
+        cp1,
+        Arc::clone(&executor),
+    );
+    let worker2 = Worker::new(
+        WorkerConfig {
+            worker_id: "w2".to_string(),
+            cpu_slots: 1,
+            per_task_memory_budget_bytes: 1024 * 1024,
+            spill_dir: spill_dir.clone(),
+            shuffle_root: shuffle_root.clone(),
+        },
+        cp2,
+        executor,
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop1 = Arc::clone(&stop);
+    let w1 = tokio::spawn(async move {
+        while !stop1.load(Ordering::Relaxed) {
+            let _ = worker1.poll_once().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let stop2 = Arc::clone(&stop);
+    let w2 = tokio::spawn(async move {
+        while !stop2.load(Ordering::Relaxed) {
+            let _ = worker2.poll_once().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    let mut cfg = EngineConfig::default();
+    cfg.spill_dir = spill_dir.to_string_lossy().to_string();
+    cfg.coordinator_endpoint = Some(endpoint.clone());
+    cfg.schema_inference = ffq_common::SchemaInferencePolicy::On;
+    let dist_engine = Engine::new(cfg.clone()).expect("distributed engine");
+    register_tables_without_schema(&dist_engine, &lineitem_path, &orders_path);
+
+    let sql = support::integration_queries::join_aggregate();
+    let dist_batches = dist_engine
+        .sql(sql)
+        .expect("dist sql")
+        .collect()
+        .await
+        .expect("dist collect");
+
+    cfg.coordinator_endpoint = None;
+    let embedded_engine = Engine::new(cfg).expect("embedded engine");
+    register_tables_without_schema(&embedded_engine, &lineitem_path, &orders_path);
+    let emb_batches = embedded_engine
+        .sql(sql)
+        .expect("embedded sql")
+        .collect()
+        .await
+        .expect("embedded collect");
+
+    let dist_norm = support::snapshot_text(&dist_batches, &["l_orderkey"], 1e-9);
+    let emb_norm = support::snapshot_text(&emb_batches, &["l_orderkey"], 1e-9);
+    assert_eq!(dist_norm, emb_norm, "distributed no-schema parity mismatch");
+
+    stop.store(true, Ordering::Relaxed);
+    w1.await.expect("worker1 join");
+    w2.await.expect("worker2 join");
+    server_handle.abort();
+    let _ = std::fs::remove_dir_all(spill_dir);
+    let _ = std::fs::remove_dir_all(shuffle_root);
+}
+
 #[cfg(feature = "vector")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
-    let _lock = DIST_TEST_LOCK.lock().expect("dist test lock");
+    let _lock = DIST_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let docs_path = support::unique_path("ffq_client_dist_docs", "parquet");
     let spill_dir = support::unique_path("ffq_client_dist_vec_spill", "dir");
     let shuffle_root = support::unique_path("ffq_client_dist_vec_shuffle", "dir");
