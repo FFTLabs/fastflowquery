@@ -76,13 +76,13 @@ impl Catalog {
     pub fn load_from_json(path: &str) -> Result<Self> {
         let s = fs::read_to_string(path)?;
         let tables = parse_tables_json(&s)?;
-        Ok(Self::from_tables(tables))
+        Self::from_tables(tables)
     }
 
     pub fn load_from_toml(path: &str) -> Result<Self> {
         let s = fs::read_to_string(path)?;
         let tables = parse_tables_toml(&s)?;
-        Ok(Self::from_tables(tables))
+        Self::from_tables(tables)
     }
 
     pub fn load(path: &str) -> Result<Self> {
@@ -98,12 +98,13 @@ impl Catalog {
         }
     }
 
-    fn from_tables(tables: Vec<TableDef>) -> Self {
+    fn from_tables(tables: Vec<TableDef>) -> Result<Self> {
         let mut cat = Catalog::new();
         for t in tables {
+            validate_table_schema_contract(&t)?;
             cat.register_table(t);
         }
-        cat
+        Ok(cat)
     }
 
     pub fn tables(&self) -> Vec<TableDef> {
@@ -176,6 +177,23 @@ fn parse_tables_toml(s: &str) -> Result<Vec<TableDef>> {
     let parsed: CatalogFile =
         toml::from_str(s).map_err(|e| FfqError::InvalidConfig(e.to_string()))?;
     Ok(parsed.into_tables())
+}
+
+fn validate_table_schema_contract(table: &TableDef) -> Result<()> {
+    if table.schema.is_some() {
+        return Ok(());
+    }
+    if format_supports_schema_inference(&table.format) {
+        return Ok(());
+    }
+    Err(FfqError::InvalidConfig(format!(
+        "table '{}' (format='{}') requires schema in catalog; only inferable formats may omit schema in v1",
+        table.name, table.format
+    )))
+}
+
+fn format_supports_schema_inference(format: &str) -> bool {
+    matches!(format.to_ascii_lowercase().as_str(), "parquet" | "qdrant")
 }
 
 fn write_atomically(path: &str, content: &[u8]) -> Result<()> {
@@ -301,5 +319,34 @@ mod tests {
             options: std::collections::HashMap::new(),
         };
         assert!(t.data_paths().is_err());
+    }
+
+    #[test]
+    fn rejects_missing_schema_for_non_inferable_format() {
+        let path = unique_path("json");
+        let payload = r#"[{"name":"t_csv","uri":"./a.csv","format":"csv"}]"#;
+        std::fs::write(&path, payload).expect("write json");
+
+        let err = Catalog::load_from_json(path.to_str().expect("path utf8")).expect_err("reject");
+        let msg = format!("{err}");
+        assert!(msg.contains("requires schema in catalog"));
+        assert!(msg.contains("format='csv'"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn allows_missing_schema_for_qdrant() {
+        let path = unique_path("json");
+        let payload = r#"[{"name":"docs_idx","uri":"docs_idx","format":"qdrant"}]"#;
+        std::fs::write(&path, payload).expect("write json");
+
+        let catalog =
+            Catalog::load_from_json(path.to_str().expect("path utf8")).expect("load qdrant");
+        let table = catalog.get("docs_idx").expect("table exists");
+        assert_eq!(table.format, "qdrant");
+        assert!(table.schema.is_none());
+
+        let _ = std::fs::remove_file(path);
     }
 }
