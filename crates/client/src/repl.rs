@@ -15,16 +15,21 @@ pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::new(opts.config)?;
     let mut plan_enabled = false;
     let mut timing_enabled = false;
+    let mut sql_buffer = String::new();
 
     eprintln!("FFQ REPL (type \\q to quit)");
     let stdin = std::io::stdin();
     let mut line = String::new();
     loop {
-        print!("ffq> ");
+        let prompt = if sql_buffer.is_empty() { "ffq> " } else { " ...> " };
+        print!("{prompt}");
         std::io::stdout().flush()?;
         line.clear();
         // Ctrl+D => EOF => exit
         if stdin.read_line(&mut line)? == 0 {
+            if !sql_buffer.trim().is_empty() {
+                eprintln!("error: unterminated SQL statement (missing ';')");
+            }
             break;
         }
         let raw = line.trim();
@@ -32,16 +37,36 @@ pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        if raw.starts_with('\\') {
+        // Shell commands are only recognized when not in the middle of SQL input.
+        if raw.starts_with('\\') && sql_buffer.trim().is_empty() {
             match handle_command(raw, &engine, &mut plan_enabled, &mut timing_enabled) {
                 CommandResult::Continue => continue,
                 CommandResult::Exit => break,
             }
         }
 
-        let sql = raw.trim_end_matches(';');
+        // Ignore SQL comments.
+        if raw.starts_with("--") {
+            continue;
+        }
+
+        if !sql_buffer.is_empty() {
+            sql_buffer.push('\n');
+        }
+        sql_buffer.push_str(raw);
+
+        if !statement_terminated(&sql_buffer) {
+            continue;
+        }
+
+        let sql = sql_buffer.trim_end().trim_end_matches(';').trim().to_string();
+        sql_buffer.clear();
+        if sql.is_empty() {
+            continue;
+        }
+
         let started = Instant::now();
-        match engine.sql(sql) {
+        match engine.sql(&sql) {
             Ok(df) => {
                 if plan_enabled {
                     println!("{:#?}", df.logical_plan());
@@ -66,6 +91,10 @@ pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = futures::executor::block_on(engine.shutdown());
     Ok(())
+}
+
+fn statement_terminated(sql: &str) -> bool {
+    sql.trim_end().ends_with(';')
 }
 
 enum CommandResult {
