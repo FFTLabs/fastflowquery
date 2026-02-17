@@ -2,8 +2,10 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use ffq_common::{FfqError, Result};
 use ffq_planner::{AggExpr, Expr, JoinType, LogicalPlan};
+use ffq_storage::parquet_provider::ParquetProvider;
 use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -113,6 +115,7 @@ impl DataFrame {
     }
 
     pub fn explain(&self) -> Result<String> {
+        self.ensure_inferred_parquet_schemas()?;
         let cat = self.session.catalog.read().expect("catalog lock poisoned");
         let provider = CatalogProvider { catalog: &*cat };
 
@@ -213,6 +216,7 @@ impl DataFrame {
     }
 
     async fn execute_with_schema(&self) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+        self.ensure_inferred_parquet_schemas()?;
         // Ensure both SQL-built and DataFrame-built plans go through the same analyze/optimize pipeline.
         let (analyzed, catalog_snapshot) = {
             let cat_guard = self.session.catalog.read().expect("catalog lock poisoned");
@@ -246,6 +250,32 @@ impl DataFrame {
         let batches: Vec<RecordBatch> = stream.try_collect().await?;
         Ok((schema, batches))
     }
+
+    fn ensure_inferred_parquet_schemas(&self) -> Result<()> {
+        let mut names = Vec::new();
+        collect_table_refs(&self.logical_plan, &mut names);
+        let mut seen = HashSet::new();
+        names.retain(|n| seen.insert(n.clone()));
+
+        if names.is_empty() {
+            return Ok(());
+        }
+
+        let mut catalog = self.session.catalog.write().expect("catalog lock poisoned");
+        for name in names {
+            let Some(mut table) = catalog.get(&name).ok().cloned() else {
+                continue;
+            };
+            if !table.format.eq_ignore_ascii_case("parquet") || table.schema.is_some() {
+                continue;
+            }
+            let paths = table.data_paths()?;
+            let schema = ParquetProvider::infer_parquet_schema(&paths)?;
+            table.schema = Some(schema);
+            catalog.register_table(table);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +294,26 @@ impl GroupedDataFrame {
             input: Box::new(self.input),
         };
         DataFrame::new(self.session, plan)
+    }
+}
+
+fn collect_table_refs(plan: &LogicalPlan, out: &mut Vec<String>) {
+    match plan {
+        LogicalPlan::TableScan { table, .. } => out.push(table.clone()),
+        LogicalPlan::Projection { input, .. } => collect_table_refs(input, out),
+        LogicalPlan::Filter { input, .. } => collect_table_refs(input, out),
+        LogicalPlan::Join { left, right, .. } => {
+            collect_table_refs(left, out);
+            collect_table_refs(right, out);
+        }
+        LogicalPlan::Aggregate { input, .. } => collect_table_refs(input, out),
+        LogicalPlan::Limit { input, .. } => collect_table_refs(input, out),
+        LogicalPlan::TopKByScore { input, .. } => collect_table_refs(input, out),
+        LogicalPlan::VectorTopK { table, .. } => out.push(table.clone()),
+        LogicalPlan::InsertInto { table, input, .. } => {
+            out.push(table.clone());
+            collect_table_refs(input, out);
+        }
     }
 }
 
