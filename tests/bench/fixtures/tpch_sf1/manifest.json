@@ -1,0 +1,39 @@
+{
+  "fixture": "tpch_sf1",
+  "description": "Deterministic synthetic TPCH-style fixture for Q1/Q3 benchmark paths.",
+  "deterministic_seed": 42,
+  "files": [
+    {
+      "file": "customer.parquet",
+      "rows": 10000,
+      "schema": [
+        "c_custkey:Int64:false",
+        "c_mktsegment:Utf8:false"
+      ]
+    },
+    {
+      "file": "orders.parquet",
+      "rows": 50000,
+      "schema": [
+        "o_orderkey:Int64:false",
+        "o_custkey:Int64:false",
+        "o_orderdate:Utf8:false",
+        "o_shippriority:Int64:false"
+      ]
+    },
+    {
+      "file": "lineitem.parquet",
+      "rows": 200000,
+      "schema": [
+        "l_orderkey:Int64:false",
+        "l_quantity:Float64:false",
+        "l_extendedprice:Float64:false",
+        "l_discount:Float64:false",
+        "l_tax:Float64:false",
+        "l_returnflag:Utf8:false",
+        "l_linestatus:Utf8:false",
+        "l_shipdate:Utf8:false"
+      ]
+    }
+  ]
+}

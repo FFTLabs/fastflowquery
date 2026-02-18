@@ -4,15 +4,46 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "ffq-coordinator"
+path = "src/bin/ffq-coordinator.rs"
+required-features = ["grpc"]
+
+[[bin]]
+name = "ffq-worker"
+path = "src/bin/ffq-worker.rs"
+required-features = ["grpc"]
+
 [features]
 default = []
 grpc = ["dep:tokio", "dep:tonic", "dep:prost", "dep:tokio-stream"]
+vector = ["ffq-planner/vector", "ffq-execution/vector"]
+qdrant = ["vector", "ffq-storage/qdrant"]
+profiling = ["ffq-common/profiling", "ffq-execution/profiling"]
 
 [dependencies]
 ffq-common = { path = "../common" }
+ffq-execution = { path = "../execution" }
+ffq-planner = { path = "../planner", default-features = false }
+ffq-shuffle = { path = "../shuffle" }
+ffq-storage = { path = "../storage" }
+arrow.workspace = true
+arrow-schema.workspace = true
+parquet.workspace = true
+futures.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
 
 tokio = { workspace = true, optional = true }
 tonic = { version = "0.12", optional = true }
 prost = { version = "0.13", optional = true }
 tokio-stream = { version = "0.1", optional = true }
+
+[build-dependencies]
+tonic-build = "0.12"
+prost-build = "0.13"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+parquet.workspace = true

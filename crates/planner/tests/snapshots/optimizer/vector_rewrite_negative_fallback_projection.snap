@@ -1,0 +1,17 @@
+# optimizer-golden: vector_rewrite_negative_fallback_projection
+
+## before
+Projection
+  title := title
+  TopKByScore k=5 score=cosine_similarity(emb, VectorF32([1.0, 0.0, 0.0])) rewrite=index_fallback
+    TableScan table=docs_idx
+      projection=None
+      pushed_filters=0
+
+## after
+Projection
+  title := title
+  TopKByScore k=5 score=cosine_similarity(emb, VectorF32([1.0, 0.0, 0.0])) rewrite=index_fallback
+    TableScan table=docs_idx
+      projection=Some(["emb"])
+      pushed_filters=0

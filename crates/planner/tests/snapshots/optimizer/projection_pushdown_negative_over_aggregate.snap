@@ -1,0 +1,25 @@
+# optimizer-golden: projection_pushdown_negative_over_aggregate
+
+## before
+Projection
+  g := g
+  Aggregate
+    group_by=1
+      g
+    aggs=1
+      sum_v := Sum(Column("v"))
+    TableScan table=agg_src
+      projection=None
+      pushed_filters=0
+
+## after
+Projection
+  g := g
+  Aggregate
+    group_by=1
+      g
+    aggs=1
+      sum_v := Sum(Column("v"))
+    TableScan table=agg_src
+      projection=Some(["g", "v"])
+      pushed_filters=0

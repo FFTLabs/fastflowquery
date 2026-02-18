@@ -1,0 +1,9 @@
+schema:k:Utf8:true,cnt:Int64:true,sum_v:Int64:true,min_v:Int64:true,max_v:Int64:true,avg_v:Float64:true
+rows:
+k=group_0|cnt=120|sum_v=455|min_v=-7|max_v=15|avg_v=3.791666667000
+k=group_1|cnt=120|sum_v=465|min_v=-7|max_v=15|avg_v=3.875000000000
+k=group_2|cnt=120|sum_v=475|min_v=-7|max_v=15|avg_v=3.958333333000
+k=group_3|cnt=120|sum_v=462|min_v=-7|max_v=15|avg_v=3.850000000000
+k=group_4|cnt=120|sum_v=472|min_v=-7|max_v=15|avg_v=3.933333333000
+k=group_5|cnt=120|sum_v=459|min_v=-7|max_v=15|avg_v=3.825000000000
+k=group_6|cnt=120|sum_v=469|min_v=-7|max_v=15|avg_v=3.908333333000

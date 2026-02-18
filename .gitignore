@@ -1,7 +1,16 @@
 /target
 /tickets
+**/__pycache__
 **/*.ipc
 **/*.parquet
 **/*.prof
 **/*.svg
-shuffle/
+
+# benchmark run artifacts
+/tests/bench/results/
+/tests/bench/fixtures/tpch_dbgen_sf1/*.tbl
+
+# local environment
+.env
+.env.*
+!.env.example

@@ -1,0 +1,18 @@
+# optimizer-golden: filter_merge_positive
+
+## before
+Projection
+  id := id
+  Filter (id) Gt (Int64(10))
+    Filter (v) Eq (Int64(1))
+      TableScan table=t
+        projection=None
+        pushed_filters=0
+
+## after
+Projection
+  id := id
+  TableScan table=t
+    projection=Some(["id", "v"])
+    pushed_filters=1
+      ((v) Eq (Int64(1))) AND ((id) Gt (Int64(10)))

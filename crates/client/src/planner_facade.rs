@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ffq_common::{EngineConfig, Result};
 use ffq_planner::{
-    Analyzer, LiteralValue, LogicalPlan, Optimizer, OptimizerConfig, OptimizerContext, PhysicalPlan
+    Analyzer, LiteralValue, LogicalPlan, Optimizer, OptimizerConfig, OptimizerContext, PhysicalPlan,
 };
 
 #[derive(Debug, Default)]
@@ -64,7 +64,8 @@ impl PlannerFacade {
         )
     }
 
-    pub fn create_physical_plan(&self, _logical: &LogicalPlan) -> Result<PhysicalPlan> {
-        Ok(PhysicalPlan::Placeholder("empty".to_string()))
+    pub fn create_physical_plan(&self, logical: &LogicalPlan) -> Result<PhysicalPlan> {
+        let cfg = ffq_planner::PhysicalPlannerConfig::default();
+        ffq_planner::create_physical_plan(logical, &cfg)
     }
 }

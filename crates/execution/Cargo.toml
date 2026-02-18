@@ -6,11 +6,15 @@ license.workspace = true
 
 [features]
 default = []
-vector = []
+vector = ["ffq-planner/vector"]
+profiling = []
 
 [dependencies]
 ffq-common = { path = "../common" }
+ffq-planner = { path = "../planner", default-features = false }
+
 arrow.workspace = true
+arrow-schema.workspace = true
 futures.workspace = true
 tracing.workspace = true
 serde.workspace = true

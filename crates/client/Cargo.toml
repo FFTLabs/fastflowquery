@@ -11,9 +11,14 @@ embedded = []
 # enables the optional dependency + turns on its grpc feature
 distributed = ["dep:ffq-distributed", "ffq-distributed/grpc"]
 
-vector = ["ffq-execution/vector", "ffq-planner/vector"]
-qdrant = ["ffq-storage/qdrant", "vector"]
+vector = ["ffq-execution/vector", "ffq-planner/vector", "ffq-distributed?/vector"]
+qdrant = ["ffq-storage/qdrant", "vector", "ffq-distributed?/qdrant"]
 s3 = ["ffq-storage/s3"]
+profiling = [
+  "ffq-common/profiling",
+  "ffq-execution/profiling",
+  "ffq-distributed?/profiling",
+]
 
 [dependencies]
 ffq-common = { path = "../common" }
@@ -25,7 +30,16 @@ ffq-shuffle = { path = "../shuffle" }
 
 ffq-distributed = { path = "../distributed", optional = true }
 
-arrow.workspace = true
+arrow = { workspace = true, features = ["prettyprint"] }
 arrow-schema.workspace = true
+parquet.workspace = true
 futures.workspace = true
 tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+dotenvy = "0.15"
+rustyline = "14"
+
+[dev-dependencies]
+tonic = "0.12"

@@ -1,0 +1,57 @@
+{
+  "fixture": "tpch_dbgen_sf1",
+  "generator": "dbgen",
+  "scale_factor": 1.0,
+  "source_repo": "https://github.com/electrum/tpch-dbgen.git",
+  "source_ref": "32f1c1b92d1664dba542e927d23d86ffa57aa253",
+  "files": [
+    {
+      "file": "customer.tbl",
+      "rows": 150000,
+      "sha256": "4483680548a965833877c911ed43e795f4d3543c7a3f7d1dba9ccb24ea5989d6",
+      "bytes": 24346144
+    },
+    {
+      "file": "lineitem.tbl",
+      "rows": 6001215,
+      "sha256": "96d555e07a1ae8cf5196387d9edd9427f9af70c56fa5f4b18affee5555ddb184",
+      "bytes": 759863287
+    },
+    {
+      "file": "nation.tbl",
+      "rows": 25,
+      "sha256": "66f96949939fa8fdf1c4ffed1e5f6c2842fe11a14b51fdc6ed1e17460031e8c5",
+      "bytes": 2224
+    },
+    {
+      "file": "orders.tbl",
+      "rows": 1500000,
+      "sha256": "8709061d7bbc81932356fdfc664f8d582252747c2d7e204ae6d3cde624586357",
+      "bytes": 171952161
+    },
+    {
+      "file": "part.tbl",
+      "rows": 200000,
+      "sha256": "f0e4ccdfb5f6d19428ce54f9c84b17037d20f00ac8d2b2272c8d43b18a0b4880",
+      "bytes": 24135125
+    },
+    {
+      "file": "partsupp.tbl",
+      "rows": 800000,
+      "sha256": "43c37f99918f06d4de6b99b05c0a28d5c46f71d66424cffcc595cb059a499254",
+      "bytes": 118984616
+    },
+    {
+      "file": "region.tbl",
+      "rows": 5,
+      "sha256": "6022658d673924389b54dcb70fa8c3d6da1b0d7afa3c1c017bab62a019df404f",
+      "bytes": 389
+    },
+    {
+      "file": "supplier.tbl",
+      "rows": 10000,
+      "sha256": "9b99cf155974e6db8773970b40746bfccfa64fa078169574165f3e19e2158391",
+      "bytes": 1409184
+    }
+  ]
+}

@@ -217,6 +217,126 @@ impl Analyzer {
                     resolver,
                 ))
             }
+            LogicalPlan::TopKByScore {
+                score_expr,
+                k,
+                input,
+            } => {
+                let (ain, schema, resolver) = self.analyze_plan(*input, provider)?;
+                if k == 0 {
+                    return Err(FfqError::Planning("TOP-K value must be > 0".to_string()));
+                }
+                let (score_expr, score_dt) = self.analyze_expr(score_expr, &resolver)?;
+                if !matches!(score_dt, DataType::Float32 | DataType::Float64) {
+                    return Err(FfqError::Planning(format!(
+                        "top-k score expression must be Float32/Float64, got {score_dt:?}"
+                    )));
+                }
+                Ok((
+                    LogicalPlan::TopKByScore {
+                        score_expr,
+                        k,
+                        input: Box::new(ain),
+                    },
+                    schema,
+                    resolver,
+                ))
+            }
+            LogicalPlan::VectorTopK {
+                table,
+                query_vector,
+                k,
+                filter,
+            } => {
+                if k == 0 {
+                    return Err(FfqError::Planning("TOP-K value must be > 0".to_string()));
+                }
+                if query_vector.is_empty() {
+                    return Err(FfqError::Planning(
+                        "vector top-k query vector cannot be empty".to_string(),
+                    ));
+                }
+                // Validate table exists.
+                let _ = provider.table_schema(&table)?;
+                let out_schema = Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("score", DataType::Float32, false),
+                    Field::new("payload", DataType::Utf8, true),
+                ]));
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                Ok((
+                    LogicalPlan::VectorTopK {
+                        table,
+                        query_vector,
+                        k,
+                        filter,
+                    },
+                    out_schema,
+                    out_resolver,
+                ))
+            }
+            LogicalPlan::InsertInto {
+                table,
+                columns,
+                input,
+            } => {
+                let (ain, input_schema, _input_resolver) = self.analyze_plan(*input, provider)?;
+                let target_schema = provider.table_schema(&table)?;
+
+                let mut target_fields: Vec<Field> = Vec::new();
+                if columns.is_empty() {
+                    for idx in 0..target_schema.fields().len() {
+                        target_fields.push(target_schema.field(idx).clone());
+                    }
+                } else {
+                    target_fields.reserve(columns.len());
+                    for col in &columns {
+                        let idx = target_schema.index_of(col).map_err(|_| {
+                            FfqError::Planning(format!(
+                                "INSERT target column '{col}' not found in table '{table}'"
+                            ))
+                        })?;
+                        target_fields.push(target_schema.field(idx).clone());
+                    }
+                }
+
+                if input_schema.fields().len() != target_fields.len() {
+                    return Err(FfqError::Planning(format!(
+                        "INSERT column count mismatch: target has {}, SELECT has {}",
+                        target_fields.len(),
+                        input_schema.fields().len()
+                    )));
+                }
+
+                for (idx, (src, dst)) in input_schema
+                    .fields()
+                    .iter()
+                    .zip(target_fields.iter())
+                    .enumerate()
+                {
+                    if !insert_type_compatible(src.data_type(), dst.data_type()) {
+                        return Err(FfqError::Planning(format!(
+                            "INSERT type mismatch at column {}: target '{}' is {:?}, SELECT is {:?}",
+                            idx,
+                            dst.name(),
+                            dst.data_type(),
+                            src.data_type()
+                        )));
+                    }
+                }
+
+                let out_schema = Arc::new(Schema::new(target_fields));
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                Ok((
+                    LogicalPlan::InsertInto {
+                        table,
+                        columns,
+                        input: Box::new(ain),
+                    },
+                    out_schema,
+                    out_resolver,
+                ))
+            }
         }
     }
 
@@ -265,13 +385,21 @@ impl Analyzer {
             Expr::Literal(v) => Ok((Expr::Literal(v.clone()), literal_type(&v))),
             Expr::Cast { expr, to_type } => {
                 let (ae, _dt) = self.analyze_expr(*expr, resolver)?;
-                Ok((Expr::Cast { expr: Box::new(ae), to_type: to_type.clone() }, to_type))
+                Ok((
+                    Expr::Cast {
+                        expr: Box::new(ae),
+                        to_type: to_type.clone(),
+                    },
+                    to_type,
+                ))
             }
             Expr::And(l, r) => {
                 let (al, ldt) = self.analyze_expr(*l, resolver)?;
                 let (ar, rdt) = self.analyze_expr(*r, resolver)?;
                 if ldt != DataType::Boolean || rdt != DataType::Boolean {
-                    return Err(FfqError::Planning("AND requires boolean operands".to_string()));
+                    return Err(FfqError::Planning(
+                        "AND requires boolean operands".to_string(),
+                    ));
                 }
                 Ok((Expr::And(Box::new(al), Box::new(ar)), DataType::Boolean))
             }
@@ -279,14 +407,18 @@ impl Analyzer {
                 let (al, ldt) = self.analyze_expr(*l, resolver)?;
                 let (ar, rdt) = self.analyze_expr(*r, resolver)?;
                 if ldt != DataType::Boolean || rdt != DataType::Boolean {
-                    return Err(FfqError::Planning("OR requires boolean operands".to_string()));
+                    return Err(FfqError::Planning(
+                        "OR requires boolean operands".to_string(),
+                    ));
                 }
                 Ok((Expr::Or(Box::new(al), Box::new(ar)), DataType::Boolean))
             }
             Expr::Not(e) => {
                 let (ae, dt) = self.analyze_expr(*e, resolver)?;
                 if dt != DataType::Boolean {
-                    return Err(FfqError::Planning("NOT requires boolean operand".to_string()));
+                    return Err(FfqError::Planning(
+                        "NOT requires boolean operand".to_string(),
+                    ));
                 }
                 Ok((Expr::Not(Box::new(ae)), DataType::Boolean))
             }
@@ -330,8 +462,10 @@ impl Analyzer {
 
             #[cfg(feature = "vector")]
             Expr::CosineSimilarity { vector, query } => {
-                let (av, _vdt) = self.analyze_expr(*vector, resolver)?;
-                let (aq, _qdt) = self.analyze_expr(*query, resolver)?;
+                let (av, vdt) = self.analyze_expr(*vector, resolver)?;
+                ensure_vector_type("cosine_similarity", &vdt)?;
+                let (aq, qdt) = self.analyze_expr(*query, resolver)?;
+                ensure_vector_literal_type("cosine_similarity", &qdt)?;
                 Ok((
                     Expr::CosineSimilarity {
                         vector: Box::new(av),
@@ -342,8 +476,10 @@ impl Analyzer {
             }
             #[cfg(feature = "vector")]
             Expr::L2Distance { vector, query } => {
-                let (av, _vdt) = self.analyze_expr(*vector, resolver)?;
-                let (aq, _qdt) = self.analyze_expr(*query, resolver)?;
+                let (av, vdt) = self.analyze_expr(*vector, resolver)?;
+                ensure_vector_type("l2_distance", &vdt)?;
+                let (aq, qdt) = self.analyze_expr(*query, resolver)?;
+                ensure_vector_literal_type("l2_distance", &qdt)?;
                 Ok((
                     Expr::L2Distance {
                         vector: Box::new(av),
@@ -354,8 +490,10 @@ impl Analyzer {
             }
             #[cfg(feature = "vector")]
             Expr::DotProduct { vector, query } => {
-                let (av, _vdt) = self.analyze_expr(*vector, resolver)?;
-                let (aq, _qdt) = self.analyze_expr(*query, resolver)?;
+                let (av, vdt) = self.analyze_expr(*vector, resolver)?;
+                ensure_vector_type("dot_product", &vdt)?;
+                let (aq, qdt) = self.analyze_expr(*query, resolver)?;
+                ensure_vector_literal_type("dot_product", &qdt)?;
                 Ok((
                     Expr::DotProduct {
                         vector: Box::new(av),
@@ -471,7 +609,9 @@ impl Resolver {
             }
             base += r.fields.len();
         }
-        Err(FfqError::Planning(format!("column index out of range: {idx}")))
+        Err(FfqError::Planning(format!(
+            "column index out of range: {idx}"
+        )))
     }
 
     fn data_type_at(&self, idx: usize) -> Result<DataType> {
@@ -498,7 +638,27 @@ fn literal_type(v: &LiteralValue) -> DataType {
         LiteralValue::Utf8(_) => DataType::Utf8,
         LiteralValue::Boolean(_) => DataType::Boolean,
         LiteralValue::Null => DataType::Null,
+        #[cfg(feature = "vector")]
+        LiteralValue::VectorF32(v) => DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float32, true)),
+            v.len() as i32,
+        ),
     }
+}
+
+#[cfg(feature = "vector")]
+fn ensure_vector_type(func_name: &str, dt: &DataType) -> Result<()> {
+    match dt {
+        DataType::FixedSizeList(field, _) if field.data_type() == &DataType::Float32 => Ok(()),
+        other => Err(FfqError::Planning(format!(
+            "{func_name} requires vector column type FixedSizeList<Float32>, got {other:?}"
+        ))),
+    }
+}
+
+#[cfg(feature = "vector")]
+fn ensure_vector_literal_type(func_name: &str, dt: &DataType) -> Result<()> {
+    ensure_vector_type(func_name, dt)
 }
 
 fn is_numeric(dt: &DataType) -> bool {
@@ -515,6 +675,115 @@ fn is_numeric(dt: &DataType) -> bool {
             | DataType::Float32
             | DataType::Float64
     )
+}
+
+fn insert_type_compatible(src: &DataType, dst: &DataType) -> bool {
+    src == dst
+        || matches!(
+            (src, dst),
+            (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64)
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
+
+    use super::{Analyzer, SchemaProvider};
+    use crate::logical_plan::LogicalPlan;
+    use crate::sql_frontend::sql_to_logical;
+
+    struct TestSchemaProvider {
+        schemas: HashMap<String, SchemaRef>,
+    }
+
+    impl SchemaProvider for TestSchemaProvider {
+        fn table_schema(&self, table: &str) -> ffq_common::Result<SchemaRef> {
+            self.schemas
+                .get(table)
+                .cloned()
+                .ok_or_else(|| ffq_common::FfqError::Planning(format!("unknown table: {table}")))
+        }
+    }
+
+    #[test]
+    fn analyze_insert_valid() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "src".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        schemas.insert(
+            "dst".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical("INSERT INTO dst SELECT a FROM src", &HashMap::new())
+            .expect("parse insert");
+        let analyzed = analyzer.analyze(plan, &provider).expect("analyze insert");
+        assert!(matches!(analyzed, LogicalPlan::InsertInto { .. }));
+    }
+
+    #[test]
+    fn analyze_insert_type_mismatch() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "src".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)])),
+        );
+        schemas.insert(
+            "dst".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical("INSERT INTO dst SELECT a FROM src", &HashMap::new())
+            .expect("parse insert");
+        let err = analyzer
+            .analyze(plan, &provider)
+            .expect_err("expected type mismatch");
+        assert!(
+            err.to_string().contains("INSERT type mismatch"),
+            "err={err}"
+        );
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn analyze_cosine_similarity_requires_fixed_size_list_f32() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "docs".to_string(),
+            Arc::new(Schema::new(vec![Field::new(
+                "emb",
+                DataType::Float64,
+                false,
+            )])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+
+        let mut params = HashMap::new();
+        params.insert(
+            "q".to_string(),
+            crate::logical_plan::LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]),
+        );
+        let plan = sql_to_logical(
+            "SELECT cosine_similarity(emb, :q) AS score FROM docs",
+            &params,
+        )
+        .expect("parse");
+        let err = analyzer.analyze(plan, &provider).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("requires vector column type FixedSizeList<Float32>"),
+            "unexpected error: {err}"
+        );
+    }
 }
 
 fn numeric_rank(dt: &DataType) -> Option<u8> {

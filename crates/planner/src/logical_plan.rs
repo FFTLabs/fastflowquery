@@ -1,4 +1,4 @@
-use arrow_schema::{DataType};
+use arrow_schema::DataType;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,7 +17,10 @@ pub enum JoinStrategyHint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expr {
     Column(String),
-    ColumnRef { name: String, index: usize },
+    ColumnRef {
+        name: String,
+        index: usize,
+    },
     Literal(LiteralValue),
     BinaryOp {
         left: Box<Expr>,
@@ -33,11 +36,20 @@ pub enum Expr {
     Not(Box<Expr>),
 
     #[cfg(feature = "vector")]
-    CosineSimilarity { vector: Box<Expr>, query: Box<Expr> },
+    CosineSimilarity {
+        vector: Box<Expr>,
+        query: Box<Expr>,
+    },
     #[cfg(feature = "vector")]
-    L2Distance { vector: Box<Expr>, query: Box<Expr> },
+    L2Distance {
+        vector: Box<Expr>,
+        query: Box<Expr>,
+    },
     #[cfg(feature = "vector")]
-    DotProduct { vector: Box<Expr>, query: Box<Expr> },
+    DotProduct {
+        vector: Box<Expr>,
+        query: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +59,9 @@ pub enum LiteralValue {
     Utf8(String),
     Boolean(bool),
     Null,
+
+    #[cfg(feature = "vector")]
+    VectorF32(Vec<f32>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +107,22 @@ pub enum LogicalPlan {
     },
     Limit {
         n: usize,
+        input: Box<LogicalPlan>,
+    },
+    TopKByScore {
+        score_expr: Expr,
+        k: usize,
+        input: Box<LogicalPlan>,
+    },
+    VectorTopK {
+        table: String,
+        query_vector: Vec<f32>,
+        k: usize,
+        filter: Option<String>,
+    },
+    InsertInto {
+        table: String,
+        columns: Vec<String>,
         input: Box<LogicalPlan>,
     },
 }

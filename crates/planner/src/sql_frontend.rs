@@ -2,12 +2,12 @@ use std::collections::HashMap;
 
 use ffq_common::{FfqError, Result};
 use sqlparser::ast::{
-    BinaryOperator as SqlBinaryOp, Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Query, SelectItem, SetExpr,
-    Statement, TableFactor, TableWithJoins, Value,
+    BinaryOperator as SqlBinaryOp, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
+    FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Query,
+    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value,
 };
 
-use crate::logical_plan::{AggExpr, BinaryOp, Expr, LiteralValue, LogicalPlan, JoinStrategyHint};
+use crate::logical_plan::{AggExpr, BinaryOp, Expr, JoinStrategyHint, LiteralValue, LogicalPlan};
 
 /// Convert a SQL string into a LogicalPlan, binding named parameters (like :k, :query).
 pub fn sql_to_logical(sql: &str, params: &HashMap<String, LiteralValue>) -> Result<LogicalPlan> {
@@ -20,13 +20,39 @@ pub fn sql_to_logical(sql: &str, params: &HashMap<String, LiteralValue>) -> Resu
     statement_to_logical(&stmts[0], params)
 }
 
-pub fn statement_to_logical(stmt: &Statement, params: &HashMap<String, LiteralValue>) -> Result<LogicalPlan> {
+pub fn statement_to_logical(
+    stmt: &Statement,
+    params: &HashMap<String, LiteralValue>,
+) -> Result<LogicalPlan> {
     match stmt {
         Statement::Query(q) => query_to_logical(q, params),
+        Statement::Insert(insert) => insert_to_logical(insert, params),
         _ => Err(FfqError::Unsupported(
-            "only SELECT queries are supported in v1".to_string(),
+            "only SELECT and INSERT INTO ... SELECT are supported in v1".to_string(),
         )),
     }
+}
+
+fn insert_to_logical(
+    insert: &sqlparser::ast::Insert,
+    params: &HashMap<String, LiteralValue>,
+) -> Result<LogicalPlan> {
+    let table = object_name_to_string(&insert.table_name);
+    let columns = insert
+        .columns
+        .iter()
+        .map(|c| c.value.clone())
+        .collect::<Vec<_>>();
+
+    let source = insert.source.as_ref().ok_or_else(|| {
+        FfqError::Unsupported("INSERT must have a SELECT source in v1".to_string())
+    })?;
+    let select_plan = query_to_logical(source, params)?;
+    Ok(LogicalPlan::InsertInto {
+        table,
+        columns,
+        input: Box::new(select_plan),
+    })
 }
 
 fn query_to_logical(q: &Query, params: &HashMap<String, LiteralValue>) -> Result<LogicalPlan> {
@@ -93,6 +119,8 @@ fn query_to_logical(q: &Query, params: &HashMap<String, LiteralValue>) -> Result
     }
 
     let needs_agg = saw_agg || !group_exprs.is_empty();
+    let output_proj_exprs = proj_exprs.clone();
+    let pre_projection_input = plan.clone();
     if needs_agg {
         plan = LogicalPlan::Aggregate {
             group_exprs,
@@ -112,8 +140,48 @@ fn query_to_logical(q: &Query, params: &HashMap<String, LiteralValue>) -> Result
         };
     }
 
-    // LIMIT
-    if let Some(limit_expr) = &q.limit {
+    // ORDER BY + LIMIT
+    if let Some(order_by) = &q.order_by {
+        if order_by.interpolate.is_some() {
+            return Err(FfqError::Unsupported(
+                "ORDER BY INTERPOLATE is not supported in v1".to_string(),
+            ));
+        }
+        if order_by.exprs.len() != 1 {
+            return Err(FfqError::Unsupported(
+                "only a single ORDER BY expression is supported in v1".to_string(),
+            ));
+        }
+        let item = &order_by.exprs[0];
+        if item.asc != Some(false) {
+            return Err(FfqError::Unsupported(
+                "only ORDER BY ... DESC is supported in v1 top-k mode".to_string(),
+            ));
+        }
+        let score_expr = sql_expr_to_expr(&item.expr, params)?;
+        if !is_topk_score_expr(&score_expr) {
+            return Err(FfqError::Unsupported(
+                "global ORDER BY is not supported in v1; only ORDER BY cosine_similarity(...) DESC LIMIT k is supported".to_string(),
+            ));
+        }
+        if needs_agg {
+            return Err(FfqError::Unsupported(
+                "ORDER BY cosine_similarity with aggregates is not supported in v1".to_string(),
+            ));
+        }
+        let limit_expr = q.limit.as_ref().ok_or_else(|| {
+            FfqError::Unsupported("ORDER BY cosine_similarity requires LIMIT k in v1".to_string())
+        })?;
+        let limit_val = sql_limit_to_usize(limit_expr, params)?;
+        plan = LogicalPlan::Projection {
+            exprs: output_proj_exprs,
+            input: Box::new(LogicalPlan::TopKByScore {
+                score_expr,
+                k: limit_val,
+                input: Box::new(pre_projection_input),
+            }),
+        };
+    } else if let Some(limit_expr) = &q.limit {
         let limit_val = sql_limit_to_usize(limit_expr, params)?;
         plan = LogicalPlan::Limit {
             n: limit_val,
@@ -124,7 +192,10 @@ fn query_to_logical(q: &Query, params: &HashMap<String, LiteralValue>) -> Result
     Ok(plan)
 }
 
-fn from_to_plan(from: &[TableWithJoins], params: &HashMap<String, LiteralValue>) -> Result<LogicalPlan> {
+fn from_to_plan(
+    from: &[TableWithJoins],
+    params: &HashMap<String, LiteralValue>,
+) -> Result<LogicalPlan> {
     if from.len() != 1 {
         return Err(FfqError::Unsupported(
             "only one FROM source is supported in v1".to_string(),
@@ -233,7 +304,10 @@ fn first_function_arg(func: &sqlparser::ast::Function) -> Option<&FunctionArg> {
     }
 }
 
-fn try_parse_agg(e: &SqlExpr, params: &HashMap<String, LiteralValue>) -> Result<Option<(AggExpr, String)>> {
+fn try_parse_agg(
+    e: &SqlExpr,
+    params: &HashMap<String, LiteralValue>,
+) -> Result<Option<(AggExpr, String)>> {
     let (func, alias) = match e {
         SqlExpr::Function(f) => (f, None),
         _ => return Ok(None),
@@ -253,7 +327,9 @@ fn try_parse_agg(e: &SqlExpr, params: &HashMap<String, LiteralValue>) -> Result<
                 let ex = function_arg_to_expr(a0, params)?;
                 AggExpr::Count(ex)
             } else {
-                return Err(FfqError::Unsupported("COUNT() requires an argument in v1".to_string()));
+                return Err(FfqError::Unsupported(
+                    "COUNT() requires an argument in v1".to_string(),
+                ));
             }
         }
         "SUM" => AggExpr::Sum(function_arg_to_expr(required_arg(arg0, "SUM")?, params)?),
@@ -288,6 +364,7 @@ fn sql_expr_to_expr(e: &SqlExpr, params: &HashMap<String, LiteralValue>) -> Resu
         SqlExpr::Identifier(id) => Ok(Expr::Column(id.value.clone())),
         SqlExpr::CompoundIdentifier(parts) => Ok(Expr::Column(compound_ident_to_string(parts))),
         SqlExpr::Value(v) => sql_value_to_literal(v, params),
+        SqlExpr::Function(func) => parse_scalar_function(func, params),
         SqlExpr::BinaryOp { left, op, right } => {
             // AND/OR are represented as BinaryOp too
             if *op == SqlBinaryOp::And {
@@ -326,14 +403,66 @@ fn sql_expr_to_expr(e: &SqlExpr, params: &HashMap<String, LiteralValue>) -> Resu
     }
 }
 
+fn parse_scalar_function(
+    func: &sqlparser::ast::Function,
+    params: &HashMap<String, LiteralValue>,
+) -> Result<Expr> {
+    let fname = object_name_to_string(&func.name).to_lowercase();
+    #[cfg(not(feature = "vector"))]
+    let _ = params;
+
+    #[cfg(feature = "vector")]
+    {
+        if fname == "cosine_similarity" {
+            let args = function_expr_args(func)?;
+            if args.len() != 2 {
+                return Err(FfqError::Unsupported(
+                    "cosine_similarity requires exactly 2 arguments in v1".to_string(),
+                ));
+            }
+            return Ok(Expr::CosineSimilarity {
+                vector: Box::new(sql_expr_to_expr(args[0], params)?),
+                query: Box::new(sql_expr_to_expr(args[1], params)?),
+            });
+        }
+    }
+
+    Err(FfqError::Unsupported(format!(
+        "unsupported scalar function in v1: {fname}"
+    )))
+}
+
+#[cfg(feature = "vector")]
+fn function_expr_args<'a>(func: &'a sqlparser::ast::Function) -> Result<Vec<&'a SqlExpr>> {
+    match &func.args {
+        FunctionArguments::List(list) => list
+            .args
+            .iter()
+            .map(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
+                _ => Err(FfqError::Unsupported(
+                    "unsupported function argument form in v1".to_string(),
+                )),
+            })
+            .collect(),
+        _ => Err(FfqError::Unsupported(
+            "unsupported function argument form in v1".to_string(),
+        )),
+    }
+}
+
 fn sql_value_to_literal(v: &Value, params: &HashMap<String, LiteralValue>) -> Result<Expr> {
     match v {
         Value::Number(s, _) => {
             if s.contains('.') {
-                let f: f64 = s.parse().map_err(|_| FfqError::Planning(format!("bad number: {s}")))?;
+                let f: f64 = s
+                    .parse()
+                    .map_err(|_| FfqError::Planning(format!("bad number: {s}")))?;
                 Ok(Expr::Literal(LiteralValue::Float64(f)))
             } else {
-                let i: i64 = s.parse().map_err(|_| FfqError::Planning(format!("bad number: {s}")))?;
+                let i: i64 = s
+                    .parse()
+                    .map_err(|_| FfqError::Planning(format!("bad number: {s}")))?;
                 Ok(Expr::Literal(LiteralValue::Int64(i)))
             }
         }
@@ -365,9 +494,9 @@ fn sql_limit_to_usize(e: &SqlExpr, params: &HashMap<String, LiteralValue>) -> Re
                 Ok(i as usize)
             }
         }
-        Expr::Literal(LiteralValue::Float64(_)) => Err(FfqError::Planning(
-            "LIMIT must be an integer".to_string(),
-        )),
+        Expr::Literal(LiteralValue::Float64(_)) => {
+            Err(FfqError::Planning("LIMIT must be an integer".to_string()))
+        }
         _ => Err(FfqError::Planning(
             "LIMIT must be a literal integer or bound parameter".to_string(),
         )),
@@ -395,11 +524,18 @@ fn sql_binop_to_binop(op: &SqlBinaryOp) -> Result<BinaryOp> {
 }
 
 fn object_name_to_string(n: &ObjectName) -> String {
-    n.0.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".")
+    n.0.iter()
+        .map(|i| i.value.clone())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn compound_ident_to_string(parts: &[Ident]) -> String {
-    parts.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".")
+    parts
+        .iter()
+        .map(|i| i.value.clone())
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 fn sql_ident_expr_to_col(e: &SqlExpr) -> Result<String> {
@@ -424,5 +560,82 @@ fn expr_to_name_fallback(e: &Expr) -> String {
         Expr::Column(c) => c.clone(),
         Expr::Literal(_) => "lit".to_string(),
         _ => "expr".to_string(),
+    }
+}
+
+fn is_topk_score_expr(_e: &Expr) -> bool {
+    #[cfg(feature = "vector")]
+    if matches!(_e, Expr::CosineSimilarity { .. }) {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::sql_to_logical;
+    #[cfg(feature = "vector")]
+    use crate::logical_plan::LiteralValue;
+    use crate::logical_plan::LogicalPlan;
+
+    #[test]
+    fn parses_insert_into_select() {
+        let plan = sql_to_logical("INSERT INTO t SELECT a FROM s", &HashMap::new()).expect("parse");
+        match plan {
+            LogicalPlan::InsertInto { table, columns, .. } => {
+                assert_eq!(table, "t");
+                assert!(columns.is_empty());
+            }
+            other => panic!("expected InsertInto, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn parses_cosine_similarity_expression() {
+        let mut params = HashMap::new();
+        params.insert(
+            "q".to_string(),
+            LiteralValue::VectorF32(vec![1.0, 2.0, 3.0]),
+        );
+        let plan = sql_to_logical(
+            "SELECT cosine_similarity(emb, :q) AS score FROM docs",
+            &params,
+        )
+        .expect("parse");
+        match plan {
+            LogicalPlan::Projection { exprs, .. } => {
+                assert_eq!(exprs.len(), 1);
+                match &exprs[0].0 {
+                    crate::logical_plan::Expr::CosineSimilarity { .. } => {}
+                    other => panic!("expected cosine expr, got {other:?}"),
+                }
+            }
+            other => panic!("expected projection, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn rewrites_order_by_cosine_limit_into_topk() {
+        let mut params = HashMap::new();
+        params.insert(
+            "q".to_string(),
+            LiteralValue::VectorF32(vec![1.0, 2.0, 3.0]),
+        );
+        let plan = sql_to_logical(
+            "SELECT id, title FROM docs ORDER BY cosine_similarity(emb, :q) DESC LIMIT 5",
+            &params,
+        )
+        .expect("parse");
+        match plan {
+            LogicalPlan::Projection { input, .. } => match *input {
+                LogicalPlan::TopKByScore { k, .. } => assert_eq!(k, 5),
+                other => panic!("expected TopKByScore input, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
     }
 }

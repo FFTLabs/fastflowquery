@@ -1,0 +1,19 @@
+# optimizer-golden: two_phase_rewrite_negative_missing_index_option
+
+## before
+Projection
+  id := id
+  title := title
+  TopKByScore k=2 score=cosine_similarity(emb, VectorF32([1.0, 0.0, 0.0])) rewrite=index_fallback
+    TableScan table=docs
+      projection=None
+      pushed_filters=0
+
+## after
+Projection
+  id := id
+  title := title
+  TopKByScore k=2 score=cosine_similarity(emb, VectorF32([1.0, 0.0, 0.0])) rewrite=index_fallback
+    TableScan table=docs
+      projection=Some(["id", "title", "emb"])
+      pushed_filters=0

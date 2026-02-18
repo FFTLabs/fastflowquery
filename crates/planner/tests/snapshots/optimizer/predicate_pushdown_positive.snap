@@ -1,0 +1,13 @@
+# optimizer-golden: predicate_pushdown_positive
+
+## before
+Filter (id) Gt (Int64(1))
+  TableScan table=t
+    projection=None
+    pushed_filters=0
+
+## after
+TableScan table=t
+  projection=Some(["id"])
+  pushed_filters=1
+    (id) Gt (Int64(1))

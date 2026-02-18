@@ -1,0 +1,13 @@
+# optimizer-golden: constant_folding_positive
+
+## before
+Filter (Boolean(true)) AND ((Int64(1)) Lt (Int64(2)))
+  TableScan table=t
+    projection=None
+    pushed_filters=0
+
+## after
+TableScan table=t
+  projection=None
+  pushed_filters=1
+    Boolean(true)

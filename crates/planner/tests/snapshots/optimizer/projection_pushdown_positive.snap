@@ -1,0 +1,15 @@
+# optimizer-golden: projection_pushdown_positive
+
+## before
+Projection
+  id := id
+  TableScan table=t
+    projection=None
+    pushed_filters=0
+
+## after
+Projection
+  id := id
+  TableScan table=t
+    projection=Some(["id"])
+    pushed_filters=0

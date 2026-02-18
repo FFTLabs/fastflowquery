@@ -1,0 +1,259 @@
+# FFQ v1 Quickstart
+
+This page is the fastest way to run FFQ v1 end-to-end.
+
+## Prerequisites
+
+1. Rust toolchain (`cargo`)
+2. Docker + Compose (only for distributed mode)
+3. Run from repo root
+
+Quick checks:
+
+```bash
+cargo --version
+docker --version
+docker compose version
+```
+
+## 10-minute Path (Embedded)
+
+1. Build:
+
+```bash
+cargo build
+```
+
+2. Run core embedded validation:
+
+```bash
+make test-13.2-embedded
+```
+
+3. Run synthetic benchmark baseline:
+
+```bash
+make bench-13.3-embedded
+```
+
+Success signals:
+
+1. Integration tests pass.
+2. Benchmark JSON/CSV artifacts are created under `tests/bench/results/`.
+
+## Run SQL from Command Line (Parquet)
+
+Use the new CLI subcommand form:
+
+```bash
+cargo run -p ffq-client -- query --sql "SELECT 1"
+```
+
+Query parquet tables through a catalog profile:
+
+```bash
+cargo run -p ffq-client -- query \
+  --catalog tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json \
+  --sql "SELECT l_orderkey, l_quantity FROM lineitem LIMIT 5"
+```
+
+Plan-only mode:
+
+```bash
+cargo run -p ffq-client -- query \
+  --catalog tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json \
+  --sql "SELECT l_orderkey FROM lineitem LIMIT 5" \
+  --plan
+```
+
+Notes:
+
+1. `--catalog` sets `FFQ_CATALOG_PATH` for that CLI process.
+2. Legacy invocation still works:
+   - `cargo run -p ffq-client -- "SELECT 1"`
+   - `cargo run -p ffq-client -- --plan "SELECT 1"`
+
+Manual-schema vs inferred-schema quick modes:
+
+1. Manual schema:
+   - use a catalog with explicit `schema` per parquet table.
+2. Inferred schema:
+   - omit `schema` for parquet table entries and set:
+     - `FFQ_SCHEMA_INFERENCE=on`
+     - `FFQ_SCHEMA_DRIFT_POLICY=refresh`
+   - optional persistence:
+     - `FFQ_SCHEMA_WRITEBACK=true`
+
+Example inferred-schema one-shot CLI run:
+
+```bash
+FFQ_SCHEMA_INFERENCE=on \
+FFQ_SCHEMA_DRIFT_POLICY=refresh \
+cargo run -p ffq-client -- query \
+  --catalog tests/fixtures/catalog/tables.json \
+  --sql "SELECT l_orderkey FROM lineitem LIMIT 5"
+```
+
+## Run SQL in REPL (Interactive)
+
+For complete REPL command/flag/error reference, see `docs/v1/repl.md`.
+
+Start REPL with catalog:
+
+```bash
+cargo run -p ffq-client -- repl \
+  --catalog tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json
+```
+
+Start REPL with explicit schema policies:
+
+```bash
+cargo run -p ffq-client -- repl \
+  --catalog tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json \
+  --schema-inference on \
+  --schema-writeback true \
+  --schema-drift-policy refresh
+```
+
+Inside REPL, run:
+
+```sql
+\tables
+SELECT l_orderkey, l_quantity FROM lineitem LIMIT 5;
+\schema lineitem
+\mode csv
+SELECT l_orderkey FROM lineitem LIMIT 3;
+\timing on
+SELECT COUNT(*) AS c FROM lineitem;
+\q
+```
+
+Expected behavior:
+
+1. `\tables` lists registered catalog tables.
+2. `SELECT ...;` prints rows immediately.
+3. `\schema lineitem` prints field names and types.
+4. `\schema <table>` also prints schema origin as `catalog-defined` or `inferred`.
+5. `\mode csv` changes rendering mode for next queries.
+6. `\timing on` shows elapsed time after each query.
+7. `\q` exits the REPL.
+
+Policy/env equivalents:
+
+1. `FFQ_SCHEMA_INFERENCE=off|on|strict|permissive`
+2. `FFQ_SCHEMA_WRITEBACK=true|false`
+3. `FFQ_SCHEMA_DRIFT_POLICY=fail|refresh`
+
+## Distributed Smoke Path
+
+1. Start cluster:
+
+```bash
+docker compose -f docker/compose/ffq.yml up --build -d
+docker compose -f docker/compose/ffq.yml ps
+```
+
+2. Run distributed integration:
+
+```bash
+FFQ_COORDINATOR_ENDPOINT=http://127.0.0.1:50051 make test-13.2-distributed
+```
+
+Coordinator note:
+1. Ensure coordinator has table metadata via `FFQ_COORDINATOR_CATALOG_PATH` (the default compose file sets this to `/data/catalog/tables.json`).
+
+3. Optional distributed benchmark:
+
+```bash
+FFQ_COORDINATOR_ENDPOINT=http://127.0.0.1:50051 make bench-13.3-distributed
+```
+
+4. Cleanup:
+
+```bash
+docker compose -f docker/compose/ffq.yml down -v
+```
+
+## Benchmarks: Which Track to Use
+
+1. Synthetic track (`13.3`): fast dev loop, trend checks.
+2. Official track (`13.4`): reportable TPC-H Q1/Q3 numbers.
+
+## Official TPC-H Flow (dbgen)
+
+1. Build dbgen and generate `.tbl`:
+
+```bash
+make tpch-dbgen-sf1
+```
+
+2. Convert to parquet:
+
+```bash
+make tpch-dbgen-parquet
+```
+
+3. Validate manifest contract:
+
+```bash
+make validate-tpch-dbgen-manifests
+```
+
+4. Run official benchmark (embedded):
+
+```bash
+make bench-13.4-official-embedded
+```
+
+5. Optional official benchmark (distributed):
+
+```bash
+FFQ_COORDINATOR_ENDPOINT=http://127.0.0.1:50051 make bench-13.4-official-distributed
+```
+
+Success signals:
+
+1. `make validate-tpch-dbgen-manifests` exits `0`.
+2. Official benchmark artifacts are written under `tests/bench/results/official_tpch/`.
+3. Any correctness divergence fails the run with explicit error in artifact `results[].error`.
+
+## Most Common Failures
+
+1. `FFQ_COORDINATOR_ENDPOINT` missing/invalid:
+   - set `FFQ_COORDINATOR_ENDPOINT=http://127.0.0.1:50051`
+2. `join key ... not found in schema` in distributed runs:
+   - ensure `tests/fixtures/catalog/tables.json` contains schemas.
+3. `Open failed for ./dists.dss` during dbgen:
+   - fixed by current scripts; rerun `make tpch-dbgen-sf1`.
+4. Manifest validation failure:
+   - regenerate with pinned ref path:
+     - `make tpch-dbgen-sf1`
+     - `make tpch-dbgen-parquet`
+     - `make validate-tpch-dbgen-manifests`
+5. `schema inference failed`:
+   - verify parquet file paths and permissions.
+   - if inference is disabled, enable with `FFQ_SCHEMA_INFERENCE=on` (or `strict`/`permissive`).
+6. `schema drift detected`:
+   - files changed after schema cache/writeback.
+   - use `FFQ_SCHEMA_DRIFT_POLICY=refresh` to auto-refresh.
+7. `incompatible parquet files`:
+   - table references parquet files with incompatible schemas.
+   - align schemas or split files into separate tables.
+
+## Schema Migration (Quick)
+
+To migrate an existing manual-schema catalog incrementally:
+
+1. Enable:
+   - `FFQ_SCHEMA_INFERENCE=on`
+   - `FFQ_SCHEMA_DRIFT_POLICY=refresh`
+2. Remove `schema` from one parquet table entry.
+3. Run a query and `\schema <table>` in REPL to verify origin is `inferred`.
+4. Enable `FFQ_SCHEMA_WRITEBACK=true` to persist inferred schema.
+5. Repeat per table.
+
+## Next Docs
+
+1. Integration runbook: `docs/v1/integration-13.2.md`
+2. Benchmark contract: `docs/v1/benchmarks.md`
+3. Full test playbook: `docs/v1/testing.md`

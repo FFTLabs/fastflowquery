@@ -1,0 +1,135 @@
+[[tables]]
+name = "customer"
+uri = "./tests/bench/fixtures/tpch_dbgen_sf1_parquet/customer.parquet"
+format = "parquet"
+
+[tables.schema]
+metadata = {}
+
+[[tables.schema.fields]]
+name = "c_custkey"
+data_type = "Int64"
+nullable = false
+dict_id = 0
+dict_is_ordered = false
+metadata = {}
+
+[[tables.schema.fields]]
+name = "c_mktsegment"
+data_type = "Utf8"
+nullable = false
+dict_id = 0
+dict_is_ordered = false
+metadata = {}
+
+[[tables]]
+name = "orders"
+uri = "./tests/bench/fixtures/tpch_dbgen_sf1_parquet/orders.parquet"
+format = "parquet"
+
+[tables.schema]
+metadata = {}
+
+[[tables.schema.fields]]
+name = "o_orderkey"
+data_type = "Int64"
+nullable = false
+dict_id = 0
+dict_is_ordered = false
+metadata = {}
+
+[[tables.schema.fields]]
+name = "o_custkey"
+data_type = "Int64"
+nullable = false
+dict_id = 0
+dict_is_ordered = false
+metadata = {}
+
+[[tables.schema.fields]]
+name = "o_orderdate"
+data_type = "Utf8"
+nullable = false
+dict_id = 0
+dict_is_ordered = false
+metadata = {}
+
+[[tables.schema.fields]]
+name = "o_shippriority"
+data_type = "Int64"
+nullable = false
+dict_id = 0
+dict_is_ordered = false
+metadata = {}
+
+[[tables]]
+name = "lineitem"
+uri = "./tests/bench/fixtures/tpch_dbgen_sf1_parquet/lineitem.parquet"
+format = "parquet"
+
+[tables.schema]
+metadata = {}
+
+[[tables.schema.fields]]
+name = "l_orderkey"
+data_type = "Int64"
+nullable = false
+dict_id = 0
+dict_is_ordered = false
+metadata = {}
+
+[[tables.schema.fields]]
+name = "l_quantity"
+data_type = "Float64"
+nullable = false
+dict_id = 0
+dict_is_ordered = false
+metadata = {}
+
+[[tables.schema.fields]]
+name = "l_extendedprice"
+data_type = "Float64"
+nullable = false
+dict_id = 0
+dict_is_ordered = false
+metadata = {}
+
+[[tables.schema.fields]]
+name = "l_discount"
+data_type = "Float64"
+nullable = false
+dict_id = 0
+dict_is_ordered = false
+metadata = {}
+
+[[tables.schema.fields]]
+name = "l_tax"
+data_type = "Float64"
+nullable = false
+dict_id = 0
+dict_is_ordered = false
+metadata = {}
+
+[[tables.schema.fields]]
+name = "l_returnflag"
+data_type = "Utf8"
+nullable = false
+dict_id = 0
+dict_is_ordered = false
+metadata = {}
+
+[[tables.schema.fields]]
+name = "l_linestatus"
+data_type = "Utf8"
+nullable = false
+dict_id = 0
+dict_is_ordered = false
+metadata = {}
+
+[[tables.schema.fields]]
+name = "l_shipdate"
+data_type = "Utf8"
+nullable = false
+dict_id = 0
+dict_is_ordered = false
+metadata = {}

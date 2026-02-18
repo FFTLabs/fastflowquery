@@ -1,0 +1,25 @@
+# optimizer-golden: join_strategy_hint_negative_falls_back_to_shuffle
+
+## before
+Join type=Inner strategy=auto
+  on=[("k2", "k3")]
+  left:
+    TableScan table=big
+      projection=None
+      pushed_filters=0
+  right:
+    TableScan table=big2
+      projection=None
+      pushed_filters=0
+
+## after
+Join type=Inner strategy=broadcast_left
+  on=[("k2", "k3")]
+  left:
+    TableScan table=big
+      projection=Some(["k2"])
+      pushed_filters=0
+  right:
+    TableScan table=big2
+      projection=Some(["k3"])
+      pushed_filters=0

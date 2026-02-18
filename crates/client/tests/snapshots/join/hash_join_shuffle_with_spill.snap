@@ -1,0 +1,5 @@
+schema:o_orderkey:Int64:false,o_custkey:Int64:false,l_orderkey:Int64:false,l_qty:Int64:false
+rows:
+o_orderkey=2|o_custkey=20|l_orderkey=2|l_qty=1
+o_orderkey=2|o_custkey=20|l_orderkey=2|l_qty=2
+o_orderkey=4|o_custkey=40|l_orderkey=4|l_qty=3
