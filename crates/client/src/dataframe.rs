@@ -412,8 +412,9 @@ fn collect_table_refs(plan: &LogicalPlan, out: &mut Vec<String>) {
         LogicalPlan::Limit { input, .. } => collect_table_refs(input, out),
         LogicalPlan::TopKByScore { input, .. } => collect_table_refs(input, out),
         LogicalPlan::VectorTopK { table, .. } => out.push(table.clone()),
-        LogicalPlan::InsertInto { table, input, .. } => {
-            out.push(table.clone());
+        LogicalPlan::InsertInto { input, .. } => {
+            // Insert target is a write sink; schema inference/fingerprint checks are only
+            // needed for read-side tables referenced by the input query.
             collect_table_refs(input, out);
         }
     }

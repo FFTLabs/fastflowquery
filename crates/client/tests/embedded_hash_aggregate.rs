@@ -171,3 +171,62 @@ fn hash_aggregate_deterministic_with_spill_and_non_spill_parity() {
     let _ = std::fs::remove_dir_all(spill_dir_low);
     let _ = std::fs::remove_dir_all(spill_dir_high);
 }
+
+#[test]
+fn grouped_sum_float64_regression_repro_should_match_expected_groups() {
+    let parquet_path = support::unique_path("ffq_hash_agg_grouped_sum_float64", "parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("l_orderkey", DataType::Int64, false),
+        Field::new("l_quantity", DataType::Float64, false),
+        Field::new("l_extendedprice", DataType::Float64, false),
+        Field::new("l_discount", DataType::Float64, false),
+        Field::new("l_tax", DataType::Float64, false),
+        Field::new("l_returnflag", DataType::Utf8, false),
+        Field::new("l_linestatus", DataType::Utf8, false),
+        Field::new("l_shipdate", DataType::Utf8, false),
+    ]));
+    support::write_parquet(
+        &parquet_path,
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5])),
+            Arc::new(Float64Array::from(vec![1.25_f64, 2.00, 3.75, 4.00, 5.50])),
+            Arc::new(Float64Array::from(vec![10.0_f64, 20.0, 30.0, 40.0, 50.0])),
+            Arc::new(Float64Array::from(vec![0.0_f64, 0.0, 0.0, 0.0, 0.0])),
+            Arc::new(Float64Array::from(vec![0.0_f64, 0.0, 0.0, 0.0, 0.0])),
+            Arc::new(StringArray::from(vec!["N", "N", "R", "N", "R"])),
+            Arc::new(StringArray::from(vec!["O", "F", "O", "F", "O"])),
+            Arc::new(StringArray::from(vec![
+                "1998-01-01",
+                "1998-01-02",
+                "1998-01-03",
+                "1998-01-04",
+                "1998-01-05",
+            ])),
+        ],
+    );
+
+    let engine = Engine::new(EngineConfig::default()).expect("engine");
+    register_src_table(&engine, &parquet_path, schema.as_ref());
+
+    let batches = futures::executor::block_on(
+        engine
+            .sql(
+                "SELECT l_linestatus, SUM(l_quantity) AS sum_qty \
+                 FROM t GROUP BY l_linestatus",
+            )
+            .expect("sql")
+            .collect(),
+    )
+    .expect("collect");
+
+    let snapshot = support::snapshot_text(&batches, &["l_linestatus"], 1e-9);
+    let expected = "\
+schema:l_linestatus:Utf8:true,sum_qty:Float64:true\n\
+rows:\n\
+l_linestatus=F|sum_qty=6.000000000000\n\
+l_linestatus=O|sum_qty=10.500000000000\n";
+    assert_eq!(snapshot, expected);
+
+    let _ = std::fs::remove_file(parquet_path);
+}

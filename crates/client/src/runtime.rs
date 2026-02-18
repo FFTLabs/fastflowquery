@@ -841,7 +841,16 @@ fn rows_to_batch(schema: &SchemaRef, rows: &[Vec<ScalarValue>]) -> Result<Record
     let arrays = cols
         .iter()
         .enumerate()
-        .map(|(idx, col)| scalars_to_array(col, schema.field(idx).data_type()))
+        .map(|(idx, col)| {
+            let field = schema.field(idx);
+            scalars_to_array(col, field.data_type()).map_err(|e| {
+                FfqError::Execution(format!(
+                    "join column '{}' build failed: {}",
+                    field.name(),
+                    e
+                ))
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(schema.clone(), arrays)
         .map_err(|e| FfqError::Execution(format!("join output batch failed: {e}")))
@@ -1397,7 +1406,16 @@ fn build_output(
     let arrays = cols
         .iter()
         .enumerate()
-        .map(|(idx, col)| scalars_to_array(col, schema.field(idx).data_type()))
+        .map(|(idx, col)| {
+            let field = schema.field(idx);
+            scalars_to_array(col, field.data_type()).map_err(|e| {
+                FfqError::Execution(format!(
+                    "aggregate column '{}' build failed: {}",
+                    field.name(),
+                    e
+                ))
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
 
     let batch = RecordBatch::try_new(schema.clone(), arrays)
@@ -1417,9 +1435,13 @@ fn group_field(
     match &group_exprs[idx] {
         Expr::ColumnRef { name, index } => Ok((
             name.clone(),
-            if *index < input_schema.fields().len() {
+            if *index < input_schema.fields().len()
+                && input_schema.field(*index).name() == name
+            {
                 input_schema.field(*index).data_type().clone()
             } else {
+                // In final aggregate mode, group columns are physically laid out by position,
+                // while ColumnRef indexes still refer to the pre-aggregate input schema.
                 input_schema.field(idx).data_type().clone()
             },
         )),
@@ -1699,9 +1721,10 @@ fn scalars_to_array(values: &[ScalarValue], dt: &DataType) -> Result<ArrayRef> {
                     ScalarValue::Int64(x) => b.append_value(*x),
                     ScalarValue::Null => b.append_null(),
                     _ => {
-                        return Err(FfqError::Execution(
-                            "type mismatch while building Int64 array".to_string(),
-                        ));
+                        return Err(FfqError::Execution(format!(
+                            "type mismatch while building Int64 array: got {:?}",
+                            v
+                        )));
                     }
                 }
             }
@@ -1835,12 +1858,23 @@ fn scalar_gt(a: &ScalarValue, b: &ScalarValue) -> Result<bool> {
 }
 
 fn write_parquet_sink(table: &ffq_storage::TableDef, child: &ExecOutput) -> Result<()> {
+    ensure_sink_parent_layout(table)?;
     let out_path = resolve_sink_output_path(table)?;
     let staged_path = temp_sibling_path(&out_path, "staged");
     if let Some(parent) = staged_path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|e| {
+            FfqError::Execution(format!(
+                "parquet sink create staged parent failed at '{}': {e}",
+                parent.display()
+            ))
+        })?;
     }
-    let file = File::create(&staged_path)?;
+    let file = File::create(&staged_path).map_err(|e| {
+        FfqError::Execution(format!(
+            "parquet sink create staged file failed at '{}': {e}",
+            staged_path.display()
+        ))
+    })?;
     let mut writer = ArrowWriter::try_new(file, child.schema.clone(), None)
         .map_err(|e| FfqError::Execution(format!("parquet writer init failed: {e}")))?;
     for batch in &child.batches {
@@ -1854,6 +1888,27 @@ fn write_parquet_sink(table: &ffq_storage::TableDef, child: &ExecOutput) -> Resu
     if let Err(err) = replace_file_atomically(&staged_path, &out_path) {
         let _ = fs::remove_file(&staged_path);
         return Err(err);
+    }
+    Ok(())
+}
+
+fn ensure_sink_parent_layout(table: &ffq_storage::TableDef) -> Result<()> {
+    let raw = if !table.uri.is_empty() {
+        table.uri.clone()
+    } else if let Some(first) = table.paths.first() {
+        first.clone()
+    } else {
+        return Ok(());
+    };
+    let p = PathBuf::from(raw);
+    let as_text = p.to_string_lossy();
+    if !as_text.ends_with(".parquet") {
+        fs::create_dir_all(&p).map_err(|e| {
+            FfqError::Execution(format!(
+                "parquet sink create output dir failed at '{}': {e}",
+                p.display()
+            ))
+        })?;
     }
     Ok(())
 }
@@ -1896,7 +1951,12 @@ fn temp_sibling_path(path: &PathBuf, label: &str) -> PathBuf {
 
 fn replace_file_atomically(staged: &PathBuf, target: &PathBuf) -> Result<()> {
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|e| {
+            FfqError::Execution(format!(
+                "file commit create target parent failed at '{}': {e}",
+                parent.display()
+            ))
+        })?;
     }
     if !target.exists() {
         fs::rename(staged, target).map_err(|e| {
