@@ -369,6 +369,11 @@ fn proj_rewrite(
                         req_right.insert(c2);
                     }
                 }
+            } else {
+                // Join is itself the root (or parent did not constrain output columns):
+                // preserve full join output shape, not just join keys.
+                req_left.extend(left_cols);
+                req_right.extend(right_cols);
             }
 
             let (new_l, _) = proj_rewrite(*left, Some(req_left), ctx)?;

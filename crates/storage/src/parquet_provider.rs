@@ -66,7 +66,12 @@ impl ParquetProvider {
     pub fn fingerprint_paths(paths: &[String]) -> Result<Vec<FileFingerprint>> {
         let mut out = Vec::with_capacity(paths.len());
         for path in paths {
-            let md = std::fs::metadata(path)?;
+            let md = std::fs::metadata(path).map_err(|e| {
+                FfqError::InvalidConfig(format!(
+                    "failed to stat parquet path '{}': {e}",
+                    path
+                ))
+            })?;
             let modified = md.modified().map_err(|e| {
                 FfqError::InvalidConfig(format!(
                     "failed to read modified time for '{}': {e}",
@@ -268,15 +273,35 @@ impl StorageProvider for ParquetProvider {
         }
 
         let paths = table.data_paths()?;
-        let schema = match &table.schema {
+        let source_schema = match &table.schema {
             Some(s) => Arc::new(s.clone()),
             None => Arc::new(Self::infer_parquet_schema(&paths)?),
+        };
+
+        let (schema, projection_indices) = if let Some(cols) = &projection {
+            let mut fields = Vec::with_capacity(cols.len());
+            let mut indices = Vec::with_capacity(cols.len());
+            for col in cols {
+                let idx = source_schema.index_of(col).map_err(|_| {
+                    FfqError::Planning(format!(
+                        "projection column '{}' not found in table '{}'",
+                        col, table.name
+                    ))
+                })?;
+                indices.push(idx);
+                fields.push(source_schema.field(idx).clone());
+            }
+            (Arc::new(Schema::new(fields)), indices)
+        } else {
+            let indices = (0..source_schema.fields().len()).collect::<Vec<_>>();
+            (source_schema.clone(), indices)
         };
 
         Ok(Arc::new(ParquetScanNode {
             paths,
             schema,
-            projection,
+            source_schema,
+            projection_indices,
             filters,
         }))
     }
@@ -285,9 +310,8 @@ impl StorageProvider for ParquetProvider {
 pub struct ParquetScanNode {
     paths: Vec<String>,
     schema: SchemaRef,
-    #[allow(dead_code)]
-    projection: Option<Vec<String>>,
-    #[allow(dead_code)]
+    source_schema: SchemaRef,
+    projection_indices: Vec<usize>,
     filters: Vec<String>,
 }
 
@@ -303,16 +327,36 @@ impl ExecNode for ParquetScanNode {
     fn execute(&self, _ctx: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         // v1 embedded path: read local parquet files eagerly and stream batches.
         let mut out = Vec::<Result<RecordBatch>>::new();
+        let _ = &self.filters;
         for path in &self.paths {
-            let file = File::open(path)?;
+            let file = File::open(path).map_err(|e| {
+                FfqError::Execution(format!("parquet scan open failed for '{}': {e}", path))
+            })?;
             let reader = ParquetRecordBatchReaderBuilder::try_new(file)
                 .map_err(|e| FfqError::Execution(format!("parquet reader build failed: {e}")))?
                 .build()
                 .map_err(|e| FfqError::Execution(format!("parquet reader open failed: {e}")))?;
 
             for batch in reader {
+                let batch =
+                    batch.map_err(|e| FfqError::Execution(format!("parquet decode failed: {e}")))?;
+                if batch.schema().fields().len() != self.source_schema.fields().len() {
+                    return Err(FfqError::Execution(format!(
+                        "parquet scan schema mismatch for '{}': expected {} columns, got {}",
+                        path,
+                        self.source_schema.fields().len(),
+                        batch.schema().fields().len()
+                    )));
+                }
+                let cols = self
+                    .projection_indices
+                    .iter()
+                    .map(|idx| batch.column(*idx).clone())
+                    .collect::<Vec<_>>();
                 out.push(
-                    batch.map_err(|e| FfqError::Execution(format!("parquet decode failed: {e}"))),
+                    RecordBatch::try_new(self.schema.clone(), cols).map_err(|e| {
+                        FfqError::Execution(format!("parquet projection failed: {e}"))
+                    }),
                 );
             }
         }

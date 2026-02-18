@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,11 +16,14 @@ use ffq_storage::TableDef;
 use parquet::arrow::ArrowWriter;
 
 fn unique_path(ext: &str) -> std::path::PathBuf {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock before epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("ffq_embedded_scan_{nanos}.{ext}"))
+    let pid = std::process::id();
+    let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("ffq_embedded_scan_{pid}_{nanos}_{seq}.{ext}"))
 }
 
 #[test]
