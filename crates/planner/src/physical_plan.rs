@@ -1,6 +1,7 @@
 use crate::logical_plan::{AggExpr, Expr, JoinStrategyHint, JoinType};
 use arrow_schema::Schema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// The physical operator graph.
 ///
@@ -36,6 +37,8 @@ pub enum PhysicalPlan {
     TopKByScore(TopKByScoreExec),
     /// Index-backed vector top-k.
     VectorTopK(VectorTopKExec),
+    /// Custom operator instantiated via runtime physical operator registry.
+    Custom(CustomExec),
 }
 
 impl PhysicalPlan {
@@ -61,6 +64,7 @@ impl PhysicalPlan {
             PhysicalPlan::Limit(x) => vec![x.input.as_ref()],
             PhysicalPlan::TopKByScore(x) => vec![x.input.as_ref()],
             PhysicalPlan::VectorTopK(_) => vec![],
+            PhysicalPlan::Custom(x) => vec![x.input.as_ref()],
         }
     }
 }
@@ -259,4 +263,16 @@ pub struct VectorTopKExec {
     pub k: usize,
     /// Optional provider-specific filter payload.
     pub filter: Option<String>,
+}
+
+/// Custom physical operator descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomExec {
+    /// Registered factory name.
+    pub op_name: String,
+    /// Opaque operator configuration map.
+    #[serde(default)]
+    pub config: HashMap<String, String>,
+    /// Input plan.
+    pub input: Box<PhysicalPlan>,
 }

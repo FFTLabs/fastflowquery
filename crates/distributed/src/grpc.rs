@@ -255,7 +255,11 @@ impl HeartbeatService for CoordinatorServices {
         let req = request.into_inner();
         let mut coordinator = self.coordinator.lock().await;
         coordinator
-            .heartbeat(&req.worker_id, req.running_tasks)
+            .heartbeat(
+                &req.worker_id,
+                req.running_tasks,
+                &req.custom_operator_capabilities,
+            )
             .map_err(to_status)?;
         Ok(Response::new(v1::HeartbeatResponse { accepted: true }))
     }

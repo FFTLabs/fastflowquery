@@ -23,6 +23,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, SchemaRef};
 use ffq_common::{FfqError, Result};
 
+use crate::udf::get_scalar_udf;
 use ffq_planner::{BinaryOp, Expr, LiteralValue};
 
 /// Executable expression for the execution engine.
@@ -106,6 +107,30 @@ pub fn compile_expr(expr: &Expr, input_schema: &SchemaRef) -> Result<Arc<dyn Phy
                 left: l,
                 right: r,
                 op: *op,
+                out,
+            }))
+        }
+        Expr::ScalarUdf { name, args } => {
+            let compiled_args = args
+                .iter()
+                .map(|a| compile_expr(a, input_schema))
+                .collect::<Result<Vec<_>>>()?;
+            let udf = get_scalar_udf(name).ok_or_else(|| {
+                FfqError::Execution(format!(
+                    "scalar udf '{}' is not registered in execution registry",
+                    name
+                ))
+            })?;
+            let out = udf.return_type(
+                &compiled_args
+                    .iter()
+                    .map(|arg| arg.data_type())
+                    .collect::<Vec<_>>(),
+            )?;
+            Ok(Arc::new(ScalarUdfExpr {
+                udf_name: name.clone(),
+                udf,
+                args: compiled_args,
                 out,
             }))
         }
@@ -262,6 +287,30 @@ struct BinaryExpr {
     right: Arc<dyn PhysicalExpr>,
     op: BinaryOp,
     out: DataType,
+}
+
+struct ScalarUdfExpr {
+    udf_name: String,
+    udf: Arc<dyn crate::udf::ScalarUdf>,
+    args: Vec<Arc<dyn PhysicalExpr>>,
+    out: DataType,
+}
+
+impl PhysicalExpr for ScalarUdfExpr {
+    fn data_type(&self) -> DataType {
+        self.out.clone()
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
+        let arrays = self
+            .args
+            .iter()
+            .map(|arg| arg.evaluate(batch))
+            .collect::<Result<Vec<_>>>()?;
+        self.udf
+            .invoke(&arrays)
+            .map_err(|e| FfqError::Execution(format!("scalar udf '{}' failed: {e}", self.udf_name)))
+    }
 }
 
 impl PhysicalExpr for BinaryExpr {

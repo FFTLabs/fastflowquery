@@ -151,6 +151,7 @@ message HeartbeatRequest {
   string worker_id = 1;
   uint64 at_ms = 2;
   uint32 running_tasks = 3;
+  repeated string custom_operator_capabilities = 4;
 }
 
 message HeartbeatResponse {

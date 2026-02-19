@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::{FfqError, Result};
@@ -12,14 +13,66 @@ pub trait SchemaProvider {
     fn table_schema(&self, table: &str) -> Result<SchemaRef>;
 }
 
-#[derive(Debug, Default)]
 /// Logical-plan semantic analyzer.
-pub struct Analyzer;
+pub struct Analyzer {
+    udf_type_resolvers: RwLock<HashMap<String, ScalarUdfTypeResolver>>,
+}
+
+/// Type resolver callback for scalar UDFs.
+pub type ScalarUdfTypeResolver =
+    Arc<dyn Fn(&[DataType]) -> Result<DataType> + Send + Sync + 'static>;
+
+impl std::fmt::Debug for Analyzer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self
+            .udf_type_resolvers
+            .read()
+            .map(|m| m.len())
+            .unwrap_or_default();
+        f.debug_struct("Analyzer")
+            .field("udf_type_resolvers", &count)
+            .finish()
+    }
+}
+
+impl Default for Analyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Analyzer {
     /// Create a new analyzer.
     pub fn new() -> Self {
-        Self
+        Self {
+            udf_type_resolvers: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register or replace a scalar UDF type resolver.
+    ///
+    /// Returns `true` when an existing resolver with the same name was replaced.
+    pub fn register_scalar_udf_type(
+        &self,
+        name: impl Into<String>,
+        resolver: ScalarUdfTypeResolver,
+    ) -> bool {
+        self.udf_type_resolvers
+            .write()
+            .expect("udf resolver lock poisoned")
+            .insert(name.into().to_ascii_lowercase(), resolver)
+            .is_some()
+    }
+
+    /// Deregister a scalar UDF type resolver by name.
+    ///
+    /// Returns `true` when an existing resolver was removed.
+    pub fn deregister_scalar_udf_type(&self, name: &str) -> bool {
+        self.udf_type_resolvers
+            .write()
+            .expect("udf resolver lock poisoned")
+            .remove(&name.to_ascii_lowercase())
+            .is_some()
     }
 
     /// Analyze a logical plan and return a semantically validated plan.
@@ -510,6 +563,30 @@ impl Analyzer {
                         query: Box::new(aq),
                     },
                     DataType::Float32,
+                ))
+            }
+            Expr::ScalarUdf { name, args } => {
+                let mut analyzed_args = Vec::with_capacity(args.len());
+                let mut arg_types = Vec::with_capacity(args.len());
+                for arg in args {
+                    let (a, dt) = self.analyze_expr(arg, resolver)?;
+                    analyzed_args.push(a);
+                    arg_types.push(dt);
+                }
+                let resolver_fn = self
+                    .udf_type_resolvers
+                    .read()
+                    .expect("udf resolver lock poisoned")
+                    .get(&name.to_ascii_lowercase())
+                    .cloned()
+                    .ok_or_else(|| FfqError::Planning(format!("unknown scalar udf: {name}")))?;
+                let out_type = resolver_fn(&arg_types)?;
+                Ok((
+                    Expr::ScalarUdf {
+                        name,
+                        args: analyzed_args,
+                    },
+                    out_type,
                 ))
             }
         }

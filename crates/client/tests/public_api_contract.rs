@@ -42,8 +42,8 @@ fn public_api_engine_and_dataframe_contract_v2() {
 #[test]
 fn public_api_hybrid_search_convenience_exists() {
     let engine = Engine::new(EngineConfig::default()).expect("engine");
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/parquet/docs.parquet");
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/parquet/docs.parquet");
     engine.register_table(
         "docs",
         TableDef {

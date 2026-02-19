@@ -424,38 +424,36 @@ fn parse_scalar_function(
     params: &HashMap<String, LiteralValue>,
 ) -> Result<Expr> {
     let fname = object_name_to_string(&func.name).to_lowercase();
-    #[cfg(not(feature = "vector"))]
-    let _ = params;
+    let args = function_expr_args(func, params)?;
 
     #[cfg(feature = "vector")]
     {
         if fname == "cosine_similarity" {
-            let args = function_expr_args(func)?;
             if args.len() != 2 {
                 return Err(FfqError::Unsupported(
                     "cosine_similarity requires exactly 2 arguments in v1".to_string(),
                 ));
             }
             return Ok(Expr::CosineSimilarity {
-                vector: Box::new(sql_expr_to_expr(args[0], params)?),
-                query: Box::new(sql_expr_to_expr(args[1], params)?),
+                vector: Box::new(args[0].clone()),
+                query: Box::new(args[1].clone()),
             });
         }
     }
 
-    Err(FfqError::Unsupported(format!(
-        "unsupported scalar function in v1: {fname}"
-    )))
+    Ok(Expr::ScalarUdf { name: fname, args })
 }
 
-#[cfg(feature = "vector")]
-fn function_expr_args<'a>(func: &'a sqlparser::ast::Function) -> Result<Vec<&'a SqlExpr>> {
+fn function_expr_args(
+    func: &sqlparser::ast::Function,
+    params: &HashMap<String, LiteralValue>,
+) -> Result<Vec<Expr>> {
     match &func.args {
         FunctionArguments::List(list) => list
             .args
             .iter()
             .map(|arg| match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => sql_expr_to_expr(e, params),
                 _ => Err(FfqError::Unsupported(
                     "unsupported function argument form in v1".to_string(),
                 )),

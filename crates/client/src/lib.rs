@@ -20,6 +20,7 @@
 //! - `distributed`: enables coordinator-backed runtime path
 //! - `vector` / `qdrant` / `profiling`: enable optional vector and observability paths.
 
+mod physical_registry;
 mod planner_facade;
 mod runtime;
 mod session;
@@ -34,15 +35,17 @@ pub mod dataframe;
 pub mod engine;
 /// Expression builder helpers for DataFrame plans.
 pub mod expr;
-/// Interactive SQL REPL implementation.
-pub mod repl;
-/// TPC-H `.tbl` fixture conversion and validation helpers.
-pub mod tpch_tbl;
 #[cfg(feature = "ffi")]
 mod ffi;
 #[cfg(feature = "python")]
 mod python;
+/// Interactive SQL REPL implementation.
+pub mod repl;
+/// TPC-H `.tbl` fixture conversion and validation helpers.
+pub mod tpch_tbl;
 
 pub use dataframe::{DataFrame, WriteMode};
 pub use engine::Engine;
 pub use expr::*;
+pub use ffq_execution::ScalarUdf;
+pub use physical_registry::PhysicalOperatorFactory;

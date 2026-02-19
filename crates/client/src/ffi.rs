@@ -121,7 +121,11 @@ fn parse_bool(raw: &str) -> std::result::Result<bool, FfqError> {
 }
 
 fn apply_config_kv(config: &mut EngineConfig, kv: &str) -> std::result::Result<(), FfqError> {
-    for pair in kv.split([',', ';']).map(str::trim).filter(|s| !s.is_empty()) {
+    for pair in kv
+        .split([',', ';'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         let Some((k, v)) = pair.split_once('=') else {
             return Err(FfqError::InvalidConfig(format!(
                 "invalid config pair '{pair}', expected key=value"
@@ -190,7 +194,10 @@ fn apply_config_kv(config: &mut EngineConfig, kv: &str) -> std::result::Result<(
     Ok(())
 }
 
-fn encode_ipc(schema: arrow_schema::SchemaRef, batches: &[RecordBatch]) -> ffq_common::Result<Vec<u8>> {
+fn encode_ipc(
+    schema: arrow_schema::SchemaRef,
+    batches: &[RecordBatch],
+) -> ffq_common::Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut writer = StreamWriter::try_new(&mut out, schema.as_ref())
         .map_err(|e| FfqError::Execution(format!("ipc writer init failed: {e}")))?;

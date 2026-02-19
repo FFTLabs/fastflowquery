@@ -140,5 +140,10 @@ fn fmt_expr(e: &Expr) -> String {
         Expr::DotProduct { vector, query } => {
             format!("dot_product({}, {})", fmt_expr(vector), fmt_expr(query))
         }
+        Expr::ScalarUdf { name, args } => format!(
+            "{}({})",
+            name,
+            args.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
+        ),
     }
 }

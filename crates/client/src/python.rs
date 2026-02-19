@@ -132,10 +132,7 @@ struct PyEngine {
 impl PyEngine {
     #[new]
     #[pyo3(signature = (config_json=None, config=None))]
-    fn new(
-        config_json: Option<&str>,
-        config: Option<HashMap<String, String>>,
-    ) -> PyResult<Self> {
+    fn new(config_json: Option<&str>, config: Option<HashMap<String, String>>) -> PyResult<Self> {
         let mut cfg = if let Some(raw) = config_json {
             serde_json::from_str::<EngineConfig>(raw)
                 .map_err(|e| PyValueError::new_err(format!("invalid config JSON: {e}")))?
@@ -210,9 +207,11 @@ impl PyDataFrame {
     }
 
     fn collect_ipc<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let stream = futures::executor::block_on(self.inner.collect_stream()).map_err(map_ffq_err)?;
+        let stream =
+            futures::executor::block_on(self.inner.collect_stream()).map_err(map_ffq_err)?;
         let schema = stream.schema();
-        let batches = futures::executor::block_on(stream.try_collect::<Vec<_>>()).map_err(map_ffq_err)?;
+        let batches =
+            futures::executor::block_on(stream.try_collect::<Vec<_>>()).map_err(map_ffq_err)?;
         let payload = encode_ipc(schema, &batches).map_err(map_ffq_err)?;
         Ok(PyBytes::new_bound(py, &payload))
     }

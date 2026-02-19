@@ -31,7 +31,10 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result};
-use ffq_execution::{TaskContext as ExecTaskContext, compile_expr};
+use ffq_execution::{
+    PhysicalOperatorRegistry, TaskContext as ExecTaskContext, compile_expr,
+    global_physical_operator_registry,
+};
 use ffq_planner::{AggExpr, BuildSide, ExchangeExec, Expr, PartitioningSpec, PhysicalPlan};
 use ffq_shuffle::{ShuffleReader, ShuffleWriter};
 use ffq_storage::parquet_provider::ParquetProvider;
@@ -129,8 +132,13 @@ pub trait WorkerControlPlane: Send + Sync {
     ) -> Result<()>;
     /// Publish final query results payload for client fetching.
     async fn register_query_results(&self, query_id: &str, ipc_payload: Vec<u8>) -> Result<()>;
-    /// Send periodic heartbeat with currently running task count.
-    async fn heartbeat(&self, worker_id: &str, running_tasks: u32) -> Result<()>;
+    /// Send periodic heartbeat with currently running task count and worker capabilities.
+    async fn heartbeat(
+        &self,
+        worker_id: &str,
+        running_tasks: u32,
+        custom_operator_capabilities: &[String],
+    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -148,6 +156,7 @@ pub trait TaskExecutor: Send + Sync {
 /// Default task executor that evaluates physical plan fragments in-process.
 pub struct DefaultTaskExecutor {
     catalog: Arc<Catalog>,
+    physical_registry: Arc<PhysicalOperatorRegistry>,
     sink_outputs: Arc<Mutex<HashMap<String, Vec<RecordBatch>>>>,
 }
 
@@ -160,8 +169,17 @@ impl std::fmt::Debug for DefaultTaskExecutor {
 impl DefaultTaskExecutor {
     /// Construct executor backed by provided catalog.
     pub fn new(catalog: Arc<Catalog>) -> Self {
+        Self::with_physical_registry(catalog, global_physical_operator_registry())
+    }
+
+    /// Construct executor with explicit physical operator registry.
+    pub fn with_physical_registry(
+        catalog: Arc<Catalog>,
+        physical_registry: Arc<PhysicalOperatorRegistry>,
+    ) -> Self {
         Self {
             catalog,
+            physical_registry,
             sink_outputs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -211,6 +229,7 @@ impl TaskExecutor for DefaultTaskExecutor {
             &mut state,
             ctx,
             Arc::clone(&self.catalog),
+            Arc::clone(&self.physical_registry),
         )?;
 
         let mut result = TaskExecutionResult {
@@ -285,6 +304,10 @@ where
         if capacity == 0 {
             return Ok(0);
         }
+        let capabilities = global_physical_operator_registry().names();
+        self.control_plane
+            .heartbeat(&self.config.worker_id, 0, &capabilities)
+            .await?;
 
         let tasks = self
             .control_plane
@@ -292,9 +315,6 @@ where
             .await?;
         let task_count = tasks.len();
         if tasks.is_empty() {
-            self.control_plane
-                .heartbeat(&self.config.worker_id, 0)
-                .await?;
             return Ok(0);
         }
 
@@ -474,9 +494,14 @@ impl WorkerControlPlane for InProcessControlPlane {
         )
     }
 
-    async fn heartbeat(&self, worker_id: &str, running_tasks: u32) -> Result<()> {
+    async fn heartbeat(
+        &self,
+        worker_id: &str,
+        running_tasks: u32,
+        custom_operator_capabilities: &[String],
+    ) -> Result<()> {
         let mut c = self.coordinator.lock().await;
-        c.heartbeat(worker_id, running_tasks)
+        c.heartbeat(worker_id, running_tasks, custom_operator_capabilities)
     }
 
     async fn register_query_results(&self, query_id: &str, ipc_payload: Vec<u8>) -> Result<()> {
@@ -559,7 +584,12 @@ impl WorkerControlPlane for GrpcControlPlane {
         Ok(())
     }
 
-    async fn heartbeat(&self, worker_id: &str, running_tasks: u32) -> Result<()> {
+    async fn heartbeat(
+        &self,
+        worker_id: &str,
+        running_tasks: u32,
+        custom_operator_capabilities: &[String],
+    ) -> Result<()> {
         let mut client = self.heartbeat.lock().await;
         client
             .heartbeat(v1::HeartbeatRequest {
@@ -569,6 +599,7 @@ impl WorkerControlPlane for GrpcControlPlane {
                     .map_err(|e| FfqError::Execution(format!("clock error: {e}")))?
                     .as_millis() as u64,
                 running_tasks,
+                custom_operator_capabilities: custom_operator_capabilities.to_vec(),
             })
             .await
             .map_err(map_tonic_err)?;
@@ -655,6 +686,7 @@ fn operator_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Limit(_) => "Limit",
         PhysicalPlan::TopKByScore(_) => "TopKByScore",
         PhysicalPlan::VectorTopK(_) => "VectorTopK",
+        PhysicalPlan::Custom(_) => "Custom",
     }
 }
 
@@ -665,6 +697,7 @@ fn eval_plan_for_stage(
     state: &mut EvalState,
     ctx: &TaskContext,
     catalog: Arc<Catalog>,
+    physical_registry: Arc<PhysicalOperatorRegistry>,
 ) -> Result<ExecOutput> {
     let started = Instant::now();
     let _span = info_span!(
@@ -708,6 +741,7 @@ fn eval_plan_for_stage(
                 state,
                 ctx,
                 catalog.clone(),
+                Arc::clone(&physical_registry),
             )?;
             let table = catalog.get(&write.table)?.clone();
             let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
@@ -731,6 +765,7 @@ fn eval_plan_for_stage(
                     state,
                     ctx,
                     catalog,
+                    Arc::clone(&physical_registry),
                 )?;
                 let (in_rows, in_batches, in_bytes) = batch_stats(&out.batches);
                 Ok(OpEval {
@@ -764,6 +799,7 @@ fn eval_plan_for_stage(
                         state,
                         ctx,
                         catalog,
+                        Arc::clone(&physical_registry),
                     )?;
                     let (in_rows, in_batches, in_bytes) = batch_stats(&out.batches);
                     Ok(OpEval {
@@ -782,6 +818,7 @@ fn eval_plan_for_stage(
                     state,
                     ctx,
                     catalog,
+                    Arc::clone(&physical_registry),
                 )?;
                 if current_stage == target_stage {
                     let metas = write_stage_shuffle_outputs(
@@ -802,8 +839,15 @@ fn eval_plan_for_stage(
             }
         },
         PhysicalPlan::PartialHashAggregate(agg) => {
-            let child =
-                eval_plan_for_stage(&agg.input, current_stage, target_stage, state, ctx, catalog)?;
+            let child = eval_plan_for_stage(
+                &agg.input,
+                current_stage,
+                target_stage,
+                state,
+                ctx,
+                catalog,
+                Arc::clone(&physical_registry),
+            )?;
             let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
             let out = run_hash_aggregate(
                 child,
@@ -820,8 +864,15 @@ fn eval_plan_for_stage(
             })
         }
         PhysicalPlan::FinalHashAggregate(agg) => {
-            let child =
-                eval_plan_for_stage(&agg.input, current_stage, target_stage, state, ctx, catalog)?;
+            let child = eval_plan_for_stage(
+                &agg.input,
+                current_stage,
+                target_stage,
+                state,
+                ctx,
+                catalog,
+                Arc::clone(&physical_registry),
+            )?;
             let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
             let out = run_hash_aggregate(
                 child,
@@ -852,9 +903,17 @@ fn eval_plan_for_stage(
                 state,
                 ctx,
                 Arc::clone(&catalog),
+                Arc::clone(&physical_registry),
             )?;
-            let right =
-                eval_plan_for_stage(right, current_stage, target_stage, state, ctx, catalog)?;
+            let right = eval_plan_for_stage(
+                right,
+                current_stage,
+                target_stage,
+                state,
+                ctx,
+                catalog,
+                Arc::clone(&physical_registry),
+            )?;
             let (left_rows, left_batches, left_bytes) = batch_stats(&left.batches);
             let (right_rows, right_batches, right_bytes) = batch_stats(&right.batches);
             let out = run_hash_join(left, right, on.clone(), *build_side, ctx)?;
@@ -873,6 +932,7 @@ fn eval_plan_for_stage(
                 state,
                 ctx,
                 catalog,
+                Arc::clone(&physical_registry),
             )?;
             let mut out_batches = Vec::with_capacity(child.batches.len());
             let schema = Arc::new(Schema::new(
@@ -914,6 +974,7 @@ fn eval_plan_for_stage(
                 state,
                 ctx,
                 catalog,
+                Arc::clone(&physical_registry),
             )?;
             let pred = compile_expr(&filter.predicate, &child.schema)?;
             let mut out = Vec::new();
@@ -948,6 +1009,7 @@ fn eval_plan_for_stage(
                 state,
                 ctx,
                 catalog,
+                Arc::clone(&physical_registry),
             )?;
             let mut out = Vec::new();
             let mut remaining = limit.n;
@@ -978,6 +1040,7 @@ fn eval_plan_for_stage(
                 state,
                 ctx,
                 catalog,
+                Arc::clone(&physical_registry),
             )?;
             let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
             let out = run_topk_by_score(child, topk.score_expr.clone(), topk.k)?;
@@ -994,6 +1057,31 @@ fn eval_plan_for_stage(
             in_batches: 0,
             in_bytes: 0,
         }),
+        PhysicalPlan::Custom(custom) => {
+            let child = eval_plan_for_stage(
+                &custom.input,
+                current_stage,
+                target_stage,
+                state,
+                ctx,
+                catalog,
+                Arc::clone(&physical_registry),
+            )?;
+            let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+            let factory = physical_registry.get(&custom.op_name).ok_or_else(|| {
+                FfqError::Unsupported(format!(
+                    "custom physical operator '{}' is not registered on worker",
+                    custom.op_name
+                ))
+            })?;
+            let (schema, batches) = factory.execute(child.schema, child.batches, &custom.config)?;
+            Ok(OpEval {
+                out: ExecOutput { schema, batches },
+                in_rows,
+                in_batches,
+                in_bytes,
+            })
+        }
         PhysicalPlan::CoalesceBatches(_) => Err(FfqError::Unsupported(
             "CoalesceBatches execution is not implemented in distributed worker".to_string(),
         )),
@@ -2649,6 +2737,10 @@ fn scalar_gt(a: &ScalarValue, b: &ScalarValue) -> Result<bool> {
 mod tests {
     use super::*;
     use crate::coordinator::CoordinatorConfig;
+    use ffq_execution::{
+        PhysicalOperatorFactory, deregister_global_physical_operator_factory,
+        register_global_physical_operator_factory,
+    };
     use ffq_planner::{
         AggExpr, Expr, JoinStrategyHint, JoinType, LogicalPlan, ParquetScanExec, ParquetWriteExec,
         PhysicalPlan, PhysicalPlannerConfig, create_physical_plan,
@@ -2660,6 +2752,62 @@ mod tests {
 
     use arrow::array::Int64Array;
     use arrow_schema::{DataType, Field, Schema};
+
+    struct AddConstFactory;
+
+    impl PhysicalOperatorFactory for AddConstFactory {
+        fn name(&self) -> &str {
+            "add_const_i64"
+        }
+
+        fn execute(
+            &self,
+            input_schema: SchemaRef,
+            input_batches: Vec<RecordBatch>,
+            config: &HashMap<String, String>,
+        ) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+            let col = config.get("column").cloned().ok_or_else(|| {
+                FfqError::InvalidConfig("custom operator missing 'column' config".to_string())
+            })?;
+            let addend: i64 = config
+                .get("addend")
+                .ok_or_else(|| {
+                    FfqError::InvalidConfig("custom operator missing 'addend' config".to_string())
+                })?
+                .parse()
+                .map_err(|e| {
+                    FfqError::InvalidConfig(format!("custom operator invalid addend value: {e}"))
+                })?;
+            let idx = input_schema
+                .index_of(&col)
+                .map_err(|e| FfqError::InvalidConfig(format!("column lookup failed: {e}")))?;
+
+            let mut out = Vec::with_capacity(input_batches.len());
+            for batch in input_batches {
+                let mut cols = batch.columns().to_vec();
+                let base = cols[idx]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .ok_or_else(|| {
+                        FfqError::Execution("add_const_i64 expects Int64 input column".to_string())
+                    })?;
+                let mut builder = Int64Builder::with_capacity(base.len());
+                for v in base.iter() {
+                    match v {
+                        Some(x) => builder.append_value(x + addend),
+                        None => builder.append_null(),
+                    }
+                }
+                cols[idx] = Arc::new(builder.finish());
+                out.push(
+                    RecordBatch::try_new(Arc::clone(&input_schema), cols).map_err(|e| {
+                        FfqError::Execution(format!("custom batch build failed: {e}"))
+                    })?,
+                );
+            }
+            Ok((input_schema, out))
+        }
+    }
 
     fn unique_path(prefix: &str, ext: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -2955,5 +3103,133 @@ mod tests {
         let _ = std::fs::remove_dir_all(out_dir);
         let _ = std::fs::remove_dir_all(spill_dir);
         panic!("sink query did not finish");
+    }
+
+    #[tokio::test]
+    async fn coordinator_with_workers_executes_custom_operator_stage() {
+        let _ = deregister_global_physical_operator_factory("add_const_i64");
+        let _ = register_global_physical_operator_factory(Arc::new(AddConstFactory));
+
+        let src_path = unique_path("ffq_dist_custom_src", "parquet");
+        let spill_dir = unique_path("ffq_dist_custom_spill", "dir");
+        let shuffle_root = unique_path("ffq_dist_custom_shuffle", "dir");
+        let _ = std::fs::create_dir_all(&shuffle_root);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        write_parquet(
+            &src_path,
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+                Arc::new(Int64Array::from(vec![10_i64, 20, 30])),
+            ],
+        );
+
+        let mut coordinator_catalog = Catalog::new();
+        coordinator_catalog.register_table(TableDef {
+            name: "t".to_string(),
+            uri: src_path.to_string_lossy().to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: None,
+            stats: TableStats::default(),
+            options: HashMap::new(),
+        });
+        let mut worker_catalog = Catalog::new();
+        worker_catalog.register_table(TableDef {
+            name: "t".to_string(),
+            uri: src_path.to_string_lossy().to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: None,
+            stats: TableStats::default(),
+            options: HashMap::new(),
+        });
+        let worker_catalog = Arc::new(worker_catalog);
+
+        let mut cfg = HashMap::new();
+        cfg.insert("column".to_string(), "v".to_string());
+        cfg.insert("addend".to_string(), "5".to_string());
+        let plan = PhysicalPlan::Custom(ffq_planner::CustomExec {
+            op_name: "add_const_i64".to_string(),
+            config: cfg,
+            input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
+                table: "t".to_string(),
+                schema: None,
+                projection: Some(vec!["k".to_string(), "v".to_string()]),
+                filters: vec![],
+            })),
+        });
+        let physical_json = serde_json::to_vec(&plan).expect("physical json");
+
+        let coordinator = Arc::new(Mutex::new(Coordinator::with_catalog(
+            CoordinatorConfig::default(),
+            coordinator_catalog,
+        )));
+        {
+            let mut c = coordinator.lock().await;
+            c.submit_query("3001".to_string(), &physical_json)
+                .expect("submit");
+        }
+
+        let control = Arc::new(InProcessControlPlane::new(Arc::clone(&coordinator)));
+        let exec = Arc::new(DefaultTaskExecutor::new(Arc::clone(&worker_catalog)));
+        let worker1 = Worker::new(
+            WorkerConfig {
+                worker_id: "w1".to_string(),
+                cpu_slots: 1,
+                spill_dir: spill_dir.clone(),
+                shuffle_root: shuffle_root.clone(),
+                ..WorkerConfig::default()
+            },
+            Arc::clone(&control),
+            Arc::clone(&exec),
+        );
+        let worker2 = Worker::new(
+            WorkerConfig {
+                worker_id: "w2".to_string(),
+                cpu_slots: 1,
+                spill_dir: spill_dir.clone(),
+                shuffle_root: shuffle_root.clone(),
+                ..WorkerConfig::default()
+            },
+            control,
+            Arc::clone(&exec),
+        );
+
+        for _ in 0..16 {
+            let _ = worker1.poll_once().await.expect("worker1 poll");
+            let _ = worker2.poll_once().await.expect("worker2 poll");
+            let state = {
+                let c = coordinator.lock().await;
+                c.get_query_status("3001").expect("status").state
+            };
+            if state == crate::coordinator::QueryState::Succeeded {
+                let batches = exec.take_query_output("3001").await.expect("sink output");
+                let all = concat_batches(&batches[0].schema(), &batches).expect("concat");
+                let values = all
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64 values");
+                assert_eq!(values.values(), &[15_i64, 25, 35]);
+
+                let _ = std::fs::remove_file(&src_path);
+                let _ = std::fs::remove_dir_all(&spill_dir);
+                let _ = std::fs::remove_dir_all(&shuffle_root);
+                let _ = deregister_global_physical_operator_factory("add_const_i64");
+                return;
+            }
+            assert_ne!(state, crate::coordinator::QueryState::Failed);
+        }
+
+        let _ = std::fs::remove_file(src_path);
+        let _ = std::fs::remove_dir_all(spill_dir);
+        let _ = std::fs::remove_dir_all(shuffle_root);
+        let _ = deregister_global_physical_operator_factory("add_const_i64");
+        panic!("custom query did not finish in allotted polls");
     }
 }

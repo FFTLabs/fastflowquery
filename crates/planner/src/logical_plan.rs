@@ -87,6 +87,16 @@ pub enum Expr {
         /// Query vector expression (typically a literal).
         query: Box<Expr>,
     },
+
+    /// Scalar UDF call.
+    ///
+    /// The analyzer resolves return type via registered UDF type resolvers.
+    ScalarUdf {
+        /// Function name (normalized lower-case from SQL frontend).
+        name: String,
+        /// Function arguments.
+        args: Vec<Expr>,
+    },
 }
 
 /// Literal values supported by the v1 planner.

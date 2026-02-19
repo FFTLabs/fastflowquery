@@ -1,5 +1,6 @@
 use ffq_common::Result;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 
 use crate::analyzer::SchemaProvider;
 use crate::logical_plan::{BinaryOp, Expr, JoinStrategyHint, JoinType, LiteralValue, LogicalPlan};
@@ -49,18 +50,75 @@ pub trait OptimizerContext: SchemaProvider {
     }
 }
 
-#[derive(Debug, Default)]
 /// Rule-based optimizer for v1 logical plans.
 ///
 /// The implementation is intentionally conservative: pushdowns and rewrites are
 /// applied only when correctness preconditions are satisfied; otherwise, the
 /// original logical behavior is preserved.
-pub struct Optimizer;
+pub struct Optimizer {
+    custom_rules: RwLock<HashMap<String, Arc<dyn OptimizerRule>>>,
+}
+
+/// Custom optimizer rule hook.
+pub trait OptimizerRule: Send + Sync {
+    /// Stable rule name used by registry.
+    fn name(&self) -> &str;
+    /// Rewrite input plan and return transformed plan.
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        ctx: &dyn OptimizerContext,
+        cfg: OptimizerConfig,
+    ) -> Result<LogicalPlan>;
+}
+
+impl std::fmt::Debug for Optimizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self
+            .custom_rules
+            .read()
+            .map(|m| m.len())
+            .unwrap_or_default();
+        f.debug_struct("Optimizer")
+            .field("custom_rules", &count)
+            .finish()
+    }
+}
+
+impl Default for Optimizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Optimizer {
     /// Create a new optimizer.
     pub fn new() -> Self {
-        Self
+        Self {
+            custom_rules: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register or replace a custom optimizer rule.
+    ///
+    /// Returns `true` when an existing rule with the same name was replaced.
+    pub fn register_rule(&self, rule: Arc<dyn OptimizerRule>) -> bool {
+        self.custom_rules
+            .write()
+            .expect("optimizer rule lock poisoned")
+            .insert(rule.name().to_string(), rule)
+            .is_some()
+    }
+
+    /// Deregister a custom optimizer rule by name.
+    ///
+    /// Returns `true` when an existing rule was removed.
+    pub fn deregister_rule(&self, name: &str) -> bool {
+        self.custom_rules
+            .write()
+            .expect("optimizer rule lock poisoned")
+            .remove(name)
+            .is_some()
     }
 
     /// Apply v1 rule pipeline to a logical plan.
@@ -98,7 +156,20 @@ impl Optimizer {
         let plan = join_strategy_hint(plan, ctx, cfg)?;
 
         // 6) rewrite to vector index execution when possible
-        let plan = vector_index_rewrite(plan, ctx)?;
+        let mut plan = vector_index_rewrite(plan, ctx)?;
+
+        // 7) user-registered custom rules (deterministic by name)
+        let mut rules = self
+            .custom_rules
+            .read()
+            .expect("optimizer rule lock poisoned")
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect::<Vec<_>>();
+        rules.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_name, rule) in rules {
+            plan = rule.rewrite(plan, ctx, cfg)?;
+        }
 
         Ok(plan)
     }
@@ -184,6 +255,10 @@ fn fold_constants_expr(e: Expr) -> Expr {
         Expr::DotProduct { vector, query } => Expr::DotProduct {
             vector: Box::new(fold_constants_expr(*vector)),
             query: Box::new(fold_constants_expr(*query)),
+        },
+        Expr::ScalarUdf { name, args } => Expr::ScalarUdf {
+            name,
+            args: args.into_iter().map(fold_constants_expr).collect(),
         },
         other => other,
     }
@@ -1285,6 +1360,13 @@ fn rewrite_expr(e: Expr, rewrite: &dyn Fn(Expr) -> Expr) -> Expr {
             vector: Box::new(rewrite_expr(*vector, rewrite)),
             query: Box::new(rewrite_expr(*query, rewrite)),
         },
+        Expr::ScalarUdf { name, args } => Expr::ScalarUdf {
+            name,
+            args: args
+                .into_iter()
+                .map(|arg| rewrite_expr(arg, rewrite))
+                .collect(),
+        },
         other => other,
     };
     rewrite(e)
@@ -1344,6 +1426,11 @@ fn collect_cols(e: &Expr, out: &mut HashSet<String>) {
             collect_cols(x, out);
         }
         Expr::Literal(_) => {}
+        Expr::ScalarUdf { args, .. } => {
+            for arg in args {
+                collect_cols(arg, out);
+            }
+        }
         #[cfg(feature = "vector")]
         Expr::CosineSimilarity { vector, query }
         | Expr::L2Distance { vector, query }

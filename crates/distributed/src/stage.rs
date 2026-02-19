@@ -128,6 +128,7 @@ fn op_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Limit(_) => "Limit",
         PhysicalPlan::TopKByScore(_) => "TopKByScore",
         PhysicalPlan::VectorTopK(_) => "VectorTopK",
+        PhysicalPlan::Custom(_) => "Custom",
     }
 }
 

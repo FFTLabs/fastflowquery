@@ -9,6 +9,7 @@ use parquet::arrow::ArrowWriter;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::{annotate_schema_inference_metadata, read_schema_fingerprint_metadata};
@@ -339,7 +340,12 @@ impl DataFrame {
 
         self.session
             .runtime
-            .execute(physical, ctx, catalog_snapshot)
+            .execute(
+                physical,
+                ctx,
+                catalog_snapshot,
+                Arc::clone(&self.session.physical_registry),
+            )
             .await
     }
 

@@ -182,12 +182,14 @@ struct TaskRuntime {
     assigned_worker: Option<String>,
     ready_at_ms: u64,
     plan_fragment_json: Vec<u8>,
+    required_custom_ops: Vec<String>,
     message: String,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct WorkerHeartbeat {
     last_seen_ms: u64,
+    custom_operator_capabilities: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,7 +229,12 @@ impl Coordinator {
 
     fn touch_worker(&mut self, worker_id: &str, now: u64) {
         self.worker_heartbeats
-            .insert(worker_id.to_string(), WorkerHeartbeat { last_seen_ms: now });
+            .entry(worker_id.to_string())
+            .and_modify(|hb| hb.last_seen_ms = now)
+            .or_insert_with(|| WorkerHeartbeat {
+                last_seen_ms: now,
+                custom_operator_capabilities: HashSet::new(),
+            });
     }
 
     fn requeue_stale_workers(&mut self, now: u64) -> Result<()> {
@@ -288,11 +295,12 @@ impl Coordinator {
                         t.task_id,
                         t.attempt,
                         t.plan_fragment_json.clone(),
+                        t.required_custom_ops.clone(),
                     ));
                 }
             }
 
-            for (stage_id, task_id, attempt, fragment) in to_retry {
+            for (stage_id, task_id, attempt, fragment, required_custom_ops) in to_retry {
                 if attempt < self.config.max_task_attempts {
                     let next_attempt = attempt + 1;
                     let backoff_ms = self
@@ -310,6 +318,7 @@ impl Coordinator {
                             assigned_worker: None,
                             ready_at_ms: now.saturating_add(backoff_ms),
                             plan_fragment_json: fragment,
+                            required_custom_ops,
                             message: "retry scheduled after worker timeout".to_string(),
                         },
                     );
@@ -439,6 +448,7 @@ impl Coordinator {
             PhysicalPlan::Limit(x) => self.resolve_parquet_scan_schemas(&mut x.input),
             PhysicalPlan::TopKByScore(x) => self.resolve_parquet_scan_schemas(&mut x.input),
             PhysicalPlan::VectorTopK(_) => Ok(()),
+            PhysicalPlan::Custom(x) => self.resolve_parquet_scan_schemas(&mut x.input),
         }
     }
 
@@ -467,6 +477,10 @@ impl Coordinator {
         let mut remaining = capacity.min(worker_budget);
         let mut out = Vec::new();
         self.touch_worker(worker_id, now);
+        let worker_caps = self
+            .worker_heartbeats
+            .get(worker_id)
+            .map(|hb| hb.custom_operator_capabilities.clone());
         if remaining == 0 {
             return Ok(out);
         }
@@ -501,6 +515,9 @@ impl Coordinator {
                         .get(&(task.stage_id, task.task_id))
                         .is_some_and(|a| *a != task.attempt)
                     {
+                        continue;
+                    }
+                    if !worker_supports_task(worker_caps.as_ref(), &task.required_custom_ops) {
                         continue;
                     }
                     task.state = TaskState::Running;
@@ -596,6 +613,11 @@ impl Coordinator {
             .get(&key)
             .map(|t| t.plan_fragment_json.clone())
             .ok_or_else(|| FfqError::Planning("unknown task status report".to_string()))?;
+        let task_required_custom_ops = query
+            .tasks
+            .get(&key)
+            .map(|t| t.required_custom_ops.clone())
+            .ok_or_else(|| FfqError::Planning("unknown task status report".to_string()))?;
         let assigned_worker_cached = query
             .tasks
             .get(&key)
@@ -652,6 +674,7 @@ impl Coordinator {
                             assigned_worker: None,
                             ready_at_ms: now.saturating_add(backoff_ms),
                             plan_fragment_json: task_plan_fragment,
+                            required_custom_ops: task_required_custom_ops,
                             message: format!("retry scheduled after failure: {message}"),
                         },
                     );
@@ -681,10 +704,23 @@ impl Coordinator {
     }
 
     /// Record worker heartbeat and liveness metadata.
-    pub fn heartbeat(&mut self, worker_id: &str, _running_tasks: u32) -> Result<()> {
+    pub fn heartbeat(
+        &mut self,
+        worker_id: &str,
+        _running_tasks: u32,
+        custom_operator_capabilities: &[String],
+    ) -> Result<()> {
         let now = now_ms()?;
-        self.worker_heartbeats
-            .insert(worker_id.to_string(), WorkerHeartbeat { last_seen_ms: now });
+        self.worker_heartbeats.insert(
+            worker_id.to_string(),
+            WorkerHeartbeat {
+                last_seen_ms: now,
+                custom_operator_capabilities: custom_operator_capabilities
+                    .iter()
+                    .cloned()
+                    .collect(),
+            },
+        );
         Ok(())
     }
 
@@ -803,6 +839,12 @@ fn build_query_runtime(
     let submitted_at_ms = now_ms()?;
     let mut stages = HashMap::<u64, StageRuntime>::new();
     let mut tasks = HashMap::<(u64, u64, u32), TaskRuntime>::new();
+    let plan: PhysicalPlan = serde_json::from_slice(physical_plan_json)
+        .map_err(|e| FfqError::Planning(format!("invalid physical plan json: {e}")))?;
+    let mut required_custom_ops = HashSet::new();
+    collect_custom_ops(&plan, &mut required_custom_ops);
+    let mut required_custom_ops = required_custom_ops.into_iter().collect::<Vec<_>>();
+    required_custom_ops.sort();
 
     for node in dag.stages {
         let sid = node.id.0 as u64;
@@ -830,6 +872,7 @@ fn build_query_runtime(
                 assigned_worker: None,
                 ready_at_ms: submitted_at_ms,
                 plan_fragment_json: fragment,
+                required_custom_ops: required_custom_ops.clone(),
                 message: String::new(),
             },
         );
@@ -844,6 +887,43 @@ fn build_query_runtime(
         stages,
         tasks,
     })
+}
+
+fn collect_custom_ops(plan: &PhysicalPlan, out: &mut HashSet<String>) {
+    match plan {
+        PhysicalPlan::ParquetScan(_) | PhysicalPlan::VectorTopK(_) => {}
+        PhysicalPlan::ParquetWrite(x) => collect_custom_ops(&x.input, out),
+        PhysicalPlan::Filter(x) => collect_custom_ops(&x.input, out),
+        PhysicalPlan::Project(x) => collect_custom_ops(&x.input, out),
+        PhysicalPlan::CoalesceBatches(x) => collect_custom_ops(&x.input, out),
+        PhysicalPlan::PartialHashAggregate(x) => collect_custom_ops(&x.input, out),
+        PhysicalPlan::FinalHashAggregate(x) => collect_custom_ops(&x.input, out),
+        PhysicalPlan::HashJoin(x) => {
+            collect_custom_ops(&x.left, out);
+            collect_custom_ops(&x.right, out);
+        }
+        PhysicalPlan::Exchange(x) => match x {
+            ExchangeExec::ShuffleWrite(e) => collect_custom_ops(&e.input, out),
+            ExchangeExec::ShuffleRead(e) => collect_custom_ops(&e.input, out),
+            ExchangeExec::Broadcast(e) => collect_custom_ops(&e.input, out),
+        },
+        PhysicalPlan::Limit(x) => collect_custom_ops(&x.input, out),
+        PhysicalPlan::TopKByScore(x) => collect_custom_ops(&x.input, out),
+        PhysicalPlan::Custom(x) => {
+            out.insert(x.op_name.clone());
+            collect_custom_ops(&x.input, out);
+        }
+    }
+}
+
+fn worker_supports_task(caps: Option<&HashSet<String>>, required_custom_ops: &[String]) -> bool {
+    if required_custom_ops.is_empty() {
+        return true;
+    }
+    let Some(caps) = caps else {
+        return false;
+    };
+    required_custom_ops.iter().all(|op| caps.contains(op))
 }
 
 fn runnable_stages(query: &QueryRuntime) -> Vec<u64> {
@@ -955,6 +1035,7 @@ fn now_ms() -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::thread;
     use std::time::Duration;
 
@@ -1053,7 +1134,7 @@ mod tests {
         }))
         .expect("plan");
         c.submit_query("10".to_string(), &plan).expect("submit");
-        c.heartbeat("w1", 0).expect("heartbeat");
+        c.heartbeat("w1", 0, &[]).expect("heartbeat");
 
         let assigned = c.get_task("w1", 1).expect("assign");
         assert_eq!(assigned.len(), 1);
@@ -1106,5 +1187,32 @@ mod tests {
 
         let third_pull = c.get_task("w1", 10).expect("third pull");
         assert_eq!(third_pull.len(), 1);
+    }
+
+    #[test]
+    fn coordinator_assigns_custom_operator_tasks_only_to_capable_workers() {
+        let mut c = Coordinator::new(CoordinatorConfig::default());
+        let plan = serde_json::to_vec(&PhysicalPlan::Custom(ffq_planner::CustomExec {
+            op_name: "my_custom_op".to_string(),
+            config: HashMap::new(),
+            input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
+                table: "t".to_string(),
+                schema: Some(Schema::empty()),
+                projection: None,
+                filters: vec![],
+            })),
+        }))
+        .expect("plan");
+        c.submit_query("q_custom".to_string(), &plan)
+            .expect("submit");
+
+        c.heartbeat("w_plain", 0, &[]).expect("heartbeat plain");
+        let plain_assignments = c.get_task("w_plain", 10).expect("plain assignments");
+        assert!(plain_assignments.is_empty());
+
+        c.heartbeat("w_custom", 0, &["my_custom_op".to_string()])
+            .expect("heartbeat custom");
+        let custom_assignments = c.get_task("w_custom", 10).expect("custom assignments");
+        assert_eq!(custom_assignments.len(), 1);
     }
 }

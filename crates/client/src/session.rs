@@ -10,6 +10,7 @@ use ffq_storage::Catalog;
 use ffq_storage::parquet_provider::FileFingerprint;
 
 use crate::engine::maybe_infer_table_schema_on_register;
+use crate::physical_registry::{PhysicalOperatorRegistry, global_physical_operator_registry};
 use crate::planner_facade::PlannerFacade;
 #[cfg(feature = "distributed")]
 use crate::runtime::DistributedRuntime;
@@ -30,6 +31,7 @@ pub struct Session {
     pub catalog_path: String,
     pub metrics: MetricsRegistry,
     pub planner: PlannerFacade,
+    pub physical_registry: Arc<PhysicalOperatorRegistry>,
     pub runtime: Arc<dyn Runtime>,
     pub(crate) schema_cache: RwLock<HashMap<String, SchemaCacheEntry>>,
 }
@@ -88,6 +90,7 @@ impl Session {
             catalog_path,
             metrics: MetricsRegistry::new(),
             planner: PlannerFacade::new(),
+            physical_registry: global_physical_operator_registry(),
             runtime,
             schema_cache: RwLock::new(HashMap::new()),
         })

@@ -6,11 +6,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_schema::Schema;
 use ffq_common::{EngineConfig, Result, SchemaInferencePolicy};
-use ffq_planner::LiteralValue;
+use ffq_execution::{ScalarUdf, deregister_scalar_udf, register_scalar_udf};
+use ffq_planner::{LiteralValue, OptimizerRule, ScalarUdfTypeResolver};
 use ffq_storage::TableDef;
 use ffq_storage::parquet_provider::{FileFingerprint, ParquetProvider};
 
 use crate::DataFrame;
+use crate::physical_registry::PhysicalOperatorFactory;
 use crate::session::{Session, SharedSession};
 
 /// Primary entry point for planning and executing queries.
@@ -183,7 +185,10 @@ impl Engine {
              LIMIT {k}"
         );
         let mut params = HashMap::new();
-        params.insert("query_vec".to_string(), LiteralValue::VectorF32(query_vector));
+        params.insert(
+            "query_vec".to_string(),
+            LiteralValue::VectorF32(query_vector),
+        );
         self.sql_with_params(&sql, params)
     }
 
@@ -248,6 +253,80 @@ impl Engine {
     /// Renders current Prometheus metrics exposition text.
     pub fn prometheus_metrics(&self) -> String {
         self.session.prometheus_metrics()
+    }
+
+    /// Register a custom optimizer rule.
+    ///
+    /// Rules are applied after built-in optimizer passes in deterministic name order.
+    /// Returns `true` when an existing rule with same name was replaced.
+    pub fn register_optimizer_rule(&self, rule: Arc<dyn OptimizerRule>) -> bool {
+        self.session.planner.register_optimizer_rule(rule)
+    }
+
+    /// Deregister a custom optimizer rule by name.
+    ///
+    /// Returns `true` when an existing rule was removed.
+    pub fn deregister_optimizer_rule(&self, name: &str) -> bool {
+        self.session.planner.deregister_optimizer_rule(name)
+    }
+
+    /// Register a scalar UDF for SQL/DataFrame execution.
+    ///
+    /// This registers:
+    /// - planner-side return type resolver
+    /// - execution-side batch invocation implementation
+    ///
+    /// Returns `true` when existing UDF with same name was replaced.
+    pub fn register_scalar_udf(&self, udf: Arc<dyn ScalarUdf>) -> bool {
+        let udf_name = udf.name().to_ascii_lowercase();
+        let resolver_udf = Arc::clone(&udf);
+        let resolver: ScalarUdfTypeResolver =
+            Arc::new(move |arg_types| resolver_udf.return_type(arg_types));
+        let replaced_analyzer = self
+            .session
+            .planner
+            .register_scalar_udf_type(udf_name.clone(), resolver);
+        let replaced_exec = register_scalar_udf(udf);
+        replaced_analyzer || replaced_exec
+    }
+
+    /// Register a numeric scalar UDF type resolver only.
+    ///
+    /// Useful when expression type can be inferred as numeric passthrough.
+    pub fn register_numeric_udf_type(&self, name: impl Into<String>) -> bool {
+        self.session
+            .planner
+            .register_numeric_passthrough_udf_type(name)
+    }
+
+    /// Deregister a scalar UDF by name from planner and execution registries.
+    ///
+    /// Returns `true` when an existing registration was removed.
+    pub fn deregister_scalar_udf(&self, name: &str) -> bool {
+        let a = self.session.planner.deregister_scalar_udf_type(name);
+        let b = deregister_scalar_udf(name);
+        a || b
+    }
+
+    /// Register a custom physical operator factory.
+    ///
+    /// This registry is used as the extension point for custom runtime
+    /// operators in v2.
+    pub fn register_physical_operator_factory(
+        &self,
+        factory: Arc<dyn PhysicalOperatorFactory>,
+    ) -> bool {
+        self.session.physical_registry.register(factory)
+    }
+
+    /// Deregister a custom physical operator factory by name.
+    pub fn deregister_physical_operator_factory(&self, name: &str) -> bool {
+        self.session.physical_registry.deregister(name)
+    }
+
+    /// List registered custom physical operator factory names.
+    pub fn list_physical_operator_factories(&self) -> Vec<String> {
+        self.session.physical_registry.names()
     }
 
     #[cfg(feature = "profiling")]
