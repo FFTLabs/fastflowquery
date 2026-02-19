@@ -19,6 +19,8 @@ pub enum PhysicalPlan {
     InSubqueryFilter(InSubqueryFilterExec),
     /// Uncorrelated EXISTS-subquery filter.
     ExistsSubqueryFilter(ExistsSubqueryFilterExec),
+    /// Uncorrelated scalar-subquery comparison filter.
+    ScalarSubqueryFilter(ScalarSubqueryFilterExec),
     /// Projection.
     Project(ProjectExec),
     /// Batch coalescing.
@@ -57,6 +59,7 @@ impl PhysicalPlan {
             PhysicalPlan::Filter(x) => vec![x.input.as_ref()],
             PhysicalPlan::InSubqueryFilter(x) => vec![x.input.as_ref(), x.subquery.as_ref()],
             PhysicalPlan::ExistsSubqueryFilter(x) => vec![x.input.as_ref(), x.subquery.as_ref()],
+            PhysicalPlan::ScalarSubqueryFilter(x) => vec![x.input.as_ref(), x.subquery.as_ref()],
             PhysicalPlan::Project(x) => vec![x.input.as_ref()],
             PhysicalPlan::CoalesceBatches(x) => vec![x.input.as_ref()],
             PhysicalPlan::PartialHashAggregate(x) => vec![x.input.as_ref()],
@@ -132,6 +135,19 @@ pub struct ExistsSubqueryFilterExec {
     pub subquery: Box<PhysicalPlan>,
     /// `true` for NOT EXISTS behavior.
     pub negated: bool,
+}
+
+/// Physical uncorrelated scalar-subquery comparison filter operator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScalarSubqueryFilterExec {
+    /// Input plan.
+    pub input: Box<PhysicalPlan>,
+    /// Left expression evaluated on input batches.
+    pub expr: Expr,
+    /// Comparison operator.
+    pub op: crate::logical_plan::BinaryOp,
+    /// Scalar subquery plan (must output one column, <= 1 row).
+    pub subquery: Box<PhysicalPlan>,
 }
 
 /// Projection operator.

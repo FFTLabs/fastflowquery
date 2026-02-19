@@ -677,6 +677,7 @@ fn operator_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Filter(_) => "Filter",
         PhysicalPlan::InSubqueryFilter(_) => "InSubqueryFilter",
         PhysicalPlan::ExistsSubqueryFilter(_) => "ExistsSubqueryFilter",
+        PhysicalPlan::ScalarSubqueryFilter(_) => "ScalarSubqueryFilter",
         PhysicalPlan::Project(_) => "Project",
         PhysicalPlan::CoalesceBatches(_) => "CoalesceBatches",
         PhysicalPlan::PartialHashAggregate(_) => "PartialHashAggregate",

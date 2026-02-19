@@ -52,6 +52,21 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!("{pad}  subquery:\n"));
             fmt_plan(subquery, indent + 2, out);
         }
+        LogicalPlan::ScalarSubqueryFilter {
+            input,
+            expr,
+            op,
+            subquery,
+        } => {
+            out.push_str(&format!(
+                "{pad}ScalarSubqueryFilter expr={} op={op:?}\n",
+                fmt_expr(expr)
+            ));
+            out.push_str(&format!("{pad}  input:\n"));
+            fmt_plan(input, indent + 2, out);
+            out.push_str(&format!("{pad}  subquery:\n"));
+            fmt_plan(subquery, indent + 2, out);
+        }
         LogicalPlan::Projection { exprs, input } => {
             out.push_str(&format!("{pad}Projection\n"));
             for (e, name) in exprs {

@@ -304,6 +304,50 @@ fn where_to_plan(
             subquery: Box::new(query_to_logical_with_ctes(subquery, params, ctes)?),
             negated: *negated,
         }),
+        SqlExpr::BinaryOp { left, op, right } => {
+            match (&**left, &**right) {
+                (SqlExpr::Subquery(sub), rhs_expr) => {
+                    let mapped_op = sql_binop_to_binop(op)?;
+                    let reversed = reverse_comparison_op(mapped_op).ok_or_else(|| {
+                        FfqError::Unsupported(format!(
+                            "scalar subquery only supports comparison operators (=, !=, <, <=, >, >=), got {op}"
+                        ))
+                    })?;
+                    Ok(LogicalPlan::ScalarSubqueryFilter {
+                        input: Box::new(input),
+                        expr: sql_expr_to_expr(rhs_expr, params)?,
+                        op: reversed,
+                        subquery: Box::new(query_to_logical_with_ctes(sub, params, ctes)?),
+                    })
+                }
+                (lhs_expr, SqlExpr::Subquery(sub)) => {
+                    let mapped_op = sql_binop_to_binop(op)?;
+                    match mapped_op {
+                        BinaryOp::Eq
+                        | BinaryOp::NotEq
+                        | BinaryOp::Lt
+                        | BinaryOp::LtEq
+                        | BinaryOp::Gt
+                        | BinaryOp::GtEq => Ok(LogicalPlan::ScalarSubqueryFilter {
+                            input: Box::new(input),
+                            expr: sql_expr_to_expr(lhs_expr, params)?,
+                            op: mapped_op,
+                            subquery: Box::new(query_to_logical_with_ctes(sub, params, ctes)?),
+                        }),
+                        _ => Err(FfqError::Unsupported(format!(
+                            "scalar subquery only supports comparison operators (=, !=, <, <=, >, >=), got {op}"
+                        ))),
+                    }
+                }
+                _ => {
+                    let pred = sql_expr_to_expr(selection, params)?;
+                    Ok(LogicalPlan::Filter {
+                        predicate: pred,
+                        input: Box::new(input),
+                    })
+                }
+            }
+        }
         _ => {
             let pred = sql_expr_to_expr(selection, params)?;
             Ok(LogicalPlan::Filter {
@@ -312,6 +356,18 @@ fn where_to_plan(
             })
         }
     }
+}
+
+fn reverse_comparison_op(op: BinaryOp) -> Option<BinaryOp> {
+    Some(match op {
+        BinaryOp::Eq => BinaryOp::Eq,
+        BinaryOp::NotEq => BinaryOp::NotEq,
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        _ => return None,
+    })
 }
 
 fn join_constraint_to_on_pairs(constraint: &JoinConstraint) -> Result<Vec<(String, String)>> {
@@ -835,6 +891,20 @@ mod tests {
             LogicalPlan::Projection { input, .. } => match input.as_ref() {
                 LogicalPlan::ExistsSubqueryFilter { .. } => {}
                 other => panic!("expected ExistsSubqueryFilter, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_scalar_subquery_filter() {
+        let plan =
+            sql_to_logical("SELECT a FROM t WHERE a = (SELECT max(b) FROM s)", &HashMap::new())
+                .expect("parse");
+        match plan {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::ScalarSubqueryFilter { .. } => {}
+                other => panic!("expected ScalarSubqueryFilter, got {other:?}"),
             },
             other => panic!("expected Projection, got {other:?}"),
         }

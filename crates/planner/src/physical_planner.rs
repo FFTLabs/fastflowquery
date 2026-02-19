@@ -4,8 +4,8 @@ use crate::logical_plan::{Expr, JoinStrategyHint, LogicalPlan};
 use crate::physical_plan::{
     BroadcastExchange, BuildSide, ExchangeExec, FilterExec, FinalHashAggregateExec, HashJoinExec,
     InSubqueryFilterExec, ExistsSubqueryFilterExec, LimitExec, ParquetScanExec, ParquetWriteExec,
-    PartialHashAggregateExec, PartitioningSpec, PhysicalPlan, ProjectExec, ShuffleReadExchange,
-    ShuffleWriteExchange, TopKByScoreExec,
+    ScalarSubqueryFilterExec, PartialHashAggregateExec, PartitioningSpec, PhysicalPlan, ProjectExec,
+    ShuffleReadExchange, ShuffleWriteExchange, TopKByScoreExec,
 };
 
 #[derive(Debug, Clone)]
@@ -83,6 +83,21 @@ pub fn create_physical_plan(
                 input: Box::new(child),
                 subquery: Box::new(sub),
                 negated: *negated,
+            }))
+        }
+        LogicalPlan::ScalarSubqueryFilter {
+            input,
+            expr,
+            op,
+            subquery,
+        } => {
+            let child = create_physical_plan(input, cfg)?;
+            let sub = create_physical_plan(subquery, cfg)?;
+            Ok(PhysicalPlan::ScalarSubqueryFilter(ScalarSubqueryFilterExec {
+                input: Box::new(child),
+                expr: expr.clone(),
+                op: *op,
+                subquery: Box::new(sub),
             }))
         }
 

@@ -30,7 +30,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result};
 use ffq_execution::{SendableRecordBatchStream, StreamAdapter, TaskContext, compile_expr};
-use ffq_planner::{AggExpr, BuildSide, ExchangeExec, Expr, JoinType, PhysicalPlan};
+use ffq_planner::{AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, JoinType, PhysicalPlan};
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
 use ffq_storage::qdrant_provider::QdrantProvider;
@@ -333,6 +333,31 @@ fn execute_plan(
                     in_bytes,
                 })
             }
+            PhysicalPlan::ScalarSubqueryFilter(exec) => {
+                let child = execute_plan(
+                    *exec.input,
+                    ctx.clone(),
+                    catalog.clone(),
+                    Arc::clone(&physical_registry),
+                    Arc::clone(&trace),
+                )
+                .await?;
+                let sub = execute_plan(
+                    *exec.subquery,
+                    ctx,
+                    catalog,
+                    Arc::clone(&physical_registry),
+                    Arc::clone(&trace),
+                )
+                .await?;
+                let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                Ok(OpEval {
+                    out: run_scalar_subquery_filter(child, exec.expr, exec.op, sub)?,
+                    in_rows,
+                    in_batches,
+                    in_bytes,
+                })
+            }
             PhysicalPlan::Limit(limit) => {
                 let child = execute_plan(
                     *limit.input,
@@ -599,6 +624,7 @@ fn operator_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Filter(_) => "Filter",
         PhysicalPlan::InSubqueryFilter(_) => "InSubqueryFilter",
         PhysicalPlan::ExistsSubqueryFilter(_) => "ExistsSubqueryFilter",
+        PhysicalPlan::ScalarSubqueryFilter(_) => "ScalarSubqueryFilter",
         PhysicalPlan::Project(_) => "Project",
         PhysicalPlan::CoalesceBatches(_) => "CoalesceBatches",
         PhysicalPlan::PartialHashAggregate(_) => "PartialHashAggregate",
@@ -1176,6 +1202,102 @@ fn run_in_subquery_filter(
         schema: input.schema,
         batches: out_batches,
     })
+}
+
+fn run_scalar_subquery_filter(
+    input: ExecOutput,
+    expr: Expr,
+    op: BinaryOp,
+    subquery: ExecOutput,
+) -> Result<ExecOutput> {
+    let scalar = scalar_subquery_value(&subquery)?;
+    let eval = compile_expr(&expr, &input.schema)?;
+    let mut out_batches = Vec::with_capacity(input.batches.len());
+    for batch in &input.batches {
+        let values = eval.evaluate(batch)?;
+        let mut mask_builder = BooleanBuilder::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let keep = if values.is_null(row) {
+                false
+            } else {
+                let lhs = scalar_from_array(&values, row)?;
+                compare_scalar_values(op, &lhs, &scalar).unwrap_or(false)
+            };
+            mask_builder.append_value(keep);
+        }
+        let mask = mask_builder.finish();
+        let filtered = arrow::compute::filter_record_batch(batch, &mask)
+            .map_err(|e| FfqError::Execution(format!("scalar-subquery filter batch failed: {e}")))?;
+        out_batches.push(filtered);
+    }
+    Ok(ExecOutput {
+        schema: input.schema,
+        batches: out_batches,
+    })
+}
+
+fn scalar_subquery_value(subquery: &ExecOutput) -> Result<ScalarValue> {
+    if subquery.schema.fields().len() != 1 {
+        return Err(FfqError::Planning(
+            "scalar subquery must produce exactly one column".to_string(),
+        ));
+    }
+    let mut seen: Option<ScalarValue> = None;
+    let mut rows = 0usize;
+    for batch in &subquery.batches {
+        if batch.num_columns() != 1 {
+            return Err(FfqError::Planning(
+                "scalar subquery must produce exactly one column".to_string(),
+            ));
+        }
+        for row in 0..batch.num_rows() {
+            rows += 1;
+            if rows > 1 {
+                return Err(FfqError::Execution(
+                    "scalar subquery returned more than one row".to_string(),
+                ));
+            }
+            seen = Some(scalar_from_array(batch.column(0), row)?);
+        }
+    }
+    Ok(seen.unwrap_or(ScalarValue::Null))
+}
+
+fn compare_scalar_values(op: BinaryOp, lhs: &ScalarValue, rhs: &ScalarValue) -> Option<bool> {
+    use ScalarValue::*;
+    if matches!(lhs, Null) || matches!(rhs, Null) {
+        return None;
+    }
+    let numeric_cmp = |a: f64, b: f64| match op {
+        BinaryOp::Eq => Some(a == b),
+        BinaryOp::NotEq => Some(a != b),
+        BinaryOp::Lt => Some(a < b),
+        BinaryOp::LtEq => Some(a <= b),
+        BinaryOp::Gt => Some(a > b),
+        BinaryOp::GtEq => Some(a >= b),
+        _ => None,
+    };
+    match (lhs, rhs) {
+        (Int64(a), Int64(b)) => numeric_cmp(*a as f64, *b as f64),
+        (Float64Bits(a), Float64Bits(b)) => numeric_cmp(f64::from_bits(*a), f64::from_bits(*b)),
+        (Int64(a), Float64Bits(b)) => numeric_cmp(*a as f64, f64::from_bits(*b)),
+        (Float64Bits(a), Int64(b)) => numeric_cmp(f64::from_bits(*a), *b as f64),
+        (Utf8(a), Utf8(b)) => match op {
+            BinaryOp::Eq => Some(a == b),
+            BinaryOp::NotEq => Some(a != b),
+            BinaryOp::Lt => Some(a < b),
+            BinaryOp::LtEq => Some(a <= b),
+            BinaryOp::Gt => Some(a > b),
+            BinaryOp::GtEq => Some(a >= b),
+            _ => None,
+        },
+        (Boolean(a), Boolean(b)) => match op {
+            BinaryOp::Eq => Some(a == b),
+            BinaryOp::NotEq => Some(a != b),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn subquery_membership_set(subquery: &ExecOutput) -> Result<HashSet<ScalarValue>> {

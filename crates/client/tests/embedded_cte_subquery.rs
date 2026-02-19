@@ -101,3 +101,29 @@ fn uncorrelated_exists_subquery_runs() {
     let _ = std::fs::remove_file(t_path);
     let _ = std::fs::remove_file(s_path);
 }
+
+#[test]
+fn scalar_subquery_comparison_runs() {
+    let (engine, t_path, s_path) = make_engine();
+    let sql = "SELECT k FROM t WHERE k = (SELECT max(k2) FROM s)";
+    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let values = batches.iter().flat_map(|b| int64_values(b, 0)).collect::<Vec<_>>();
+    assert_eq!(values, vec![3]);
+    let _ = std::fs::remove_file(t_path);
+    let _ = std::fs::remove_file(s_path);
+}
+
+#[test]
+fn scalar_subquery_errors_on_multiple_rows() {
+    let (engine, t_path, s_path) = make_engine();
+    let sql = "SELECT k FROM t WHERE k = (SELECT k2 FROM s)";
+    let err = futures::executor::block_on(engine.sql(sql).expect("sql").collect())
+        .expect_err("expected scalar-subquery multi-row error");
+    assert!(
+        err.to_string()
+            .contains("scalar subquery returned more than one row"),
+        "unexpected error: {err}"
+    );
+    let _ = std::fs::remove_file(t_path);
+    let _ = std::fs::remove_file(s_path);
+}

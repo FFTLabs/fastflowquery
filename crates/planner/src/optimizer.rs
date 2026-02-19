@@ -429,6 +429,26 @@ fn proj_rewrite(
                 child_req,
             ))
         }
+        LogicalPlan::ScalarSubqueryFilter {
+            input,
+            expr,
+            op,
+            subquery,
+        } => {
+            let mut req = required.unwrap_or_default();
+            req.extend(expr_columns(&expr));
+            let (new_in, child_req) = proj_rewrite(*input, Some(req), ctx)?;
+            let (new_sub, _sub_req) = proj_rewrite(*subquery, None, ctx)?;
+            Ok((
+                LogicalPlan::ScalarSubqueryFilter {
+                    input: Box::new(new_in),
+                    expr,
+                    op,
+                    subquery: Box::new(new_sub),
+                },
+                child_req,
+            ))
+        }
 
         LogicalPlan::Projection { exprs, input } => {
             // Optional column pruning: if parent only needs subset of projection outputs,
@@ -843,6 +863,17 @@ fn vector_index_rewrite(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result
             input: Box::new(vector_index_rewrite(*input, ctx)?),
             subquery: Box::new(vector_index_rewrite(*subquery, ctx)?),
             negated,
+        }),
+        LogicalPlan::ScalarSubqueryFilter {
+            input,
+            expr,
+            op,
+            subquery,
+        } => Ok(LogicalPlan::ScalarSubqueryFilter {
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+            expr,
+            op,
+            subquery: Box::new(vector_index_rewrite(*subquery, ctx)?),
         }),
         LogicalPlan::Projection { exprs, input } => {
             let rewritten_input = vector_index_rewrite(*input, ctx)?;
@@ -1283,6 +1314,17 @@ fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy
             subquery: Box::new(f(*subquery)),
             negated,
         },
+        LogicalPlan::ScalarSubqueryFilter {
+            input,
+            expr,
+            op,
+            subquery,
+        } => LogicalPlan::ScalarSubqueryFilter {
+            input: Box::new(f(*input)),
+            expr,
+            op,
+            subquery: Box::new(f(*subquery)),
+        },
         LogicalPlan::Projection { exprs, input } => LogicalPlan::Projection {
             exprs,
             input: Box::new(f(*input)),
@@ -1371,6 +1413,17 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
             subquery: Box::new(rewrite_plan_exprs(*subquery, rewrite)),
             negated,
+        },
+        LogicalPlan::ScalarSubqueryFilter {
+            input,
+            expr,
+            op,
+            subquery,
+        } => LogicalPlan::ScalarSubqueryFilter {
+            input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+            expr: rewrite_expr(expr, rewrite),
+            op,
+            subquery: Box::new(rewrite_plan_exprs(*subquery, rewrite)),
         },
         LogicalPlan::Projection { exprs, input } => LogicalPlan::Projection {
             exprs: exprs
@@ -1627,6 +1680,7 @@ fn plan_output_columns(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result
         LogicalPlan::Filter { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::InSubqueryFilter { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::ExistsSubqueryFilter { input, .. } => plan_output_columns(input, ctx),
+        LogicalPlan::ScalarSubqueryFilter { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::Limit { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::TopKByScore { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::Projection { exprs, .. } => Ok(exprs.iter().map(|(_, n)| n.clone()).collect()),
@@ -1660,6 +1714,7 @@ fn estimate_bytes(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result<Opti
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::InSubqueryFilter { input, .. }
         | LogicalPlan::ExistsSubqueryFilter { input, .. }
+        | LogicalPlan::ScalarSubqueryFilter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Limit { input, .. }

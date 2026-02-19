@@ -223,6 +223,45 @@ impl Analyzer {
                     out_resolver,
                 ))
             }
+            LogicalPlan::ScalarSubqueryFilter {
+                input,
+                expr,
+                op,
+                subquery,
+            } => {
+                let (ain, in_schema, in_resolver) = self.analyze_plan(*input, provider)?;
+                let (asub, sub_schema, _sub_resolver) = self.analyze_plan(*subquery, provider)?;
+                if sub_schema.fields().len() != 1 {
+                    return Err(FfqError::Planning(
+                        "scalar subquery must return exactly one column".to_string(),
+                    ));
+                }
+                let sub_col_name = sub_schema.field(0).name().clone();
+                let sub_col_dt = sub_schema.field(0).data_type().clone();
+                let (aexpr, expr_dt) = self.analyze_expr(expr, &in_resolver)?;
+                let sub_expr = Expr::ColumnRef {
+                    name: sub_col_name,
+                    index: 0,
+                };
+                let (coerced_left, coerced_sub, _target) =
+                    coerce_for_compare(aexpr, expr_dt, sub_expr, sub_col_dt)?;
+                let coerced_subquery = LogicalPlan::Projection {
+                    exprs: vec![(coerced_sub, "__scalar".to_string())],
+                    input: Box::new(asub),
+                };
+                let out_schema = in_schema.clone();
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                Ok((
+                    LogicalPlan::ScalarSubqueryFilter {
+                        input: Box::new(ain),
+                        expr: coerced_left,
+                        op,
+                        subquery: Box::new(coerced_subquery),
+                    },
+                    out_schema,
+                    out_resolver,
+                ))
+            }
 
             LogicalPlan::Projection { exprs, input } => {
                 let (ain, _in_schema, in_resolver) = self.analyze_plan(*input, provider)?;

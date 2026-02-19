@@ -213,6 +213,20 @@ pub enum LogicalPlan {
         /// `true` for `NOT EXISTS`.
         negated: bool,
     },
+    /// Uncorrelated scalar-subquery comparison filter.
+    ///
+    /// Represents predicates like `a < (SELECT ...)` where subquery must
+    /// produce exactly one column and at most one row.
+    ScalarSubqueryFilter {
+        /// Left input.
+        input: Box<LogicalPlan>,
+        /// Left expression evaluated on input rows.
+        expr: Expr,
+        /// Comparison operator.
+        op: BinaryOp,
+        /// Uncorrelated scalar subquery plan.
+        subquery: Box<LogicalPlan>,
+    },
     /// Equi-join two inputs using `on` key pairs.
     Join {
         /// Left input.

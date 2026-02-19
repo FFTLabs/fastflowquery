@@ -515,6 +515,12 @@ fn collect_table_refs(plan: &LogicalPlan, out: &mut Vec<String>) {
             collect_table_refs(input, out);
             collect_table_refs(subquery, out);
         }
+        LogicalPlan::ScalarSubqueryFilter {
+            input, subquery, ..
+        } => {
+            collect_table_refs(input, out);
+            collect_table_refs(subquery, out);
+        }
         LogicalPlan::Join { left, right, .. } => {
             collect_table_refs(left, out);
             collect_table_refs(right, out);
