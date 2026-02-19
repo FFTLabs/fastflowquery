@@ -40,6 +40,8 @@ pub mod repl;
 pub mod tpch_tbl;
 #[cfg(feature = "ffi")]
 mod ffi;
+#[cfg(feature = "python")]
+mod python;
 
 pub use dataframe::{DataFrame, WriteMode};
 pub use engine::Engine;

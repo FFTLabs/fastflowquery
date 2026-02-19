@@ -34,6 +34,10 @@ FFI (C ABI) reference:
 
 1. `docs/dev/ffi-c-api.md`
 
+Python bindings reference:
+
+1. `docs/dev/python-bindings.md`
+
 For a concept-first deep guide (architecture, optimizer, distributed control plane, labs, glossary, FAQ):
 
 1. `docs/learn/README.md`

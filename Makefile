@@ -35,7 +35,9 @@ SHELL := /bin/bash
 	repl \
 	repl-smoke \
 	ffi-build \
-	ffi-example
+	ffi-example \
+	python-wheel \
+	python-dev-install
 
 clean:
 	cargo clean
@@ -159,3 +161,11 @@ ffi-build:
 
 ffi-example:
 	./scripts/run-ffi-c-example.sh "$${PARQUET_PATH:-tests/fixtures/parquet/lineitem.parquet}"
+
+python-wheel:
+	python -m pip install --upgrade maturin
+	maturin build --release
+
+python-dev-install:
+	python -m pip install --upgrade maturin
+	maturin develop --features python

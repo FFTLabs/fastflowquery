@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ffq"
+version = "2.0.0"
+description = "FastFlowQuery Python bindings"
+readme = "Readme.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "FFQ Contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+pyarrow = ["pyarrow>=14"]
+
+[tool.maturin]
+manifest-path = "crates/client/Cargo.toml"
+module-name = "ffq._native"
+features = ["python"]
+bindings = "pyo3"
+python-source = "python"
