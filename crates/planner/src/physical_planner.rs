@@ -8,6 +8,7 @@ use crate::physical_plan::{
 };
 
 #[derive(Debug, Clone)]
+/// Physical planning knobs that control exchange fanout and output batch sizing.
 pub struct PhysicalPlannerConfig {
     /// Number of hash partitions used by shuffle exchanges.
     pub shuffle_partitions: usize,

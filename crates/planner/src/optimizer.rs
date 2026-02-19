@@ -20,6 +20,7 @@ impl Default for OptimizerConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Table metadata exposed to optimizer rewrite rules.
 pub struct TableMetadata {
     /// Storage format (for example `parquet`, `qdrant`).
     pub format: String,
@@ -32,14 +33,17 @@ pub trait OptimizerContext: SchemaProvider {
     /// Return `(bytes, rows)` estimates for a table.
     fn table_stats(&self, table: &str) -> Result<(Option<u64>, Option<u64>)>; // (bytes, rows)
 
+    /// Return table metadata used by rewrite rules.
     fn table_metadata(&self, _table: &str) -> Result<Option<TableMetadata>> {
         Ok(None)
     }
 
+    /// Convenience getter for table format.
     fn table_format(&self, table: &str) -> Result<Option<String>> {
         Ok(self.table_metadata(table)?.map(|m| m.format))
     }
 
+    /// Convenience getter for table options map.
     fn table_options(&self, table: &str) -> Result<Option<HashMap<String, String>>> {
         Ok(self.table_metadata(table)?.map(|m| m.options))
     }

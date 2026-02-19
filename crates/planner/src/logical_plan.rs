@@ -32,17 +32,30 @@ pub enum Expr {
     /// Unresolved column name (before analysis).
     Column(String),
     /// Resolved column binding emitted by analyzer.
-    ColumnRef { name: String, index: usize },
+    ColumnRef {
+        /// Resolved display name.
+        name: String,
+        /// Resolved column index in input schema.
+        index: usize,
+    },
     /// Scalar literal.
     Literal(LiteralValue),
     /// Binary operator expression.
     BinaryOp {
+        /// Left operand.
         left: Box<Expr>,
+        /// Binary operator.
         op: BinaryOp,
+        /// Right operand.
         right: Box<Expr>,
     },
     /// Explicit type cast.
-    Cast { expr: Box<Expr>, to_type: DataType },
+    Cast {
+        /// Input expression.
+        expr: Box<Expr>,
+        /// Target type.
+        to_type: DataType,
+    },
     /// Boolean conjunction.
     And(Box<Expr>, Box<Expr>),
     /// Boolean disjunction.
@@ -61,10 +74,15 @@ pub enum Expr {
 /// Literal values supported by the v1 planner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LiteralValue {
+    /// 64-bit integer literal.
     Int64(i64),
+    /// 64-bit floating literal.
     Float64(f64),
+    /// UTF-8 string literal.
     Utf8(String),
+    /// Boolean literal.
     Boolean(bool),
+    /// Null literal.
     Null,
 
     #[cfg(feature = "vector")]
@@ -74,15 +92,25 @@ pub enum LiteralValue {
 /// Binary operators supported by v1 expression evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinaryOp {
+    /// Equality.
     Eq,
+    /// Inequality.
     NotEq,
+    /// Less-than.
     Lt,
+    /// Less-than or equal.
     LtEq,
+    /// Greater-than.
     Gt,
+    /// Greater-than or equal.
     GtEq,
+    /// Addition.
     Plus,
+    /// Subtraction.
     Minus,
+    /// Multiplication.
     Multiply,
+    /// Division.
     Divide,
 }
 
@@ -99,26 +127,38 @@ pub enum BinaryOp {
 pub enum LogicalPlan {
     /// Scan a catalog table.
     TableScan {
+        /// Catalog table name.
         table: String,
+        /// Optional projected column names.
         projection: Option<Vec<String>>,
+        /// Best-effort pushdown filters.
         filters: Vec<Expr>,
     },
     /// Compute named expressions from input rows.
     Projection {
+        /// `(expr, output_name)` pairs.
         exprs: Vec<(Expr, String)>,
+        /// Input plan.
         input: Box<LogicalPlan>,
     },
     /// Keep rows matching predicate.
     Filter {
+        /// Boolean predicate.
         predicate: Expr,
+        /// Input plan.
         input: Box<LogicalPlan>,
     },
     /// Equi-join two inputs using `on` key pairs.
     Join {
+        /// Left input.
         left: Box<LogicalPlan>,
+        /// Right input.
         right: Box<LogicalPlan>,
+        /// Join key pairs `(left_col, right_col)`.
         on: Vec<(String, String)>,
+        /// Join type.
         join_type: JoinType,
+        /// Distribution strategy hint.
         strategy_hint: JoinStrategyHint,
     },
     /// Grouped aggregate.
@@ -126,34 +166,52 @@ pub enum LogicalPlan {
     /// `group_exprs` define grouping keys; `aggr_exprs` define aggregate
     /// outputs and aliases.
     Aggregate {
+        /// Grouping expressions.
         group_exprs: Vec<Expr>,
+        /// Aggregate expressions and aliases.
         aggr_exprs: Vec<(AggExpr, String)>,
+        /// Input plan.
         input: Box<LogicalPlan>,
     },
     /// Return at most `n` rows.
-    Limit { n: usize, input: Box<LogicalPlan> },
+    Limit {
+        /// Maximum number of rows.
+        n: usize,
+        /// Input plan.
+        input: Box<LogicalPlan>,
+    },
     /// Return top `k` rows by score expression.
     ///
     /// This is used for brute-force vector reranking and remains the fallback
     /// when index-backed rewrite preconditions fail.
     TopKByScore {
+        /// Score expression.
         score_expr: Expr,
+        /// Number of rows to keep.
         k: usize,
+        /// Input plan.
         input: Box<LogicalPlan>,
     },
     /// Index-backed vector top-k logical operator.
     ///
     /// Rewritten from `TopKByScore` only when optimizer preconditions are met.
     VectorTopK {
+        /// Table name.
         table: String,
+        /// Query vector literal.
         query_vector: Vec<f32>,
+        /// Number of rows to keep.
         k: usize,
+        /// Optional provider-specific filter payload.
         filter: Option<String>,
     },
     /// Insert query result into a target table.
     InsertInto {
+        /// Target table.
         table: String,
+        /// Target column list.
         columns: Vec<String>,
+        /// Input plan.
         input: Box<LogicalPlan>,
     },
 }
@@ -161,9 +219,14 @@ pub enum LogicalPlan {
 /// Aggregate expression kinds supported by v1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AggExpr {
+    /// Count non-null input rows.
     Count(Expr),
+    /// Sum numeric input.
     Sum(Expr),
+    /// Minimum input value.
     Min(Expr),
+    /// Maximum input value.
     Max(Expr),
+    /// Average numeric input.
     Avg(Expr),
 }

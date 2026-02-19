@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Logical/physical planning stack for FFQ SQL and DataFrame execution.
 //!
 //! Architecture role:
@@ -16,12 +18,19 @@
 //! Feature flags:
 //! - vector and qdrant-related rewrites are conditionally compiled via crate features.
 
+/// Semantic analyzer and schema resolution.
 pub mod analyzer;
+/// Logical plan explain/pretty formatting helpers.
 pub mod explain;
+/// Logical plan and expression model.
 pub mod logical_plan;
+/// Rule-based logical optimizer.
 pub mod optimizer;
+/// Physical operator plan model.
 pub mod physical_plan;
+/// Logical-to-physical lowering.
 pub mod physical_planner;
+/// SQL frontend translation into logical plans.
 pub mod sql_frontend;
 
 pub use analyzer::*;

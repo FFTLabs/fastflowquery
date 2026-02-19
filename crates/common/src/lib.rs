@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Shared configuration, error types, IDs, and observability primitives for FFQ crates.
 //!
 //! Architecture role:
@@ -15,11 +17,16 @@
 //! Feature flags:
 //! - `profiling`: enables the metrics HTTP exporter helpers.
 
+/// Shared engine/runtime configuration types.
 pub mod config;
+/// Shared error taxonomy.
 pub mod error;
+/// Strongly-typed identifier wrappers.
 pub mod ids;
+/// Metrics registry and Prometheus rendering helpers.
 pub mod metrics;
 #[cfg(feature = "profiling")]
+/// Optional HTTP metrics exporter.
 pub mod metrics_exporter;
 
 pub use config::{EngineConfig, SchemaDriftPolicy, SchemaInferencePolicy};

@@ -8,10 +8,12 @@ use crate::logical_plan::{AggExpr, BinaryOp, Expr, JoinType, LiteralValue, Logic
 /// The analyzer needs schemas to resolve columns.
 /// The client (Engine) will provide this from its Catalog.
 pub trait SchemaProvider {
+    /// Return schema for a table by name.
     fn table_schema(&self, table: &str) -> Result<SchemaRef>;
 }
 
 #[derive(Debug, Default)]
+/// Logical-plan semantic analyzer.
 pub struct Analyzer;
 
 impl Analyzer {

@@ -4,6 +4,7 @@ use prometheus::{
     CounterVec, Encoder, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
 };
 
+/// Shared metrics registry for query/operator/shuffle/spill/scheduler telemetry.
 #[derive(Clone, Debug)]
 pub struct MetricsRegistry {
     inner: Arc<MetricsInner>,
@@ -32,12 +33,14 @@ struct MetricsInner {
 }
 
 impl MetricsRegistry {
+    /// Create a new in-memory Prometheus registry with FFQ metric families.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(MetricsInner::new()),
         }
     }
 
+    /// Record per-operator throughput and latency metrics.
     pub fn record_operator(
         &self,
         query_id: &str,
@@ -88,6 +91,7 @@ impl MetricsRegistry {
             .observe(secs.max(0.0));
     }
 
+    /// Record shuffle write metrics for one task.
     pub fn record_shuffle_write(
         &self,
         query_id: &str,
@@ -112,6 +116,7 @@ impl MetricsRegistry {
             .observe(secs.max(0.0));
     }
 
+    /// Record shuffle read metrics for one task.
     pub fn record_shuffle_read(
         &self,
         query_id: &str,
@@ -136,6 +141,7 @@ impl MetricsRegistry {
             .observe(secs.max(0.0));
     }
 
+    /// Record spill bytes/time metrics for one task and spill kind.
     pub fn record_spill(
         &self,
         query_id: &str,
@@ -156,6 +162,7 @@ impl MetricsRegistry {
             .observe(secs.max(0.0));
     }
 
+    /// Set current scheduler queued-task gauge for one stage.
     pub fn set_scheduler_queued_tasks(&self, query_id: &str, stage_id: u64, queued: u64) {
         let labels = [query_id, &stage_id.to_string()];
         self.inner
@@ -164,6 +171,7 @@ impl MetricsRegistry {
             .set(queued as f64);
     }
 
+    /// Set current scheduler running-task gauge for one stage.
     pub fn set_scheduler_running_tasks(&self, query_id: &str, stage_id: u64, running: u64) {
         let labels = [query_id, &stage_id.to_string()];
         self.inner
@@ -172,6 +180,7 @@ impl MetricsRegistry {
             .set(running as f64);
     }
 
+    /// Increment scheduler retry counter for one stage.
     pub fn inc_scheduler_retries(&self, query_id: &str, stage_id: u64) {
         let labels = [query_id, &stage_id.to_string()];
         self.inner
@@ -180,6 +189,7 @@ impl MetricsRegistry {
             .inc();
     }
 
+    /// Render current metrics in Prometheus text exposition format.
     pub fn render_prometheus(&self) -> String {
         let metric_families = self.inner.registry.gather();
         let mut out = Vec::new();
@@ -356,6 +366,7 @@ fn histogram_vec(registry: &Registry, name: &str, help: &str, labels: &[&str]) -
 
 static GLOBAL_METRICS: OnceLock<MetricsRegistry> = OnceLock::new();
 
+/// Returns process-global shared metrics registry singleton.
 pub fn global_metrics() -> &'static MetricsRegistry {
     GLOBAL_METRICS.get_or_init(MetricsRegistry::new)
 }

@@ -8,21 +8,33 @@ use serde::{Deserialize, Serialize};
 /// Later we'll split "physical expr" vs "logical expr" more strictly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PhysicalPlan {
+    /// Parquet table scan.
     ParquetScan(ParquetScanExec),
+    /// Parquet sink write.
     ParquetWrite(ParquetWriteExec),
+    /// Row filter.
     Filter(FilterExec),
+    /// Projection.
     Project(ProjectExec),
+    /// Batch coalescing.
     CoalesceBatches(CoalesceBatchesExec),
 
+    /// Partial aggregate.
     PartialHashAggregate(PartialHashAggregateExec),
+    /// Final aggregate.
     FinalHashAggregate(FinalHashAggregateExec),
 
+    /// Hash join.
     HashJoin(HashJoinExec),
 
+    /// Data exchange boundary.
     Exchange(ExchangeExec),
 
+    /// Limit.
     Limit(LimitExec),
+    /// Brute-force top-k.
     TopKByScore(TopKByScoreExec),
+    /// Index-backed vector top-k.
     VectorTopK(VectorTopKExec),
 }
 
@@ -73,14 +85,18 @@ pub struct ParquetScanExec {
 /// semantics from catalog/table options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParquetWriteExec {
+    /// Target table.
     pub table: String,
+    /// Input plan.
     pub input: Box<PhysicalPlan>,
 }
 
 /// Row filter operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterExec {
+    /// Predicate.
     pub predicate: Expr,
+    /// Input plan.
     pub input: Box<PhysicalPlan>,
 }
 
@@ -89,13 +105,16 @@ pub struct FilterExec {
 pub struct ProjectExec {
     /// (expr, output_name)
     pub exprs: Vec<(Expr, String)>,
+    /// Input plan.
     pub input: Box<PhysicalPlan>,
 }
 
 /// Batch coalescing operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoalesceBatchesExec {
+    /// Desired row count per output batch.
     pub target_batch_rows: usize,
+    /// Input plan.
     pub input: Box<PhysicalPlan>,
 }
 
@@ -105,23 +124,31 @@ pub struct CoalesceBatchesExec {
 /// aggregate semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartialHashAggregateExec {
+    /// Grouping expressions.
     pub group_exprs: Vec<Expr>,
+    /// Aggregate expressions and aliases.
     pub aggr_exprs: Vec<(AggExpr, String)>,
+    /// Input plan.
     pub input: Box<PhysicalPlan>,
 }
 
 /// Phase-2 hash aggregate merging partial states after shuffle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalHashAggregateExec {
+    /// Grouping expressions.
     pub group_exprs: Vec<Expr>,
+    /// Aggregate expressions and aliases.
     pub aggr_exprs: Vec<(AggExpr, String)>,
+    /// Input plan.
     pub input: Box<PhysicalPlan>,
 }
 
 /// Side chosen to build the hash table for [`HashJoinExec`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum BuildSide {
+    /// Build hash table from left input.
     Left,
+    /// Build hash table from right input.
     Right,
 }
 
@@ -134,9 +161,13 @@ pub enum BuildSide {
 /// - `build_side` must match the side expected to be in-memory hash build.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HashJoinExec {
+    /// Left input.
     pub left: Box<PhysicalPlan>,
+    /// Right input.
     pub right: Box<PhysicalPlan>,
+    /// Join key pairs `(left_key, right_key)`.
     pub on: Vec<(String, String)>,
+    /// Join type.
     pub join_type: JoinType,
     /// From optimizer (broadcast/shuffle hint). Physical planner inserts exchanges accordingly.
     pub strategy_hint: JoinStrategyHint,
@@ -147,28 +178,36 @@ pub struct HashJoinExec {
 /// Stage-boundary exchange operators.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExchangeExec {
+    /// Shuffle write boundary.
     ShuffleWrite(ShuffleWriteExchange),
+    /// Shuffle read boundary.
     ShuffleRead(ShuffleReadExchange),
+    /// Broadcast boundary.
     Broadcast(BroadcastExchange),
 }
 
 /// Shuffle write boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShuffleWriteExchange {
+    /// Input plan.
     pub input: Box<PhysicalPlan>,
+    /// Partitioning specification.
     pub partitioning: PartitioningSpec,
 }
 
 /// Shuffle read boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShuffleReadExchange {
+    /// Input plan.
     pub input: Box<PhysicalPlan>,
+    /// Partitioning specification.
     pub partitioning: PartitioningSpec,
 }
 
 /// Broadcast boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BroadcastExchange {
+    /// Input plan.
     pub input: Box<PhysicalPlan>,
 }
 
@@ -177,7 +216,9 @@ pub struct BroadcastExchange {
 pub enum PartitioningSpec {
     /// Hash partition by expressions into N partitions.
     HashKeys {
+        /// Partition key names.
         keys: Vec<String>,
+        /// Partition count.
         partitions: usize,
     },
     /// Single partition.
@@ -187,7 +228,9 @@ pub enum PartitioningSpec {
 /// Limit operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimitExec {
+    /// Maximum number of rows.
     pub n: usize,
+    /// Input plan.
     pub input: Box<PhysicalPlan>,
 }
 
@@ -197,16 +240,23 @@ pub struct LimitExec {
 /// index rewrite does not apply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopKByScoreExec {
+    /// Score expression.
     pub score_expr: Expr,
+    /// Number of rows to keep.
     pub k: usize,
+    /// Input plan.
     pub input: Box<PhysicalPlan>,
 }
 
 /// Index-backed vector top-k physical operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorTopKExec {
+    /// Table name.
     pub table: String,
+    /// Query vector literal.
     pub query_vector: Vec<f32>,
+    /// Number of rows to keep.
     pub k: usize,
+    /// Optional provider-specific filter payload.
     pub filter: Option<String>,
 }

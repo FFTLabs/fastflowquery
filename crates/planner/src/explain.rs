@@ -1,5 +1,6 @@
 use crate::logical_plan::{Expr, JoinStrategyHint, LogicalPlan};
 
+/// Render logical plan as human-readable multiline text.
 pub fn explain_logical(plan: &LogicalPlan) -> String {
     let mut s = String::new();
     fmt_plan(plan, 0, &mut s);
