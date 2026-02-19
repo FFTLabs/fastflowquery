@@ -1,3 +1,17 @@
+//! Coordinator state machine and scheduling logic.
+//!
+//! Responsibilities:
+//! - accept submitted physical plans and cut stage DAGs;
+//! - materialize task attempts and serve pull-based task assignment;
+//! - track query/task status transitions and aggregate stage metrics;
+//! - maintain map-output registry keyed by `(query, stage, map_task, attempt)`;
+//! - enforce basic worker blacklisting/retry behavior.
+//!
+//! Retry semantics:
+//! - attempts are explicit in task and map-output keys;
+//! - fetches must request the intended attempt; stale attempts are not used
+//!   unless caller asks for latest-attempt read path.
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +27,7 @@ use tracing::{debug, info, warn};
 use crate::stage::{StageDag, build_stage_dag};
 
 #[derive(Debug, Clone)]
+/// Coordinator behavior/configuration knobs.
 pub struct CoordinatorConfig {
     pub blacklist_failure_threshold: u32,
     pub shuffle_root: PathBuf,
@@ -30,6 +45,7 @@ impl Default for CoordinatorConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Query lifecycle states tracked by the coordinator.
 pub enum QueryState {
     Queued,
     Running,
@@ -39,6 +55,7 @@ pub enum QueryState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Task lifecycle states tracked by the coordinator.
 pub enum TaskState {
     Queued,
     Running,
@@ -47,6 +64,7 @@ pub enum TaskState {
 }
 
 #[derive(Debug, Clone)]
+/// One schedulable task assignment returned to workers.
 pub struct TaskAssignment {
     pub query_id: String,
     pub stage_id: u64,
@@ -56,6 +74,7 @@ pub struct TaskAssignment {
 }
 
 #[derive(Debug, Clone, Default)]
+/// Aggregated per-stage progress and map-output metrics.
 pub struct StageMetrics {
     pub queued_tasks: u32,
     pub running_tasks: u32,
@@ -67,6 +86,7 @@ pub struct StageMetrics {
 }
 
 #[derive(Debug, Clone)]
+/// Map output metadata for one reduce partition.
 pub struct MapOutputPartitionMeta {
     pub reduce_partition: u32,
     pub bytes: u64,
@@ -75,6 +95,7 @@ pub struct MapOutputPartitionMeta {
 }
 
 #[derive(Debug, Clone)]
+/// Public query status snapshot returned by control-plane APIs.
 pub struct QueryStatus {
     pub query_id: String,
     pub state: QueryState,
@@ -121,6 +142,7 @@ struct QueryRuntime {
 }
 
 #[derive(Debug, Default)]
+/// In-memory coordinator runtime for query/task orchestration.
 pub struct Coordinator {
     config: CoordinatorConfig,
     catalog: Catalog,
@@ -132,6 +154,7 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
+    /// Construct coordinator with an empty catalog.
     pub fn new(config: CoordinatorConfig) -> Self {
         Self {
             config,
@@ -140,6 +163,7 @@ impl Coordinator {
         }
     }
 
+    /// Construct coordinator with a preloaded catalog.
     pub fn with_catalog(config: CoordinatorConfig, catalog: Catalog) -> Self {
         Self {
             config,
@@ -148,6 +172,7 @@ impl Coordinator {
         }
     }
 
+    /// Submit a physical plan and initialize query runtime/task attempts.
     pub fn submit_query(
         &mut self,
         query_id: String,
@@ -239,6 +264,10 @@ impl Coordinator {
         }
     }
 
+    /// Worker pull-scheduling API.
+    ///
+    /// Returns up to `capacity` runnable task attempts for the requesting
+    /// worker, skipping blacklisted workers.
     pub fn get_task(&mut self, worker_id: &str, capacity: u32) -> Result<Vec<TaskAssignment>> {
         if self.blacklisted_workers.contains(worker_id) || capacity == 0 {
             debug!(
@@ -306,6 +335,7 @@ impl Coordinator {
         Ok(out)
     }
 
+    /// Record a task attempt status transition and update query/stage metrics.
     pub fn report_task_status(
         &mut self,
         query_id: &str,
@@ -384,6 +414,7 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Cancel a running/queued query.
     pub fn cancel_query(&mut self, query_id: &str, reason: &str) -> Result<QueryState> {
         let query = self
             .queries
@@ -395,6 +426,7 @@ impl Coordinator {
         Ok(QueryState::Canceled)
     }
 
+    /// Read current query status snapshot.
     pub fn get_query_status(&self, query_id: &str) -> Result<QueryStatus> {
         let query = self
             .queries
@@ -403,6 +435,7 @@ impl Coordinator {
         Ok(build_query_status(query_id, query))
     }
 
+    /// Register map output metadata for one `(query, stage, map_task, attempt)`.
     pub fn register_map_output(
         &mut self,
         query_id: String,
@@ -432,10 +465,12 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Number of registered map-output entries.
     pub fn map_output_registry_size(&self) -> usize {
         self.map_outputs.len()
     }
 
+    /// Store final query result payload (Arrow IPC bytes).
     pub fn register_query_results(&mut self, query_id: String, ipc_payload: Vec<u8>) -> Result<()> {
         if !self.queries.contains_key(&query_id) {
             return Err(FfqError::Planning(format!("unknown query: {query_id}")));
@@ -444,6 +479,7 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Fetch final query result payload.
     pub fn fetch_query_results(&self, query_id: &str) -> Result<Vec<u8>> {
         if !self.queries.contains_key(query_id) {
             return Err(FfqError::Planning(format!("unknown query: {query_id}")));
@@ -454,10 +490,12 @@ impl Coordinator {
             .ok_or_else(|| FfqError::Execution("query results not ready".to_string()))
     }
 
+    /// Returns whether worker is currently blacklisted.
     pub fn is_worker_blacklisted(&self, worker_id: &str) -> bool {
         self.blacklisted_workers.contains(worker_id)
     }
 
+    /// Read shuffle partition bytes for the requested map attempt.
     pub fn fetch_shuffle_partition_chunks(
         &self,
         query_id: &str,

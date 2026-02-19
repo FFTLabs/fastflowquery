@@ -1,3 +1,18 @@
+//! Worker runtime and task execution loop.
+//!
+//! Responsibilities:
+//! - pull task attempts from coordinator (`GetTask`);
+//! - execute stage fragments with shared planner/runtime semantics;
+//! - write/register shuffle outputs for map stages;
+//! - publish final query results for sink stages;
+//! - report task state transitions and heartbeat.
+//!
+//! Retry/attempt semantics:
+//! - each assignment carries an explicit `attempt`;
+//! - map outputs are keyed by `(query, stage, map_task, attempt)`;
+//! - coordinator-side status updates use the same attempt key so stale
+//!   attempts are not mistaken for current progress.
+
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, hash_map::DefaultHasher};
 use std::fs::{self, File};
@@ -35,6 +50,7 @@ use crate::coordinator::{Coordinator, MapOutputPartitionMeta, TaskAssignment, Ta
 use crate::grpc::v1;
 
 #[derive(Debug, Clone)]
+/// Worker resource/configuration controls.
 pub struct WorkerConfig {
     pub worker_id: String,
     pub cpu_slots: usize,
@@ -56,6 +72,7 @@ impl Default for WorkerConfig {
 }
 
 #[derive(Debug, Clone)]
+/// Task-scoped execution context provided to task executors.
 pub struct TaskContext {
     pub query_id: String,
     pub stage_id: u64,
@@ -67,6 +84,7 @@ pub struct TaskContext {
 }
 
 #[derive(Debug, Clone, Default)]
+/// Task execution outputs returned by [`TaskExecutor`].
 pub struct TaskExecutionResult {
     pub map_output_partitions: Vec<MapOutputPartitionMeta>,
     pub output_batches: Vec<RecordBatch>,
@@ -75,6 +93,7 @@ pub struct TaskExecutionResult {
 }
 
 #[async_trait]
+/// Control-plane contract used by worker runtime.
 pub trait WorkerControlPlane: Send + Sync {
     async fn get_task(&self, worker_id: &str, capacity: u32) -> Result<Vec<TaskAssignment>>;
     async fn report_task_status(
@@ -94,6 +113,7 @@ pub trait WorkerControlPlane: Send + Sync {
 }
 
 #[async_trait]
+/// Task execution contract for worker-assigned plan fragments.
 pub trait TaskExecutor: Send + Sync {
     async fn execute(
         &self,
@@ -103,6 +123,7 @@ pub trait TaskExecutor: Send + Sync {
 }
 
 #[derive(Clone, Default)]
+/// Default task executor that evaluates physical plan fragments in-process.
 pub struct DefaultTaskExecutor {
     catalog: Arc<Catalog>,
     sink_outputs: Arc<Mutex<HashMap<String, Vec<RecordBatch>>>>,
@@ -115,6 +136,7 @@ impl std::fmt::Debug for DefaultTaskExecutor {
 }
 
 impl DefaultTaskExecutor {
+    /// Construct executor backed by provided catalog.
     pub fn new(catalog: Arc<Catalog>) -> Self {
         Self {
             catalog,
@@ -122,6 +144,7 @@ impl DefaultTaskExecutor {
         }
     }
 
+    /// Take and clear sink output batches for a query (test helper).
     pub async fn take_query_output(&self, query_id: &str) -> Option<Vec<RecordBatch>> {
         self.sink_outputs.lock().await.remove(query_id)
     }
@@ -219,6 +242,7 @@ where
     C: WorkerControlPlane + 'static,
     E: TaskExecutor + 'static,
 {
+    /// Build worker runtime with control plane and task executor.
     pub fn new(config: WorkerConfig, control_plane: Arc<C>, task_executor: Arc<E>) -> Self {
         let slots = config.cpu_slots.max(1);
         Self {
@@ -229,6 +253,10 @@ where
         }
     }
 
+    /// Perform one poll cycle:
+    /// - pull assignments
+    /// - execute up to available CPU slots
+    /// - report status/map outputs/results
     pub async fn poll_once(&self) -> Result<usize> {
         let capacity = self.cpu_slots.available_permits() as u32;
         if capacity == 0 {

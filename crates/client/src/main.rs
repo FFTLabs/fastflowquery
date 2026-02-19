@@ -72,6 +72,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[derive(Debug, Clone)]
+/// Parsed one-shot query mode CLI options.
 struct QueryOpts {
     sql: String,
     plan_only: bool,
@@ -79,10 +80,15 @@ struct QueryOpts {
 }
 
 #[derive(Debug, Clone)]
+/// Parsed REPL mode CLI options.
 struct ReplOpts {
     config: EngineConfig,
 }
 
+/// Parse query-mode CLI arguments.
+///
+/// Supports both legacy form (`ffq-client "SELECT 1"`) and subcommand form
+/// (`ffq-client query --sql ...`).
 fn parse_query_opts(args: &[String]) -> Result<QueryOpts, Box<dyn std::error::Error>> {
     // Backward-compatible forms:
     //   ffq-client "SELECT 1"
@@ -142,6 +148,7 @@ fn parse_query_opts(args: &[String]) -> Result<QueryOpts, Box<dyn std::error::Er
     })
 }
 
+/// Parse REPL CLI arguments and map into [`EngineConfig`].
 fn parse_repl_opts(args: &[String]) -> Result<ReplOpts, Box<dyn std::error::Error>> {
     let mut config = EngineConfig::default();
     let mut i = 1usize;
@@ -227,6 +234,7 @@ fn parse_repl_opts(args: &[String]) -> Result<ReplOpts, Box<dyn std::error::Erro
     Ok(ReplOpts { config })
 }
 
+/// Print CLI usage for query and REPL modes.
 fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  ffq-client \"<SQL>\"");
@@ -237,6 +245,7 @@ fn print_usage() {
     );
 }
 
+/// Parse schema inference policy option value.
 fn parse_schema_inference_policy(
     raw: &str,
 ) -> Result<SchemaInferencePolicy, Box<dyn std::error::Error>> {
@@ -252,6 +261,7 @@ fn parse_schema_inference_policy(
     }
 }
 
+/// Parse schema drift policy option value.
 fn parse_schema_drift_policy(raw: &str) -> Result<SchemaDriftPolicy, Box<dyn std::error::Error>> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "fail" => Ok(SchemaDriftPolicy::Fail),
@@ -263,6 +273,7 @@ fn parse_schema_drift_policy(raw: &str) -> Result<SchemaDriftPolicy, Box<dyn std
     }
 }
 
+/// Parse boolean-like CLI option values.
 fn parse_bool(raw: &str, flag: &str) -> Result<bool, Box<dyn std::error::Error>> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -271,6 +282,7 @@ fn parse_bool(raw: &str, flag: &str) -> Result<bool, Box<dyn std::error::Error>>
     }
 }
 
+/// Print categorized CLI errors with recovery hints.
 fn print_cli_error(err: &(dyn std::error::Error + 'static)) {
     if let Some(ffq) = err.downcast_ref::<FfqError>() {
         let (category, hint) = classify_ffq_error(ffq);
@@ -292,6 +304,7 @@ fn print_cli_error(err: &(dyn std::error::Error + 'static)) {
     }
 }
 
+/// Map internal error type to user-facing category + hint.
 fn classify_ffq_error(err: &FfqError) -> (&'static str, Option<&'static str>) {
     match err {
         FfqError::Planning(msg) => ("planning", planning_hint(msg)),

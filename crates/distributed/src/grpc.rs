@@ -1,3 +1,23 @@
+//! gRPC service/client glue for coordinator and worker shuffle services.
+//!
+//! RPC schema source: `proto/ffq_distributed.proto`.
+//!
+//! Key control-plane RPCs (generated under [`v1`]):
+//! - `SubmitQuery`, `GetTask`, `ReportTaskStatus`
+//! - `GetQueryStatus`, `CancelQuery`
+//! - `RegisterQueryResults`, `FetchQueryResults`
+//!
+//! Key shuffle/data RPCs:
+//! - `RegisterMapOutput`
+//! - `FetchShufflePartition` (stream)
+//! - `Heartbeat`
+//!
+//! Useful generated request/response types:
+//! [`v1::SubmitQueryRequest`], [`v1::GetTaskRequest`],
+//! [`v1::ReportTaskStatusRequest`], [`v1::GetQueryStatusRequest`],
+//! [`v1::RegisterMapOutputRequest`], [`v1::FetchShufflePartitionRequest`],
+//! [`v1::FetchQueryResultsRequest`].
+
 use std::sync::Arc;
 use std::{collections::HashMap, path::PathBuf};
 
@@ -24,21 +44,25 @@ pub use v1::shuffle_service_client::ShuffleServiceClient;
 pub use v1::shuffle_service_server::{ShuffleService, ShuffleServiceServer};
 
 #[derive(Clone)]
+/// Combined gRPC service implementation backed by shared [`Coordinator`].
 pub struct CoordinatorServices {
     coordinator: Arc<Mutex<Coordinator>>,
 }
 
 impl CoordinatorServices {
+    /// Build services from an owned coordinator instance.
     pub fn new(coordinator: Coordinator) -> Self {
         Self {
             coordinator: Arc::new(Mutex::new(coordinator)),
         }
     }
 
+    /// Build services from shared coordinator state.
     pub fn from_shared(coordinator: Arc<Mutex<Coordinator>>) -> Self {
         Self { coordinator }
     }
 
+    /// Access shared coordinator state.
     pub fn coordinator(&self) -> Arc<Mutex<Coordinator>> {
         Arc::clone(&self.coordinator)
     }
@@ -285,12 +309,14 @@ fn to_status(err: ffq_common::FfqError) -> Status {
 }
 
 #[derive(Clone)]
+/// Worker-local shuffle service that reads shuffle data from local filesystem.
 pub struct WorkerShuffleService {
     shuffle_root: PathBuf,
     map_outputs: Arc<Mutex<HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>>>,
 }
 
 impl WorkerShuffleService {
+    /// Create service bound to a shuffle root directory.
     pub fn new(shuffle_root: impl Into<PathBuf>) -> Self {
         Self {
             shuffle_root: shuffle_root.into(),

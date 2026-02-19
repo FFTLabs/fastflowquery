@@ -149,6 +149,18 @@ impl DataFrame {
 
     /// df.collect() (async)
     ///
+    /// # Examples
+    /// ```no_run
+    /// use ffq_client::Engine;
+    /// use ffq_common::EngineConfig;
+    ///
+    /// let engine = Engine::new(EngineConfig::default())?;
+    /// let df = engine.sql("SELECT 1 as one")?;
+    /// let batches = futures::executor::block_on(df.collect())?;
+    /// assert!(!batches.is_empty());
+    /// # Ok::<(), ffq_common::FfqError>(())
+    /// ```
+    ///
     /// # Errors
     /// Returns an error when planning or execution fails.
     pub async fn collect(&self) -> Result<Vec<RecordBatch>> {
@@ -160,6 +172,17 @@ impl DataFrame {
     ///
     /// If `path` ends with `.parquet`, output is written to that file.
     /// Otherwise, `path` is treated as output directory.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use ffq_client::Engine;
+    /// use ffq_common::EngineConfig;
+    ///
+    /// let engine = Engine::new(EngineConfig::default())?;
+    /// let df = engine.sql("SELECT 1 as id")?;
+    /// futures::executor::block_on(df.write_parquet("/tmp/ffq_out"))?;
+    /// # Ok::<(), ffq_common::FfqError>(())
+    /// ```
     ///
     /// # Errors
     /// Returns an error when planning, execution, or file commit fails.
@@ -212,6 +235,19 @@ impl DataFrame {
     /// Executes this plan and saves output as a managed table with explicit write mode.
     ///
     /// Overwrite replaces table data paths; append adds new parts and deduplicates paths.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use ffq_client::Engine;
+    /// use ffq_common::EngineConfig;
+    ///
+    /// let engine = Engine::new(EngineConfig::default())?;
+    /// let df = engine.sql("SELECT 42 as answer")?;
+    /// futures::executor::block_on(df.save_as_table("answers"))?;
+    /// let rows = futures::executor::block_on(engine.sql("SELECT answer FROM answers")?.collect())?;
+    /// assert!(!rows.is_empty());
+    /// # Ok::<(), ffq_common::FfqError>(())
+    /// ```
     ///
     /// # Errors
     /// Returns an error when name validation, execution, write, or catalog persistence fails.

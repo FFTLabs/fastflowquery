@@ -1,3 +1,20 @@
+//! Interactive FFQ SQL REPL.
+//!
+//! UX behavior:
+//! - accepts SQL statements terminated by `;`
+//! - supports shell commands when not in multiline SQL mode:
+//!   - `\help`, `\q`, `\tables`, `\schema <table>`
+//!   - `\plan on|off`, `\timing on|off`, `\mode table|csv|json`
+//! - multiline SQL prompt switches from `ffq> ` to ` ...> ` until a trailing
+//!   semicolon is seen
+//! - comment-only lines (`-- ...`) are ignored
+//! - write queries (`INSERT INTO ... SELECT ...`) print `OK` when sink output
+//!   is empty instead of rendering an empty table
+//!
+//! Error taxonomy:
+//! - planning/config/unsupported/io/execution errors are classified and
+//!   rendered with short hints for common recovery paths.
+
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -166,6 +183,7 @@ fn statement_terminated(sql: &str) -> bool {
     sql.trim_end().ends_with(';')
 }
 
+/// Append one user input line to multiline SQL buffer.
 fn append_sql_line(sql_buffer: &mut String, raw: &str) {
     if !sql_buffer.is_empty() {
         sql_buffer.push('\n');
@@ -190,12 +208,16 @@ enum CommandResult {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Output rendering mode for query result batches.
 enum OutputMode {
     Table,
     Csv,
     Json,
 }
 
+/// Handle one REPL shell command.
+///
+/// Command parsing is intentionally strict and usage errors are reported inline.
 fn handle_command(
     raw: &str,
     engine: &Engine,
@@ -304,6 +326,7 @@ fn print_help() {
     println!("  \\mode table|csv|json  set output rendering mode");
 }
 
+/// Render batches according to selected output mode.
 fn print_batches(batches: &[RecordBatch], mode: OutputMode) -> Result<(), FfqError> {
     match mode {
         OutputMode::Table => {
@@ -321,6 +344,7 @@ fn print_batches(batches: &[RecordBatch], mode: OutputMode) -> Result<(), FfqErr
     Ok(())
 }
 
+/// Render batches as CSV with header.
 fn print_batches_csv(batches: &[RecordBatch]) -> Result<(), FfqError> {
     if batches.is_empty() {
         return Ok(());
@@ -348,6 +372,7 @@ fn print_batches_csv(batches: &[RecordBatch]) -> Result<(), FfqError> {
     Ok(())
 }
 
+/// Render batches as JSON array of row objects.
 fn print_batches_json(batches: &[RecordBatch]) -> Result<(), FfqError> {
     let mut rows = Vec::<Value>::new();
     for batch in batches {
@@ -376,6 +401,7 @@ fn print_batches_json(batches: &[RecordBatch]) -> Result<(), FfqError> {
     Ok(())
 }
 
+/// Escape one CSV field.
 fn csv_escape(s: &str) -> String {
     if s.contains([',', '"', '\n']) {
         format!("\"{}\"", s.replace('"', "\"\""))
@@ -384,6 +410,7 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
+/// Print classified REPL error with optional hint.
 fn print_repl_error(stage: &str, err: &FfqError) {
     let (category, hint) = classify_error(err);
     eprintln!("[{category}] {stage}: {err}");
@@ -392,6 +419,7 @@ fn print_repl_error(stage: &str, err: &FfqError) {
     }
 }
 
+/// Classify engine errors into user-facing REPL categories.
 fn classify_error(err: &FfqError) -> (&'static str, Option<&'static str>) {
     match err {
         FfqError::Planning(msg) => ("planning", planning_hint(msg)),

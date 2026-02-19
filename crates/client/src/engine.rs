@@ -43,6 +43,16 @@ impl Engine {
     /// Schema policy env overrides are also applied from session bootstrap:
     /// `FFQ_SCHEMA_INFERENCE`, `FFQ_SCHEMA_WRITEBACK`, `FFQ_SCHEMA_DRIFT_POLICY`.
     ///
+    /// # Examples
+    /// ```no_run
+    /// use ffq_client::Engine;
+    /// use ffq_common::EngineConfig;
+    ///
+    /// let engine = Engine::new(EngineConfig::default())?;
+    /// # let _ = engine;
+    /// # Ok::<(), ffq_common::FfqError>(())
+    /// ```
+    ///
     /// # Errors
     /// Returns an error if session initialization fails (for example catalog load or invalid config).
     pub fn new(config: EngineConfig) -> Result<Self> {
@@ -61,6 +71,33 @@ impl Engine {
     ///
     /// For parquet tables with inference enabled and no explicit schema,
     /// registration may infer schema immediately.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use arrow_schema::{DataType, Field, Schema};
+    /// use ffq_client::Engine;
+    /// use ffq_common::EngineConfig;
+    /// use ffq_storage::{TableDef, TableStats};
+    /// use std::collections::HashMap;
+    ///
+    /// let engine = Engine::new(EngineConfig::default())?;
+    /// engine.register_table_checked(
+    ///     "lineitem",
+    ///     TableDef {
+    ///         name: "lineitem".to_string(),
+    ///         uri: "tests/fixtures/parquet/lineitem.parquet".to_string(),
+    ///         paths: vec![],
+    ///         format: "parquet".to_string(),
+    ///         schema: Some(Schema::new(vec![
+    ///             Field::new("l_orderkey", DataType::Int64, false),
+    ///             Field::new("l_quantity", DataType::Float64, false),
+    ///         ])),
+    ///         stats: TableStats::default(),
+    ///         options: HashMap::new(),
+    ///     },
+    /// )?;
+    /// # Ok::<(), ffq_common::FfqError>(())
+    /// ```
     ///
     /// # Errors
     /// Returns an error when schema inference/validation fails or table metadata is invalid.
@@ -82,6 +119,18 @@ impl Engine {
     /// Parses SQL into a query [`DataFrame`].
     ///
     /// The query is planned/analyzed during execution (`collect`, write methods, etc.).
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use ffq_client::Engine;
+    /// use ffq_common::EngineConfig;
+    ///
+    /// let engine = Engine::new(EngineConfig::default())?;
+    /// let df = engine.sql("SELECT 1")?;
+    /// let batches = futures::executor::block_on(df.collect())?;
+    /// # let _ = batches;
+    /// # Ok::<(), ffq_common::FfqError>(())
+    /// ```
     ///
     /// # Errors
     /// Returns an error when SQL parsing fails.

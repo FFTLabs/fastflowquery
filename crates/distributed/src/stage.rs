@@ -1,10 +1,20 @@
+//! Stage DAG construction from physical plans.
+//!
+//! Contract:
+//! - stage boundaries are cut at `ShuffleRead` exchanges;
+//! - each stage contains operator names reachable without crossing another
+//!   `ShuffleRead`;
+//! - edges represent upstream (map) -> downstream (reduce) dependencies.
+
 use ffq_planner::{ExchangeExec, PhysicalPlan};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Stable stage identifier inside one query DAG.
 pub struct StageId(pub usize);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// One stage node and its dependency links.
 pub struct StageNode {
     pub id: StageId,
     pub operators: Vec<String>,
@@ -13,20 +23,24 @@ pub struct StageNode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Query stage DAG used by coordinator task scheduling.
 pub struct StageDag {
     pub stages: Vec<StageNode>,
 }
 
 impl StageDag {
+    /// Create an empty DAG.
     pub fn new() -> Self {
         Self { stages: vec![] }
     }
 
+    /// Returns root stage id if present.
     pub fn root_id(&self) -> Option<StageId> {
         self.stages.first().map(|s| s.id)
     }
 }
 
+/// Build stage DAG by traversing a physical plan and cutting at shuffle reads.
 pub fn build_stage_dag(plan: &PhysicalPlan) -> StageDag {
     let mut dag = StageDag::new();
     let root = new_stage(&mut dag);
