@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Distributed coordinator/worker runtime building blocks.
 //!
 //! Architecture role:
@@ -26,11 +28,15 @@
 //! RPC type definitions live in `proto/ffq_distributed.proto` and are generated
 //! under `grpc::v1` when `grpc` feature is enabled.
 
+/// Coordinator state machine and scheduling APIs.
 pub mod coordinator;
 #[cfg(feature = "grpc")]
+/// gRPC services/clients and protobuf-generated bindings.
 pub mod grpc;
+/// Stage DAG modeling and stage-cut construction.
 pub mod stage;
 #[cfg(feature = "grpc")]
+/// Worker runtime and control-plane adapters.
 pub mod worker;
 
 pub use coordinator::{

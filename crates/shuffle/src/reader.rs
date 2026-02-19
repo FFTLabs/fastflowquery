@@ -13,12 +13,14 @@ use crate::layout::{
 const INDEX_BIN_MAGIC: &[u8; 4] = b"FFQI";
 const INDEX_BIN_HEADER_LEN: usize = 12;
 
+/// Reads shuffle partitions and index metadata from local storage.
 pub struct ShuffleReader {
     root_dir: PathBuf,
     fetch_chunk_bytes: usize,
 }
 
 impl ShuffleReader {
+    /// Create a reader rooted at `root_dir`.
     pub fn new(root_dir: impl Into<PathBuf>) -> Self {
         Self {
             root_dir: root_dir.into(),
@@ -26,11 +28,13 @@ impl ShuffleReader {
         }
     }
 
+    /// Configure maximum chunk size used by streamed partition fetch simulation.
     pub fn with_fetch_chunk_bytes(mut self, bytes: usize) -> Self {
         self.fetch_chunk_bytes = bytes.max(1);
         self
     }
 
+    /// Read map-task index metadata, preferring binary index when present.
     pub fn read_map_task_index(
         &self,
         query_id: u64,
@@ -54,6 +58,7 @@ impl ShuffleReader {
             .map_err(|e| FfqError::Execution(format!("index json decode failed: {e}")))
     }
 
+    /// List available attempt ids for a given `(query, stage, map_task)`.
     pub fn available_attempts(
         &self,
         query_id: u64,
@@ -81,6 +86,7 @@ impl ShuffleReader {
         Ok(attempts)
     }
 
+    /// Return highest available attempt id for a map task, if any exists.
     pub fn latest_attempt(
         &self,
         query_id: u64,
@@ -93,6 +99,7 @@ impl ShuffleReader {
             .max())
     }
 
+    /// Return partition metadata for one reduce partition in one attempt.
     pub fn partition_meta(
         &self,
         query_id: u64,
@@ -112,6 +119,7 @@ impl ShuffleReader {
             })
     }
 
+    /// Read one partition payload and decode as Arrow record batches.
     pub fn read_partition(
         &self,
         query_id: u64,
@@ -125,6 +133,7 @@ impl ShuffleReader {
         decode_ipc_bytes(&bytes)
     }
 
+    /// Read partition payload using the newest available attempt.
     pub fn read_partition_latest(
         &self,
         query_id: u64,
@@ -143,6 +152,7 @@ impl ShuffleReader {
     }
 
     // Simulates FetchShufflePartition as server-streamed byte chunks.
+    /// Read one partition payload and split bytes into fetch-sized chunks.
     pub fn fetch_partition_chunks(
         &self,
         query_id: u64,
@@ -163,6 +173,7 @@ impl ShuffleReader {
         Ok(out)
     }
 
+    /// Fetch partition chunks for the newest available attempt.
     pub fn fetch_partition_chunks_latest(
         &self,
         query_id: u64,
@@ -180,6 +191,7 @@ impl ShuffleReader {
         Ok((attempt, chunks))
     }
 
+    /// Decode record batches from previously streamed byte chunks.
     pub fn read_partition_from_streamed_chunks(
         &self,
         chunks: impl IntoIterator<Item = Vec<u8>>,

@@ -12,4 +12,5 @@ pub struct TaskContext {
     pub mem_budget_bytes: usize,
 }
 
+/// Shared task context handle passed across operator boundaries.
 pub type SharedTaskContext = Arc<TaskContext>;

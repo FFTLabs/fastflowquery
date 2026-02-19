@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Minimal SQL parsing facade used by planner/frontend code.
 //!
 //! Architecture role:
@@ -15,6 +17,9 @@ use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
+/// Parse one SQL string into `sqlparser` statements using the generic dialect.
+///
+/// Returns [`ffq_common::FfqError::Planning`] when parsing fails.
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let dialect = GenericDialect {};
     Parser::parse_sql(&dialect, sql).map_err(|e| FfqError::Planning(e.to_string()))

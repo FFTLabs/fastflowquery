@@ -32,7 +32,9 @@ use ffq_planner::{BinaryOp, Expr, LiteralValue};
 /// - execution compiles Expr -> PhysicalExpr
 /// - evaluation returns Arrow ArrayRef aligned with the input RecordBatch length
 pub trait PhysicalExpr: Send + Sync {
+    /// Static output data type of this expression.
     fn data_type(&self) -> DataType;
+    /// Evaluate the expression for every row in `batch`.
     fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef>;
 }
 

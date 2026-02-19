@@ -29,8 +29,11 @@ use crate::stage::{StageDag, build_stage_dag};
 #[derive(Debug, Clone)]
 /// Coordinator behavior/configuration knobs.
 pub struct CoordinatorConfig {
+    /// Consecutive task failures before a worker is blacklisted.
     pub blacklist_failure_threshold: u32,
+    /// Root directory containing shuffle files and indexes.
     pub shuffle_root: PathBuf,
+    /// Coordinator-side schema inference policy for schema-less parquet scans.
     pub schema_inference: SchemaInferencePolicy,
 }
 
@@ -47,67 +50,104 @@ impl Default for CoordinatorConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Query lifecycle states tracked by the coordinator.
 pub enum QueryState {
+    /// Query is accepted but not yet running.
     Queued,
+    /// At least one task attempt is currently running.
     Running,
+    /// All tasks completed successfully.
     Succeeded,
+    /// At least one task failed and query cannot recover.
     Failed,
+    /// Query was canceled by user or system request.
     Canceled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Task lifecycle states tracked by the coordinator.
 pub enum TaskState {
+    /// Task is pending scheduling.
     Queued,
+    /// Task is currently executing.
     Running,
+    /// Task completed successfully.
     Succeeded,
+    /// Task execution failed.
     Failed,
 }
 
 #[derive(Debug, Clone)]
 /// One schedulable task assignment returned to workers.
 pub struct TaskAssignment {
+    /// Stable query identifier.
     pub query_id: String,
+    /// Stage identifier within query DAG.
     pub stage_id: u64,
+    /// Task identifier within stage.
     pub task_id: u64,
+    /// Attempt number for retries.
     pub attempt: u32,
+    /// Serialized physical-plan fragment for this task.
     pub plan_fragment_json: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default)]
 /// Aggregated per-stage progress and map-output metrics.
 pub struct StageMetrics {
+    /// Number of queued tasks in the stage.
     pub queued_tasks: u32,
+    /// Number of running tasks in the stage.
     pub running_tasks: u32,
+    /// Number of succeeded tasks in the stage.
     pub succeeded_tasks: u32,
+    /// Number of failed tasks in the stage.
     pub failed_tasks: u32,
+    /// Total rows written by map outputs in this stage.
     pub map_output_rows: u64,
+    /// Total bytes written by map outputs in this stage.
     pub map_output_bytes: u64,
+    /// Total batches written by map outputs in this stage.
     pub map_output_batches: u64,
 }
 
 #[derive(Debug, Clone)]
 /// Map output metadata for one reduce partition.
 pub struct MapOutputPartitionMeta {
+    /// Reduce partition id this map output belongs to.
     pub reduce_partition: u32,
+    /// Bytes produced for the partition.
     pub bytes: u64,
+    /// Rows produced for the partition.
     pub rows: u64,
+    /// Batches produced for the partition.
     pub batches: u64,
 }
 
 #[derive(Debug, Clone)]
 /// Public query status snapshot returned by control-plane APIs.
 pub struct QueryStatus {
+    /// Stable query identifier.
     pub query_id: String,
+    /// Current query state.
     pub state: QueryState,
+    /// Submission timestamp in unix milliseconds.
     pub submitted_at_ms: u64,
+    /// First-start timestamp in unix milliseconds, or 0 if not started.
     pub started_at_ms: u64,
+    /// Finish timestamp in unix milliseconds, or 0 if unfinished.
     pub finished_at_ms: u64,
+    /// Human-readable status message.
     pub message: String,
+    /// Total number of task attempts tracked for the query.
     pub total_tasks: u32,
+    /// Number of queued tasks across all stages.
     pub queued_tasks: u32,
+    /// Number of running tasks across all stages.
     pub running_tasks: u32,
+    /// Number of succeeded tasks across all stages.
     pub succeeded_tasks: u32,
+    /// Number of failed tasks across all stages.
     pub failed_tasks: u32,
+    /// Per-stage metrics keyed by stage id.
     pub stage_metrics: HashMap<u64, StageMetrics>,
 }
 

@@ -1,3 +1,5 @@
+#![warn(missing_docs)]
+
 //! Execution-layer primitives used by runtimes and physical operators.
 //!
 //! Architecture role:

@@ -16,15 +16,20 @@ pub struct StageId(pub usize);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// One stage node and its dependency links.
 pub struct StageNode {
+    /// Stage identifier.
     pub id: StageId,
+    /// Physical operator names assigned to this stage.
     pub operators: Vec<String>,
+    /// Upstream dependencies that must complete before this stage.
     pub parents: Vec<StageId>,
+    /// Downstream stages that consume this stage outputs.
     pub children: Vec<StageId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Query stage DAG used by coordinator task scheduling.
 pub struct StageDag {
+    /// All stage nodes in this query DAG.
     pub stages: Vec<StageNode>,
 }
 

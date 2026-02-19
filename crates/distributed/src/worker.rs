@@ -52,10 +52,15 @@ use crate::grpc::v1;
 #[derive(Debug, Clone)]
 /// Worker resource/configuration controls.
 pub struct WorkerConfig {
+    /// Stable worker id used in scheduling and heartbeats.
     pub worker_id: String,
+    /// Max concurrent task executions.
     pub cpu_slots: usize,
+    /// Per-task soft memory budget.
     pub per_task_memory_budget_bytes: usize,
+    /// Local spill directory for memory-pressure fallback paths.
     pub spill_dir: PathBuf,
+    /// Root directory containing shuffle data.
     pub shuffle_root: PathBuf,
 }
 
@@ -74,28 +79,41 @@ impl Default for WorkerConfig {
 #[derive(Debug, Clone)]
 /// Task-scoped execution context provided to task executors.
 pub struct TaskContext {
+    /// Query id for this task attempt.
     pub query_id: String,
+    /// Stage id for this task attempt.
     pub stage_id: u64,
+    /// Task id within stage.
     pub task_id: u64,
+    /// Attempt number for retries.
     pub attempt: u32,
+    /// Per-task soft memory budget.
     pub per_task_memory_budget_bytes: usize,
+    /// Local spill directory.
     pub spill_dir: PathBuf,
+    /// Root directory containing shuffle data.
     pub shuffle_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
 /// Task execution outputs returned by [`TaskExecutor`].
 pub struct TaskExecutionResult {
+    /// Map output partition metadata emitted by map stages.
     pub map_output_partitions: Vec<MapOutputPartitionMeta>,
+    /// Output batches emitted by sink/final stages.
     pub output_batches: Vec<RecordBatch>,
+    /// Whether result batches should be published to coordinator.
     pub publish_results: bool,
+    /// Human-readable completion message.
     pub message: String,
 }
 
 #[async_trait]
 /// Control-plane contract used by worker runtime.
 pub trait WorkerControlPlane: Send + Sync {
+    /// Pull up to `capacity` task assignments for `worker_id`.
     async fn get_task(&self, worker_id: &str, capacity: u32) -> Result<Vec<TaskAssignment>>;
+    /// Report a task state transition and status message.
     async fn report_task_status(
         &self,
         worker_id: &str,
@@ -103,18 +121,22 @@ pub trait WorkerControlPlane: Send + Sync {
         state: TaskState,
         message: String,
     ) -> Result<()>;
+    /// Register map output partition metadata for a completed map task.
     async fn register_map_output(
         &self,
         assignment: &TaskAssignment,
         partitions: Vec<MapOutputPartitionMeta>,
     ) -> Result<()>;
+    /// Publish final query results payload for client fetching.
     async fn register_query_results(&self, query_id: &str, ipc_payload: Vec<u8>) -> Result<()>;
+    /// Send periodic heartbeat with currently running task count.
     async fn heartbeat(&self, worker_id: &str, running_tasks: u32) -> Result<()>;
 }
 
 #[async_trait]
 /// Task execution contract for worker-assigned plan fragments.
 pub trait TaskExecutor: Send + Sync {
+    /// Execute one task assignment and return map/sink outputs.
     async fn execute(
         &self,
         assignment: &TaskAssignment,
@@ -226,6 +248,7 @@ impl TaskExecutor for DefaultTaskExecutor {
 }
 
 #[derive(Clone)]
+/// Worker runtime that orchestrates pull scheduling and task execution.
 pub struct Worker<C, E>
 where
     C: WorkerControlPlane + 'static,
@@ -370,17 +393,20 @@ where
 }
 
 #[derive(Clone)]
+/// In-process control-plane adapter for embedded/distributed tests.
 pub struct InProcessControlPlane {
     coordinator: Arc<Mutex<Coordinator>>,
 }
 
 impl InProcessControlPlane {
+    /// Create adapter backed by shared in-memory coordinator.
     pub fn new(coordinator: Arc<Mutex<Coordinator>>) -> Self {
         Self { coordinator }
     }
 }
 
 #[derive(Debug)]
+/// gRPC-based control-plane adapter for remote coordinator connectivity.
 pub struct GrpcControlPlane {
     control: Mutex<crate::grpc::ControlPlaneClient<tonic::transport::Channel>>,
     shuffle: Mutex<crate::grpc::ShuffleServiceClient<tonic::transport::Channel>>,
@@ -388,6 +414,7 @@ pub struct GrpcControlPlane {
 }
 
 impl GrpcControlPlane {
+    /// Connect gRPC control/shuffle/heartbeat clients to a coordinator endpoint.
     pub async fn connect(endpoint: &str) -> Result<Self> {
         let control = crate::grpc::ControlPlaneClient::connect(endpoint.to_string())
             .await
@@ -577,6 +604,7 @@ fn proto_task_state(state: TaskState) -> v1::TaskState {
     }
 }
 
+/// Encode a set of record batches as Arrow IPC stream bytes.
 pub fn encode_record_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     if batches.is_empty() {
         return Ok(Vec::new());

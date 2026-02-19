@@ -13,17 +13,20 @@ use crate::layout::{
 const INDEX_BIN_MAGIC: &[u8; 4] = b"FFQI";
 const INDEX_BIN_VERSION: u32 = 1;
 
+/// Writes shuffle partition payloads and map-task index metadata.
 pub struct ShuffleWriter {
     root_dir: PathBuf,
 }
 
 impl ShuffleWriter {
+    /// Create a writer rooted at `root_dir`.
     pub fn new(root_dir: impl Into<PathBuf>) -> Self {
         Self {
             root_dir: root_dir.into(),
         }
     }
 
+    /// Write one reduce partition payload as Arrow IPC and return its metadata.
     pub fn write_partition(
         &self,
         query_id: u64,
@@ -71,6 +74,7 @@ impl ShuffleWriter {
         })
     }
 
+    /// Write JSON and binary index files for one map-task attempt.
     pub fn write_map_task_index(
         &self,
         query_id: u64,
@@ -119,6 +123,7 @@ impl ShuffleWriter {
         Ok(())
     }
 
+    /// Remove expired non-latest attempts based on `ttl`.
     pub fn cleanup_expired_attempts(&self, ttl: Duration, now: SystemTime) -> Result<usize> {
         let shuffle_root = self.root_dir.join("shuffle");
         if !shuffle_root.exists() {

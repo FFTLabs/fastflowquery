@@ -32,6 +32,7 @@ use crate::coordinator::{
     TaskState as CoreTaskState,
 };
 
+#[allow(missing_docs)]
 pub mod v1 {
     tonic::include_proto!("ffq.distributed.v1");
 }

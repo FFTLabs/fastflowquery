@@ -11,6 +11,7 @@ use futures::channel::mpsc;
 
 /// A stream of RecordBatches that also knows its output schema.
 pub trait RecordBatchStream: Stream<Item = Result<RecordBatch>> + Send {
+    /// Output schema for every batch yielded by this stream.
     fn schema(&self) -> SchemaRef;
 }
 
@@ -24,6 +25,7 @@ pub struct StreamAdapter<S> {
 }
 
 impl<S> StreamAdapter<S> {
+    /// Create a new schema-attached stream adapter.
     pub fn new(schema: SchemaRef, inner: S) -> Self {
         Self { schema, inner }
     }

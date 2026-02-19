@@ -13,20 +13,25 @@ This tracks incremental `#![warn(missing_docs)]` rollout across crates.
 - `ffq-storage`
   - status: enabled in `crates/storage/src/lib.rs`
   - current gate: `cargo rustc -p ffq-storage --lib -- -D missing-docs` clean
+- `ffq-planner`
+  - status: enabled in `crates/planner/src/lib.rs`
+  - current gate: `cargo rustc -p ffq-planner --lib -- -D missing-docs` clean
+- `ffq-execution`
+  - status: enabled in `crates/execution/src/lib.rs`
+  - current gate: `cargo rustc -p ffq-execution --lib -- -D missing-docs` clean
+- `ffq-distributed`
+  - status: enabled in `crates/distributed/src/lib.rs`
+  - current gate: `cargo rustc -p ffq-distributed --lib -- -D missing-docs` clean
+- `ffq-shuffle`
+  - status: enabled in `crates/shuffle/src/lib.rs`
+  - current gate: `cargo rustc -p ffq-shuffle --lib -- -D missing-docs` clean
+- `ffq-sql`
+  - status: enabled in `crates/sql/src/lib.rs`
+  - current gate: `cargo rustc -p ffq-sql --lib -- -D missing-docs` clean
 
 ## Next crates
 
-2. `ffq-planner`
-- reason: logical/physical planning types are public and heavily reused
-- action: enable in `crates/planner/src/lib.rs`, fix warnings
-
-3. `ffq-execution`
-- reason: execution traits/streams are shared runtime contracts
-- action: enable in `crates/execution/src/lib.rs`, fix warnings
-
-4. `ffq-distributed`
-- reason: public coordinator/worker APIs and RPC glue
-- action: enable in `crates/distributed/src/lib.rs`, fix warnings
+No additional crates are currently queued in this backlog.
 
 ## Rollout command pattern
 
