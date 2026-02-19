@@ -29,7 +29,7 @@ pub mod metrics;
 /// Optional HTTP metrics exporter.
 pub mod metrics_exporter;
 
-pub use config::{EngineConfig, SchemaDriftPolicy, SchemaInferencePolicy};
+pub use config::{CteReusePolicy, EngineConfig, SchemaDriftPolicy, SchemaInferencePolicy};
 pub use error::{FfqError, Result};
 pub use ids::*;
 pub use metrics::MetricsRegistry;

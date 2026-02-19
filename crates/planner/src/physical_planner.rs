@@ -5,7 +5,7 @@ use crate::physical_plan::{
     BroadcastExchange, BuildSide, ExchangeExec, FilterExec, FinalHashAggregateExec, HashJoinExec,
     InSubqueryFilterExec, ExistsSubqueryFilterExec, LimitExec, ParquetScanExec, ParquetWriteExec,
     ScalarSubqueryFilterExec, PartialHashAggregateExec, PartitioningSpec, PhysicalPlan, ProjectExec,
-    ShuffleReadExchange, ShuffleWriteExchange, TopKByScoreExec, UnionAllExec,
+    CteRefExec, ShuffleReadExchange, ShuffleWriteExchange, TopKByScoreExec, UnionAllExec,
 };
 
 #[derive(Debug, Clone)]
@@ -137,6 +137,13 @@ pub fn create_physical_plan(
             Ok(PhysicalPlan::UnionAll(UnionAllExec {
                 left: Box::new(l),
                 right: Box::new(r),
+            }))
+        }
+        LogicalPlan::CteRef { name, plan } => {
+            let child = create_physical_plan(plan, cfg)?;
+            Ok(PhysicalPlan::CteRef(CteRefExec {
+                name: name.clone(),
+                plan: Box::new(child),
             }))
         }
         LogicalPlan::VectorTopK {

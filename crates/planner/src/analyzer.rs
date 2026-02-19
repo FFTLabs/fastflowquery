@@ -503,6 +503,17 @@ impl Analyzer {
                     out_resolver,
                 ))
             }
+            LogicalPlan::CteRef { name, plan } => {
+                let (aplan, schema, resolver) = self.analyze_plan(*plan, provider)?;
+                Ok((
+                    LogicalPlan::CteRef {
+                        name,
+                        plan: Box::new(aplan),
+                    },
+                    schema,
+                    resolver,
+                ))
+            }
             LogicalPlan::VectorTopK {
                 table,
                 query_vector,

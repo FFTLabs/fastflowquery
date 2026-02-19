@@ -17,7 +17,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use ffq_common::{EngineConfig, FfqError, SchemaDriftPolicy, SchemaInferencePolicy};
+use ffq_common::{
+    CteReusePolicy, EngineConfig, FfqError, SchemaDriftPolicy, SchemaInferencePolicy,
+};
 use ffq_storage::{Catalog, TableDef};
 use futures::TryStreamExt;
 
@@ -184,6 +186,17 @@ fn apply_config_kv(config: &mut EngineConfig, kv: &str) -> std::result::Result<(
                 };
             }
             "schema_writeback" => config.schema_writeback = parse_bool(value)?,
+            "cte_reuse_policy" => {
+                config.cte_reuse_policy = match value.to_ascii_lowercase().as_str() {
+                    "inline" => CteReusePolicy::Inline,
+                    "materialize" => CteReusePolicy::Materialize,
+                    other => {
+                        return Err(FfqError::InvalidConfig(format!(
+                            "invalid cte_reuse_policy '{other}'"
+                        )));
+                    }
+                };
+            }
             other => {
                 return Err(FfqError::InvalidConfig(format!(
                     "unknown config key '{other}'"

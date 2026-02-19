@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::DataType;
-use ffq_common::{EngineConfig, Result};
+use ffq_common::{CteReusePolicy, EngineConfig, Result};
 use ffq_planner::{
     Analyzer, LiteralValue, LogicalPlan, Optimizer, OptimizerConfig, OptimizerContext,
     OptimizerRule, PhysicalPlan, ScalarUdfTypeResolver,
@@ -37,6 +37,10 @@ impl PlannerFacade {
             params,
             ffq_planner::SqlFrontendOptions {
                 recursive_cte_max_depth: cfg.recursive_cte_max_depth,
+                cte_reuse_mode: match cfg.cte_reuse_policy {
+                    CteReusePolicy::Inline => ffq_planner::CteReuseMode::Inline,
+                    CteReusePolicy::Materialize => ffq_planner::CteReuseMode::Materialize,
+                },
             },
         )
     }

@@ -306,6 +306,16 @@ pub enum LogicalPlan {
         /// Right input.
         right: Box<LogicalPlan>,
     },
+    /// Shared CTE reference for materialized reuse mode.
+    ///
+    /// When planned in materialized mode, repeated references to the same CTE
+    /// name are emitted as `CteRef` nodes and can share one runtime result.
+    CteRef {
+        /// CTE name.
+        name: String,
+        /// CTE definition plan to evaluate/cache.
+        plan: Box<LogicalPlan>,
+    },
     /// Index-backed vector top-k logical operator.
     ///
     /// Rewritten from `TopKByScore` only when optimizer preconditions are met.

@@ -5,7 +5,9 @@ use std::sync::{Arc, RwLock};
 use std::{env, path::Path, path::PathBuf};
 
 use arrow_schema::Schema;
-use ffq_common::{EngineConfig, MetricsRegistry, Result, SchemaDriftPolicy, SchemaInferencePolicy};
+use ffq_common::{
+    CteReusePolicy, EngineConfig, MetricsRegistry, Result, SchemaDriftPolicy, SchemaInferencePolicy,
+};
 use ffq_storage::Catalog;
 use ffq_storage::parquet_provider::FileFingerprint;
 
@@ -130,6 +132,9 @@ fn apply_schema_policy_env_overrides(config: &mut EngineConfig) -> Result<()> {
     if let Ok(raw) = env::var("FFQ_SCHEMA_DRIFT_POLICY") {
         config.schema_drift_policy = parse_schema_drift_policy(&raw)?;
     }
+    if let Ok(raw) = env::var("FFQ_CTE_REUSE_POLICY") {
+        config.cte_reuse_policy = parse_cte_reuse_policy(&raw)?;
+    }
     Ok(())
 }
 
@@ -151,6 +156,16 @@ fn parse_schema_drift_policy(raw: &str) -> Result<SchemaDriftPolicy> {
         "refresh" => Ok(SchemaDriftPolicy::Refresh),
         other => Err(ffq_common::FfqError::InvalidConfig(format!(
             "invalid FFQ_SCHEMA_DRIFT_POLICY='{other}'; expected fail|refresh"
+        ))),
+    }
+}
+
+fn parse_cte_reuse_policy(raw: &str) -> Result<CteReusePolicy> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "inline" => Ok(CteReusePolicy::Inline),
+        "materialize" => Ok(CteReusePolicy::Materialize),
+        other => Err(ffq_common::FfqError::InvalidConfig(format!(
+            "invalid FFQ_CTE_REUSE_POLICY='{other}'; expected inline|materialize"
         ))),
     }
 }

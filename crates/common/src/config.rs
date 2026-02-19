@@ -48,6 +48,22 @@ impl Default for SchemaDriftPolicy {
     }
 }
 
+/// CTE reuse strategy used by SQL frontend planning.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CteReusePolicy {
+    /// Inline CTE definitions at every reference site.
+    Inline,
+    /// Materialize reused CTEs and share results across references.
+    Materialize,
+}
+
+impl Default for CteReusePolicy {
+    fn default() -> Self {
+        Self::Inline
+    }
+}
+
 /// Global engine/session configuration shared across planner/runtime layers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -79,6 +95,9 @@ pub struct EngineConfig {
     /// Maximum recursive expansion depth for `WITH RECURSIVE` planning.
     #[serde(default = "default_recursive_cte_max_depth")]
     pub recursive_cte_max_depth: usize,
+    /// CTE reuse policy (`inline` or `materialize`).
+    #[serde(default)]
+    pub cte_reuse_policy: CteReusePolicy,
 }
 
 fn default_recursive_cte_max_depth() -> usize {
@@ -99,6 +118,7 @@ impl Default for EngineConfig {
             schema_drift_policy: SchemaDriftPolicy::default(),
             schema_writeback: false,
             recursive_cte_max_depth: default_recursive_cte_max_depth(),
+            cte_reuse_policy: CteReusePolicy::default(),
         }
     }
 }

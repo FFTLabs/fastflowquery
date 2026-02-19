@@ -10,7 +10,9 @@ use std::collections::HashMap;
 
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use ffq_common::{EngineConfig, FfqError, SchemaDriftPolicy, SchemaInferencePolicy};
+use ffq_common::{
+    CteReusePolicy, EngineConfig, FfqError, SchemaDriftPolicy, SchemaInferencePolicy,
+};
 use ffq_storage::{Catalog, TableDef, TableStats};
 use futures::TryStreamExt;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -91,6 +93,17 @@ fn apply_config_map(
                     other => {
                         return Err(FfqError::InvalidConfig(format!(
                             "invalid schema_writeback '{other}'"
+                        )));
+                    }
+                };
+            }
+            "cte_reuse_policy" => {
+                config.cte_reuse_policy = match value.to_ascii_lowercase().as_str() {
+                    "inline" => CteReusePolicy::Inline,
+                    "materialize" => CteReusePolicy::Materialize,
+                    other => {
+                        return Err(FfqError::InvalidConfig(format!(
+                            "invalid cte_reuse_policy '{other}'"
                         )));
                     }
                 };

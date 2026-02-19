@@ -43,6 +43,8 @@ pub enum PhysicalPlan {
     TopKByScore(TopKByScoreExec),
     /// Concatenate child outputs (UNION ALL).
     UnionAll(UnionAllExec),
+    /// Shared materialized CTE reference.
+    CteRef(CteRefExec),
     /// Index-backed vector top-k.
     VectorTopK(VectorTopKExec),
     /// Custom operator instantiated via runtime physical operator registry.
@@ -75,6 +77,7 @@ impl PhysicalPlan {
             PhysicalPlan::Limit(x) => vec![x.input.as_ref()],
             PhysicalPlan::TopKByScore(x) => vec![x.input.as_ref()],
             PhysicalPlan::UnionAll(x) => vec![x.left.as_ref(), x.right.as_ref()],
+            PhysicalPlan::CteRef(x) => vec![x.plan.as_ref()],
             PhysicalPlan::VectorTopK(_) => vec![],
             PhysicalPlan::Custom(x) => vec![x.input.as_ref()],
         }
@@ -308,6 +311,15 @@ pub struct UnionAllExec {
     pub left: Box<PhysicalPlan>,
     /// Right input.
     pub right: Box<PhysicalPlan>,
+}
+
+/// Physical shared CTE reference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CteRefExec {
+    /// CTE name used as cache key.
+    pub name: String,
+    /// CTE definition physical plan.
+    pub plan: Box<PhysicalPlan>,
 }
 
 /// Index-backed vector top-k physical operator.

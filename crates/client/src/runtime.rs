@@ -17,6 +17,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::physical_registry::PhysicalOperatorRegistry;
@@ -123,6 +124,7 @@ impl Runtime for EmbeddedRuntime {
     }
 }
 
+#[derive(Clone)]
 struct ExecOutput {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
@@ -151,6 +153,18 @@ fn execute_plan(
     catalog: Arc<Catalog>,
     physical_registry: Arc<PhysicalOperatorRegistry>,
     trace: Arc<TraceIds>,
+) -> BoxFuture<'static, Result<ExecOutput>> {
+    let cte_cache = Arc::new(Mutex::new(HashMap::<String, ExecOutput>::new()));
+    execute_plan_with_cache(plan, ctx, catalog, physical_registry, trace, cte_cache)
+}
+
+fn execute_plan_with_cache(
+    plan: PhysicalPlan,
+    ctx: QueryContext,
+    catalog: Arc<Catalog>,
+    physical_registry: Arc<PhysicalOperatorRegistry>,
+    trace: Arc<TraceIds>,
+    cte_cache: Arc<Mutex<HashMap<String, ExecOutput>>>,
 ) -> BoxFuture<'static, Result<ExecOutput>> {
     let operator = operator_name(&plan);
     let span = info_span!(
@@ -185,12 +199,13 @@ fn execute_plan(
                 })
             }
             PhysicalPlan::ParquetWrite(write) => {
-                let child = execute_plan(
+                let child = execute_plan_with_cache(
                     *write.input,
                     ctx,
                     catalog.clone(),
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
                 let table = catalog.get(&write.table)?.clone();
@@ -207,12 +222,13 @@ fn execute_plan(
                 })
             }
             PhysicalPlan::Project(project) => {
-                let child = execute_plan(
+                let child = execute_plan_with_cache(
                     *project.input,
                     ctx,
                     catalog,
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
                 let mut out_batches = Vec::with_capacity(child.batches.len());
@@ -248,12 +264,13 @@ fn execute_plan(
                 })
             }
             PhysicalPlan::Filter(filter) => {
-                let child = execute_plan(
+                let child = execute_plan_with_cache(
                     *filter.input,
                     ctx,
                     catalog,
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
                 let pred = compile_expr(&filter.predicate, &child.schema)?;
@@ -284,20 +301,22 @@ fn execute_plan(
                 })
             }
             PhysicalPlan::InSubqueryFilter(exec) => {
-                let child = execute_plan(
+                let child = execute_plan_with_cache(
                     *exec.input,
                     ctx.clone(),
                     catalog.clone(),
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
-                let sub = execute_plan(
+                let sub = execute_plan_with_cache(
                     *exec.subquery,
                     ctx,
                     catalog,
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
                 let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
@@ -309,20 +328,22 @@ fn execute_plan(
                 })
             }
             PhysicalPlan::ExistsSubqueryFilter(exec) => {
-                let child = execute_plan(
+                let child = execute_plan_with_cache(
                     *exec.input,
                     ctx.clone(),
                     catalog.clone(),
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
-                let sub = execute_plan(
+                let sub = execute_plan_with_cache(
                     *exec.subquery,
                     ctx,
                     catalog,
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
                 let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
@@ -334,20 +355,22 @@ fn execute_plan(
                 })
             }
             PhysicalPlan::ScalarSubqueryFilter(exec) => {
-                let child = execute_plan(
+                let child = execute_plan_with_cache(
                     *exec.input,
                     ctx.clone(),
                     catalog.clone(),
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
-                let sub = execute_plan(
+                let sub = execute_plan_with_cache(
                     *exec.subquery,
                     ctx,
                     catalog,
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
                 let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
@@ -359,12 +382,13 @@ fn execute_plan(
                 })
             }
             PhysicalPlan::Limit(limit) => {
-                let child = execute_plan(
+                let child = execute_plan_with_cache(
                     *limit.input,
                     ctx,
                     catalog,
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
                 let mut out = Vec::new();
@@ -389,12 +413,13 @@ fn execute_plan(
                 })
             }
             PhysicalPlan::TopKByScore(topk) => {
-                let child = execute_plan(
+                let child = execute_plan_with_cache(
                     *topk.input,
                     ctx,
                     catalog,
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
                 let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
@@ -406,20 +431,22 @@ fn execute_plan(
                 })
             }
             PhysicalPlan::UnionAll(union) => {
-                let left = execute_plan(
+                let left = execute_plan_with_cache(
                     *union.left,
                     ctx.clone(),
                     Arc::clone(&catalog),
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
-                let right = execute_plan(
+                let right = execute_plan_with_cache(
                     *union.right,
                     ctx,
                     catalog,
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
                 if left.schema.fields().len() != right.schema.fields().len() {
@@ -443,6 +470,37 @@ fn execute_plan(
                     in_bytes: l_bytes + r_bytes,
                 })
             }
+            PhysicalPlan::CteRef(cte_ref) => {
+                if let Some(cached) = cte_cache.lock().ok().and_then(|m| m.get(&cte_ref.name).cloned()) {
+                    let (in_rows, in_batches, in_bytes) = batch_stats(&cached.batches);
+                    Ok(OpEval {
+                        out: cached,
+                        in_rows,
+                        in_batches,
+                        in_bytes,
+                    })
+                } else {
+                    let out = execute_plan_with_cache(
+                        *cte_ref.plan,
+                        ctx,
+                        catalog,
+                        Arc::clone(&physical_registry),
+                        Arc::clone(&trace),
+                        Arc::clone(&cte_cache),
+                    )
+                    .await?;
+                    if let Ok(mut guard) = cte_cache.lock() {
+                        guard.insert(cte_ref.name.clone(), out.clone());
+                    }
+                    let (in_rows, in_batches, in_bytes) = batch_stats(&out.batches);
+                    Ok(OpEval {
+                        out,
+                        in_rows,
+                        in_batches,
+                        in_bytes,
+                    })
+                }
+            }
             PhysicalPlan::VectorTopK(exec) => Ok(OpEval {
                 out: execute_vector_topk(exec, catalog).await?,
                 in_rows: 0,
@@ -450,12 +508,13 @@ fn execute_plan(
                 in_bytes: 0,
             }),
             PhysicalPlan::Custom(custom) => {
-                let child = execute_plan(
+                let child = execute_plan_with_cache(
                     *custom.input,
                     ctx,
                     catalog,
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
                 let factory = physical_registry.get(&custom.op_name).ok_or_else(|| {
@@ -476,12 +535,13 @@ fn execute_plan(
             }
             PhysicalPlan::Exchange(exchange) => match exchange {
                 ExchangeExec::ShuffleWrite(x) => {
-                    let child = execute_plan(
+                    let child = execute_plan_with_cache(
                         *x.input,
                         ctx,
                         catalog,
                         Arc::clone(&physical_registry),
                         Arc::clone(&trace),
+                        Arc::clone(&cte_cache),
                     )
                     .await?;
                     let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
@@ -493,12 +553,13 @@ fn execute_plan(
                     })
                 }
                 ExchangeExec::ShuffleRead(x) => {
-                    let child = execute_plan(
+                    let child = execute_plan_with_cache(
                         *x.input,
                         ctx,
                         catalog,
                         Arc::clone(&physical_registry),
                         Arc::clone(&trace),
+                        Arc::clone(&cte_cache),
                     )
                     .await?;
                     let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
@@ -510,12 +571,13 @@ fn execute_plan(
                     })
                 }
                 ExchangeExec::Broadcast(x) => {
-                    let child = execute_plan(
+                    let child = execute_plan_with_cache(
                         *x.input,
                         ctx,
                         catalog,
                         Arc::clone(&physical_registry),
                         Arc::clone(&trace),
+                        Arc::clone(&cte_cache),
                     )
                     .await?;
                     let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
@@ -528,12 +590,13 @@ fn execute_plan(
                 }
             },
             PhysicalPlan::PartialHashAggregate(agg) => {
-                let child = execute_plan(
+                let child = execute_plan_with_cache(
                     *agg.input,
                     ctx.clone(),
                     catalog,
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
                 let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
@@ -552,12 +615,13 @@ fn execute_plan(
                 })
             }
             PhysicalPlan::FinalHashAggregate(agg) => {
-                let child = execute_plan(
+                let child = execute_plan_with_cache(
                     *agg.input,
                     ctx.clone(),
                     catalog,
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
                 let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
@@ -584,20 +648,22 @@ fn execute_plan(
                     build_side,
                     ..
                 } = join;
-                let left = execute_plan(
+                let left = execute_plan_with_cache(
                     *left_plan,
                     ctx.clone(),
                     catalog.clone(),
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
-                let right = execute_plan(
+                let right = execute_plan_with_cache(
                     *right_plan,
                     ctx.clone(),
                     catalog,
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
                 )
                 .await?;
                 let (l_rows, l_batches, l_bytes) = batch_stats(&left.batches);
@@ -674,6 +740,7 @@ fn operator_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Limit(_) => "Limit",
         PhysicalPlan::TopKByScore(_) => "TopKByScore",
         PhysicalPlan::UnionAll(_) => "UnionAll",
+        PhysicalPlan::CteRef(_) => "CteRef",
         PhysicalPlan::VectorTopK(_) => "VectorTopK",
         PhysicalPlan::Custom(_) => "Custom",
     }
@@ -2847,24 +2914,36 @@ fn decode_record_batches_ipc(payload: &[u8]) -> Result<(SchemaRef, Vec<RecordBat
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(feature = "vector")]
     use std::sync::Arc;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
+    use arrow::array::Int64Array;
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
     #[cfg(feature = "vector")]
     use arrow::array::{FixedSizeListBuilder, Float32Array, Float32Builder, Int64Array};
-    #[cfg(feature = "vector")]
-    use arrow::record_batch::RecordBatch;
-    #[cfg(feature = "vector")]
-    use arrow_schema::{DataType, Field, Schema};
+    use ffq_execution::PhysicalOperatorFactory;
+    use ffq_planner::{CteRefExec, CustomExec, ParquetScanExec, PhysicalPlan, UnionAllExec};
+    use ffq_storage::{Catalog, TableDef, TableStats};
     use ffq_planner::VectorTopKExec;
     #[cfg(feature = "vector")]
     use ffq_planner::{Expr, LiteralValue};
     use ffq_storage::vector_index::{VectorIndexProvider, VectorTopKRow};
     use futures::future::BoxFuture;
+    use futures::TryStreamExt;
+    use parquet::arrow::ArrowWriter;
 
     #[cfg(feature = "vector")]
     use super::{ExecOutput, run_topk_by_score};
-    use super::{rows_to_vector_topk_output, run_vector_topk_with_provider};
+    use super::{
+        EmbeddedRuntime, QueryContext, Runtime, rows_to_vector_topk_output, run_vector_topk_with_provider,
+    };
+    use crate::physical_registry::PhysicalOperatorRegistry;
 
     struct MockVectorProvider;
 
@@ -2889,6 +2968,26 @@ mod tests {
                     },
                 ])
             })
+        }
+    }
+
+    struct CountingFactory {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PhysicalOperatorFactory for CountingFactory {
+        fn name(&self) -> &str {
+            "counting_passthrough"
+        }
+
+        fn execute(
+            &self,
+            input_schema: arrow_schema::SchemaRef,
+            input_batches: Vec<RecordBatch>,
+            _config: &HashMap<String, String>,
+        ) -> ffq_common::Result<(arrow_schema::SchemaRef, Vec<RecordBatch>)> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok((input_schema, input_batches))
         }
     }
 
@@ -2932,6 +3031,89 @@ mod tests {
         assert_eq!(b.schema().field(0).name(), "id");
         assert_eq!(b.schema().field(1).name(), "score");
         assert_eq!(b.schema().field(2).name(), "payload");
+    }
+
+    #[test]
+    fn materialized_cte_ref_executes_shared_subplan_once() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ffq_runtime_cte_ref_{}.parquet",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+        )
+        .expect("batch");
+        let file = File::create(&tmp).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+
+        let mut catalog = Catalog::new();
+        catalog.register_table(TableDef {
+            name: "t".to_string(),
+            uri: tmp.to_string_lossy().into_owned(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: Some((*schema).clone()),
+            stats: TableStats::default(),
+            options: HashMap::new(),
+        });
+        let catalog = Arc::new(catalog);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(PhysicalOperatorRegistry::default());
+        assert!(!registry.register(Arc::new(CountingFactory {
+            calls: Arc::clone(&calls),
+        })));
+
+        let shared = PhysicalPlan::Custom(CustomExec {
+            op_name: "counting_passthrough".to_string(),
+            config: HashMap::new(),
+            input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
+                table: "t".to_string(),
+                schema: None,
+                projection: None,
+                filters: Vec::new(),
+            })),
+        });
+        let plan = PhysicalPlan::UnionAll(UnionAllExec {
+            left: Box::new(PhysicalPlan::CteRef(CteRefExec {
+                name: "shared_cte".to_string(),
+                plan: Box::new(shared.clone()),
+            })),
+            right: Box::new(PhysicalPlan::CteRef(CteRefExec {
+                name: "shared_cte".to_string(),
+                plan: Box::new(shared),
+            })),
+        });
+
+        let runtime = EmbeddedRuntime::new();
+        let stream = futures::executor::block_on(runtime.execute(
+            plan,
+            QueryContext {
+                batch_size_rows: 1024,
+                mem_budget_bytes: 64 * 1024 * 1024,
+                spill_dir: "./ffq_spill_test".to_string(),
+            },
+            Arc::clone(&catalog),
+            Arc::clone(&registry),
+        ))
+        .expect("execute");
+        let batches = futures::executor::block_on(stream.try_collect::<Vec<RecordBatch>>())
+            .expect("collect");
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 6);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "shared CTE subplan should execute exactly once"
+        );
+        let _ = std::fs::remove_file(tmp);
     }
 
     #[cfg(feature = "vector")]

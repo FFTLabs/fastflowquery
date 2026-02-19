@@ -5,7 +5,7 @@ use sqlparser::ast::{
     BinaryOperator as SqlBinaryOp, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
     FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Query,
     SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, TableWithJoins,
-    Value,
+    Value, CteAsMaterialized,
 };
 
 use crate::logical_plan::{
@@ -17,14 +17,32 @@ use crate::logical_plan::{
 pub struct SqlFrontendOptions {
     /// Maximum recursive CTE expansion depth for `WITH RECURSIVE`.
     pub recursive_cte_max_depth: usize,
+    /// CTE reuse strategy.
+    pub cte_reuse_mode: CteReuseMode,
+}
+
+/// CTE reuse strategy used while lowering SQL to logical plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CteReuseMode {
+    /// Always inline CTE plan at each reference.
+    Inline,
+    /// Materialize reused CTEs and share references.
+    Materialize,
 }
 
 impl Default for SqlFrontendOptions {
     fn default() -> Self {
         Self {
             recursive_cte_max_depth: 32,
+            cte_reuse_mode: CteReuseMode::Inline,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct CteBinding {
+    plan: LogicalPlan,
+    materialize: bool,
 }
 
 /// Convert a SQL string into a [`LogicalPlan`], binding named parameters (for
@@ -118,7 +136,7 @@ fn query_to_logical(
 fn query_to_logical_with_ctes(
     q: &Query,
     params: &HashMap<String, LiteralValue>,
-    parent_ctes: &HashMap<String, LogicalPlan>,
+    parent_ctes: &HashMap<String, CteBinding>,
     opts: SqlFrontendOptions,
 ) -> Result<LogicalPlan> {
     // We only support plain SELECT in v1.
@@ -135,6 +153,12 @@ fn query_to_logical_with_ctes(
     if let Some(with) = &q.with {
         let ordered = ordered_cte_indices(with, parent_ctes)?;
         let recursive_self = recursive_self_ctes(with);
+        let cte_names = with
+            .cte_tables
+            .iter()
+            .map(|c| c.alias.name.value.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let cte_ref_counts = cte_reference_counts_in_query(q, &cte_names);
         for idx in ordered {
             let cte = &with.cte_tables[idx];
             let name = cte.alias.name.value.clone();
@@ -148,7 +172,21 @@ fn query_to_logical_with_ctes(
             } else {
                 query_to_logical_with_ctes(&cte.query, params, &cte_map, opts)?
             };
-            cte_map.insert(name, cte_plan);
+            let materialize = match cte.materialized {
+                Some(CteAsMaterialized::Materialized) => true,
+                Some(CteAsMaterialized::NotMaterialized) => false,
+                None => {
+                    opts.cte_reuse_mode == CteReuseMode::Materialize
+                        && cte_ref_counts.get(&name).copied().unwrap_or(0) > 1
+                }
+            };
+            cte_map.insert(
+                name,
+                CteBinding {
+                    plan: cte_plan,
+                    materialize,
+                },
+            );
         }
     }
 
@@ -276,7 +314,7 @@ fn query_to_logical_with_ctes(
 
 fn ordered_cte_indices(
     with: &sqlparser::ast::With,
-    parent_ctes: &HashMap<String, LogicalPlan>,
+    parent_ctes: &HashMap<String, CteBinding>,
 ) -> Result<Vec<usize>> {
     let mut name_to_idx: HashMap<String, usize> = HashMap::new();
     for (idx, cte) in with.cte_tables.iter().enumerate() {
@@ -375,7 +413,7 @@ fn build_recursive_cte_plan(
     cte: &sqlparser::ast::Cte,
     cte_name: &str,
     params: &HashMap<String, LiteralValue>,
-    cte_map: &HashMap<String, LogicalPlan>,
+    cte_map: &HashMap<String, CteBinding>,
     opts: SqlFrontendOptions,
 ) -> Result<LogicalPlan> {
     if opts.recursive_cte_max_depth == 0 {
@@ -427,7 +465,13 @@ fn build_recursive_cte_plan(
         let mut rec_query = (*cte.query).clone();
         rec_query.body = Box::new(rec_body.clone());
         let mut loop_ctes = cte_map.clone();
-        loop_ctes.insert(cte_name.to_string(), delta.clone());
+        loop_ctes.insert(
+            cte_name.to_string(),
+            CteBinding {
+                plan: delta.clone(),
+                materialize: false,
+            },
+        );
         let step = query_to_logical_with_ctes(&rec_query, params, &loop_ctes, opts)?;
         acc = LogicalPlan::UnionAll {
             left: Box::new(acc),
@@ -464,6 +508,111 @@ fn table_factor_references_cte(tf: &TableFactor, cte_name: &str) -> bool {
         TableFactor::Table { name, .. } => object_name_to_string(name) == cte_name,
         TableFactor::Derived { subquery, .. } => setexpr_references_cte(&subquery.body, cte_name),
         _ => false,
+    }
+}
+
+fn cte_reference_counts_in_query(
+    q: &Query,
+    cte_names: &std::collections::HashSet<String>,
+) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    collect_cte_ref_counts_from_setexpr(&q.body, cte_names, &mut out);
+    out
+}
+
+fn collect_cte_ref_counts_from_setexpr(
+    body: &SetExpr,
+    cte_names: &std::collections::HashSet<String>,
+    out: &mut HashMap<String, usize>,
+) {
+    match body {
+        SetExpr::Select(sel) => collect_cte_ref_counts_from_select(sel.as_ref(), cte_names, out),
+        SetExpr::Query(q) => collect_cte_ref_counts_from_setexpr(&q.body, cte_names, out),
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_cte_ref_counts_from_setexpr(left, cte_names, out);
+            collect_cte_ref_counts_from_setexpr(right, cte_names, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_cte_ref_counts_from_select(
+    select: &sqlparser::ast::Select,
+    cte_names: &std::collections::HashSet<String>,
+    out: &mut HashMap<String, usize>,
+) {
+    for twj in &select.from {
+        collect_cte_ref_counts_from_table_factor(&twj.relation, cte_names, out);
+        for j in &twj.joins {
+            collect_cte_ref_counts_from_table_factor(&j.relation, cte_names, out);
+        }
+    }
+    if let Some(selection) = &select.selection {
+        collect_cte_ref_counts_from_expr(selection, cte_names, out);
+    }
+    for item in &select.projection {
+        match item {
+            SelectItem::UnnamedExpr(e) => collect_cte_ref_counts_from_expr(e, cte_names, out),
+            SelectItem::ExprWithAlias { expr, .. } => {
+                collect_cte_ref_counts_from_expr(expr, cte_names, out)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_cte_ref_counts_from_table_factor(
+    tf: &TableFactor,
+    cte_names: &std::collections::HashSet<String>,
+    out: &mut HashMap<String, usize>,
+) {
+    match tf {
+        TableFactor::Table { name, .. } => {
+            let t = object_name_to_string(name);
+            if cte_names.contains(&t) {
+                *out.entry(t).or_insert(0) += 1;
+            }
+        }
+        TableFactor::Derived { subquery, .. } => {
+            collect_cte_ref_counts_from_setexpr(&subquery.body, cte_names, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_cte_ref_counts_from_expr(
+    expr: &SqlExpr,
+    cte_names: &std::collections::HashSet<String>,
+    out: &mut HashMap<String, usize>,
+) {
+    match expr {
+        SqlExpr::Subquery(q) => collect_cte_ref_counts_from_setexpr(&q.body, cte_names, out),
+        SqlExpr::Exists { subquery, .. } => {
+            collect_cte_ref_counts_from_setexpr(&subquery.body, cte_names, out)
+        }
+        SqlExpr::InSubquery { expr, subquery, .. } => {
+            collect_cte_ref_counts_from_expr(expr, cte_names, out);
+            collect_cte_ref_counts_from_setexpr(&subquery.body, cte_names, out);
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            collect_cte_ref_counts_from_expr(left, cte_names, out);
+            collect_cte_ref_counts_from_expr(right, cte_names, out);
+        }
+        SqlExpr::UnaryOp { expr, .. } => collect_cte_ref_counts_from_expr(expr, cte_names, out),
+        SqlExpr::Nested(e) => collect_cte_ref_counts_from_expr(e, cte_names, out),
+        SqlExpr::IsNull(e) | SqlExpr::IsNotNull(e) => {
+            collect_cte_ref_counts_from_expr(e, cte_names, out)
+        }
+        SqlExpr::Function(f) => {
+            if let FunctionArguments::List(list) = &f.args {
+                for arg in &list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                        collect_cte_ref_counts_from_expr(e, cte_names, out);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -573,7 +722,7 @@ fn collect_cte_refs_from_expr(
 fn from_to_plan(
     from: &[TableWithJoins],
     params: &HashMap<String, LiteralValue>,
-    ctes: &HashMap<String, LogicalPlan>,
+    ctes: &HashMap<String, CteBinding>,
 ) -> Result<LogicalPlan> {
     if from.len() != 1 {
         return Err(FfqError::Unsupported(
@@ -612,12 +761,18 @@ fn from_to_plan(
     Ok(left)
 }
 
-fn table_factor_to_scan(tf: &TableFactor, ctes: &HashMap<String, LogicalPlan>) -> Result<LogicalPlan> {
+fn table_factor_to_scan(tf: &TableFactor, ctes: &HashMap<String, CteBinding>) -> Result<LogicalPlan> {
     match tf {
         TableFactor::Table { name, .. } => {
             let t = object_name_to_string(name);
-            if let Some(cte_plan) = ctes.get(&t) {
-                return Ok(cte_plan.clone());
+            if let Some(cte) = ctes.get(&t) {
+                if cte.materialize {
+                    return Ok(LogicalPlan::CteRef {
+                        name: t,
+                        plan: Box::new(cte.plan.clone()),
+                    });
+                }
+                return Ok(cte.plan.clone());
             }
             Ok(LogicalPlan::TableScan {
                 table: t,
@@ -635,7 +790,7 @@ fn where_to_plan(
     input: LogicalPlan,
     selection: &SqlExpr,
     params: &HashMap<String, LiteralValue>,
-    ctes: &HashMap<String, LogicalPlan>,
+    ctes: &HashMap<String, CteBinding>,
     opts: SqlFrontendOptions,
 ) -> Result<LogicalPlan> {
     match selection {
@@ -1085,7 +1240,7 @@ fn is_topk_score_expr(_e: &Expr) -> bool {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{SqlFrontendOptions, sql_to_logical, sql_to_logical_with_options};
+    use super::{CteReuseMode, SqlFrontendOptions, sql_to_logical, sql_to_logical_with_options};
     use crate::logical_plan::LiteralValue;
     use crate::logical_plan::LogicalPlan;
 
@@ -1253,6 +1408,7 @@ mod tests {
                     contains_tablescan(left, target) || contains_tablescan(right, target)
                 }
                 LogicalPlan::Aggregate { input, .. } => contains_tablescan(input, target),
+                LogicalPlan::CteRef { plan, .. } => contains_tablescan(plan, target),
                 LogicalPlan::VectorTopK { .. } => false,
             }
         }
@@ -1261,6 +1417,60 @@ mod tests {
             contains_tablescan(&plan, "t"),
             "expected dependency-ordered expansion to include base table t: {plan:?}"
         );
+    }
+
+    fn count_cte_refs(plan: &LogicalPlan) -> usize {
+        match plan {
+            LogicalPlan::CteRef { plan, .. } => 1 + count_cte_refs(plan),
+            LogicalPlan::Projection { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::TopKByScore { input, .. }
+            | LogicalPlan::InsertInto { input, .. } => count_cte_refs(input),
+            LogicalPlan::InSubqueryFilter { input, subquery, .. }
+            | LogicalPlan::ExistsSubqueryFilter { input, subquery, .. }
+            | LogicalPlan::ScalarSubqueryFilter { input, subquery, .. } => {
+                count_cte_refs(input) + count_cte_refs(subquery)
+            }
+            LogicalPlan::Join { left, right, .. } | LogicalPlan::UnionAll { left, right } => {
+                count_cte_refs(left) + count_cte_refs(right)
+            }
+            LogicalPlan::Aggregate { input, .. } => count_cte_refs(input),
+            LogicalPlan::TableScan { .. } | LogicalPlan::VectorTopK { .. } => 0,
+        }
+    }
+
+    #[test]
+    fn cte_reuse_policy_materialize_emits_cte_refs_for_reused_cte() {
+        let sql = "WITH c AS (SELECT a FROM t) SELECT l.a FROM c l JOIN c r ON l.a = r.a";
+        let plan = sql_to_logical_with_options(
+            sql,
+            &HashMap::new(),
+            SqlFrontendOptions {
+                recursive_cte_max_depth: 32,
+                cte_reuse_mode: CteReuseMode::Materialize,
+            },
+        )
+        .expect("materialize cte parse");
+        assert!(
+            count_cte_refs(&plan) >= 2,
+            "expected reused CTE references to emit CteRef nodes: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn cte_reuse_policy_inline_does_not_emit_cte_refs() {
+        let sql = "WITH c AS (SELECT a FROM t) SELECT l.a FROM c l JOIN c r ON l.a = r.a";
+        let plan = sql_to_logical_with_options(
+            sql,
+            &HashMap::new(),
+            SqlFrontendOptions {
+                recursive_cte_max_depth: 32,
+                cte_reuse_mode: CteReuseMode::Inline,
+            },
+        )
+        .expect("inline cte parse");
+        assert_eq!(count_cte_refs(&plan), 0, "expected inline plan: {plan:?}");
     }
 
     #[test]
@@ -1334,6 +1544,7 @@ mod tests {
                     has_union_all(left) || has_union_all(right)
                 }
                 LogicalPlan::Aggregate { input, .. } => has_union_all(input),
+                LogicalPlan::CteRef { plan, .. } => has_union_all(plan),
                 LogicalPlan::TableScan { .. } | LogicalPlan::VectorTopK { .. } => false,
             }
         }
@@ -1376,6 +1587,7 @@ mod tests {
             &HashMap::new(),
             SqlFrontendOptions {
                 recursive_cte_max_depth: 0,
+                cte_reuse_mode: CteReuseMode::Inline,
             },
         )
         .expect_err("depth=0 should reject recursive CTE");

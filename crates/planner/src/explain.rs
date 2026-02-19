@@ -137,6 +137,10 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!("{pad}  right:\n"));
             fmt_plan(right, indent + 2, out);
         }
+        LogicalPlan::CteRef { name, plan } => {
+            out.push_str(&format!("{pad}CteRef name={name}\n"));
+            fmt_plan(plan, indent + 1, out);
+        }
         LogicalPlan::VectorTopK {
             table,
             query_vector,

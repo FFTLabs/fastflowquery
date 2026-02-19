@@ -532,6 +532,7 @@ fn collect_table_refs(plan: &LogicalPlan, out: &mut Vec<String>) {
             collect_table_refs(left, out);
             collect_table_refs(right, out);
         }
+        LogicalPlan::CteRef { plan, .. } => collect_table_refs(plan, out),
         LogicalPlan::VectorTopK { table, .. } => out.push(table.clone()),
         LogicalPlan::InsertInto { input, .. } => {
             // Insert target is a write sink; schema inference/fingerprint checks are only
