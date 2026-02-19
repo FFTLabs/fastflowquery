@@ -60,6 +60,13 @@ impl Engine {
         Ok(Self { session })
     }
 
+    /// Returns the effective engine configuration for this session.
+    ///
+    /// This reflects env-driven overrides applied during session bootstrap.
+    pub fn config(&self) -> EngineConfig {
+        self.session.config.clone()
+    }
+
     /// Register a table under a given name.
     /// We override `table.name` to avoid ambiguity.
     pub fn register_table(&self, name: impl Into<String>, table: TableDef) {
@@ -150,6 +157,34 @@ impl Engine {
     ) -> Result<DataFrame> {
         let logical = self.session.planner.plan_sql_with_params(query, &params)?;
         Ok(DataFrame::new(self.session.clone(), logical))
+    }
+
+    #[cfg(feature = "vector")]
+    /// Convenience helper for vector top-k search.
+    ///
+    /// This constructs a query equivalent to:
+    /// `SELECT <id_col>, cosine_similarity(<vector_col>, :query_vec) AS score
+    ///  FROM <table> ORDER BY cosine_similarity(<vector_col>, :query_vec) DESC LIMIT <k>`.
+    ///
+    /// # Errors
+    /// Returns an error when SQL planning fails.
+    pub fn hybrid_search(
+        &self,
+        table: &str,
+        id_col: &str,
+        vector_col: &str,
+        query_vector: Vec<f32>,
+        k: usize,
+    ) -> Result<DataFrame> {
+        let sql = format!(
+            "SELECT {id_col}, cosine_similarity({vector_col}, :query_vec) AS score \
+             FROM {table} \
+             ORDER BY cosine_similarity({vector_col}, :query_vec) DESC \
+             LIMIT {k}"
+        );
+        let mut params = HashMap::new();
+        params.insert("query_vec".to_string(), LiteralValue::VectorF32(query_vector));
+        self.sql_with_params(&sql, params)
     }
 
     /// Returns a [`DataFrame`] that scans a registered table.

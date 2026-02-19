@@ -30,6 +30,10 @@ Open an issue describing:
 Source-level Rust documentation standard:
 - `docs/dev/rustdoc-style.md`
 
+API SemVer + deprecation policy:
+- `docs/dev/api-semver-policy.md`
+- CI workflow: `.github/workflows/api-semver.yml`
+
 ## Distributed Compose Smoke Test
 Use the v1 coordinator + 2 worker topology:
 

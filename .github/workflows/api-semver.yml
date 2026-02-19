@@ -1,0 +1,48 @@
+name: api-semver
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  public-api-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Public API contract test
+        run: cargo test -p ffq-client --test public_api_contract
+
+  semver-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks --locked
+
+      - name: SemVer check (ffq-client vs base branch)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          BASE_REF="${BASE_REF:-main}"
+          git fetch origin "${BASE_REF}" --depth=1
+          cargo semver-checks check-release \
+            --manifest-path crates/client/Cargo.toml \
+            --baseline-rev "origin/${BASE_REF}"

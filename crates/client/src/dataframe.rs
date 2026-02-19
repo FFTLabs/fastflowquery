@@ -1,6 +1,7 @@
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use ffq_common::{FfqError, Result};
+use ffq_execution::stream::SendableRecordBatchStream;
 use ffq_planner::{AggExpr, Expr, JoinType, LogicalPlan};
 use ffq_storage::parquet_provider::ParquetProvider;
 use futures::TryStreamExt;
@@ -164,8 +165,16 @@ impl DataFrame {
     /// # Errors
     /// Returns an error when planning or execution fails.
     pub async fn collect(&self) -> Result<Vec<RecordBatch>> {
-        let (_schema, batches) = self.execute_with_schema().await?;
-        Ok(batches)
+        let stream = self.collect_stream().await?;
+        stream.try_collect().await
+    }
+
+    /// Executes this plan and returns a streaming batch result.
+    ///
+    /// # Errors
+    /// Returns an error when planning or execution fails.
+    pub async fn collect_stream(&self) -> Result<SendableRecordBatchStream> {
+        self.create_execution_stream().await
     }
 
     /// Executes this plan and writes output to parquet, replacing destination by default.
@@ -297,6 +306,13 @@ impl DataFrame {
     }
 
     async fn execute_with_schema(&self) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+        let stream = self.create_execution_stream().await?;
+        let schema = stream.schema();
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        Ok((schema, batches))
+    }
+
+    async fn create_execution_stream(&self) -> Result<SendableRecordBatchStream> {
         self.ensure_inferred_parquet_schemas()?;
         // Ensure both SQL-built and DataFrame-built plans go through the same analyze/optimize pipeline.
         let (analyzed, catalog_snapshot) = {
@@ -321,15 +337,10 @@ impl DataFrame {
             spill_dir: self.session.config.spill_dir.clone(),
         };
 
-        let stream: ffq_execution::stream::SendableRecordBatchStream = self
-            .session
+        self.session
             .runtime
             .execute(physical, ctx, catalog_snapshot)
-            .await?;
-        let schema = stream.schema();
-
-        let batches: Vec<RecordBatch> = stream.try_collect().await?;
-        Ok((schema, batches))
+            .await
     }
 
     fn ensure_inferred_parquet_schemas(&self) -> Result<()> {
