@@ -64,11 +64,29 @@ pub enum Expr {
     Not(Box<Expr>),
 
     #[cfg(feature = "vector")]
-    CosineSimilarity { vector: Box<Expr>, query: Box<Expr> },
+    /// Cosine similarity between a vector expression and query vector literal.
+    CosineSimilarity {
+        /// Vector-valued input expression.
+        vector: Box<Expr>,
+        /// Query vector expression (typically a literal).
+        query: Box<Expr>,
+    },
     #[cfg(feature = "vector")]
-    L2Distance { vector: Box<Expr>, query: Box<Expr> },
+    /// L2 distance between a vector expression and query vector literal.
+    L2Distance {
+        /// Vector-valued input expression.
+        vector: Box<Expr>,
+        /// Query vector expression (typically a literal).
+        query: Box<Expr>,
+    },
     #[cfg(feature = "vector")]
-    DotProduct { vector: Box<Expr>, query: Box<Expr> },
+    /// Dot product between a vector expression and query vector literal.
+    DotProduct {
+        /// Vector-valued input expression.
+        vector: Box<Expr>,
+        /// Query vector expression (typically a literal).
+        query: Box<Expr>,
+    },
 }
 
 /// Literal values supported by the v1 planner.
@@ -86,6 +104,7 @@ pub enum LiteralValue {
     Null,
 
     #[cfg(feature = "vector")]
+    /// `f32` vector literal (feature `vector`).
     VectorF32(Vec<f32>),
 }
 
