@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ffq_client::bench_fixtures::{
-    generate_default_benchmark_fixtures, FixtureIndex, FixtureManifest,
+    FixtureIndex, FixtureManifest, generate_default_benchmark_fixtures,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 

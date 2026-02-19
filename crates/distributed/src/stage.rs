@@ -118,7 +118,7 @@ mod tests {
     use std::collections::HashSet;
 
     use ffq_planner::{
-        create_physical_plan, AggExpr, Expr, LogicalPlan, PhysicalPlan, PhysicalPlannerConfig,
+        AggExpr, Expr, LogicalPlan, PhysicalPlan, PhysicalPlannerConfig, create_physical_plan,
     };
 
     #[test]

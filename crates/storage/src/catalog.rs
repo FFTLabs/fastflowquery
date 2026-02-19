@@ -7,26 +7,54 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Logical table definition persisted in catalog files (`tables.json` / `tables.toml`).
+///
+/// Contract:
+/// - a table must provide data locations via either [`TableDef::uri`] or [`TableDef::paths`]
+/// - `schema` may be omitted only for inferable formats (currently parquet and qdrant)
+/// - format-specific options are carried in `options`
+///
+/// Persistence:
+/// - this struct is serialized directly by [`Catalog::save`] and loaded by [`Catalog::load`]
+/// - when schema inference/writeback is enabled at client layer, inferred schema and
+///   fingerprint metadata are stored in `schema` and `options`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
+    /// Registry key for this table.
     pub name: String,
+    /// Single path/URI location for table data.
+    ///
+    /// When set and [`TableDef::paths`] is empty, providers read from this location.
     #[serde(default)]
     pub uri: String,
+    /// Multi-file explicit data paths.
+    ///
+    /// Takes precedence over [`TableDef::uri`] when non-empty.
     #[serde(default)]
     pub paths: Vec<String>,
+    /// Storage format identifier (for example `parquet`, `qdrant`).
     pub format: String,
 
+    /// Optional table schema.
+    ///
+    /// For parquet, schema can be omitted and inferred by client/storage inference policies.
     #[serde(default)]
     pub schema: Option<Schema>,
 
+    /// Optional table statistics used by optimizer heuristics.
     #[serde(default)]
     pub stats: crate::TableStats,
 
+    /// Provider- and feature-specific options map.
     #[serde(default)]
     pub options: HashMap<String, String>,
 }
 
 impl TableDef {
+    /// Returns schema as [`SchemaRef`] or an error if missing.
+    ///
+    /// # Errors
+    /// Returns an error when schema is absent.
     pub fn schema_ref(&self) -> Result<SchemaRef> {
         match &self.schema {
             Some(s) => Ok(Arc::new(s.clone())),
@@ -37,6 +65,14 @@ impl TableDef {
         }
     }
 
+    /// Resolves data locations in provider-consumable order.
+    ///
+    /// Resolution:
+    /// - returns `paths` when non-empty
+    /// - otherwise returns `uri` as a single entry
+    ///
+    /// # Errors
+    /// Returns an error when neither `paths` nor `uri` is configured.
     pub fn data_paths(&self) -> Result<Vec<String>> {
         if !self.paths.is_empty() {
             return Ok(self.paths.clone());
@@ -51,40 +87,59 @@ impl TableDef {
     }
 }
 
+/// In-memory table catalog with JSON/TOML persistence helpers.
 #[derive(Debug, Default, Clone)]
 pub struct Catalog {
     tables: HashMap<String, TableDef>,
 }
 
 impl Catalog {
+    /// Creates an empty catalog.
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
         }
     }
 
+    /// Registers or replaces a table by name.
     pub fn register_table(&mut self, table: TableDef) {
         self.tables.insert(table.name.clone(), table);
     }
 
+    /// Retrieves a table definition by name.
+    ///
+    /// # Errors
+    /// Returns planning error for unknown table names.
     pub fn get(&self, name: &str) -> Result<&TableDef> {
         self.tables
             .get(name)
             .ok_or_else(|| FfqError::Planning(format!("unknown table: {name}")))
     }
 
+    /// Loads catalog from a JSON file.
+    ///
+    /// # Errors
+    /// Returns an error on read/parse/validation failures.
     pub fn load_from_json(path: &str) -> Result<Self> {
         let s = fs::read_to_string(path)?;
         let tables = parse_tables_json(&s)?;
         Self::from_tables(tables)
     }
 
+    /// Loads catalog from a TOML file.
+    ///
+    /// # Errors
+    /// Returns an error on read/parse/validation failures.
     pub fn load_from_toml(path: &str) -> Result<Self> {
         let s = fs::read_to_string(path)?;
         let tables = parse_tables_toml(&s)?;
         Self::from_tables(tables)
     }
 
+    /// Loads catalog from JSON or TOML based on file extension.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported extensions or load/validation failures.
     pub fn load(path: &str) -> Result<Self> {
         match Path::new(path).extension().and_then(|ext| ext.to_str()) {
             Some("json") => Self::load_from_json(path),
@@ -107,12 +162,17 @@ impl Catalog {
         Ok(cat)
     }
 
+    /// Returns all table definitions sorted by table name.
     pub fn tables(&self) -> Vec<TableDef> {
         let mut v = self.tables.values().cloned().collect::<Vec<_>>();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
     }
 
+    /// Persists catalog atomically to JSON.
+    ///
+    /// # Errors
+    /// Returns an error on encode/write/commit failures.
     pub fn save_to_json(&self, path: &str) -> Result<()> {
         if let Some(parent) = Path::new(path).parent() {
             fs::create_dir_all(parent)?;
@@ -125,6 +185,10 @@ impl Catalog {
         Ok(())
     }
 
+    /// Persists catalog atomically to TOML.
+    ///
+    /// # Errors
+    /// Returns an error on encode/write/commit failures.
     pub fn save_to_toml(&self, path: &str) -> Result<()> {
         if let Some(parent) = Path::new(path).parent() {
             fs::create_dir_all(parent)?;
@@ -137,6 +201,10 @@ impl Catalog {
         Ok(())
     }
 
+    /// Persists catalog to JSON/TOML based on file extension.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported extension or save failures.
     pub fn save(&self, path: &str) -> Result<()> {
         match Path::new(path).extension().and_then(|ext| ext.to_str()) {
             Some("json") => self.save_to_json(path),
@@ -196,6 +264,15 @@ fn format_supports_schema_inference(format: &str) -> bool {
     matches!(format.to_ascii_lowercase().as_str(), "parquet" | "qdrant")
 }
 
+/// Writes bytes to `path` using stage-then-rename atomic commit semantics.
+///
+/// Behavior:
+/// - writes staged file under the same parent directory
+/// - if target exists, renames existing target to backup, then commits staged file
+/// - on commit failure, best-effort rollback restores backup
+///
+/// # Errors
+/// Returns an error when stage/write/rename steps fail.
 fn write_atomically(path: &str, content: &[u8]) -> Result<()> {
     let target = Path::new(path);
     let parent = target

@@ -27,6 +27,10 @@ pub enum PhysicalPlan {
 }
 
 impl PhysicalPlan {
+    /// Returns direct child operators.
+    ///
+    /// This is used by explain/inspection code and assumes `VectorTopK` is a
+    /// leaf and exchange operators have exactly one child.
     pub fn children(&self) -> Vec<&PhysicalPlan> {
         match self {
             PhysicalPlan::ParquetScan(_) => vec![],
@@ -49,6 +53,7 @@ impl PhysicalPlan {
     }
 }
 
+/// Physical parquet scan operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParquetScanExec {
     /// Table name from the catalog (v1).
@@ -62,18 +67,24 @@ pub struct ParquetScanExec {
     pub filters: Vec<Expr>,
 }
 
+/// Physical parquet sink operator.
+///
+/// The execution runtime uses `table` to resolve target path and commit
+/// semantics from catalog/table options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParquetWriteExec {
     pub table: String,
     pub input: Box<PhysicalPlan>,
 }
 
+/// Row filter operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterExec {
     pub predicate: Expr,
     pub input: Box<PhysicalPlan>,
 }
 
+/// Projection operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectExec {
     /// (expr, output_name)
@@ -81,12 +92,17 @@ pub struct ProjectExec {
     pub input: Box<PhysicalPlan>,
 }
 
+/// Batch coalescing operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoalesceBatchesExec {
     pub target_batch_rows: usize,
     pub input: Box<PhysicalPlan>,
 }
 
+/// Phase-1 hash aggregate over local/shuffle partitions.
+///
+/// Must be followed by compatible repartition + final aggregate for global SQL
+/// aggregate semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartialHashAggregateExec {
     pub group_exprs: Vec<Expr>,
@@ -94,6 +110,7 @@ pub struct PartialHashAggregateExec {
     pub input: Box<PhysicalPlan>,
 }
 
+/// Phase-2 hash aggregate merging partial states after shuffle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalHashAggregateExec {
     pub group_exprs: Vec<Expr>,
@@ -101,12 +118,20 @@ pub struct FinalHashAggregateExec {
     pub input: Box<PhysicalPlan>,
 }
 
+/// Side chosen to build the hash table for [`HashJoinExec`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum BuildSide {
     Left,
     Right,
 }
 
+/// Hash join physical operator.
+///
+/// Contract:
+/// - `on` is positional key mapping `(left_key, right_key)`.
+/// - `strategy_hint` records optimizer intent; exchange nodes define actual
+///   data movement.
+/// - `build_side` must match the side expected to be in-memory hash build.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HashJoinExec {
     pub left: Box<PhysicalPlan>,
@@ -119,6 +144,7 @@ pub struct HashJoinExec {
     pub build_side: BuildSide,
 }
 
+/// Stage-boundary exchange operators.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExchangeExec {
     ShuffleWrite(ShuffleWriteExchange),
@@ -126,23 +152,27 @@ pub enum ExchangeExec {
     Broadcast(BroadcastExchange),
 }
 
+/// Shuffle write boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShuffleWriteExchange {
     pub input: Box<PhysicalPlan>,
     pub partitioning: PartitioningSpec,
 }
 
+/// Shuffle read boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShuffleReadExchange {
     pub input: Box<PhysicalPlan>,
     pub partitioning: PartitioningSpec,
 }
 
+/// Broadcast boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BroadcastExchange {
     pub input: Box<PhysicalPlan>,
 }
 
+/// Partitioning contract used by exchanges and distributed stage planner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PartitioningSpec {
     /// Hash partition by expressions into N partitions.
@@ -154,12 +184,17 @@ pub enum PartitioningSpec {
     Single,
 }
 
+/// Limit operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimitExec {
     pub n: usize,
     pub input: Box<PhysicalPlan>,
 }
 
+/// Brute-force top-k by score expression.
+///
+/// Used both as explicit SQL top-k execution path and as fallback when vector
+/// index rewrite does not apply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopKByScoreExec {
     pub score_expr: Expr,
@@ -167,6 +202,7 @@ pub struct TopKByScoreExec {
     pub input: Box<PhysicalPlan>,
 }
 
+/// Index-backed vector top-k physical operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorTopKExec {
     pub table: String,

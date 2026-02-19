@@ -1,5 +1,5 @@
 use std::cmp::{Ordering, Reverse};
-use std::collections::{hash_map::DefaultHasher, BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, hash_map::DefaultHasher};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -16,7 +16,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result};
-use ffq_execution::{compile_expr, TaskContext as ExecTaskContext};
+use ffq_execution::{TaskContext as ExecTaskContext, compile_expr};
 use ffq_planner::{AggExpr, BuildSide, ExchangeExec, Expr, PartitioningSpec, PhysicalPlan};
 use ffq_shuffle::{ShuffleReader, ShuffleWriter};
 use ffq_storage::parquet_provider::ParquetProvider;
@@ -2593,8 +2593,8 @@ mod tests {
     use super::*;
     use crate::coordinator::CoordinatorConfig;
     use ffq_planner::{
-        create_physical_plan, AggExpr, Expr, JoinStrategyHint, JoinType, LogicalPlan,
-        ParquetScanExec, ParquetWriteExec, PhysicalPlan, PhysicalPlannerConfig,
+        AggExpr, Expr, JoinStrategyHint, JoinType, LogicalPlan, ParquetScanExec, ParquetWriteExec,
+        PhysicalPlan, PhysicalPlannerConfig, create_physical_plan,
     };
     use ffq_storage::{TableDef, TableStats};
     use parquet::arrow::ArrowWriter;

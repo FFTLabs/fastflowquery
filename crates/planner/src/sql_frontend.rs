@@ -9,7 +9,12 @@ use sqlparser::ast::{
 
 use crate::logical_plan::{AggExpr, BinaryOp, Expr, JoinStrategyHint, LiteralValue, LogicalPlan};
 
-/// Convert a SQL string into a LogicalPlan, binding named parameters (like :k, :query).
+/// Convert a SQL string into a [`LogicalPlan`], binding named parameters (for
+/// example `:k`, `:query`).
+///
+/// Contract:
+/// - exactly one statement must be present;
+/// - supported statements are delegated to [`statement_to_logical`].
 pub fn sql_to_logical(sql: &str, params: &HashMap<String, LiteralValue>) -> Result<LogicalPlan> {
     let stmts = ffq_sql::parse_sql(sql)?;
     if stmts.len() != 1 {
@@ -20,6 +25,9 @@ pub fn sql_to_logical(sql: &str, params: &HashMap<String, LiteralValue>) -> Resu
     statement_to_logical(&stmts[0], params)
 }
 
+/// Convert one parsed SQL statement into a [`LogicalPlan`].
+///
+/// v1 supports `SELECT` and `INSERT INTO ... SELECT ...` only.
 pub fn statement_to_logical(
     stmt: &Statement,
     params: &HashMap<String, LiteralValue>,
@@ -62,7 +70,7 @@ fn query_to_logical(q: &Query, params: &HashMap<String, LiteralValue>) -> Result
         _ => {
             return Err(FfqError::Unsupported(
                 "only simple SELECT is supported (no UNION/EXCEPT/INTERSECT)".to_string(),
-            ))
+            ));
         }
     };
 
@@ -113,7 +121,7 @@ fn query_to_logical(q: &Query, params: &HashMap<String, LiteralValue>) -> Result
             SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
                 return Err(FfqError::Unsupported(
                     "SELECT * is not supported in v1 subset (use explicit columns)".to_string(),
-                ))
+                ));
             }
         }
     }
@@ -221,7 +229,7 @@ fn from_to_plan(
             _ => {
                 return Err(FfqError::Unsupported(
                     "only INNER JOIN is supported in v1".to_string(),
-                ))
+                ));
             }
         }
     }
@@ -518,7 +526,7 @@ fn sql_binop_to_binop(op: &SqlBinaryOp) -> Result<BinaryOp> {
         _ => {
             return Err(FfqError::Unsupported(format!(
                 "unsupported binary operator in v1: {op}"
-            )))
+            )));
         }
     })
 }

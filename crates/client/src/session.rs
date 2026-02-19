@@ -1,13 +1,11 @@
+use std::collections::HashMap;
 #[cfg(feature = "profiling")]
 use std::net::SocketAddr;
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::{env, path::Path, path::PathBuf};
 
 use arrow_schema::Schema;
-use ffq_common::{
-    EngineConfig, MetricsRegistry, Result, SchemaDriftPolicy, SchemaInferencePolicy,
-};
+use ffq_common::{EngineConfig, MetricsRegistry, Result, SchemaDriftPolicy, SchemaInferencePolicy};
 use ffq_storage::Catalog;
 use ffq_storage::parquet_provider::FileFingerprint;
 

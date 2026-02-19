@@ -6,11 +6,11 @@ use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result, SchemaInferencePolicy};
 use ffq_planner::{ExchangeExec, PhysicalPlan};
 use ffq_shuffle::ShuffleReader;
-use ffq_storage::parquet_provider::ParquetProvider;
 use ffq_storage::Catalog;
+use ffq_storage::parquet_provider::ParquetProvider;
 use tracing::{debug, info, warn};
 
-use crate::stage::{build_stage_dag, StageDag};
+use crate::stage::{StageDag, build_stage_dag};
 
 #[derive(Debug, Clone)]
 pub struct CoordinatorConfig {
@@ -161,8 +161,9 @@ impl Coordinator {
         let mut plan: PhysicalPlan = serde_json::from_slice(physical_plan_json)
             .map_err(|e| FfqError::Planning(format!("invalid physical plan json: {e}")))?;
         self.resolve_parquet_scan_schemas(&mut plan)?;
-        let resolved_plan_json = serde_json::to_vec(&plan)
-            .map_err(|e| FfqError::Planning(format!("encode resolved physical plan failed: {e}")))?;
+        let resolved_plan_json = serde_json::to_vec(&plan).map_err(|e| {
+            FfqError::Planning(format!("encode resolved physical plan failed: {e}"))
+        })?;
         let dag = build_stage_dag(&plan);
         info!(
             query_id = %query_id,
@@ -219,7 +220,9 @@ impl Coordinator {
             PhysicalPlan::Filter(x) => self.resolve_parquet_scan_schemas(&mut x.input),
             PhysicalPlan::Project(x) => self.resolve_parquet_scan_schemas(&mut x.input),
             PhysicalPlan::CoalesceBatches(x) => self.resolve_parquet_scan_schemas(&mut x.input),
-            PhysicalPlan::PartialHashAggregate(x) => self.resolve_parquet_scan_schemas(&mut x.input),
+            PhysicalPlan::PartialHashAggregate(x) => {
+                self.resolve_parquet_scan_schemas(&mut x.input)
+            }
             PhysicalPlan::FinalHashAggregate(x) => self.resolve_parquet_scan_schemas(&mut x.input),
             PhysicalPlan::HashJoin(x) => {
                 self.resolve_parquet_scan_schemas(&mut x.left)?;

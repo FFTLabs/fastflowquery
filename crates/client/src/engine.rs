@@ -7,11 +7,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arrow_schema::Schema;
 use ffq_common::{EngineConfig, Result, SchemaInferencePolicy};
 use ffq_planner::LiteralValue;
-use ffq_storage::parquet_provider::{FileFingerprint, ParquetProvider};
 use ffq_storage::TableDef;
+use ffq_storage::parquet_provider::{FileFingerprint, ParquetProvider};
 
-use crate::session::{Session, SharedSession};
 use crate::DataFrame;
+use crate::session::{Session, SharedSession};
 
 /// Primary entry point for planning and executing queries.
 ///
@@ -64,7 +64,11 @@ impl Engine {
     ///
     /// # Errors
     /// Returns an error when schema inference/validation fails or table metadata is invalid.
-    pub fn register_table_checked(&self, name: impl Into<String>, mut table: TableDef) -> Result<()> {
+    pub fn register_table_checked(
+        &self,
+        name: impl Into<String>,
+        mut table: TableDef,
+    ) -> Result<()> {
         table.name = name.into();
         maybe_infer_table_schema_on_register(self.session.config.schema_inference, &mut table)?;
         self.session
@@ -133,7 +137,10 @@ impl Engine {
     ///
     /// # Errors
     /// Returns an error if table lookup fails.
-    pub fn table_schema_with_origin(&self, name: &str) -> Result<Option<(Schema, TableSchemaOrigin)>> {
+    pub fn table_schema_with_origin(
+        &self,
+        name: &str,
+    ) -> Result<Option<(Schema, TableSchemaOrigin)>> {
         let cat = self.session.catalog.read().expect("catalog lock poisoned");
         let table = cat.get(name)?;
         let Some(schema) = table.schema.clone() else {
@@ -203,10 +210,9 @@ pub(crate) fn annotate_schema_inference_metadata(
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    table.options.insert(
-        "schema.inferred_at".to_string(),
-        now_secs.to_string(),
-    );
+    table
+        .options
+        .insert("schema.inferred_at".to_string(), now_secs.to_string());
     table.options.insert(
         "schema.fingerprint".to_string(),
         serde_json::to_string(fingerprint).map_err(|e| {

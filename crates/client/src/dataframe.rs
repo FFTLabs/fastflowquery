@@ -316,7 +316,8 @@ impl DataFrame {
                 if !table.format.eq_ignore_ascii_case("parquet") {
                     continue;
                 }
-                if !self.session.config.schema_inference.allows_inference() && table.schema.is_none()
+                if !self.session.config.schema_inference.allows_inference()
+                    && table.schema.is_none()
                 {
                     continue;
                 }

@@ -6,8 +6,8 @@ use arrow::record_batch::RecordBatch;
 use ffq_common::{FfqError, Result};
 
 use crate::layout::{
-    index_bin_path, index_json_path, map_task_base_dir, shuffle_path, MapTaskIndex,
-    ShufflePartitionMeta,
+    MapTaskIndex, ShufflePartitionMeta, index_bin_path, index_json_path, map_task_base_dir,
+    shuffle_path,
 };
 
 const INDEX_BIN_MAGIC: &[u8; 4] = b"FFQI";

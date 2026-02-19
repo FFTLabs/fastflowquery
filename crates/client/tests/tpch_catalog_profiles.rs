@@ -2,8 +2,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use ffq_client::bench_queries::{load_benchmark_query, BenchmarkQueryId};
 use ffq_client::Engine;
+use ffq_client::bench_queries::{BenchmarkQueryId, load_benchmark_query};
 use ffq_common::EngineConfig;
 use ffq_storage::Catalog;
 
@@ -80,15 +80,13 @@ fn run_catalog_profile_query_checks(profile_path: &Path) {
 #[test]
 #[ignore = "slow official SF1 Q1/Q3 profile validation"]
 fn tpch_official_catalog_profile_json_runs_q1_q3_without_manual_registration() {
-    let profile =
-        repo_root().join("tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json");
+    let profile = repo_root().join("tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.json");
     run_catalog_profile_query_checks(&profile);
 }
 
 #[test]
 #[ignore = "slow official SF1 Q1/Q3 profile validation"]
 fn tpch_official_catalog_profile_toml_runs_q1_q3_without_manual_registration() {
-    let profile =
-        repo_root().join("tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.toml");
+    let profile = repo_root().join("tests/fixtures/catalog/tpch_dbgen_sf1_parquet.tables.toml");
     run_catalog_profile_query_checks(&profile);
 }

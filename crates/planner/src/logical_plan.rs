@@ -1,57 +1,64 @@
 use arrow_schema::DataType;
 use serde::{Deserialize, Serialize};
 
+/// Join semantics supported by the logical planner.
+///
+/// v1 currently only supports [`JoinType::Inner`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinType {
+    /// Keep only rows where join keys match on both sides.
     Inner,
 }
 
+/// Optimizer hint controlling join distribution strategy.
+///
+/// This is a hint, not a hard promise. Physical planning may still choose a
+/// safe fallback shape when constraints are not met.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinStrategyHint {
+    /// Let optimizer/physical planner pick the strategy.
     Auto,
+    /// Broadcast left side and build hash table from left.
     BroadcastLeft,
+    /// Broadcast right side and build hash table from right.
     BroadcastRight,
+    /// Shuffle both sides by join key and join partition-wise.
     Shuffle,
 }
 
+/// Scalar expression used by logical and physical planning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expr {
+    /// Unresolved column name (before analysis).
     Column(String),
-    ColumnRef {
-        name: String,
-        index: usize,
-    },
+    /// Resolved column binding emitted by analyzer.
+    ColumnRef { name: String, index: usize },
+    /// Scalar literal.
     Literal(LiteralValue),
+    /// Binary operator expression.
     BinaryOp {
         left: Box<Expr>,
         op: BinaryOp,
         right: Box<Expr>,
     },
-    Cast {
-        expr: Box<Expr>,
-        to_type: DataType,
-    },
+    /// Explicit type cast.
+    Cast { expr: Box<Expr>, to_type: DataType },
+    /// Boolean conjunction.
     And(Box<Expr>, Box<Expr>),
+    /// Boolean disjunction.
     Or(Box<Expr>, Box<Expr>),
+    /// Boolean negation.
     Not(Box<Expr>),
 
     #[cfg(feature = "vector")]
-    CosineSimilarity {
-        vector: Box<Expr>,
-        query: Box<Expr>,
-    },
+    CosineSimilarity { vector: Box<Expr>, query: Box<Expr> },
     #[cfg(feature = "vector")]
-    L2Distance {
-        vector: Box<Expr>,
-        query: Box<Expr>,
-    },
+    L2Distance { vector: Box<Expr>, query: Box<Expr> },
     #[cfg(feature = "vector")]
-    DotProduct {
-        vector: Box<Expr>,
-        query: Box<Expr>,
-    },
+    DotProduct { vector: Box<Expr>, query: Box<Expr> },
 }
 
+/// Literal values supported by the v1 planner.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LiteralValue {
     Int64(i64),
@@ -64,6 +71,7 @@ pub enum LiteralValue {
     VectorF32(Vec<f32>),
 }
 
+/// Binary operators supported by v1 expression evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinaryOp {
     Eq,
@@ -78,21 +86,34 @@ pub enum BinaryOp {
     Divide,
 }
 
+/// Logical plan tree produced by SQL/DataFrame frontend and rewritten by
+/// analyzer/optimizer passes.
+///
+/// Contracts:
+/// - `TableScan.projection` is best-effort pushdown and may be widened later.
+/// - `Join.on` uses `(left_col, right_col)` column names.
+/// - `Aggregate` uses SQL grouped-aggregate semantics.
+/// - `TopKByScore` is the safe fallback path when vector index rewrite cannot
+///   be applied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
+    /// Scan a catalog table.
     TableScan {
         table: String,
         projection: Option<Vec<String>>,
         filters: Vec<Expr>,
     },
+    /// Compute named expressions from input rows.
     Projection {
         exprs: Vec<(Expr, String)>,
         input: Box<LogicalPlan>,
     },
+    /// Keep rows matching predicate.
     Filter {
         predicate: Expr,
         input: Box<LogicalPlan>,
     },
+    /// Equi-join two inputs using `on` key pairs.
     Join {
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
@@ -100,26 +121,36 @@ pub enum LogicalPlan {
         join_type: JoinType,
         strategy_hint: JoinStrategyHint,
     },
+    /// Grouped aggregate.
+    ///
+    /// `group_exprs` define grouping keys; `aggr_exprs` define aggregate
+    /// outputs and aliases.
     Aggregate {
         group_exprs: Vec<Expr>,
         aggr_exprs: Vec<(AggExpr, String)>,
         input: Box<LogicalPlan>,
     },
-    Limit {
-        n: usize,
-        input: Box<LogicalPlan>,
-    },
+    /// Return at most `n` rows.
+    Limit { n: usize, input: Box<LogicalPlan> },
+    /// Return top `k` rows by score expression.
+    ///
+    /// This is used for brute-force vector reranking and remains the fallback
+    /// when index-backed rewrite preconditions fail.
     TopKByScore {
         score_expr: Expr,
         k: usize,
         input: Box<LogicalPlan>,
     },
+    /// Index-backed vector top-k logical operator.
+    ///
+    /// Rewritten from `TopKByScore` only when optimizer preconditions are met.
     VectorTopK {
         table: String,
         query_vector: Vec<f32>,
         k: usize,
         filter: Option<String>,
     },
+    /// Insert query result into a target table.
     InsertInto {
         table: String,
         columns: Vec<String>,
@@ -127,6 +158,7 @@ pub enum LogicalPlan {
     },
 }
 
+/// Aggregate expression kinds supported by v1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AggExpr {
     Count(Expr),

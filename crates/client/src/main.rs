@@ -14,7 +14,7 @@
 
 use arrow::util::pretty::pretty_format_batches;
 use ffq_client::Engine;
-use ffq_client::repl::{run_repl, ReplOptions};
+use ffq_client::repl::{ReplOptions, run_repl};
 use ffq_common::{EngineConfig, FfqError, SchemaDriftPolicy, SchemaInferencePolicy};
 use ffq_storage::Catalog;
 
@@ -39,7 +39,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.first().map(|a| a.as_str()) == Some("repl") {
         let opts = parse_repl_opts(&args)?;
-        return run_repl(ReplOptions { config: opts.config });
+        return run_repl(ReplOptions {
+            config: opts.config,
+        });
     }
 
     let opts = parse_query_opts(&args)?;
@@ -113,18 +115,11 @@ fn parse_query_opts(args: &[String]) -> Result<QueryOpts, Box<dyn std::error::Er
         match args[i].as_str() {
             "--sql" => {
                 i += 1;
-                sql = args
-                    .get(i)
-                    .cloned()
-                    .ok_or("missing value for --sql")?;
+                sql = args.get(i).cloned().ok_or("missing value for --sql")?;
             }
             "--catalog" => {
                 i += 1;
-                catalog = Some(
-                    args.get(i)
-                        .cloned()
-                        .ok_or("missing value for --catalog")?,
-                );
+                catalog = Some(args.get(i).cloned().ok_or("missing value for --catalog")?);
             }
             "--plan" => {
                 plan_only = true;
@@ -154,11 +149,8 @@ fn parse_repl_opts(args: &[String]) -> Result<ReplOpts, Box<dyn std::error::Erro
         match args[i].as_str() {
             "--catalog" => {
                 i += 1;
-                config.catalog_path = Some(
-                    args.get(i)
-                        .cloned()
-                        .ok_or("missing value for --catalog")?,
-                );
+                config.catalog_path =
+                    Some(args.get(i).cloned().ok_or("missing value for --catalog")?);
             }
             "--coordinator-endpoint" => {
                 i += 1;
@@ -245,7 +237,9 @@ fn print_usage() {
     );
 }
 
-fn parse_schema_inference_policy(raw: &str) -> Result<SchemaInferencePolicy, Box<dyn std::error::Error>> {
+fn parse_schema_inference_policy(
+    raw: &str,
+) -> Result<SchemaInferencePolicy, Box<dyn std::error::Error>> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "off" => Ok(SchemaInferencePolicy::Off),
         "on" => Ok(SchemaInferencePolicy::On),
@@ -273,10 +267,7 @@ fn parse_bool(raw: &str, flag: &str) -> Result<bool, Box<dyn std::error::Error>>
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
-        other => Err(format!(
-            "invalid value for {flag}: {other} (expected true|false)"
-        )
-        .into()),
+        other => Err(format!("invalid value for {flag}: {other} (expected true|false)").into()),
     }
 }
 
@@ -291,8 +282,13 @@ fn print_cli_error(err: &(dyn std::error::Error + 'static)) {
     }
     let msg = err.to_string();
     eprintln!("[error] {msg}");
-    if msg.to_ascii_lowercase().contains("incompatible parquet files") {
-        eprintln!("hint: table points to parquet files with incompatible schemas; align schemas or split into separate tables");
+    if msg
+        .to_ascii_lowercase()
+        .contains("incompatible parquet files")
+    {
+        eprintln!(
+            "hint: table points to parquet files with incompatible schemas; align schemas or split into separate tables"
+        );
     }
 }
 
@@ -341,7 +337,9 @@ fn execution_hint(msg: &str) -> Option<&'static str> {
         || m.contains("transport error")
         || m.contains("coordinator")
     {
-        return Some("check FFQ_COORDINATOR_ENDPOINT and ensure coordinator/worker services are reachable");
+        return Some(
+            "check FFQ_COORDINATOR_ENDPOINT and ensure coordinator/worker services are reachable",
+        );
     }
     None
 }
@@ -349,16 +347,22 @@ fn execution_hint(msg: &str) -> Option<&'static str> {
 fn config_hint(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
     if m.contains("schema inference failed") {
-        return Some("verify parquet files exist and are readable; or define schema explicitly in catalog");
+        return Some(
+            "verify parquet files exist and are readable; or define schema explicitly in catalog",
+        );
     }
     if m.contains("schema drift detected") {
         return Some("set FFQ_SCHEMA_DRIFT_POLICY=refresh to auto-refresh schema on file changes");
     }
     if m.contains("incompatible parquet files") {
-        return Some("all parquet files in one table must have compatible schema; split mismatched files into separate tables");
+        return Some(
+            "all parquet files in one table must have compatible schema; split mismatched files into separate tables",
+        );
     }
     if m.contains("has no schema") {
-        return Some("define table schema in catalog or enable inference with FFQ_SCHEMA_INFERENCE=on|strict|permissive");
+        return Some(
+            "define table schema in catalog or enable inference with FFQ_SCHEMA_INFERENCE=on|strict|permissive",
+        );
     }
     if m.contains("catalog") {
         return Some("verify --catalog path exists and has .json/.toml extension");
@@ -369,7 +373,9 @@ fn config_hint(msg: &str) -> Option<&'static str> {
 fn unsupported_hint(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
     if m.contains("qdrant") {
-        return Some("enable required feature flags (vector/qdrant) or use brute-force fallback shape");
+        return Some(
+            "enable required feature flags (vector/qdrant) or use brute-force fallback shape",
+        );
     }
     None
 }

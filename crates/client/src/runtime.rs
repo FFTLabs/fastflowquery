@@ -1,6 +1,16 @@
+//! Query runtime implementations and operator execution helpers.
+//!
+//! This module executes physical plans in embedded and distributed modes.
+//! Operator contracts in v1:
+//! - scan/filter/project preserve row alignment per batch;
+//! - join/aggregate may reorder rows, but preserve logical SQL semantics;
+//! - sink operators return empty result batches and persist side effects;
+//! - memory budget (`QueryContext.mem_budget_bytes`) triggers spill paths for
+//!   hash join/hash aggregate when estimates exceed the budget.
+
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::fmt::Debug;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
@@ -18,7 +28,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result};
-use ffq_execution::{compile_expr, SendableRecordBatchStream, StreamAdapter, TaskContext};
+use ffq_execution::{SendableRecordBatchStream, StreamAdapter, TaskContext, compile_expr};
 use ffq_planner::{AggExpr, BuildSide, ExchangeExec, Expr, PhysicalPlan};
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
@@ -30,11 +40,15 @@ use futures::future::BoxFuture;
 use futures::{FutureExt, TryStreamExt};
 use parquet::arrow::ArrowWriter;
 use serde::{Deserialize, Serialize};
+use tracing::{Instrument, info, info_span};
 #[cfg(feature = "distributed")]
 use tracing::{debug, error};
-use tracing::{info, info_span, Instrument};
 
 #[derive(Debug, Clone)]
+/// Per-query runtime controls.
+///
+/// `mem_budget_bytes` is a soft threshold used by join/aggregate operators to
+/// choose in-memory vs spill-enabled execution.
 pub struct QueryContext {
     pub batch_size_rows: usize,
     pub mem_budget_bytes: usize,
@@ -43,6 +57,10 @@ pub struct QueryContext {
 
 /// Runtime = something that can execute a PhysicalPlan and return a stream of RecordBatches.
 pub trait Runtime: Send + Sync + Debug {
+    /// Execute one physical plan and return its output stream.
+    ///
+    /// Errors are surfaced as `FfqError::Planning`, `FfqError::Execution`,
+    /// `FfqError::Io`, or `FfqError::InvalidConfig` depending on failure stage.
     fn execute(
         &self,
         plan: PhysicalPlan,
@@ -56,6 +74,7 @@ pub trait Runtime: Send + Sync + Debug {
 }
 
 #[derive(Debug, Default)]
+/// In-process runtime that executes all operators locally.
 pub struct EmbeddedRuntime;
 
 impl EmbeddedRuntime {
@@ -112,6 +131,10 @@ struct TraceIds {
     task_id: u64,
 }
 
+/// Recursively execute one physical-plan subtree and materialize output batches.
+///
+/// This is the central operator dispatcher for scan/filter/project/limit/top-k,
+/// exchange, hash join, hash aggregate, and parquet sink paths.
 fn execute_plan(
     plan: PhysicalPlan,
     ctx: QueryContext,
@@ -529,6 +552,11 @@ impl Ord for TopKEntry {
 }
 
 #[cfg_attr(feature = "profiling", inline(never))]
+/// Evaluate `TopKByScoreExec`.
+///
+/// Input: arbitrary batches + numeric score expression (`Float32`/`Float64`).
+/// Output: one batch containing top-k rows in descending score order.
+/// Errors: non-numeric score expression evaluation or batch concat failures.
 fn run_topk_by_score(child: ExecOutput, score_expr: Expr, k: usize) -> Result<ExecOutput> {
     #[cfg(feature = "profiling")]
     let _profile_span = info_span!("profile_topk_by_score").entered();
@@ -737,6 +765,13 @@ enum JoinExecSide {
 }
 
 #[cfg_attr(feature = "profiling", inline(never))]
+/// Execute `HashJoinExec` with optional spill to grace-hash mode.
+///
+/// Input: fully materialized left/right child outputs and equi-join keys.
+/// Output: one joined batch with schema `left ++ right`.
+/// Spill behavior: when estimated build-side bytes exceed
+/// `ctx.mem_budget_bytes`, join partitions are spilled to JSONL and joined
+/// partition-wise.
 fn run_hash_join(
     left: ExecOutput,
     right: ExecOutput,
@@ -943,6 +978,10 @@ fn estimate_join_rows_bytes(rows: &[Vec<ScalarValue>]) -> usize {
 }
 
 #[cfg_attr(feature = "profiling", inline(never))]
+/// Grace hash-join spill path.
+///
+/// Both build/probe rows are partitioned to disk by join key hash, then joined
+/// partition-wise to keep peak in-memory state bounded.
 fn grace_hash_join(
     build_rows: &[Vec<ScalarValue>],
     probe_rows: &[Vec<ScalarValue>],
@@ -1066,6 +1105,12 @@ fn hash_key(key: &[ScalarValue]) -> u64 {
 }
 
 #[cfg_attr(feature = "profiling", inline(never))]
+/// Execute two-phase hash aggregation (partial or final mode).
+///
+/// Input: child rows, group expressions, aggregate expressions.
+/// Output: one batch with grouping columns followed by aggregate outputs.
+/// Spill behavior: group state spills to JSONL files when estimated memory
+/// usage exceeds `ctx.mem_budget_bytes`.
 fn run_hash_aggregate(
     child: ExecOutput,
     group_exprs: Vec<Expr>,
@@ -1435,9 +1480,7 @@ fn group_field(
     match &group_exprs[idx] {
         Expr::ColumnRef { name, index } => Ok((
             name.clone(),
-            if *index < input_schema.fields().len()
-                && input_schema.field(*index).name() == name
-            {
+            if *index < input_schema.fields().len() && input_schema.field(*index).name() == name {
                 input_schema.field(*index).data_type().clone()
             } else {
                 // In final aggregate mode, group columns are physically laid out by position,
@@ -1477,6 +1520,7 @@ fn state_to_scalar(state: &AggState, expr: &AggExpr, mode: AggregateMode) -> Sca
     }
 }
 
+/// Spill aggregate state to disk when memory budget is exceeded.
 fn maybe_spill(
     groups: &mut HashMap<Vec<ScalarValue>, Vec<AggState>>,
     spills: &mut Vec<PathBuf>,
@@ -1528,6 +1572,7 @@ fn maybe_spill(
     Ok(())
 }
 
+/// Merge one spilled aggregate state file back into in-memory groups.
 fn merge_spill_file(
     path: &PathBuf,
     groups: &mut HashMap<Vec<ScalarValue>, Vec<AggState>>,
@@ -1857,6 +1902,9 @@ fn scalar_gt(a: &ScalarValue, b: &ScalarValue) -> Result<bool> {
     scalar_lt(b, a)
 }
 
+/// Execute parquet sink write with temp-file + atomic-commit semantics.
+///
+/// Side effect: writes/overwrites target parquet object and returns no rows.
 fn write_parquet_sink(table: &ffq_storage::TableDef, child: &ExecOutput) -> Result<()> {
     ensure_sink_parent_layout(table)?;
     let out_path = resolve_sink_output_path(table)?;
@@ -1995,14 +2043,16 @@ fn replace_file_atomically(staged: &PathBuf, target: &PathBuf) -> Result<()> {
 }
 
 #[cfg(feature = "distributed")]
-use ffq_distributed::grpc::v1::QueryState as DistQueryState;
+use ffq_distributed::DistributedRuntime as InnerDistributedRuntime;
 #[cfg(feature = "distributed")]
 use ffq_distributed::grpc::ControlPlaneClient;
 #[cfg(feature = "distributed")]
-use ffq_distributed::DistributedRuntime as InnerDistributedRuntime;
+use ffq_distributed::grpc::v1::QueryState as DistQueryState;
 
 #[cfg(feature = "distributed")]
 #[derive(Debug)]
+/// gRPC-backed runtime that submits and fetches query work/results from the
+/// distributed coordinator.
 pub struct DistributedRuntime {
     _inner: InnerDistributedRuntime,
     coordinator_endpoint: String,
@@ -2010,6 +2060,7 @@ pub struct DistributedRuntime {
 
 #[cfg(feature = "distributed")]
 impl DistributedRuntime {
+    /// Create a distributed runtime targeting a coordinator endpoint.
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             _inner: InnerDistributedRuntime::default(),
@@ -2197,9 +2248,9 @@ mod tests {
     use ffq_storage::vector_index::{VectorIndexProvider, VectorTopKRow};
     use futures::future::BoxFuture;
 
-    use super::{rows_to_vector_topk_output, run_vector_topk_with_provider};
     #[cfg(feature = "vector")]
-    use super::{run_topk_by_score, ExecOutput};
+    use super::{ExecOutput, run_topk_by_score};
+    use super::{rows_to_vector_topk_output, run_vector_topk_with_provider};
 
     struct MockVectorProvider;
 

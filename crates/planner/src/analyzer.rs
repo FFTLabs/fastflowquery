@@ -15,14 +15,18 @@ pub trait SchemaProvider {
 pub struct Analyzer;
 
 impl Analyzer {
+    /// Create a new analyzer.
     pub fn new() -> Self {
         Self
     }
 
-    /// Analyze:
-    /// - resolve columns -> ColumnRef { index }
-    /// - infer types
-    /// - insert minimal casts
+    /// Analyze a logical plan and return a semantically validated plan.
+    ///
+    /// Guarantees:
+    /// - unresolved `Expr::Column` references become `Expr::ColumnRef`;
+    /// - expression/aggregate types are inferred and checked;
+    /// - required casts are inserted for supported coercions;
+    /// - join and insert contracts are validated early.
     pub fn analyze(&self, plan: LogicalPlan, provider: &dyn SchemaProvider) -> Result<LogicalPlan> {
         let (p, _schema, _resolver) = self.analyze_plan(plan, provider)?;
         Ok(p)

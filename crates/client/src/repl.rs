@@ -1,16 +1,16 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use arrow::util::pretty::pretty_format_batches;
-use arrow::util::display::array_value_to_string;
 use arrow::record_batch::RecordBatch;
+use arrow::util::display::array_value_to_string;
+use arrow::util::pretty::pretty_format_batches;
 use ffq_common::{EngineConfig, FfqError};
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use serde_json::{Map, Value};
 
-use crate::engine::TableSchemaOrigin;
 use crate::Engine;
+use crate::engine::TableSchemaOrigin;
 
 /// REPL startup options.
 #[derive(Debug, Clone)]
@@ -31,8 +31,7 @@ pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
     let mut rl = DefaultEditor::new()?;
     let history_path = repl_history_path();
     if let Err(err) = rl.load_history(&history_path) {
-        if !matches!(err, ReadlineError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound)
-        {
+        if !matches!(err, ReadlineError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound) {
             eprintln!(
                 "warning: failed to load history '{}': {err}",
                 history_path.display()
@@ -47,7 +46,11 @@ pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("FFQ REPL (type \\q to quit)");
     loop {
-        let prompt = if sql_buffer.is_empty() { "ffq> " } else { " ...> " };
+        let prompt = if sql_buffer.is_empty() {
+            "ffq> "
+        } else {
+            " ...> "
+        };
         let line = match rl.readline(prompt) {
             Ok(line) => {
                 if !line.trim().is_empty() {
@@ -104,7 +107,11 @@ pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let sql = sql_buffer.trim_end().trim_end_matches(';').trim().to_string();
+        let sql = sql_buffer
+            .trim_end()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
         sql_buffer.clear();
         if sql.is_empty() {
             continue;
@@ -297,10 +304,7 @@ fn print_help() {
     println!("  \\mode table|csv|json  set output rendering mode");
 }
 
-fn print_batches(
-    batches: &[RecordBatch],
-    mode: OutputMode,
-) -> Result<(), FfqError> {
+fn print_batches(batches: &[RecordBatch], mode: OutputMode) -> Result<(), FfqError> {
     match mode {
         OutputMode::Table => {
             let rendered = pretty_format_batches(batches)
@@ -438,7 +442,9 @@ fn execution_hint(msg: &str) -> Option<&'static str> {
         );
     }
     if m.contains("query vector dim") {
-        return Some("ensure query vector length matches embedding column fixed-size list dimension");
+        return Some(
+            "ensure query vector length matches embedding column fixed-size list dimension",
+        );
     }
     None
 }
@@ -483,7 +489,9 @@ fn unsupported_hint(msg: &str) -> Option<&'static str> {
         return Some("v1 supports ORDER BY only for cosine_similarity(...) DESC LIMIT k pattern");
     }
     if m.contains("qdrant") {
-        return Some("enable required feature flags (vector/qdrant) or use brute-force fallback shape");
+        return Some(
+            "enable required feature flags (vector/qdrant) or use brute-force fallback shape",
+        );
     }
     None
 }
@@ -625,13 +633,9 @@ mod tests {
             },
         );
 
-        let batches = futures::executor::block_on(
-            engine
-                .sql("SELECT a FROM t")
-                .expect("sql")
-                .collect(),
-        )
-        .expect("collect");
+        let batches =
+            futures::executor::block_on(engine.sql("SELECT a FROM t").expect("sql").collect())
+                .expect("collect");
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);

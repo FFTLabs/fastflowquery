@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::fs::File;
 use std::fs;
+use std::fs::File;
 #[cfg(feature = "distributed")]
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -12,11 +12,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
+use ffq_client::Engine;
 use ffq_client::bench_fixtures::{
     default_benchmark_fixture_root, generate_default_benchmark_fixtures,
 };
-use ffq_client::bench_queries::{load_benchmark_query_from_root, BenchmarkQueryId};
-use ffq_client::Engine;
+use ffq_client::bench_queries::{BenchmarkQueryId, load_benchmark_query_from_root};
 use ffq_common::{EngineConfig, FfqError, Result};
 use ffq_planner::LiteralValue;
 use ffq_storage::{TableDef, TableStats};
@@ -1262,7 +1262,10 @@ fn maybe_verify_official_tpch_correctness(
     if !is_official {
         return Ok(());
     }
-    if !matches!(query_id, BenchmarkQueryId::TpchQ1 | BenchmarkQueryId::TpchQ3) {
+    if !matches!(
+        query_id,
+        BenchmarkQueryId::TpchQ1 | BenchmarkQueryId::TpchQ3
+    ) {
         return Ok(());
     }
 
@@ -1417,9 +1420,12 @@ fn read_parquet_batches(path: &Path) -> Result<Vec<RecordBatch>> {
     let file = File::open(path)?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| FfqError::Execution(format!("open parquet {} failed: {e}", path.display())))?;
-    let reader = builder
-        .build()
-        .map_err(|e| FfqError::Execution(format!("build parquet reader {} failed: {e}", path.display())))?;
+    let reader = builder.build().map_err(|e| {
+        FfqError::Execution(format!(
+            "build parquet reader {} failed: {e}",
+            path.display()
+        ))
+    })?;
     let mut out = Vec::new();
     for batch in reader {
         out.push(batch.map_err(|e| {
