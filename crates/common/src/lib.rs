@@ -1,3 +1,20 @@
+//! Shared configuration, error types, IDs, and observability primitives for FFQ crates.
+//!
+//! Architecture role:
+//! - defines engine/runtime configuration passed across layers
+//! - provides common [`FfqError`] / [`Result`] contracts
+//! - hosts metrics and optional exporter utilities
+//!
+//! Key modules:
+//! - [`config`]
+//! - [`error`]
+//! - [`ids`]
+//! - [`metrics`]
+//! - `metrics_exporter` (feature-gated)
+//!
+//! Feature flags:
+//! - `profiling`: enables the metrics HTTP exporter helpers.
+
 pub mod config;
 pub mod error;
 pub mod ids;

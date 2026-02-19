@@ -12,11 +12,20 @@ use serde_json::{Map, Value};
 use crate::engine::TableSchemaOrigin;
 use crate::Engine;
 
+/// REPL startup options.
 #[derive(Debug, Clone)]
 pub struct ReplOptions {
+    /// Engine configuration used for the session.
     pub config: EngineConfig,
 }
 
+/// Runs the interactive FFQ SQL REPL.
+///
+/// The REPL supports SQL statements and shell-style commands (for example `\help`, `\tables`,
+/// `\schema`, `\mode`), with persistent history via `~/.ffq_history`.
+///
+/// # Errors
+/// Returns an error if engine bootstrap or line-editor initialization fails.
 pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::new(opts.config)?;
     let mut rl = DefaultEditor::new()?;

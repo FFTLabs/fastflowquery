@@ -3,15 +3,21 @@ use std::path::{Path, PathBuf};
 
 use ffq_common::{FfqError, Result};
 
+/// Identifier for canonical benchmark SQL files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BenchmarkQueryId {
+    /// TPC-H Q1 aggregate workload.
     TpchQ1,
+    /// TPC-H Q3 join + filter workload.
     TpchQ3,
+    /// Vector brute-force top-k benchmark query.
     RagTopkBruteforce,
+    /// Optional qdrant-backed vector top-k benchmark query.
     RagTopkQdrant,
 }
 
 impl BenchmarkQueryId {
+    /// Stable machine-readable identifier used in result artifacts.
     pub fn stable_id(self) -> &'static str {
         match self {
             Self::TpchQ1 => "tpch_q1",
@@ -21,6 +27,7 @@ impl BenchmarkQueryId {
         }
     }
 
+    /// Relative SQL file location under the benchmark query root.
     pub fn file_name(self) -> &'static str {
         match self {
             Self::TpchQ1 => "canonical/tpch_q1.sql",
@@ -31,6 +38,7 @@ impl BenchmarkQueryId {
     }
 }
 
+/// Ordered list of benchmark queries expected by the benchmark runner.
 pub const CANONICAL_BENCHMARK_QUERIES: [BenchmarkQueryId; 4] = [
     BenchmarkQueryId::TpchQ1,
     BenchmarkQueryId::TpchQ3,
@@ -38,16 +46,25 @@ pub const CANONICAL_BENCHMARK_QUERIES: [BenchmarkQueryId; 4] = [
     BenchmarkQueryId::RagTopkQdrant,
 ];
 
+/// Returns the default benchmark query directory.
 pub fn default_benchmark_query_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/bench/queries")
         .to_path_buf()
 }
 
+/// Loads one benchmark SQL file from the default query root.
+///
+/// # Errors
+/// Returns an error when file loading fails or query content is empty.
 pub fn load_benchmark_query(id: BenchmarkQueryId) -> Result<String> {
     load_benchmark_query_from_root(&default_benchmark_query_root(), id)
 }
 
+/// Loads one benchmark SQL file from an explicit query root.
+///
+/// # Errors
+/// Returns an error when file loading fails or query content is empty.
 pub fn load_benchmark_query_from_root(root: &Path, id: BenchmarkQueryId) -> Result<String> {
     let path = root.join(id.file_name());
     let query = fs::read_to_string(&path).map_err(|e| {
@@ -71,6 +88,10 @@ pub fn load_benchmark_query_from_root(root: &Path, id: BenchmarkQueryId) -> Resu
     Ok(trimmed)
 }
 
+/// Loads all canonical benchmark SQL files.
+///
+/// # Errors
+/// Returns an error if any canonical query fails to load.
 pub fn load_all_benchmark_queries() -> Result<Vec<(BenchmarkQueryId, String)>> {
     let root = default_benchmark_query_root();
     CANONICAL_BENCHMARK_QUERIES

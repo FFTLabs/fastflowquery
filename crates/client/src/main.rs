@@ -1,3 +1,17 @@
+//! `ffq-client` command-line entrypoint.
+//!
+//! Architecture role:
+//! - provides query mode and interactive REPL mode
+//! - maps CLI/env configuration into [`ffq_common::EngineConfig`]
+//! - executes SQL via [`ffq_client::Engine`] and renders result batches
+//!
+//! Key flows:
+//! - `query`: one-shot SQL execution
+//! - `repl`: interactive SQL and shell commands
+//!
+//! Feature flags:
+//! - runtime behavior follows features enabled in `ffq-client` (for example `distributed`).
+
 use arrow::util::pretty::pretty_format_batches;
 use ffq_client::Engine;
 use ffq_client::repl::{run_repl, ReplOptions};

@@ -12,20 +12,34 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
 
+/// Per-file manifest entry for converted TPCH parquet outputs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TpchParquetFileManifest {
+    /// File name relative to output directory.
     pub file: String,
+    /// Number of rows in the output file.
     pub rows: i64,
+    /// Flattened field descriptors in `name:type:nullable` format.
     pub schema: Vec<String>,
 }
 
+/// Manifest emitted after converting TPCH `.tbl` files to parquet.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TpchParquetManifest {
+    /// Fixture identifier.
     pub fixture: String,
+    /// Input source format identifier.
     pub source_format: String,
+    /// Converted files.
     pub files: Vec<TpchParquetFileManifest>,
 }
 
+/// Converts TPCH dbgen SF1 `.tbl` files (`customer`, `orders`, `lineitem`) to parquet.
+///
+/// Writes parquet files and a `manifest.json` into `output_dir`.
+///
+/// # Errors
+/// Returns an error when input files are missing or parsing/writing fails.
 pub fn convert_tpch_sf1_tbl_to_parquet(
     input_dir: &Path,
     output_dir: &Path,
@@ -57,10 +71,12 @@ pub fn convert_tpch_sf1_tbl_to_parquet(
     Ok(manifest)
 }
 
+/// Default location for TPCH dbgen `.tbl` source files.
 pub fn default_tpch_dbgen_tbl_input_dir() -> PathBuf {
     PathBuf::from("./tests/bench/fixtures/tpch_dbgen_sf1")
 }
 
+/// Default location for converted TPCH parquet fixture files.
 pub fn default_tpch_dbgen_parquet_output_dir() -> PathBuf {
     PathBuf::from("./tests/bench/fixtures/tpch_dbgen_sf1_parquet")
 }

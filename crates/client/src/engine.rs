@@ -13,18 +13,38 @@ use ffq_storage::TableDef;
 use crate::session::{Session, SharedSession};
 use crate::DataFrame;
 
+/// Primary entry point for planning and executing queries.
+///
+/// `Engine` owns a shared session containing planner, catalog, runtime, and metrics state.
+/// Clone is cheap and shares the same underlying session.
 #[derive(Clone)]
 pub struct Engine {
     session: SharedSession,
 }
 
+/// Source of a table schema returned by [`Engine::table_schema_with_origin`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableSchemaOrigin {
+    /// Schema came directly from catalog definition.
     CatalogDefined,
+    /// Schema was inferred from parquet files and cached/persisted as metadata.
     Inferred,
 }
 
 impl Engine {
+    /// Constructs a new engine with the provided configuration.
+    ///
+    /// Runtime selection behavior:
+    /// - when built **without** `distributed` feature: always embedded runtime
+    /// - when built **with** `distributed` feature:
+    ///   - uses distributed runtime if `config.coordinator_endpoint` is set, or
+    ///   - uses `FFQ_COORDINATOR_ENDPOINT` when set, otherwise falls back to embedded.
+    ///
+    /// Schema policy env overrides are also applied from session bootstrap:
+    /// `FFQ_SCHEMA_INFERENCE`, `FFQ_SCHEMA_WRITEBACK`, `FFQ_SCHEMA_DRIFT_POLICY`.
+    ///
+    /// # Errors
+    /// Returns an error if session initialization fails (for example catalog load or invalid config).
     pub fn new(config: EngineConfig) -> Result<Self> {
         let session = Arc::new(Session::new(config)?);
         Ok(Self { session })
@@ -37,6 +57,13 @@ impl Engine {
             .expect("table registration failed");
     }
 
+    /// Registers a table and returns a fallible result.
+    ///
+    /// For parquet tables with inference enabled and no explicit schema,
+    /// registration may infer schema immediately.
+    ///
+    /// # Errors
+    /// Returns an error when schema inference/validation fails or table metadata is invalid.
     pub fn register_table_checked(&self, name: impl Into<String>, mut table: TableDef) -> Result<()> {
         table.name = name.into();
         maybe_infer_table_schema_on_register(self.session.config.schema_inference, &mut table)?;
@@ -48,11 +75,21 @@ impl Engine {
         Ok(())
     }
 
+    /// Parses SQL into a query [`DataFrame`].
+    ///
+    /// The query is planned/analyzed during execution (`collect`, write methods, etc.).
+    ///
+    /// # Errors
+    /// Returns an error when SQL parsing fails.
     pub fn sql(&self, query: &str) -> Result<DataFrame> {
         let logical = self.session.planner.plan_sql(query)?;
         Ok(DataFrame::new(self.session.clone(), logical))
     }
 
+    /// Same as [`Engine::sql`] but binds named parameters.
+    ///
+    /// # Errors
+    /// Returns an error when SQL parsing/binding fails.
     pub fn sql_with_params(
         &self,
         query: &str,
@@ -62,10 +99,15 @@ impl Engine {
         Ok(DataFrame::new(self.session.clone(), logical))
     }
 
+    /// Returns a [`DataFrame`] that scans a registered table.
+    ///
+    /// # Errors
+    /// Returns an error if table lookup/planning fails.
     pub fn table(&self, name: &str) -> Result<DataFrame> {
         Ok(DataFrame::table(self.session.clone(), name))
     }
 
+    /// Lists all currently registered table names.
     pub fn list_tables(&self) -> Vec<String> {
         self.session
             .catalog
@@ -77,12 +119,20 @@ impl Engine {
             .collect()
     }
 
+    /// Returns schema for a registered table when available.
+    ///
+    /// # Errors
+    /// Returns an error if table lookup fails.
     pub fn table_schema(&self, name: &str) -> Result<Option<Schema>> {
         let cat = self.session.catalog.read().expect("catalog lock poisoned");
         let table = cat.get(name)?;
         Ok(table.schema.clone())
     }
 
+    /// Returns schema together with origin metadata.
+    ///
+    /// # Errors
+    /// Returns an error if table lookup fails.
     pub fn table_schema_with_origin(&self, name: &str) -> Result<Option<(Schema, TableSchemaOrigin)>> {
         let cat = self.session.catalog.read().expect("catalog lock poisoned");
         let table = cat.get(name)?;
@@ -99,15 +149,21 @@ impl Engine {
         Ok(Some((schema, origin)))
     }
 
+    /// Gracefully shuts down runtime resources.
     pub async fn shutdown(&self) -> Result<()> {
         self.session.runtime.shutdown().await
     }
 
+    /// Renders current Prometheus metrics exposition text.
     pub fn prometheus_metrics(&self) -> String {
         self.session.prometheus_metrics()
     }
 
     #[cfg(feature = "profiling")]
+    /// Serves metrics exporter endpoint for profiling/observability workflows.
+    ///
+    /// # Errors
+    /// Returns an error if binding or serving fails.
     pub async fn serve_metrics_exporter(&self, addr: SocketAddr) -> Result<()> {
         self.session.serve_metrics_exporter(addr).await
     }

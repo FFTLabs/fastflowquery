@@ -1,3 +1,19 @@
+//! Execution-layer primitives used by runtimes and physical operators.
+//!
+//! Architecture role:
+//! - task context and execution node contracts
+//! - expression compilation/evaluation
+//! - batch stream abstractions and channels
+//!
+//! Key modules:
+//! - [`context`]
+//! - [`exec_node`]
+//! - [`expressions`]
+//! - [`stream`]
+//!
+//! Feature flags:
+//! - no crate-level flags; vector expression support is coordinated with planner/runtime features.
+
 pub mod context;
 pub mod exec_node;
 pub mod expressions;

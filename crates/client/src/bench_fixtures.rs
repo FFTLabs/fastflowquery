@@ -18,27 +18,48 @@ const RAG_DOC_ROWS: i64 = 10_000;
 const RAG_EMBED_DIM: i32 = 64;
 const RAG_SYNTH_SEED: u64 = 42;
 
+/// Per-file manifest entry for generated benchmark fixtures.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FixtureFileManifest {
+    /// File name relative to fixture directory.
     pub file: String,
+    /// Number of rows in the parquet file.
     pub rows: i64,
+    /// Flattened field descriptors in `name:type:nullable` format.
     pub schema: Vec<String>,
 }
 
+/// Manifest for one generated fixture set.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FixtureManifest {
+    /// Fixture identifier.
     pub fixture: String,
+    /// Human-readable fixture description.
     pub description: String,
+    /// Seed that makes generation deterministic.
     pub deterministic_seed: u64,
+    /// Files produced for this fixture.
     pub files: Vec<FixtureFileManifest>,
 }
 
+/// Top-level index file for all generated fixture sets.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FixtureIndex {
+    /// Stable fixture-set id.
     pub fixture_set: String,
+    /// Subdirectories included in this fixture set.
     pub fixtures: Vec<String>,
 }
 
+/// Generates deterministic default benchmark fixtures under `root`.
+///
+/// Creates:
+/// - `tpch_sf1` (synthetic TPCH-shaped data)
+/// - `rag_synth` (synthetic vector data)
+/// - `index.json` and per-fixture manifests
+///
+/// # Errors
+/// Returns an error if directory creation, parquet writing, or manifest writes fail.
 pub fn generate_default_benchmark_fixtures(root: &Path) -> Result<()> {
     std::fs::create_dir_all(root)?;
     let tpch_root = root.join("tpch_sf1");
@@ -350,6 +371,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T, err_prefix: &str) -> Result<
     Ok(())
 }
 
+/// Returns default directory for benchmark fixtures used by benchmark runners.
 pub fn default_benchmark_fixture_root() -> PathBuf {
     PathBuf::from("./tests/bench/fixtures")
 }
