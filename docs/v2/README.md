@@ -78,6 +78,7 @@ The matrix below is the complete required v2 doc set. Ownership can be updated a
 | Runtime | `docs/v2/distributed-runtime.md` | `@ffq-runtime` | draft |
 | Runtime | `docs/v2/control-plane.md` | `@ffq-runtime` | draft |
 | Runtime | `docs/v2/distributed-capabilities.md` | `@ffq-runtime` | draft |
+| Runtime | `docs/v2/custom-operators-deployment.md` | `@ffq-runtime` | draft |
 | Runtime | `docs/v2/shuffle-stage-model.md` | `@ffq-runtime` | draft |
 | Runtime | `docs/v2/operators-core.md` | `@ffq-runtime` | draft |
 | Runtime | `docs/v2/observability.md` | `@ffq-runtime` | draft |
