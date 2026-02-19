@@ -1177,20 +1177,23 @@ fn run_in_subquery_filter(
     subquery: ExecOutput,
     negated: bool,
 ) -> Result<ExecOutput> {
-    let sub_set = subquery_membership_set(&subquery)?;
+    let sub_membership = subquery_membership_set(&subquery)?;
     let eval = compile_expr(&expr, &input.schema)?;
     let mut out_batches = Vec::with_capacity(input.batches.len());
     for batch in &input.batches {
         let values = eval.evaluate(batch)?;
         let mut mask_builder = BooleanBuilder::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
-            let keep = if values.is_null(row) {
-                false
+            // SQL 3-valued semantics:
+            // - keep row only when predicate is TRUE
+            // - FALSE/NULL are filtered out by WHERE.
+            let predicate = if values.is_null(row) {
+                None
             } else {
                 let value = scalar_from_array(&values, row)?;
-                let contains = value != ScalarValue::Null && sub_set.contains(&value);
-                if negated { !contains } else { contains }
+                eval_in_predicate(value, &sub_membership, negated)
             };
+            let keep = predicate == Some(true);
             mask_builder.append_value(keep);
         }
         let mask = mask_builder.finish();
@@ -1300,13 +1303,13 @@ fn compare_scalar_values(op: BinaryOp, lhs: &ScalarValue, rhs: &ScalarValue) -> 
     }
 }
 
-fn subquery_membership_set(subquery: &ExecOutput) -> Result<HashSet<ScalarValue>> {
+fn subquery_membership_set(subquery: &ExecOutput) -> Result<InSubqueryMembership> {
     if subquery.schema.fields().len() != 1 {
         return Err(FfqError::Planning(
             "IN subquery must produce exactly one column".to_string(),
         ));
     }
-    let mut out = HashSet::new();
+    let mut out = InSubqueryMembership::default();
     for batch in &subquery.batches {
         if batch.num_columns() != 1 {
             return Err(FfqError::Planning(
@@ -1316,11 +1319,40 @@ fn subquery_membership_set(subquery: &ExecOutput) -> Result<HashSet<ScalarValue>
         for row in 0..batch.num_rows() {
             let value = scalar_from_array(batch.column(0), row)?;
             if value != ScalarValue::Null {
-                out.insert(value);
+                out.values.insert(value);
+            } else {
+                out.has_null = true;
             }
         }
     }
     Ok(out)
+}
+
+#[derive(Debug, Default)]
+struct InSubqueryMembership {
+    values: HashSet<ScalarValue>,
+    has_null: bool,
+}
+
+fn eval_in_predicate(
+    lhs: ScalarValue,
+    membership: &InSubqueryMembership,
+    negated: bool,
+) -> Option<bool> {
+    // NULL IN (...) and NULL NOT IN (...) are NULL.
+    if lhs == ScalarValue::Null {
+        return None;
+    }
+    // Match found.
+    if membership.values.contains(&lhs) {
+        return Some(!negated);
+    }
+    // No match, but NULL in rhs yields UNKNOWN for both IN and NOT IN.
+    if membership.has_null {
+        return None;
+    }
+    // No match and no NULL in rhs.
+    Some(negated)
 }
 
 fn rows_to_batch(schema: &SchemaRef, rows: &[Vec<ScalarValue>]) -> Result<RecordBatch> {

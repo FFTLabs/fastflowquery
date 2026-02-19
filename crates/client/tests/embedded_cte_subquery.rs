@@ -127,3 +127,145 @@ fn scalar_subquery_errors_on_multiple_rows() {
     let _ = std::fs::remove_file(t_path);
     let _ = std::fs::remove_file(s_path);
 }
+
+fn make_engine_with_in_null_fixtures() -> (Engine, Vec<std::path::PathBuf>) {
+    let t_path = support::unique_path("ffq_in_null_t", "parquet");
+    let s_null_path = support::unique_path("ffq_in_null_snull", "parquet");
+    let s_empty_path = support::unique_path("ffq_in_null_sempty", "parquet");
+    let s_all_null_path = support::unique_path("ffq_in_null_sallnull", "parquet");
+
+    let t_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+    support::write_parquet(
+        &t_path,
+        t_schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![Some(1_i64), Some(2), None]))],
+    );
+
+    let s_schema = Arc::new(Schema::new(vec![Field::new("k2", DataType::Int64, true)]));
+    support::write_parquet(
+        &s_null_path,
+        s_schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![Some(2_i64), None]))],
+    );
+    support::write_parquet(
+        &s_empty_path,
+        s_schema.clone(),
+        vec![Arc::new(Int64Array::from(Vec::<Option<i64>>::new()))],
+    );
+    support::write_parquet(
+        &s_all_null_path,
+        s_schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![None, None]))],
+    );
+
+    let engine = Engine::new(EngineConfig::default()).expect("engine");
+    for (name, path, schema) in [
+        ("tnull", &t_path, &t_schema),
+        ("snull", &s_null_path, &s_schema),
+        ("sempty", &s_empty_path, &s_schema),
+        ("sallnull", &s_all_null_path, &s_schema),
+    ] {
+        engine.register_table(
+            name,
+            TableDef {
+                name: "ignored".to_string(),
+                uri: path.to_string_lossy().into_owned(),
+                paths: Vec::new(),
+                format: "parquet".to_string(),
+                schema: Some((**schema).clone()),
+                stats: ffq_storage::TableStats::default(),
+                options: HashMap::new(),
+            },
+        );
+    }
+    (
+        engine,
+        vec![t_path, s_null_path, s_empty_path, s_all_null_path],
+    )
+}
+
+#[test]
+fn in_not_in_null_semantics_with_null_in_rhs() {
+    let (engine, paths) = make_engine_with_in_null_fixtures();
+
+    let in_sql = "SELECT k FROM tnull WHERE k IN (SELECT k2 FROM snull)";
+    let in_batches =
+        futures::executor::block_on(engine.sql(in_sql).expect("sql").collect()).expect("collect");
+    let in_values = in_batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    assert_eq!(in_values, vec![2]);
+
+    let not_in_sql = "SELECT k FROM tnull WHERE k NOT IN (SELECT k2 FROM snull)";
+    let not_in_batches = futures::executor::block_on(
+        engine.sql(not_in_sql).expect("sql").collect(),
+    )
+    .expect("collect");
+    let not_in_values = not_in_batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    assert!(not_in_values.is_empty(), "unexpected rows: {not_in_values:?}");
+
+    for p in paths {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn in_not_in_null_semantics_with_empty_rhs_and_all_null_rhs() {
+    let (engine, paths) = make_engine_with_in_null_fixtures();
+
+    let in_empty_sql = "SELECT k FROM tnull WHERE k IN (SELECT k2 FROM sempty)";
+    let in_empty_batches = futures::executor::block_on(
+        engine.sql(in_empty_sql).expect("sql").collect(),
+    )
+    .expect("collect");
+    let in_empty_values = in_empty_batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    assert!(in_empty_values.is_empty(), "unexpected rows: {in_empty_values:?}");
+
+    let not_in_empty_sql = "SELECT k FROM tnull WHERE k NOT IN (SELECT k2 FROM sempty)";
+    let not_in_empty_batches = futures::executor::block_on(
+        engine.sql(not_in_empty_sql).expect("sql").collect(),
+    )
+    .expect("collect");
+    let mut not_in_empty_values = not_in_empty_batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    not_in_empty_values.sort_unstable();
+    assert_eq!(not_in_empty_values, vec![1, 2]);
+
+    let in_all_null_sql = "SELECT k FROM tnull WHERE k IN (SELECT k2 FROM sallnull)";
+    let in_all_null_batches = futures::executor::block_on(
+        engine.sql(in_all_null_sql).expect("sql").collect(),
+    )
+    .expect("collect");
+    let in_all_null_values = in_all_null_batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    assert!(in_all_null_values.is_empty(), "unexpected rows: {in_all_null_values:?}");
+
+    let not_in_all_null_sql = "SELECT k FROM tnull WHERE k NOT IN (SELECT k2 FROM sallnull)";
+    let not_in_all_null_batches = futures::executor::block_on(
+        engine.sql(not_in_all_null_sql).expect("sql").collect(),
+    )
+    .expect("collect");
+    let not_in_all_null_values = not_in_all_null_batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    assert!(
+        not_in_all_null_values.is_empty(),
+        "unexpected rows: {not_in_all_null_values:?}"
+    );
+
+    for p in paths {
+        let _ = std::fs::remove_file(p);
+    }
+}
