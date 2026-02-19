@@ -130,6 +130,13 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             ));
             fmt_plan(input, indent + 1, out);
         }
+        LogicalPlan::UnionAll { left, right } => {
+            out.push_str(&format!("{pad}UnionAll\n"));
+            out.push_str(&format!("{pad}  left:\n"));
+            fmt_plan(left, indent + 2, out);
+            out.push_str(&format!("{pad}  right:\n"));
+            fmt_plan(right, indent + 2, out);
+        }
         LogicalPlan::VectorTopK {
             table,
             query_vector,

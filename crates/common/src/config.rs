@@ -76,6 +76,13 @@ pub struct EngineConfig {
     /// Whether inferred schema/fingerprint metadata should be persisted back to catalog.
     #[serde(default)]
     pub schema_writeback: bool,
+    /// Maximum recursive expansion depth for `WITH RECURSIVE` planning.
+    #[serde(default = "default_recursive_cte_max_depth")]
+    pub recursive_cte_max_depth: usize,
+}
+
+fn default_recursive_cte_max_depth() -> usize {
+    32
 }
 
 impl Default for EngineConfig {
@@ -91,6 +98,7 @@ impl Default for EngineConfig {
             schema_inference: SchemaInferencePolicy::default(),
             schema_drift_policy: SchemaDriftPolicy::default(),
             schema_writeback: false,
+            recursive_cte_max_depth: default_recursive_cte_max_depth(),
         }
     }
 }

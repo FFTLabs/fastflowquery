@@ -379,6 +379,17 @@ fn proj_rewrite(
                 child_req,
             ))
         }
+        LogicalPlan::UnionAll { left, right } => {
+            let (new_left, _lreq) = proj_rewrite(*left, None, ctx)?;
+            let (new_right, _rreq) = proj_rewrite(*right, None, ctx)?;
+            Ok((
+                LogicalPlan::UnionAll {
+                    left: Box::new(new_left),
+                    right: Box::new(new_right),
+                },
+                required.unwrap_or_default(),
+            ))
+        }
 
         LogicalPlan::Filter { predicate, input } => {
             let mut req = required.unwrap_or_default();
@@ -948,6 +959,10 @@ fn vector_index_rewrite(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result
             columns,
             input: Box::new(vector_index_rewrite(*input, ctx)?),
         }),
+        LogicalPlan::UnionAll { left, right } => Ok(LogicalPlan::UnionAll {
+            left: Box::new(vector_index_rewrite(*left, ctx)?),
+            right: Box::new(vector_index_rewrite(*right, ctx)?),
+        }),
         leaf @ LogicalPlan::TableScan { .. } => Ok(leaf),
         leaf @ LogicalPlan::VectorTopK { .. } => Ok(leaf),
     }
@@ -1403,6 +1418,10 @@ fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy
             columns,
             input: Box::new(f(*input)),
         },
+        LogicalPlan::UnionAll { left, right } => LogicalPlan::UnionAll {
+            left: Box::new(f(*left)),
+            right: Box::new(f(*right)),
+        },
         s @ LogicalPlan::TableScan { .. } => s,
     }
 }
@@ -1514,6 +1533,10 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
             table,
             columns,
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+        },
+        LogicalPlan::UnionAll { left, right } => LogicalPlan::UnionAll {
+            left: Box::new(rewrite_plan_exprs(*left, rewrite)),
+            right: Box::new(rewrite_plan_exprs(*right, rewrite)),
         },
         s @ LogicalPlan::TableScan { .. } => s,
     }
@@ -1736,6 +1759,7 @@ fn plan_output_columns(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result
             Ok(l)
         }
         LogicalPlan::InsertInto { input, .. } => plan_output_columns(input, ctx),
+        LogicalPlan::UnionAll { left, .. } => plan_output_columns(left, ctx),
     }
 }
 
@@ -1759,6 +1783,7 @@ fn estimate_bytes(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result<Opti
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::TopKByScore { input, .. }
+        | LogicalPlan::UnionAll { left: input, .. }
         | LogicalPlan::InsertInto { input, .. } => estimate_bytes(input, ctx),
         LogicalPlan::VectorTopK { .. } => Ok(None),
         LogicalPlan::Join { .. } => Ok(None),

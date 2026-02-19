@@ -41,6 +41,8 @@ pub enum PhysicalPlan {
     Limit(LimitExec),
     /// Brute-force top-k.
     TopKByScore(TopKByScoreExec),
+    /// Concatenate child outputs (UNION ALL).
+    UnionAll(UnionAllExec),
     /// Index-backed vector top-k.
     VectorTopK(VectorTopKExec),
     /// Custom operator instantiated via runtime physical operator registry.
@@ -72,6 +74,7 @@ impl PhysicalPlan {
             },
             PhysicalPlan::Limit(x) => vec![x.input.as_ref()],
             PhysicalPlan::TopKByScore(x) => vec![x.input.as_ref()],
+            PhysicalPlan::UnionAll(x) => vec![x.left.as_ref(), x.right.as_ref()],
             PhysicalPlan::VectorTopK(_) => vec![],
             PhysicalPlan::Custom(x) => vec![x.input.as_ref()],
         }
@@ -296,6 +299,15 @@ pub struct TopKByScoreExec {
     pub k: usize,
     /// Input plan.
     pub input: Box<PhysicalPlan>,
+}
+
+/// Physical UNION ALL operator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnionAllExec {
+    /// Left input.
+    pub left: Box<PhysicalPlan>,
+    /// Right input.
+    pub right: Box<PhysicalPlan>,
 }
 
 /// Index-backed vector top-k physical operator.

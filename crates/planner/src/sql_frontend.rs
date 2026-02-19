@@ -4,12 +4,28 @@ use ffq_common::{FfqError, Result};
 use sqlparser::ast::{
     BinaryOperator as SqlBinaryOp, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
     FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Query,
-    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value,
+    SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, TableWithJoins,
+    Value,
 };
 
 use crate::logical_plan::{
     AggExpr, BinaryOp, Expr, JoinStrategyHint, LiteralValue, LogicalPlan, SubqueryCorrelation,
 };
+
+/// SQL frontend planning options.
+#[derive(Debug, Clone, Copy)]
+pub struct SqlFrontendOptions {
+    /// Maximum recursive CTE expansion depth for `WITH RECURSIVE`.
+    pub recursive_cte_max_depth: usize,
+}
+
+impl Default for SqlFrontendOptions {
+    fn default() -> Self {
+        Self {
+            recursive_cte_max_depth: 32,
+        }
+    }
+}
 
 /// Convert a SQL string into a [`LogicalPlan`], binding named parameters (for
 /// example `:k`, `:query`).
@@ -22,13 +38,22 @@ use crate::logical_plan::{
 /// - `Unsupported`: SQL construct is outside v1 supported subset
 /// - `Planning`: parse/parameter literal shape issues (for example bad LIMIT literal)
 pub fn sql_to_logical(sql: &str, params: &HashMap<String, LiteralValue>) -> Result<LogicalPlan> {
+    sql_to_logical_with_options(sql, params, SqlFrontendOptions::default())
+}
+
+/// Convert a SQL string into a [`LogicalPlan`] using explicit frontend options.
+pub fn sql_to_logical_with_options(
+    sql: &str,
+    params: &HashMap<String, LiteralValue>,
+    opts: SqlFrontendOptions,
+) -> Result<LogicalPlan> {
     let stmts = ffq_sql::parse_sql(sql)?;
     if stmts.len() != 1 {
         return Err(FfqError::Unsupported(
             "only single-statement SQL is supported in v1".to_string(),
         ));
     }
-    statement_to_logical(&stmts[0], params)
+    statement_to_logical_with_options(&stmts[0], params, opts)
 }
 
 /// Convert one parsed SQL statement into a [`LogicalPlan`].
@@ -42,9 +67,17 @@ pub fn statement_to_logical(
     stmt: &Statement,
     params: &HashMap<String, LiteralValue>,
 ) -> Result<LogicalPlan> {
+    statement_to_logical_with_options(stmt, params, SqlFrontendOptions::default())
+}
+
+fn statement_to_logical_with_options(
+    stmt: &Statement,
+    params: &HashMap<String, LiteralValue>,
+    opts: SqlFrontendOptions,
+) -> Result<LogicalPlan> {
     match stmt {
-        Statement::Query(q) => query_to_logical(q, params),
-        Statement::Insert(insert) => insert_to_logical(insert, params),
+        Statement::Query(q) => query_to_logical(q, params, opts),
+        Statement::Insert(insert) => insert_to_logical(insert, params, opts),
         _ => Err(FfqError::Unsupported(
             "only SELECT and INSERT INTO ... SELECT are supported in v1".to_string(),
         )),
@@ -54,6 +87,7 @@ pub fn statement_to_logical(
 fn insert_to_logical(
     insert: &sqlparser::ast::Insert,
     params: &HashMap<String, LiteralValue>,
+    opts: SqlFrontendOptions,
 ) -> Result<LogicalPlan> {
     let table = object_name_to_string(&insert.table_name);
     let columns = insert
@@ -65,7 +99,7 @@ fn insert_to_logical(
     let source = insert.source.as_ref().ok_or_else(|| {
         FfqError::Unsupported("INSERT must have a SELECT source in v1".to_string())
     })?;
-    let select_plan = query_to_logical(source, params)?;
+    let select_plan = query_to_logical(source, params, opts)?;
     Ok(LogicalPlan::InsertInto {
         table,
         columns,
@@ -73,14 +107,19 @@ fn insert_to_logical(
     })
 }
 
-fn query_to_logical(q: &Query, params: &HashMap<String, LiteralValue>) -> Result<LogicalPlan> {
-    query_to_logical_with_ctes(q, params, &HashMap::new())
+fn query_to_logical(
+    q: &Query,
+    params: &HashMap<String, LiteralValue>,
+    opts: SqlFrontendOptions,
+) -> Result<LogicalPlan> {
+    query_to_logical_with_ctes(q, params, &HashMap::new(), opts)
 }
 
 fn query_to_logical_with_ctes(
     q: &Query,
     params: &HashMap<String, LiteralValue>,
     parent_ctes: &HashMap<String, LogicalPlan>,
+    opts: SqlFrontendOptions,
 ) -> Result<LogicalPlan> {
     // We only support plain SELECT in v1.
     let select = match &*q.body {
@@ -95,10 +134,20 @@ fn query_to_logical_with_ctes(
     let mut cte_map = parent_ctes.clone();
     if let Some(with) = &q.with {
         let ordered = ordered_cte_indices(with, parent_ctes)?;
+        let recursive_self = recursive_self_ctes(with);
         for idx in ordered {
             let cte = &with.cte_tables[idx];
             let name = cte.alias.name.value.clone();
-            let cte_plan = query_to_logical_with_ctes(&cte.query, params, &cte_map)?;
+            let cte_plan = if recursive_self.contains(&name) {
+                if !with.recursive {
+                    return Err(FfqError::Planning(format!(
+                        "CTE '{name}' references itself; use WITH RECURSIVE"
+                    )));
+                }
+                build_recursive_cte_plan(cte, &name, params, &cte_map, opts)?
+            } else {
+                query_to_logical_with_ctes(&cte.query, params, &cte_map, opts)?
+            };
             cte_map.insert(name, cte_plan);
         }
     }
@@ -108,7 +157,7 @@ fn query_to_logical_with_ctes(
 
     // WHERE
     if let Some(selection) = &select.selection {
-        plan = where_to_plan(plan, selection, params, &cte_map)?;
+        plan = where_to_plan(plan, selection, params, &cte_map, opts)?;
     }
 
     // GROUP BY
@@ -249,9 +298,14 @@ fn ordered_cte_indices(
         vec![std::collections::HashSet::new(); with.cte_tables.len()];
     let mut outgoing_by_idx: Vec<Vec<usize>> = vec![Vec::new(); with.cte_tables.len()];
 
+    let self_recursive = recursive_self_ctes(with);
     for (idx, cte) in with.cte_tables.iter().enumerate() {
         let deps = referenced_local_ctes_in_query(&cte.query, &cte_names);
         for dep_name in deps {
+            if dep_name == cte.alias.name.value && self_recursive.contains(&dep_name) {
+                // Allow legal self-edge; this is handled by recursive CTE expansion.
+                continue;
+            }
             if let Some(dep_idx) = name_to_idx.get(&dep_name).copied() {
                 deps_by_idx[idx].insert(dep_idx);
             }
@@ -299,6 +353,118 @@ fn ordered_cte_indices(
         )));
     }
     Ok(out)
+}
+
+fn recursive_self_ctes(with: &sqlparser::ast::With) -> std::collections::HashSet<String> {
+    let cte_names = with
+        .cte_tables
+        .iter()
+        .map(|c| c.alias.name.value.clone())
+        .collect::<std::collections::HashSet<_>>();
+    with.cte_tables
+        .iter()
+        .filter_map(|cte| {
+            let name = cte.alias.name.value.clone();
+            let refs = referenced_local_ctes_in_query(&cte.query, &cte_names);
+            refs.contains(&name).then_some(name)
+        })
+        .collect()
+}
+
+fn build_recursive_cte_plan(
+    cte: &sqlparser::ast::Cte,
+    cte_name: &str,
+    params: &HashMap<String, LiteralValue>,
+    cte_map: &HashMap<String, LogicalPlan>,
+    opts: SqlFrontendOptions,
+) -> Result<LogicalPlan> {
+    if opts.recursive_cte_max_depth == 0 {
+        return Err(FfqError::Planning(format!(
+            "recursive CTE '{cte_name}' cannot be planned with recursive_cte_max_depth=0"
+        )));
+    }
+    let SetExpr::SetOperation {
+        op,
+        set_quantifier,
+        left,
+        right,
+    } = cte.query.body.as_ref()
+    else {
+        return Err(FfqError::Unsupported(format!(
+            "recursive CTE '{cte_name}' must use UNION ALL between seed and recursive term"
+        )));
+    };
+    if *op != SetOperator::Union || *set_quantifier != SetQuantifier::All {
+        return Err(FfqError::Unsupported(format!(
+            "recursive CTE '{cte_name}' only supports UNION ALL in phase-1"
+        )));
+    }
+
+    let left_refs_self = setexpr_references_cte(left, cte_name);
+    let right_refs_self = setexpr_references_cte(right, cte_name);
+    let (seed_body, rec_body) = match (left_refs_self, right_refs_self) {
+        (false, true) => (left.as_ref().clone(), right.as_ref().clone()),
+        (true, false) => (right.as_ref().clone(), left.as_ref().clone()),
+        (false, false) => {
+            return Err(FfqError::Planning(format!(
+                "recursive CTE '{cte_name}' has no self-reference in recursive term"
+            )));
+        }
+        (true, true) => {
+            return Err(FfqError::Unsupported(format!(
+                "recursive CTE '{cte_name}' has multiple self-references; phase-1 supports one recursive term reference"
+            )));
+        }
+    };
+
+    let mut seed_query = (*cte.query).clone();
+    seed_query.body = Box::new(seed_body);
+    let seed = query_to_logical_with_ctes(&seed_query, params, cte_map, opts)?;
+
+    let mut acc = seed.clone();
+    let mut delta = seed;
+    for _ in 0..opts.recursive_cte_max_depth {
+        let mut rec_query = (*cte.query).clone();
+        rec_query.body = Box::new(rec_body.clone());
+        let mut loop_ctes = cte_map.clone();
+        loop_ctes.insert(cte_name.to_string(), delta.clone());
+        let step = query_to_logical_with_ctes(&rec_query, params, &loop_ctes, opts)?;
+        acc = LogicalPlan::UnionAll {
+            left: Box::new(acc),
+            right: Box::new(step.clone()),
+        };
+        delta = step;
+    }
+    Ok(acc)
+}
+
+fn setexpr_references_cte(expr: &SetExpr, cte_name: &str) -> bool {
+    match expr {
+        SetExpr::Select(sel) => select_references_cte(sel, cte_name),
+        SetExpr::Query(q) => setexpr_references_cte(&q.body, cte_name),
+        SetExpr::SetOperation { left, right, .. } => {
+            setexpr_references_cte(left, cte_name) || setexpr_references_cte(right, cte_name)
+        }
+        _ => false,
+    }
+}
+
+fn select_references_cte(select: &sqlparser::ast::Select, cte_name: &str) -> bool {
+    select.from.iter().any(|twj| {
+        table_factor_references_cte(&twj.relation, cte_name)
+            || twj
+                .joins
+                .iter()
+                .any(|j| table_factor_references_cte(&j.relation, cte_name))
+    })
+}
+
+fn table_factor_references_cte(tf: &TableFactor, cte_name: &str) -> bool {
+    match tf {
+        TableFactor::Table { name, .. } => object_name_to_string(name) == cte_name,
+        TableFactor::Derived { subquery, .. } => setexpr_references_cte(&subquery.body, cte_name),
+        _ => false,
+    }
 }
 
 fn referenced_local_ctes_in_query(
@@ -470,6 +636,7 @@ fn where_to_plan(
     selection: &SqlExpr,
     params: &HashMap<String, LiteralValue>,
     ctes: &HashMap<String, LogicalPlan>,
+    opts: SqlFrontendOptions,
 ) -> Result<LogicalPlan> {
     match selection {
         SqlExpr::InSubquery {
@@ -479,13 +646,13 @@ fn where_to_plan(
         } => Ok(LogicalPlan::InSubqueryFilter {
             input: Box::new(input),
             expr: sql_expr_to_expr(expr, params)?,
-            subquery: Box::new(query_to_logical_with_ctes(subquery, params, ctes)?),
+            subquery: Box::new(query_to_logical_with_ctes(subquery, params, ctes, opts)?),
             negated: *negated,
             correlation: SubqueryCorrelation::Unresolved,
         }),
         SqlExpr::Exists { subquery, negated } => Ok(LogicalPlan::ExistsSubqueryFilter {
             input: Box::new(input),
-            subquery: Box::new(query_to_logical_with_ctes(subquery, params, ctes)?),
+            subquery: Box::new(query_to_logical_with_ctes(subquery, params, ctes, opts)?),
             negated: *negated,
             correlation: SubqueryCorrelation::Unresolved,
         }),
@@ -502,7 +669,7 @@ fn where_to_plan(
                         input: Box::new(input),
                         expr: sql_expr_to_expr(rhs_expr, params)?,
                         op: reversed,
-                        subquery: Box::new(query_to_logical_with_ctes(sub, params, ctes)?),
+                        subquery: Box::new(query_to_logical_with_ctes(sub, params, ctes, opts)?),
                         correlation: SubqueryCorrelation::Unresolved,
                     })
                 }
@@ -518,7 +685,7 @@ fn where_to_plan(
                             input: Box::new(input),
                             expr: sql_expr_to_expr(lhs_expr, params)?,
                             op: mapped_op,
-                            subquery: Box::new(query_to_logical_with_ctes(sub, params, ctes)?),
+                            subquery: Box::new(query_to_logical_with_ctes(sub, params, ctes, opts)?),
                             correlation: SubqueryCorrelation::Unresolved,
                         }),
                         _ => Err(FfqError::Unsupported(format!(
@@ -918,7 +1085,7 @@ fn is_topk_score_expr(_e: &Expr) -> bool {
 mod tests {
     use std::collections::HashMap;
 
-    use super::sql_to_logical;
+    use super::{SqlFrontendOptions, sql_to_logical, sql_to_logical_with_options};
     use crate::logical_plan::LiteralValue;
     use crate::logical_plan::LogicalPlan;
 
@@ -1082,6 +1249,9 @@ mod tests {
                 LogicalPlan::Join { left, right, .. } => {
                     contains_tablescan(left, target) || contains_tablescan(right, target)
                 }
+                LogicalPlan::UnionAll { left, right } => {
+                    contains_tablescan(left, target) || contains_tablescan(right, target)
+                }
                 LogicalPlan::Aggregate { input, .. } => contains_tablescan(input, target),
                 LogicalPlan::VectorTopK { .. } => false,
             }
@@ -1130,6 +1300,89 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("shadows an outer CTE"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parses_recursive_cte_union_all() {
+        let plan = sql_to_logical(
+            "WITH RECURSIVE r AS (
+                SELECT 1 AS node FROM t
+                UNION ALL
+                SELECT node + 1 AS node FROM r WHERE node < 3
+            )
+            SELECT node FROM r",
+            &HashMap::new(),
+        )
+        .expect("recursive parse");
+
+        fn has_union_all(plan: &LogicalPlan) -> bool {
+            match plan {
+                LogicalPlan::UnionAll { .. } => true,
+                LogicalPlan::Projection { input, .. }
+                | LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Limit { input, .. }
+                | LogicalPlan::TopKByScore { input, .. }
+                | LogicalPlan::InsertInto { input, .. } => has_union_all(input),
+                LogicalPlan::InSubqueryFilter { input, subquery, .. }
+                | LogicalPlan::ExistsSubqueryFilter { input, subquery, .. }
+                | LogicalPlan::ScalarSubqueryFilter { input, subquery, .. } => {
+                    has_union_all(input) || has_union_all(subquery)
+                }
+                LogicalPlan::Join { left, right, .. } => {
+                    has_union_all(left) || has_union_all(right)
+                }
+                LogicalPlan::Aggregate { input, .. } => has_union_all(input),
+                LogicalPlan::TableScan { .. } | LogicalPlan::VectorTopK { .. } => false,
+            }
+        }
+
+        assert!(
+            has_union_all(&plan),
+            "expected recursive CTE to expand into UnionAll: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_self_referencing_cte_without_recursive_keyword() {
+        let err = sql_to_logical(
+            "WITH r AS (
+                SELECT 1 AS node FROM t
+                UNION ALL
+                SELECT node + 1 AS node FROM r WHERE node < 3
+            )
+            SELECT node FROM r",
+            &HashMap::new(),
+        )
+        .expect_err("self-reference without WITH RECURSIVE should fail");
+
+        assert!(
+            err.to_string()
+                .contains("use WITH RECURSIVE"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_recursive_cte_when_depth_limit_is_zero() {
+        let err = sql_to_logical_with_options(
+            "WITH RECURSIVE r AS (
+                SELECT 1 AS node FROM t
+                UNION ALL
+                SELECT node + 1 AS node FROM r WHERE node < 3
+            )
+            SELECT node FROM r",
+            &HashMap::new(),
+            SqlFrontendOptions {
+                recursive_cte_max_depth: 0,
+            },
+        )
+        .expect_err("depth=0 should reject recursive CTE");
+
+        assert!(
+            err.to_string()
+                .contains("recursive_cte_max_depth=0"),
             "unexpected error: {err}"
         );
     }

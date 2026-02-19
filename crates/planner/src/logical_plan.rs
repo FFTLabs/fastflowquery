@@ -299,6 +299,13 @@ pub enum LogicalPlan {
         /// Input plan.
         input: Box<LogicalPlan>,
     },
+    /// Concatenate rows from two inputs (UNION ALL semantics).
+    UnionAll {
+        /// Left input.
+        left: Box<LogicalPlan>,
+        /// Right input.
+        right: Box<LogicalPlan>,
+    },
     /// Index-backed vector top-k logical operator.
     ///
     /// Rewritten from `TopKByScore` only when optimizer preconditions are met.

@@ -405,6 +405,44 @@ fn execute_plan(
                     in_bytes,
                 })
             }
+            PhysicalPlan::UnionAll(union) => {
+                let left = execute_plan(
+                    *union.left,
+                    ctx.clone(),
+                    Arc::clone(&catalog),
+                    Arc::clone(&physical_registry),
+                    Arc::clone(&trace),
+                )
+                .await?;
+                let right = execute_plan(
+                    *union.right,
+                    ctx,
+                    catalog,
+                    Arc::clone(&physical_registry),
+                    Arc::clone(&trace),
+                )
+                .await?;
+                if left.schema.fields().len() != right.schema.fields().len() {
+                    return Err(FfqError::Execution(format!(
+                        "UNION ALL schema mismatch: left has {} columns, right has {} columns",
+                        left.schema.fields().len(),
+                        right.schema.fields().len()
+                    )));
+                }
+                let (l_rows, l_batches, l_bytes) = batch_stats(&left.batches);
+                let (r_rows, r_batches, r_bytes) = batch_stats(&right.batches);
+                let mut batches = left.batches;
+                batches.extend(right.batches);
+                Ok(OpEval {
+                    out: ExecOutput {
+                        schema: left.schema,
+                        batches,
+                    },
+                    in_rows: l_rows + r_rows,
+                    in_batches: l_batches + r_batches,
+                    in_bytes: l_bytes + r_bytes,
+                })
+            }
             PhysicalPlan::VectorTopK(exec) => Ok(OpEval {
                 out: execute_vector_topk(exec, catalog).await?,
                 in_rows: 0,
@@ -635,6 +673,7 @@ fn operator_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Exchange(ExchangeExec::Broadcast(_)) => "Broadcast",
         PhysicalPlan::Limit(_) => "Limit",
         PhysicalPlan::TopKByScore(_) => "TopKByScore",
+        PhysicalPlan::UnionAll(_) => "UnionAll",
         PhysicalPlan::VectorTopK(_) => "VectorTopK",
         PhysicalPlan::Custom(_) => "Custom",
     }

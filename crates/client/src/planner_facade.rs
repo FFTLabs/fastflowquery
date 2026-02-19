@@ -23,15 +23,22 @@ impl PlannerFacade {
     }
 
     pub fn plan_sql(&self, sql: &str) -> Result<LogicalPlan> {
-        self.plan_sql_with_params(sql, &HashMap::new())
+        self.plan_sql_with_params(sql, &HashMap::new(), &EngineConfig::default())
     }
 
     pub fn plan_sql_with_params(
         &self,
         sql: &str,
         params: &HashMap<String, LiteralValue>,
+        cfg: &EngineConfig,
     ) -> Result<LogicalPlan> {
-        ffq_planner::sql_to_logical(sql, params)
+        ffq_planner::sql_to_logical_with_options(
+            sql,
+            params,
+            ffq_planner::SqlFrontendOptions {
+                recursive_cte_max_depth: cfg.recursive_cte_max_depth,
+            },
+        )
     }
 
     /// v1: optimizer first (pushdown changes projection), then analyzer (name->idx, casts)

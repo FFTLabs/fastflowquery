@@ -473,6 +473,36 @@ impl Analyzer {
                     resolver,
                 ))
             }
+            LogicalPlan::UnionAll { left, right } => {
+                let (al, ls, _lr) = self.analyze_plan(*left, provider)?;
+                let (ar, rs, _rr) = self.analyze_plan(*right, provider)?;
+                if ls.fields().len() != rs.fields().len() {
+                    return Err(FfqError::Planning(format!(
+                        "UNION ALL column-count mismatch: left has {}, right has {}",
+                        ls.fields().len(),
+                        rs.fields().len()
+                    )));
+                }
+                for idx in 0..ls.fields().len() {
+                    let ldt = ls.field(idx).data_type();
+                    let rdt = rs.field(idx).data_type();
+                    if ldt != rdt {
+                        return Err(FfqError::Planning(format!(
+                            "UNION ALL type mismatch at column {idx}: left={ldt:?}, right={rdt:?}"
+                        )));
+                    }
+                }
+                let out_schema = ls.clone();
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                Ok((
+                    LogicalPlan::UnionAll {
+                        left: Box::new(al),
+                        right: Box::new(ar),
+                    },
+                    out_schema,
+                    out_resolver,
+                ))
+            }
             LogicalPlan::VectorTopK {
                 table,
                 query_vector,

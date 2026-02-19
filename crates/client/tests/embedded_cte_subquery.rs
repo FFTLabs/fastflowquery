@@ -66,6 +66,53 @@ fn make_engine() -> (Engine, std::path::PathBuf, std::path::PathBuf) {
     (engine, t_path, s_path)
 }
 
+fn make_engine_with_config(cfg: EngineConfig) -> (Engine, std::path::PathBuf, std::path::PathBuf) {
+    let t_path = support::unique_path("ffq_cte_cfg_t", "parquet");
+    let s_path = support::unique_path("ffq_cte_cfg_s", "parquet");
+
+    let t_schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+    support::write_parquet(
+        &t_path,
+        t_schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+    );
+
+    let s_schema = Arc::new(Schema::new(vec![Field::new("k2", DataType::Int64, false)]));
+    support::write_parquet(
+        &s_path,
+        s_schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![2_i64, 3]))],
+    );
+
+    let engine = Engine::new(cfg).expect("engine");
+    engine.register_table(
+        "t",
+        TableDef {
+            name: "ignored".to_string(),
+            uri: t_path.to_string_lossy().into_owned(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: Some((*t_schema).clone()),
+            stats: ffq_storage::TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+    engine.register_table(
+        "s",
+        TableDef {
+            name: "ignored".to_string(),
+            uri: s_path.to_string_lossy().into_owned(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: Some((*s_schema).clone()),
+            stats: ffq_storage::TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+
+    (engine, t_path, s_path)
+}
+
 #[test]
 fn cte_query_runs() {
     let (engine, t_path, s_path) = make_engine();
@@ -247,6 +294,57 @@ fn scalar_subquery_errors_on_multiple_rows() {
     assert!(
         err.to_string()
             .contains("scalar subquery returned more than one row"),
+        "unexpected error: {err}"
+    );
+    let _ = std::fs::remove_file(t_path);
+    let _ = std::fs::remove_file(s_path);
+}
+
+#[test]
+fn recursive_cte_hierarchical_query_runs() {
+    let mut cfg = EngineConfig::default();
+    cfg.recursive_cte_max_depth = 4;
+    let (engine, t_path, s_path) = make_engine_with_config(cfg);
+    let sql = "WITH RECURSIVE r AS (
+        SELECT 1 AS node, 0 AS depth FROM t
+        UNION ALL
+        SELECT node + 1 AS node, depth + 1 AS depth
+        FROM r
+        WHERE depth < 4
+    )
+    SELECT node FROM r";
+
+    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let mut values = batches.iter().flat_map(|b| int64_values(b, 0)).collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    assert_eq!(values, vec![1, 2, 3, 4, 5]);
+    let _ = std::fs::remove_file(t_path);
+    let _ = std::fs::remove_file(s_path);
+}
+
+#[test]
+fn recursive_cte_respects_depth_limit_config() {
+    let mut cfg = EngineConfig::default();
+    cfg.recursive_cte_max_depth = 0;
+    let (engine, t_path, s_path) = make_engine_with_config(cfg);
+    let sql = "WITH RECURSIVE r AS (
+        SELECT 1 AS node, 0 AS depth FROM t
+        UNION ALL
+        SELECT node + 1 AS node, depth + 1 AS depth
+        FROM r
+        WHERE depth < 4
+    )
+    SELECT node FROM r";
+
+    let err = match engine.sql(sql) {
+        Ok(df) => futures::executor::block_on(df.collect())
+            .expect_err("recursive depth=0 should fail at planning or execution"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string()
+            .contains("recursive_cte_max_depth=0"),
         "unexpected error: {err}"
     );
     let _ = std::fs::remove_file(t_path);
