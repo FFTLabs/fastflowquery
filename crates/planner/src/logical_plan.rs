@@ -157,6 +157,20 @@ pub enum BinaryOp {
     Divide,
 }
 
+/// Correlation classification for subquery filter operators.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubqueryCorrelation {
+    /// Correlation has not been classified yet (frontend output).
+    Unresolved,
+    /// Subquery does not reference any outer query columns.
+    Uncorrelated,
+    /// Subquery references one or more outer query columns.
+    Correlated {
+        /// Outer references observed while analyzing this subquery.
+        outer_refs: Vec<String>,
+    },
+}
+
 /// Logical plan tree produced by SQL/DataFrame frontend and rewritten by
 /// analyzer/optimizer passes.
 ///
@@ -203,6 +217,8 @@ pub enum LogicalPlan {
         subquery: Box<LogicalPlan>,
         /// `true` for `NOT IN`.
         negated: bool,
+        /// Correlation classification emitted by analyzer.
+        correlation: SubqueryCorrelation,
     },
     /// Uncorrelated `EXISTS (SELECT ...)` filter.
     ExistsSubqueryFilter {
@@ -212,6 +228,8 @@ pub enum LogicalPlan {
         subquery: Box<LogicalPlan>,
         /// `true` for `NOT EXISTS`.
         negated: bool,
+        /// Correlation classification emitted by analyzer.
+        correlation: SubqueryCorrelation,
     },
     /// Uncorrelated scalar-subquery comparison filter.
     ///
@@ -226,6 +244,8 @@ pub enum LogicalPlan {
         op: BinaryOp,
         /// Uncorrelated scalar subquery plan.
         subquery: Box<LogicalPlan>,
+        /// Correlation classification emitted by analyzer.
+        correlation: SubqueryCorrelation,
     },
     /// Equi-join two inputs using `on` key pairs.
     Join {

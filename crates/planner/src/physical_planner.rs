@@ -62,6 +62,7 @@ pub fn create_physical_plan(
             expr,
             subquery,
             negated,
+            correlation: _,
         } => {
             let child = create_physical_plan(input, cfg)?;
             let sub = create_physical_plan(subquery, cfg)?;
@@ -76,6 +77,7 @@ pub fn create_physical_plan(
             input,
             subquery,
             negated,
+            correlation: _,
         } => {
             let child = create_physical_plan(input, cfg)?;
             let sub = create_physical_plan(subquery, cfg)?;
@@ -90,6 +92,7 @@ pub fn create_physical_plan(
             expr,
             op,
             subquery,
+            correlation: _,
         } => {
             let child = create_physical_plan(input, cfg)?;
             let sub = create_physical_plan(subquery, cfg)?;

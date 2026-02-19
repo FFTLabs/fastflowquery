@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::{FfqError, Result};
 
-use crate::logical_plan::{AggExpr, BinaryOp, Expr, LiteralValue, LogicalPlan};
+use crate::logical_plan::{AggExpr, BinaryOp, Expr, LiteralValue, LogicalPlan, SubqueryCorrelation};
 
 /// The analyzer needs schemas to resolve columns.
 /// The client (Engine) will provide this from its Catalog.
@@ -169,9 +169,15 @@ impl Analyzer {
                 expr,
                 subquery,
                 negated,
+                correlation: _,
             } => {
                 let (ain, in_schema, in_resolver) = self.analyze_plan(*input, provider)?;
-                let (asub, sub_schema, _sub_resolver) = self.analyze_plan(*subquery, provider)?;
+                let (asub, sub_schema, _sub_resolver) = self.analyze_uncorrelated_subquery(
+                    *subquery,
+                    provider,
+                    &in_resolver,
+                    "IN subquery",
+                )?;
                 if sub_schema.fields().len() != 1 {
                     return Err(FfqError::Planning(
                         "IN subquery must return exactly one column".to_string(),
@@ -199,6 +205,7 @@ impl Analyzer {
                         expr: coerced_left,
                         subquery: Box::new(coerced_subquery),
                         negated,
+                        correlation: SubqueryCorrelation::Uncorrelated,
                     },
                     out_schema,
                     out_resolver,
@@ -208,9 +215,15 @@ impl Analyzer {
                 input,
                 subquery,
                 negated,
+                correlation: _,
             } => {
-                let (ain, in_schema, _in_resolver) = self.analyze_plan(*input, provider)?;
-                let (asub, _sub_schema, _sub_resolver) = self.analyze_plan(*subquery, provider)?;
+                let (ain, in_schema, in_resolver) = self.analyze_plan(*input, provider)?;
+                let (asub, _sub_schema, _sub_resolver) = self.analyze_uncorrelated_subquery(
+                    *subquery,
+                    provider,
+                    &in_resolver,
+                    "EXISTS subquery",
+                )?;
                 let out_schema = in_schema.clone();
                 let out_resolver = Resolver::anonymous(out_schema.clone());
                 Ok((
@@ -218,6 +231,7 @@ impl Analyzer {
                         input: Box::new(ain),
                         subquery: Box::new(asub),
                         negated,
+                        correlation: SubqueryCorrelation::Uncorrelated,
                     },
                     out_schema,
                     out_resolver,
@@ -228,9 +242,15 @@ impl Analyzer {
                 expr,
                 op,
                 subquery,
+                correlation: _,
             } => {
                 let (ain, in_schema, in_resolver) = self.analyze_plan(*input, provider)?;
-                let (asub, sub_schema, _sub_resolver) = self.analyze_plan(*subquery, provider)?;
+                let (asub, sub_schema, _sub_resolver) = self.analyze_uncorrelated_subquery(
+                    *subquery,
+                    provider,
+                    &in_resolver,
+                    "scalar subquery",
+                )?;
                 if sub_schema.fields().len() != 1 {
                     return Err(FfqError::Planning(
                         "scalar subquery must return exactly one column".to_string(),
@@ -257,6 +277,7 @@ impl Analyzer {
                         expr: coerced_left,
                         op,
                         subquery: Box::new(coerced_subquery),
+                        correlation: SubqueryCorrelation::Uncorrelated,
                     },
                     out_schema,
                     out_resolver,
@@ -491,6 +512,28 @@ impl Analyzer {
                     out_schema,
                     out_resolver,
                 ))
+            }
+        }
+    }
+
+    fn analyze_uncorrelated_subquery(
+        &self,
+        subquery: LogicalPlan,
+        provider: &dyn SchemaProvider,
+        outer_resolver: &Resolver,
+        subquery_kind: &str,
+    ) -> Result<(LogicalPlan, SchemaRef, Resolver)> {
+        match self.analyze_plan(subquery, provider) {
+            Ok(v) => Ok(v),
+            Err(err) => {
+                if let Some(col) = unknown_column_name(&err) {
+                    if outer_resolver.resolve(col).is_ok() {
+                        return Err(FfqError::Unsupported(format!(
+                            "{subquery_kind} correlated outer reference is not supported yet: {col}"
+                        )));
+                    }
+                }
+                Err(err)
             }
         }
     }
@@ -852,6 +895,14 @@ fn split_qual(s: &str) -> (Option<&str>, &str) {
     }
 }
 
+fn unknown_column_name(err: &FfqError) -> Option<&str> {
+    let msg = match err {
+        FfqError::Planning(msg) => msg,
+        _ => return None,
+    };
+    msg.strip_prefix("unknown column: ")
+}
+
 // -------------------------
 // Type inference + casts
 // -------------------------
@@ -918,7 +969,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
     use super::{Analyzer, SchemaProvider};
-    use crate::logical_plan::LogicalPlan;
+    use crate::logical_plan::{LogicalPlan, SubqueryCorrelation};
     use crate::sql_frontend::sql_to_logical;
 
     struct TestSchemaProvider {
@@ -974,6 +1025,89 @@ mod tests {
         assert!(
             err.to_string().contains("INSERT type mismatch"),
             "err={err}"
+        );
+    }
+
+    #[test]
+    fn analyze_exists_subquery_marks_uncorrelated() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        schemas.insert(
+            "s".to_string(),
+            Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, false)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical("SELECT a FROM t WHERE EXISTS (SELECT b FROM s)", &HashMap::new())
+            .expect("parse");
+        let analyzed = analyzer.analyze(plan, &provider).expect("analyze");
+        match analyzed {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::ExistsSubqueryFilter { correlation, .. } => {
+                    assert_eq!(correlation, &SubqueryCorrelation::Uncorrelated);
+                }
+                other => panic!("expected ExistsSubqueryFilter, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_rejects_correlated_exists_subquery() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        schemas.insert(
+            "s".to_string(),
+            Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, false)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT a FROM t WHERE EXISTS (SELECT b FROM s WHERE s.b = t.a)",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let err = analyzer.analyze(plan, &provider).expect_err("must reject");
+        assert!(
+            err.to_string()
+                .contains("EXISTS subquery correlated outer reference is not supported yet: t.a"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn analyze_rejects_nested_correlated_subquery_reference() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        schemas.insert(
+            "s".to_string(),
+            Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, false)])),
+        );
+        schemas.insert(
+            "u".to_string(),
+            Arc::new(Schema::new(vec![Field::new("c", DataType::Int64, false)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT a FROM t WHERE EXISTS (SELECT b FROM s WHERE EXISTS (SELECT c FROM u WHERE u.c = t.a))",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let err = analyzer.analyze(plan, &provider).expect_err("must reject");
+        assert!(
+            err.to_string()
+                .contains("EXISTS subquery correlated outer reference is not supported yet: t.a"),
+            "unexpected error: {err}"
         );
     }
 

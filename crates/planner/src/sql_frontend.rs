@@ -7,7 +7,9 @@ use sqlparser::ast::{
     SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Value,
 };
 
-use crate::logical_plan::{AggExpr, BinaryOp, Expr, JoinStrategyHint, LiteralValue, LogicalPlan};
+use crate::logical_plan::{
+    AggExpr, BinaryOp, Expr, JoinStrategyHint, LiteralValue, LogicalPlan, SubqueryCorrelation,
+};
 
 /// Convert a SQL string into a [`LogicalPlan`], binding named parameters (for
 /// example `:k`, `:query`).
@@ -298,11 +300,13 @@ fn where_to_plan(
             expr: sql_expr_to_expr(expr, params)?,
             subquery: Box::new(query_to_logical_with_ctes(subquery, params, ctes)?),
             negated: *negated,
+            correlation: SubqueryCorrelation::Unresolved,
         }),
         SqlExpr::Exists { subquery, negated } => Ok(LogicalPlan::ExistsSubqueryFilter {
             input: Box::new(input),
             subquery: Box::new(query_to_logical_with_ctes(subquery, params, ctes)?),
             negated: *negated,
+            correlation: SubqueryCorrelation::Unresolved,
         }),
         SqlExpr::BinaryOp { left, op, right } => {
             match (&**left, &**right) {
@@ -318,6 +322,7 @@ fn where_to_plan(
                         expr: sql_expr_to_expr(rhs_expr, params)?,
                         op: reversed,
                         subquery: Box::new(query_to_logical_with_ctes(sub, params, ctes)?),
+                        correlation: SubqueryCorrelation::Unresolved,
                     })
                 }
                 (lhs_expr, SqlExpr::Subquery(sub)) => {
@@ -333,6 +338,7 @@ fn where_to_plan(
                             expr: sql_expr_to_expr(lhs_expr, params)?,
                             op: mapped_op,
                             subquery: Box::new(query_to_logical_with_ctes(sub, params, ctes)?),
+                            correlation: SubqueryCorrelation::Unresolved,
                         }),
                         _ => Err(FfqError::Unsupported(format!(
                             "scalar subquery only supports comparison operators (=, !=, <, <=, >, >=), got {op}"

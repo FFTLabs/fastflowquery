@@ -397,6 +397,7 @@ fn proj_rewrite(
             expr,
             subquery,
             negated,
+            correlation,
         } => {
             let mut req = required.unwrap_or_default();
             req.extend(expr_columns(&expr));
@@ -408,6 +409,7 @@ fn proj_rewrite(
                     expr,
                     subquery: Box::new(new_sub),
                     negated,
+                    correlation,
                 },
                 child_req,
             ))
@@ -416,6 +418,7 @@ fn proj_rewrite(
             input,
             subquery,
             negated,
+            correlation,
         } => {
             let req = required.unwrap_or_default();
             let (new_in, child_req) = proj_rewrite(*input, Some(req), ctx)?;
@@ -425,6 +428,7 @@ fn proj_rewrite(
                     input: Box::new(new_in),
                     subquery: Box::new(new_sub),
                     negated,
+                    correlation,
                 },
                 child_req,
             ))
@@ -434,6 +438,7 @@ fn proj_rewrite(
             expr,
             op,
             subquery,
+            correlation,
         } => {
             let mut req = required.unwrap_or_default();
             req.extend(expr_columns(&expr));
@@ -445,6 +450,7 @@ fn proj_rewrite(
                     expr,
                     op,
                     subquery: Box::new(new_sub),
+                    correlation,
                 },
                 child_req,
             ))
@@ -849,31 +855,37 @@ fn vector_index_rewrite(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result
             expr,
             subquery,
             negated,
+            correlation,
         } => Ok(LogicalPlan::InSubqueryFilter {
             input: Box::new(vector_index_rewrite(*input, ctx)?),
             expr,
             subquery: Box::new(vector_index_rewrite(*subquery, ctx)?),
             negated,
+            correlation,
         }),
         LogicalPlan::ExistsSubqueryFilter {
             input,
             subquery,
             negated,
+            correlation,
         } => Ok(LogicalPlan::ExistsSubqueryFilter {
             input: Box::new(vector_index_rewrite(*input, ctx)?),
             subquery: Box::new(vector_index_rewrite(*subquery, ctx)?),
             negated,
+            correlation,
         }),
         LogicalPlan::ScalarSubqueryFilter {
             input,
             expr,
             op,
             subquery,
+            correlation,
         } => Ok(LogicalPlan::ScalarSubqueryFilter {
             input: Box::new(vector_index_rewrite(*input, ctx)?),
             expr,
             op,
             subquery: Box::new(vector_index_rewrite(*subquery, ctx)?),
+            correlation,
         }),
         LogicalPlan::Projection { exprs, input } => {
             let rewritten_input = vector_index_rewrite(*input, ctx)?;
@@ -1299,31 +1311,37 @@ fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy
             expr,
             subquery,
             negated,
+            correlation,
         } => LogicalPlan::InSubqueryFilter {
             input: Box::new(f(*input)),
             expr,
             subquery: Box::new(f(*subquery)),
             negated,
+            correlation,
         },
         LogicalPlan::ExistsSubqueryFilter {
             input,
             subquery,
             negated,
+            correlation,
         } => LogicalPlan::ExistsSubqueryFilter {
             input: Box::new(f(*input)),
             subquery: Box::new(f(*subquery)),
             negated,
+            correlation,
         },
         LogicalPlan::ScalarSubqueryFilter {
             input,
             expr,
             op,
             subquery,
+            correlation,
         } => LogicalPlan::ScalarSubqueryFilter {
             input: Box::new(f(*input)),
             expr,
             op,
             subquery: Box::new(f(*subquery)),
+            correlation,
         },
         LogicalPlan::Projection { exprs, input } => LogicalPlan::Projection {
             exprs,
@@ -1399,31 +1417,37 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
             expr,
             subquery,
             negated,
+            correlation,
         } => LogicalPlan::InSubqueryFilter {
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
             expr: rewrite_expr(expr, rewrite),
             subquery: Box::new(rewrite_plan_exprs(*subquery, rewrite)),
             negated,
+            correlation,
         },
         LogicalPlan::ExistsSubqueryFilter {
             input,
             subquery,
             negated,
+            correlation,
         } => LogicalPlan::ExistsSubqueryFilter {
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
             subquery: Box::new(rewrite_plan_exprs(*subquery, rewrite)),
             negated,
+            correlation,
         },
         LogicalPlan::ScalarSubqueryFilter {
             input,
             expr,
             op,
             subquery,
+            correlation,
         } => LogicalPlan::ScalarSubqueryFilter {
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
             expr: rewrite_expr(expr, rewrite),
             op,
             subquery: Box::new(rewrite_plan_exprs(*subquery, rewrite)),
+            correlation,
         },
         LogicalPlan::Projection { exprs, input } => LogicalPlan::Projection {
             exprs: exprs

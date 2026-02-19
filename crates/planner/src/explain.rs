@@ -1,4 +1,4 @@
-use crate::logical_plan::{Expr, JoinStrategyHint, LogicalPlan};
+use crate::logical_plan::{Expr, JoinStrategyHint, LogicalPlan, SubqueryCorrelation};
 
 /// Render logical plan as human-readable multiline text.
 pub fn explain_logical(plan: &LogicalPlan) -> String {
@@ -31,10 +31,12 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             expr,
             subquery,
             negated,
+            correlation,
         } => {
             out.push_str(&format!(
-                "{pad}InSubqueryFilter negated={negated} expr={}\n",
-                fmt_expr(expr)
+                "{pad}InSubqueryFilter negated={negated} correlation={} expr={}\n",
+                fmt_subquery_correlation(correlation),
+                fmt_expr(expr),
             ));
             out.push_str(&format!("{pad}  input:\n"));
             fmt_plan(input, indent + 2, out);
@@ -45,8 +47,12 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             input,
             subquery,
             negated,
+            correlation,
         } => {
-            out.push_str(&format!("{pad}ExistsSubqueryFilter negated={negated}\n"));
+            out.push_str(&format!(
+                "{pad}ExistsSubqueryFilter negated={negated} correlation={}\n",
+                fmt_subquery_correlation(correlation)
+            ));
             out.push_str(&format!("{pad}  input:\n"));
             fmt_plan(input, indent + 2, out);
             out.push_str(&format!("{pad}  subquery:\n"));
@@ -57,10 +63,12 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             expr,
             op,
             subquery,
+            correlation,
         } => {
             out.push_str(&format!(
-                "{pad}ScalarSubqueryFilter expr={} op={op:?}\n",
-                fmt_expr(expr)
+                "{pad}ScalarSubqueryFilter correlation={} expr={} op={op:?}\n",
+                fmt_subquery_correlation(correlation),
+                fmt_expr(expr),
             ));
             out.push_str(&format!("{pad}  input:\n"));
             fmt_plan(input, indent + 2, out);
@@ -152,6 +160,16 @@ fn fmt_join_hint(h: JoinStrategyHint) -> &'static str {
         JoinStrategyHint::BroadcastLeft => "broadcast_left",
         JoinStrategyHint::BroadcastRight => "broadcast_right",
         JoinStrategyHint::Shuffle => "shuffle",
+    }
+}
+
+fn fmt_subquery_correlation(c: &SubqueryCorrelation) -> String {
+    match c {
+        SubqueryCorrelation::Unresolved => "unresolved".to_string(),
+        SubqueryCorrelation::Uncorrelated => "uncorrelated".to_string(),
+        SubqueryCorrelation::Correlated { outer_refs } => {
+            format!("correlated({})", outer_refs.join(","))
+        }
     }
 }
 
