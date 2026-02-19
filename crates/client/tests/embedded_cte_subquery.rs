@@ -132,6 +132,51 @@ fn uncorrelated_exists_truth_table_non_empty_subquery() {
 }
 
 #[test]
+fn correlated_exists_rewrites_and_runs() {
+    let (engine, t_path, s_path) = make_engine();
+
+    let sql = "SELECT k FROM t WHERE EXISTS (SELECT k2 FROM s WHERE s.k2 = t.k)";
+    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let mut values = batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    assert_eq!(values, vec![2, 3]);
+
+    let sql_with_inner_filter =
+        "SELECT k FROM t WHERE EXISTS (SELECT k2 FROM s WHERE s.k2 = t.k AND s.k2 > 2)";
+    let filtered_batches = futures::executor::block_on(
+        engine.sql(sql_with_inner_filter).expect("sql").collect(),
+    )
+    .expect("collect");
+    let filtered_values = filtered_batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    assert_eq!(filtered_values, vec![3]);
+
+    let _ = std::fs::remove_file(t_path);
+    let _ = std::fs::remove_file(s_path);
+}
+
+#[test]
+fn correlated_not_exists_rewrites_and_runs() {
+    let (engine, t_path, s_path) = make_engine();
+
+    let sql = "SELECT k FROM t WHERE NOT EXISTS (SELECT k2 FROM s WHERE s.k2 = t.k)";
+    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let values = batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec![1]);
+
+    let _ = std::fs::remove_file(t_path);
+    let _ = std::fs::remove_file(s_path);
+}
+
+#[test]
 fn uncorrelated_exists_truth_table_empty_subquery() {
     let (engine, t_path, s_path) = make_engine();
     let sempty_path = support::unique_path("ffq_cte_sempty", "parquet");

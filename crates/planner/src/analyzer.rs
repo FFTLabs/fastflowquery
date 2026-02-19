@@ -218,12 +218,43 @@ impl Analyzer {
                 correlation: _,
             } => {
                 let (ain, in_schema, in_resolver) = self.analyze_plan(*input, provider)?;
-                let (asub, _sub_schema, _sub_resolver) = self.analyze_uncorrelated_subquery(
-                    *subquery,
+                let raw_subquery = *subquery;
+                let (asub, _sub_schema, _sub_resolver) = match self.analyze_uncorrelated_subquery(
+                    raw_subquery.clone(),
                     provider,
                     &in_resolver,
                     "EXISTS subquery",
-                )?;
+                ) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        if let Some((decorrelated_subquery, on)) = self
+                            .try_decorrelate_exists_subquery(
+                                raw_subquery,
+                                provider,
+                                &in_resolver,
+                            )?
+                        {
+                            let out_schema = in_schema.clone();
+                            let out_resolver = Resolver::anonymous(out_schema.clone());
+                            return Ok((
+                                LogicalPlan::Join {
+                                    left: Box::new(ain),
+                                    right: Box::new(decorrelated_subquery),
+                                    on,
+                                    join_type: if negated {
+                                        crate::logical_plan::JoinType::Anti
+                                    } else {
+                                        crate::logical_plan::JoinType::Semi
+                                    },
+                                    strategy_hint: crate::logical_plan::JoinStrategyHint::Auto,
+                                },
+                                out_schema,
+                                out_resolver,
+                            ));
+                        }
+                        return Err(err);
+                    }
+                };
                 let out_schema = in_schema.clone();
                 let out_resolver = Resolver::anonymous(out_schema.clone());
                 Ok((
@@ -366,7 +397,12 @@ impl Analyzer {
                     }
                 }
 
-                let out_resolver = Resolver::join(lres, rres);
+                let out_resolver = match join_type {
+                    crate::logical_plan::JoinType::Semi | crate::logical_plan::JoinType::Anti => {
+                        lres.clone()
+                    }
+                    _ => Resolver::join(lres, rres),
+                };
                 let out_schema = out_resolver.schema();
 
                 Ok((
@@ -527,7 +563,7 @@ impl Analyzer {
             Ok(v) => Ok(v),
             Err(err) => {
                 if let Some(col) = unknown_column_name(&err) {
-                    if outer_resolver.resolve(col).is_ok() {
+                    if resolver_has_col(outer_resolver, col) {
                         return Err(FfqError::Unsupported(format!(
                             "{subquery_kind} correlated outer reference is not supported yet: {col}"
                         )));
@@ -536,6 +572,68 @@ impl Analyzer {
                 Err(err)
             }
         }
+    }
+
+    fn try_decorrelate_exists_subquery(
+        &self,
+        subquery: LogicalPlan,
+        provider: &dyn SchemaProvider,
+        outer_resolver: &Resolver,
+    ) -> Result<Option<(LogicalPlan, Vec<(String, String)>)>> {
+        let mut core = subquery;
+        while let LogicalPlan::Projection { input, .. } = core {
+            core = *input;
+        }
+
+        let (mut base_input, mut predicates) = match core {
+            LogicalPlan::Filter { predicate, input } => (*input, split_conjuncts(predicate)),
+            other => (other, Vec::new()),
+        };
+        if let LogicalPlan::TableScan {
+            table,
+            projection,
+            filters,
+        } = base_input
+        {
+            predicates.extend(filters.into_iter().flat_map(split_conjuncts));
+            base_input = LogicalPlan::TableScan {
+                table,
+                projection,
+                filters: Vec::new(),
+            };
+        }
+
+        let mut join_keys = Vec::<(String, String)>::new();
+        let mut inner_only = Vec::<Expr>::new();
+        for pred in predicates {
+            if let Some((outer_col, inner_col)) =
+                extract_outer_inner_eq_pair(&pred, outer_resolver)
+            {
+                join_keys.push((outer_col, inner_col));
+                continue;
+            }
+            if predicate_has_outer_ref(&pred, outer_resolver) {
+                return Err(FfqError::Unsupported(format!(
+                    "EXISTS subquery correlated predicate shape is not supported yet: {pred:?}"
+                )));
+            }
+            inner_only.push(strip_inner_qualifiers(pred, outer_resolver));
+        }
+
+        if join_keys.is_empty() {
+            return Ok(None);
+        }
+
+        let rewritten_subquery = if inner_only.is_empty() {
+            base_input
+        } else {
+            LogicalPlan::Filter {
+                predicate: combine_conjuncts(inner_only),
+                input: Box::new(base_input),
+            }
+        };
+        let (analyzed_subquery, _schema, _resolver) = self.analyze_plan(rewritten_subquery, provider)?;
+        Ok(Some((analyzed_subquery, join_keys)))
     }
 
     fn analyze_agg(&self, agg: AggExpr, resolver: &Resolver) -> Result<(AggExpr, DataType)> {
@@ -903,6 +1001,169 @@ fn unknown_column_name(err: &FfqError) -> Option<&str> {
     msg.strip_prefix("unknown column: ")
 }
 
+fn split_conjuncts(expr: Expr) -> Vec<Expr> {
+    match expr {
+        Expr::And(left, right) => {
+            let mut out = split_conjuncts(*left);
+            out.extend(split_conjuncts(*right));
+            out
+        }
+        other => vec![other],
+    }
+}
+
+fn combine_conjuncts(mut exprs: Vec<Expr>) -> Expr {
+    let mut it = exprs.drain(..);
+    let first = it
+        .next()
+        .expect("combine_conjuncts requires non-empty expression list");
+    it.fold(first, |acc, e| Expr::And(Box::new(acc), Box::new(e)))
+}
+
+fn predicate_has_outer_ref(expr: &Expr, outer_resolver: &Resolver) -> bool {
+    match expr {
+        Expr::Column(name) => resolver_has_col(outer_resolver, name),
+        Expr::ColumnRef { name, .. } => resolver_has_col(outer_resolver, name),
+        Expr::Literal(_) => false,
+        Expr::BinaryOp { left, right, .. } => {
+            predicate_has_outer_ref(left, outer_resolver)
+                || predicate_has_outer_ref(right, outer_resolver)
+        }
+        Expr::Cast { expr, .. } => predicate_has_outer_ref(expr, outer_resolver),
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            predicate_has_outer_ref(left, outer_resolver)
+                || predicate_has_outer_ref(right, outer_resolver)
+        }
+        Expr::Not(inner) => predicate_has_outer_ref(inner, outer_resolver),
+        Expr::CaseWhen { branches, else_expr } => {
+            branches.iter().any(|(c, v)| {
+                predicate_has_outer_ref(c, outer_resolver)
+                    || predicate_has_outer_ref(v, outer_resolver)
+            }) || else_expr
+                .as_ref()
+                .is_some_and(|e| predicate_has_outer_ref(e, outer_resolver))
+        }
+        #[cfg(feature = "vector")]
+        Expr::CosineSimilarity { vector, query }
+        | Expr::L2Distance { vector, query }
+        | Expr::DotProduct { vector, query } => {
+            predicate_has_outer_ref(vector, outer_resolver)
+                || predicate_has_outer_ref(query, outer_resolver)
+        }
+        Expr::ScalarUdf { args, .. } => args
+            .iter()
+            .any(|a| predicate_has_outer_ref(a, outer_resolver)),
+    }
+}
+
+fn extract_outer_inner_eq_pair(
+    expr: &Expr,
+    outer_resolver: &Resolver,
+) -> Option<(String, String)> {
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return None;
+    };
+    if *op != BinaryOp::Eq {
+        return None;
+    }
+    let left_name = column_name_from_expr(left)?;
+    let right_name = column_name_from_expr(right)?;
+    let left_outer = resolver_has_col(outer_resolver, left_name);
+    let right_outer = resolver_has_col(outer_resolver, right_name);
+    match (left_outer, right_outer) {
+        (true, false) => Some((left_name.clone(), right_name.clone())),
+        (false, true) => Some((right_name.clone(), left_name.clone())),
+        _ => None,
+    }
+}
+
+fn column_name_from_expr(expr: &Expr) -> Option<&String> {
+    match expr {
+        Expr::Column(name) | Expr::ColumnRef { name, .. } => Some(name),
+        Expr::Cast { expr, .. } => column_name_from_expr(expr),
+        _ => None,
+    }
+}
+
+fn resolver_has_col(resolver: &Resolver, col: &str) -> bool {
+    resolver.resolve(col).is_ok() || resolver.resolve(split_qual(col).1).is_ok()
+}
+
+fn strip_inner_qualifiers(expr: Expr, outer_resolver: &Resolver) -> Expr {
+    match expr {
+        Expr::Column(name) => {
+            if resolver_has_col(outer_resolver, &name) {
+                Expr::Column(name)
+            } else {
+                Expr::Column(split_qual(&name).1.to_string())
+            }
+        }
+        Expr::ColumnRef { name, index } => {
+            if resolver_has_col(outer_resolver, &name) {
+                Expr::ColumnRef { name, index }
+            } else {
+                Expr::ColumnRef {
+                    name: split_qual(&name).1.to_string(),
+                    index,
+                }
+            }
+        }
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(strip_inner_qualifiers(*left, outer_resolver)),
+            op,
+            right: Box::new(strip_inner_qualifiers(*right, outer_resolver)),
+        },
+        Expr::Cast { expr, to_type } => Expr::Cast {
+            expr: Box::new(strip_inner_qualifiers(*expr, outer_resolver)),
+            to_type,
+        },
+        Expr::And(left, right) => Expr::And(
+            Box::new(strip_inner_qualifiers(*left, outer_resolver)),
+            Box::new(strip_inner_qualifiers(*right, outer_resolver)),
+        ),
+        Expr::Or(left, right) => Expr::Or(
+            Box::new(strip_inner_qualifiers(*left, outer_resolver)),
+            Box::new(strip_inner_qualifiers(*right, outer_resolver)),
+        ),
+        Expr::Not(inner) => Expr::Not(Box::new(strip_inner_qualifiers(*inner, outer_resolver))),
+        Expr::CaseWhen { branches, else_expr } => Expr::CaseWhen {
+            branches: branches
+                .into_iter()
+                .map(|(c, v)| {
+                    (
+                        strip_inner_qualifiers(c, outer_resolver),
+                        strip_inner_qualifiers(v, outer_resolver),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr.map(|e| Box::new(strip_inner_qualifiers(*e, outer_resolver))),
+        },
+        #[cfg(feature = "vector")]
+        Expr::CosineSimilarity { vector, query } => Expr::CosineSimilarity {
+            vector: Box::new(strip_inner_qualifiers(*vector, outer_resolver)),
+            query: Box::new(strip_inner_qualifiers(*query, outer_resolver)),
+        },
+        #[cfg(feature = "vector")]
+        Expr::L2Distance { vector, query } => Expr::L2Distance {
+            vector: Box::new(strip_inner_qualifiers(*vector, outer_resolver)),
+            query: Box::new(strip_inner_qualifiers(*query, outer_resolver)),
+        },
+        #[cfg(feature = "vector")]
+        Expr::DotProduct { vector, query } => Expr::DotProduct {
+            vector: Box::new(strip_inner_qualifiers(*vector, outer_resolver)),
+            query: Box::new(strip_inner_qualifiers(*query, outer_resolver)),
+        },
+        Expr::ScalarUdf { name, args } => Expr::ScalarUdf {
+            name,
+            args: args
+                .into_iter()
+                .map(|arg| strip_inner_qualifiers(arg, outer_resolver))
+                .collect(),
+        },
+        Expr::Literal(v) => Expr::Literal(v),
+    }
+}
+
 // -------------------------
 // Type inference + casts
 // -------------------------
@@ -969,7 +1230,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
     use super::{Analyzer, SchemaProvider};
-    use crate::logical_plan::{LogicalPlan, SubqueryCorrelation};
+    use crate::logical_plan::{JoinType, LogicalPlan, SubqueryCorrelation};
     use crate::sql_frontend::sql_to_logical;
 
     struct TestSchemaProvider {
@@ -1056,7 +1317,7 @@ mod tests {
     }
 
     #[test]
-    fn analyze_rejects_correlated_exists_subquery() {
+    fn analyze_decorrelates_correlated_exists_subquery_to_semijoin() {
         let mut schemas = HashMap::new();
         schemas.insert(
             "t".to_string(),
@@ -1073,12 +1334,17 @@ mod tests {
             &HashMap::new(),
         )
         .expect("parse");
-        let err = analyzer.analyze(plan, &provider).expect_err("must reject");
-        assert!(
-            err.to_string()
-                .contains("EXISTS subquery correlated outer reference is not supported yet: t.a"),
-            "unexpected error: {err}"
-        );
+        let analyzed = analyzer.analyze(plan, &provider).expect("analyze");
+        match analyzed {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Join { on, join_type, .. } => {
+                    assert_eq!(*join_type, JoinType::Semi);
+                    assert_eq!(on, &vec![("t.a".to_string(), "s.b".to_string())]);
+                }
+                other => panic!("expected decorrelated Join, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1106,7 +1372,10 @@ mod tests {
         let err = analyzer.analyze(plan, &provider).expect_err("must reject");
         assert!(
             err.to_string()
-                .contains("EXISTS subquery correlated outer reference is not supported yet: t.a"),
+                .contains("correlated predicate shape is not supported yet")
+                || err
+                    .to_string()
+                    .contains("correlated outer reference is not supported yet"),
             "unexpected error: {err}"
         );
     }

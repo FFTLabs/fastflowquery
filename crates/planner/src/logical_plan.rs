@@ -12,6 +12,10 @@ pub enum JoinType {
     Right,
     /// Keep all rows from both inputs, null-extending non-matching rows.
     Full,
+    /// Keep left rows with at least one matching right row (no right columns in output).
+    Semi,
+    /// Keep left rows with no matching right row (no right columns in output).
+    Anti,
 }
 
 /// Optimizer hint controlling join distribution strategy.

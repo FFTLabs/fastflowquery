@@ -1713,10 +1713,17 @@ fn plan_output_columns(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result
             .into_iter()
             .map(std::string::ToString::to_string)
             .collect()),
-        LogicalPlan::Join { left, right, .. } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            ..
+        } => {
             let mut l = plan_output_columns(left, ctx)?;
-            let r = plan_output_columns(right, ctx)?;
-            l.extend(r);
+            if !matches!(join_type, JoinType::Semi | JoinType::Anti) {
+                let r = plan_output_columns(right, ctx)?;
+                l.extend(r);
+            }
             Ok(l)
         }
         LogicalPlan::InsertInto { input, .. } => plan_output_columns(input, ctx),

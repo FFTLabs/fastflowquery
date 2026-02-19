@@ -970,7 +970,9 @@ struct JoinMatchOutput {
 /// Execute `HashJoinExec` with optional spill to grace-hash mode.
 ///
 /// Input: fully materialized left/right child outputs and equi-join keys.
-/// Output: one joined batch with schema `left ++ right`.
+/// Output: one joined batch.
+/// - `Inner/Left/Right/Full`: schema `left ++ right`
+/// - `Semi/Anti`: schema `left`
 /// Spill behavior: when estimated build-side bytes exceed
 /// `ctx.mem_budget_bytes`, join partitions are spilled to JSONL and joined
 /// partition-wise.
@@ -1017,26 +1019,31 @@ fn run_hash_join(
     let build_key_idx = resolve_key_indexes(&build_schema, &build_key_names)?;
     let probe_key_idx = resolve_key_indexes(&probe_schema, &probe_key_names)?;
 
-    let output_schema = Arc::new(Schema::new(
-        left.schema
-            .fields()
-            .iter()
-            .map(|f| {
-                let nullable = match join_type {
-                    JoinType::Right | JoinType::Full => true,
-                    JoinType::Inner | JoinType::Left => f.is_nullable(),
-                };
-                f.as_ref().clone().with_nullable(nullable)
-            })
-            .chain(right.schema.fields().iter().map(|f| {
-                let nullable = match join_type {
-                    JoinType::Left | JoinType::Full => true,
-                    JoinType::Inner | JoinType::Right => f.is_nullable(),
-                };
-                f.as_ref().clone().with_nullable(nullable)
-            }))
-            .collect::<Vec<_>>(),
-    ));
+    let output_schema = match join_type {
+        JoinType::Semi | JoinType::Anti => left.schema.clone(),
+        _ => Arc::new(Schema::new(
+            left.schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    let nullable = match join_type {
+                        JoinType::Right | JoinType::Full => true,
+                        JoinType::Inner | JoinType::Left => f.is_nullable(),
+                        JoinType::Semi | JoinType::Anti => f.is_nullable(),
+                    };
+                    f.as_ref().clone().with_nullable(nullable)
+                })
+                .chain(right.schema.fields().iter().map(|f| {
+                    let nullable = match join_type {
+                        JoinType::Left | JoinType::Full => true,
+                        JoinType::Inner | JoinType::Right => f.is_nullable(),
+                        JoinType::Semi | JoinType::Anti => f.is_nullable(),
+                    };
+                    f.as_ref().clone().with_nullable(nullable)
+                }))
+                .collect::<Vec<_>>(),
+        )),
+    };
 
     let mut match_output = if ctx.mem_budget_bytes > 0
         && estimate_join_rows_bytes(build_rows) > ctx.mem_budget_bytes
@@ -1064,14 +1071,29 @@ fn run_hash_join(
         )
     };
 
-    apply_outer_join_null_extension(
-        &mut match_output.rows,
-        &match_output.matched_left,
-        &match_output.matched_right,
-        &left_rows,
-        &right_rows,
-        join_type,
-    );
+    if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+        match_output.rows = left_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, row)| {
+                let keep = match join_type {
+                    JoinType::Semi => match_output.matched_left[idx],
+                    JoinType::Anti => !match_output.matched_left[idx],
+                    _ => false,
+                };
+                keep.then(|| row.clone())
+            })
+            .collect();
+    } else {
+        apply_outer_join_null_extension(
+            &mut match_output.rows,
+            &match_output.matched_left,
+            &match_output.matched_right,
+            &left_rows,
+            &right_rows,
+            join_type,
+        );
+    }
 
     let batch = rows_to_batch(&output_schema, &match_output.rows)?;
     Ok(ExecOutput {
@@ -1092,6 +1114,7 @@ fn apply_outer_join_null_extension(
     let right_nulls = vec![ScalarValue::Null; right_rows.first().map_or(0, Vec::len)];
     match join_type {
         JoinType::Inner => {}
+        JoinType::Semi | JoinType::Anti => {}
         JoinType::Left => {
             for (idx, left) in left_rows.iter().enumerate() {
                 if !matched_left[idx] {
