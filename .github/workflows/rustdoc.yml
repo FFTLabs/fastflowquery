@@ -1,0 +1,34 @@
+name: rustdoc-gate
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  rustdoc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Rustdoc warnings as errors (selected crates)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps -p ffq-common
+          cargo doc --no-deps -p ffq-planner
+          cargo doc --no-deps -p ffq-execution
+          cargo doc --no-deps -p ffq-storage
+          cargo doc --no-deps -p ffq-client
+          cargo doc --no-deps -p ffq-distributed
+
+      - name: Missing docs gate (incremental rollout)
+        run: |
+          cargo rustc -p ffq-client --lib -- -D missing-docs

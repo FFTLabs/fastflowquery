@@ -420,6 +420,13 @@ fn print_repl_error(stage: &str, err: &FfqError) {
 }
 
 /// Classify engine errors into user-facing REPL categories.
+///
+/// Taxonomy mapping:
+/// - `Planning` -> `[planning]`
+/// - `Execution` -> `[execution]`
+/// - `InvalidConfig` -> `[config]`
+/// - `Unsupported` -> `[unsupported]`
+/// - `Io` -> `[io]`
 fn classify_error(err: &FfqError) -> (&'static str, Option<&'static str>) {
     match err {
         FfqError::Planning(msg) => ("planning", planning_hint(msg)),

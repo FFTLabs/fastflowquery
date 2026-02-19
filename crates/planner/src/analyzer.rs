@@ -27,6 +27,10 @@ impl Analyzer {
     /// - expression/aggregate types are inferred and checked;
     /// - required casts are inserted for supported coercions;
     /// - join and insert contracts are validated early.
+    ///
+    /// Error taxonomy:
+    /// - `Planning`: semantic/type/name resolution failures
+    /// - `Unsupported`: valid SQL shape that analyzer intentionally does not support in v1
     pub fn analyze(&self, plan: LogicalPlan, provider: &dyn SchemaProvider) -> Result<LogicalPlan> {
         let (p, _schema, _resolver) = self.analyze_plan(plan, provider)?;
         Ok(p)

@@ -15,6 +15,10 @@ use crate::logical_plan::{AggExpr, BinaryOp, Expr, JoinStrategyHint, LiteralValu
 /// Contract:
 /// - exactly one statement must be present;
 /// - supported statements are delegated to [`statement_to_logical`].
+///
+/// Error taxonomy:
+/// - `Unsupported`: SQL construct is outside v1 supported subset
+/// - `Planning`: parse/parameter literal shape issues (for example bad LIMIT literal)
 pub fn sql_to_logical(sql: &str, params: &HashMap<String, LiteralValue>) -> Result<LogicalPlan> {
     let stmts = ffq_sql::parse_sql(sql)?;
     if stmts.len() != 1 {
@@ -28,6 +32,10 @@ pub fn sql_to_logical(sql: &str, params: &HashMap<String, LiteralValue>) -> Resu
 /// Convert one parsed SQL statement into a [`LogicalPlan`].
 ///
 /// v1 supports `SELECT` and `INSERT INTO ... SELECT ...` only.
+///
+/// Error taxonomy:
+/// - `Unsupported`: statement kind not supported in v1
+/// - `Planning`: invalid statement arguments/literals where applicable
 pub fn statement_to_logical(
     stmt: &Statement,
     params: &HashMap<String, LiteralValue>,

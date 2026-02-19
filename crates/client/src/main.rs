@@ -305,6 +305,13 @@ fn print_cli_error(err: &(dyn std::error::Error + 'static)) {
 }
 
 /// Map internal error type to user-facing category + hint.
+///
+/// Taxonomy mapping:
+/// - `Planning` -> `[planning]`
+/// - `Execution` -> `[execution]`
+/// - `InvalidConfig` -> `[config]`
+/// - `Unsupported` -> `[unsupported]`
+/// - `Io` -> `[io]`
 fn classify_ffq_error(err: &FfqError) -> (&'static str, Option<&'static str>) {
     match err {
         FfqError::Planning(msg) => ("planning", planning_hint(msg)),

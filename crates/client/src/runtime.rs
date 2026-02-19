@@ -135,6 +135,12 @@ struct TraceIds {
 ///
 /// This is the central operator dispatcher for scan/filter/project/limit/top-k,
 /// exchange, hash join, hash aggregate, and parquet sink paths.
+///
+/// Error taxonomy at call sites:
+/// - `Execution`: operator evaluation, encode/decode, spill, or batch-shape failures
+/// - `InvalidConfig`: missing table sink path/schema contracts discovered at runtime
+/// - `Unsupported`: physical node or runtime feature path not supported in current build
+/// - `Io`: filesystem failures surfaced through std io conversions
 fn execute_plan(
     plan: PhysicalPlan,
     ctx: QueryContext,
