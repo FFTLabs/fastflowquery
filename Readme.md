@@ -30,6 +30,10 @@ Full REPL reference:
 
 1. `docs/v1/repl.md`
 
+FFI (C ABI) reference:
+
+1. `docs/dev/ffi-c-api.md`
+
 For a concept-first deep guide (architecture, optimizer, distributed control plane, labs, glossary, FAQ):
 
 1. `docs/learn/README.md`

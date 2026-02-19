@@ -33,7 +33,9 @@ SHELL := /bin/bash
 	validate-tpch-dbgen-manifests \
 	compare-13.3 \
 	repl \
-	repl-smoke
+	repl-smoke \
+	ffi-build \
+	ffi-example
 
 clean:
 	cargo clean
@@ -151,3 +153,9 @@ repl:
 
 repl-smoke:
 	./scripts/run-repl-smoke.sh
+
+ffi-build:
+	cargo build -p ffq-client --features ffi
+
+ffi-example:
+	./scripts/run-ffi-c-example.sh "$${PARQUET_PATH:-tests/fixtures/parquet/lineitem.parquet}"

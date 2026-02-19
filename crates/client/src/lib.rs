@@ -38,6 +38,8 @@ pub mod expr;
 pub mod repl;
 /// TPC-H `.tbl` fixture conversion and validation helpers.
 pub mod tpch_tbl;
+#[cfg(feature = "ffi")]
+mod ffi;
 
 pub use dataframe::{DataFrame, WriteMode};
 pub use engine::Engine;

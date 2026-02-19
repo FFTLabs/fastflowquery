@@ -29,3 +29,6 @@ jobs:
 
       - name: Build full feature matrix
         run: cargo build -p ffq-client --no-default-features --features core,distributed,s3,vector,qdrant,python,ffi
+
+      - name: FFI C example smoke
+        run: make ffi-example
