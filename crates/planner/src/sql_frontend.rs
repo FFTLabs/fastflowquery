@@ -94,7 +94,9 @@ fn query_to_logical_with_ctes(
 
     let mut cte_map = parent_ctes.clone();
     if let Some(with) = &q.with {
-        for cte in &with.cte_tables {
+        let ordered = ordered_cte_indices(with, parent_ctes)?;
+        for idx in ordered {
+            let cte = &with.cte_tables[idx];
             let name = cte.alias.name.value.clone();
             let cte_plan = query_to_logical_with_ctes(&cte.query, params, &cte_map)?;
             cte_map.insert(name, cte_plan);
@@ -221,6 +223,185 @@ fn query_to_logical_with_ctes(
     }
 
     Ok(plan)
+}
+
+fn ordered_cte_indices(
+    with: &sqlparser::ast::With,
+    parent_ctes: &HashMap<String, LogicalPlan>,
+) -> Result<Vec<usize>> {
+    let mut name_to_idx: HashMap<String, usize> = HashMap::new();
+    for (idx, cte) in with.cte_tables.iter().enumerate() {
+        let name = cte.alias.name.value.clone();
+        if parent_ctes.contains_key(&name) {
+            return Err(FfqError::Planning(format!(
+                "CTE '{name}' shadows an outer CTE; shadowing is not allowed"
+            )));
+        }
+        if name_to_idx.insert(name.clone(), idx).is_some() {
+            return Err(FfqError::Planning(format!(
+                "duplicate CTE name in WITH clause: '{name}'"
+            )));
+        }
+    }
+
+    let cte_names = name_to_idx.keys().cloned().collect::<std::collections::HashSet<_>>();
+    let mut deps_by_idx: Vec<std::collections::HashSet<usize>> =
+        vec![std::collections::HashSet::new(); with.cte_tables.len()];
+    let mut outgoing_by_idx: Vec<Vec<usize>> = vec![Vec::new(); with.cte_tables.len()];
+
+    for (idx, cte) in with.cte_tables.iter().enumerate() {
+        let deps = referenced_local_ctes_in_query(&cte.query, &cte_names);
+        for dep_name in deps {
+            if let Some(dep_idx) = name_to_idx.get(&dep_name).copied() {
+                deps_by_idx[idx].insert(dep_idx);
+            }
+        }
+    }
+    for (idx, deps) in deps_by_idx.iter().enumerate() {
+        for dep in deps {
+            outgoing_by_idx[*dep].push(idx);
+        }
+    }
+
+    let mut indegree = deps_by_idx.iter().map(|d| d.len()).collect::<Vec<_>>();
+    let mut ready = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, deg)| (*deg == 0).then_some(idx))
+        .collect::<Vec<_>>();
+    // Deterministic ordering: declaration order when multiple CTEs are ready.
+    ready.sort_unstable();
+
+    let mut out = Vec::with_capacity(with.cte_tables.len());
+    while let Some(idx) = ready.first().copied() {
+        ready.remove(0);
+        out.push(idx);
+        for succ in &outgoing_by_idx[idx] {
+            indegree[*succ] -= 1;
+            if indegree[*succ] == 0 {
+                ready.push(*succ);
+                ready.sort_unstable();
+            }
+        }
+    }
+
+    if out.len() != with.cte_tables.len() {
+        let cycle_nodes = indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, deg)| {
+                (*deg > 0).then_some(with.cte_tables[idx].alias.name.value.clone())
+            })
+            .collect::<Vec<_>>();
+        return Err(FfqError::Planning(format!(
+            "CTE dependency cycle detected involving: {}",
+            cycle_nodes.join(", ")
+        )));
+    }
+    Ok(out)
+}
+
+fn referenced_local_ctes_in_query(
+    q: &Query,
+    cte_names: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    collect_cte_refs_from_setexpr(&q.body, cte_names, &mut out);
+    out
+}
+
+fn collect_cte_refs_from_setexpr(
+    body: &Box<SetExpr>,
+    cte_names: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match body.as_ref() {
+        SetExpr::Select(sel) => {
+            collect_cte_refs_from_select(sel.as_ref(), cte_names, out);
+        }
+        SetExpr::Query(q) => {
+            collect_cte_refs_from_setexpr(&q.body, cte_names, out);
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_cte_refs_from_setexpr(left, cte_names, out);
+            collect_cte_refs_from_setexpr(right, cte_names, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_cte_refs_from_select(
+    select: &sqlparser::ast::Select,
+    cte_names: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    for twj in &select.from {
+        collect_cte_refs_from_table_factor(&twj.relation, cte_names, out);
+        for j in &twj.joins {
+            collect_cte_refs_from_table_factor(&j.relation, cte_names, out);
+        }
+    }
+    if let Some(selection) = &select.selection {
+        collect_cte_refs_from_expr(selection, cte_names, out);
+    }
+    for proj in &select.projection {
+        match proj {
+            SelectItem::UnnamedExpr(e) => collect_cte_refs_from_expr(e, cte_names, out),
+            SelectItem::ExprWithAlias { expr, .. } => collect_cte_refs_from_expr(expr, cte_names, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_cte_refs_from_table_factor(
+    tf: &TableFactor,
+    cte_names: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match tf {
+        TableFactor::Table { name, .. } => {
+            let t = object_name_to_string(name);
+            if cte_names.contains(&t) {
+                out.insert(t);
+            }
+        }
+        TableFactor::Derived { subquery, .. } => {
+            collect_cte_refs_from_setexpr(&subquery.body, cte_names, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_cte_refs_from_expr(
+    expr: &SqlExpr,
+    cte_names: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match expr {
+        SqlExpr::Subquery(q) => collect_cte_refs_from_setexpr(&q.body, cte_names, out),
+        SqlExpr::Exists { subquery, .. } => collect_cte_refs_from_setexpr(&subquery.body, cte_names, out),
+        SqlExpr::InSubquery { subquery, expr, .. } => {
+            collect_cte_refs_from_expr(expr, cte_names, out);
+            collect_cte_refs_from_setexpr(&subquery.body, cte_names, out);
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            collect_cte_refs_from_expr(left, cte_names, out);
+            collect_cte_refs_from_expr(right, cte_names, out);
+        }
+        SqlExpr::UnaryOp { expr, .. } => collect_cte_refs_from_expr(expr, cte_names, out),
+        SqlExpr::Nested(e) => collect_cte_refs_from_expr(e, cte_names, out),
+        SqlExpr::IsNull(e) | SqlExpr::IsNotNull(e) => collect_cte_refs_from_expr(e, cte_names, out),
+        SqlExpr::Function(f) => {
+            if let FunctionArguments::List(list) = &f.args {
+                for arg in &list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                        collect_cte_refs_from_expr(e, cte_names, out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn from_to_plan(
@@ -875,6 +1056,82 @@ mod tests {
             },
             other => panic!("expected Projection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_multi_cte_with_dependency_ordering() {
+        let plan = sql_to_logical(
+            "WITH b AS (SELECT a FROM c), c AS (SELECT a FROM t) SELECT a FROM b",
+            &HashMap::new(),
+        )
+        .expect("parse");
+
+        fn contains_tablescan(plan: &LogicalPlan, target: &str) -> bool {
+            match plan {
+                LogicalPlan::TableScan { table, .. } => table == target,
+                LogicalPlan::Projection { input, .. }
+                | LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Limit { input, .. }
+                | LogicalPlan::TopKByScore { input, .. }
+                | LogicalPlan::InsertInto { input, .. } => contains_tablescan(input, target),
+                LogicalPlan::InSubqueryFilter { input, subquery, .. }
+                | LogicalPlan::ExistsSubqueryFilter { input, subquery, .. }
+                | LogicalPlan::ScalarSubqueryFilter { input, subquery, .. } => {
+                    contains_tablescan(input, target) || contains_tablescan(subquery, target)
+                }
+                LogicalPlan::Join { left, right, .. } => {
+                    contains_tablescan(left, target) || contains_tablescan(right, target)
+                }
+                LogicalPlan::Aggregate { input, .. } => contains_tablescan(input, target),
+                LogicalPlan::VectorTopK { .. } => false,
+            }
+        }
+
+        assert!(
+            contains_tablescan(&plan, "t"),
+            "expected dependency-ordered expansion to include base table t: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_cte_dependency_cycle() {
+        let err = sql_to_logical(
+            "WITH a AS (SELECT x FROM b), b AS (SELECT y FROM a) SELECT x FROM a",
+            &HashMap::new(),
+        )
+        .expect_err("cycle should fail");
+        assert!(
+            err.to_string().contains("CTE dependency cycle detected involving"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_cte_name() {
+        let err = sql_to_logical(
+            "WITH c AS (SELECT a FROM t), c AS (SELECT a FROM t2) SELECT a FROM c",
+            &HashMap::new(),
+        )
+        .expect_err("duplicate CTE name should fail");
+        assert!(
+            err.to_string()
+                .contains("duplicate CTE name in WITH clause"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_cte_shadowing_outer_scope() {
+        let err = sql_to_logical(
+            "WITH c AS (SELECT a FROM t), d AS (WITH c AS (SELECT a FROM t) SELECT a FROM c) SELECT a FROM d",
+            &HashMap::new(),
+        )
+        .expect_err("shadowing should fail");
+        assert!(
+            err.to_string()
+                .contains("shadows an outer CTE"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
