@@ -399,9 +399,9 @@ fn proj_rewrite(
             negated,
             correlation,
         } => {
-            let mut req = required.unwrap_or_default();
-            req.extend(expr_columns(&expr));
-            let (new_in, child_req) = proj_rewrite(*input, Some(req), ctx)?;
+            // Keep full left input shape before analysis so correlated-IN decorrelation
+            // can still discover/use outer reference columns.
+            let (new_in, child_req) = proj_rewrite(*input, None, ctx)?;
             let (new_sub, _sub_req) = proj_rewrite(*subquery, None, ctx)?;
             Ok((
                 LogicalPlan::InSubqueryFilter {
@@ -420,8 +420,9 @@ fn proj_rewrite(
             negated,
             correlation,
         } => {
-            let req = required.unwrap_or_default();
-            let (new_in, child_req) = proj_rewrite(*input, Some(req), ctx)?;
+            // Keep full left input shape before analysis so correlated-EXISTS
+            // decorrelation can still discover/use outer reference columns.
+            let (new_in, child_req) = proj_rewrite(*input, None, ctx)?;
             let (new_sub, _sub_req) = proj_rewrite(*subquery, None, ctx)?;
             Ok((
                 LogicalPlan::ExistsSubqueryFilter {
@@ -1534,6 +1535,8 @@ fn rewrite_expr(e: Expr, rewrite: &dyn Fn(Expr) -> Expr) -> Expr {
             Box::new(rewrite_expr(*b, rewrite)),
         ),
         Expr::Not(x) => Expr::Not(Box::new(rewrite_expr(*x, rewrite))),
+        Expr::IsNull(x) => Expr::IsNull(Box::new(rewrite_expr(*x, rewrite))),
+        Expr::IsNotNull(x) => Expr::IsNotNull(Box::new(rewrite_expr(*x, rewrite))),
         Expr::Cast { expr, to_type } => Expr::Cast {
             expr: Box::new(rewrite_expr(*expr, rewrite)),
             to_type,
@@ -1622,7 +1625,10 @@ fn collect_cols(e: &Expr, out: &mut HashSet<String>) {
             collect_cols(a, out);
             collect_cols(b, out);
         }
-        Expr::Not(x) | Expr::Cast { expr: x, .. } => {
+        Expr::Not(x)
+        | Expr::IsNull(x)
+        | Expr::IsNotNull(x)
+        | Expr::Cast { expr: x, .. } => {
             collect_cols(x, out);
         }
         Expr::CaseWhen { branches, else_expr } => {
@@ -1655,7 +1661,10 @@ fn expr_contains_case(e: &Expr) -> bool {
         Expr::CaseWhen { .. } => true,
         Expr::BinaryOp { left, right, .. } => expr_contains_case(left) || expr_contains_case(right),
         Expr::And(a, b) | Expr::Or(a, b) => expr_contains_case(a) || expr_contains_case(b),
-        Expr::Not(x) | Expr::Cast { expr: x, .. } => expr_contains_case(x),
+        Expr::Not(x)
+        | Expr::IsNull(x)
+        | Expr::IsNotNull(x)
+        | Expr::Cast { expr: x, .. } => expr_contains_case(x),
         Expr::ScalarUdf { args, .. } => args.iter().any(expr_contains_case),
         #[cfg(feature = "vector")]
         Expr::CosineSimilarity { vector, query }

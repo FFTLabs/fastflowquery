@@ -1445,6 +1445,10 @@ fn join_key_from_row(row: &[ScalarValue], idxs: &[usize]) -> Vec<ScalarValue> {
     idxs.iter().map(|i| row[*i].clone()).collect()
 }
 
+fn join_key_has_null(key: &[ScalarValue]) -> bool {
+    key.iter().any(|v| *v == ScalarValue::Null)
+}
+
 fn in_memory_hash_join(
     build_rows: &[Vec<ScalarValue>],
     probe_rows: &[Vec<ScalarValue>],
@@ -1456,9 +1460,11 @@ fn in_memory_hash_join(
 ) -> JoinMatchOutput {
     let mut ht: HashMap<Vec<ScalarValue>, Vec<usize>> = HashMap::new();
     for (idx, row) in build_rows.iter().enumerate() {
-        ht.entry(join_key_from_row(row, build_key_idx))
-            .or_default()
-            .push(idx);
+        let key = join_key_from_row(row, build_key_idx);
+        if join_key_has_null(&key) {
+            continue;
+        }
+        ht.entry(key).or_default().push(idx);
     }
 
     let mut out = Vec::new();
@@ -1466,6 +1472,9 @@ fn in_memory_hash_join(
     let mut matched_right = vec![false; right_len];
     for (probe_idx, probe) in probe_rows.iter().enumerate() {
         let probe_key = join_key_from_row(probe, probe_key_idx);
+        if join_key_has_null(&probe_key) {
+            continue;
+        }
         if let Some(build_matches) = ht.get(&probe_key) {
             for build_idx in build_matches {
                 let build = &build_rows[*build_idx];
@@ -1641,6 +1650,9 @@ fn spill_join_partitions(
 
     for (row_id, row) in rows.iter().enumerate() {
         let key = join_key_from_row(row, key_idx);
+        if join_key_has_null(&key) {
+            continue;
+        }
         let part = (hash_key(&key) as usize) % writers.len();
         let rec = JoinSpillRow {
             row_id,

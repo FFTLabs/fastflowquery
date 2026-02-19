@@ -526,6 +526,8 @@ fn sql_expr_to_expr(e: &SqlExpr, params: &HashMap<String, LiteralValue>) -> Resu
                 )))
             }
         }
+        SqlExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(sql_expr_to_expr(expr, params)?))),
+        SqlExpr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(sql_expr_to_expr(expr, params)?))),
         SqlExpr::Case {
             operand,
             conditions,

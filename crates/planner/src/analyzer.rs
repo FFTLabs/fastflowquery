@@ -172,44 +172,63 @@ impl Analyzer {
                 correlation: _,
             } => {
                 let (ain, in_schema, in_resolver) = self.analyze_plan(*input, provider)?;
-                let (asub, sub_schema, _sub_resolver) = self.analyze_uncorrelated_subquery(
-                    *subquery,
+                let raw_subquery = *subquery;
+                let (aexpr, expr_dt) = self.analyze_expr(expr.clone(), &in_resolver)?;
+                let uncorrelated = self.analyze_uncorrelated_subquery(
+                    raw_subquery.clone(),
                     provider,
                     &in_resolver,
                     "IN subquery",
-                )?;
-                if sub_schema.fields().len() != 1 {
-                    return Err(FfqError::Planning(
-                        "IN subquery must return exactly one column".to_string(),
-                    ));
+                );
+                match uncorrelated {
+                    Ok((asub, sub_schema, _sub_resolver)) => {
+                        if sub_schema.fields().len() != 1 {
+                            return Err(FfqError::Planning(
+                                "IN subquery must return exactly one column".to_string(),
+                            ));
+                        }
+                        let sub_col_name = sub_schema.field(0).name().clone();
+                        let sub_col_dt = sub_schema.field(0).data_type().clone();
+                        let sub_expr = Expr::ColumnRef {
+                            name: sub_col_name.clone(),
+                            index: 0,
+                        };
+                        let (coerced_left, coerced_sub, target_dt) =
+                            coerce_for_compare(aexpr, expr_dt, sub_expr, sub_col_dt)?;
+                        let coerced_subquery = LogicalPlan::Projection {
+                            exprs: vec![(coerced_sub, "__in_key".to_string())],
+                            input: Box::new(asub),
+                        };
+                        let out_schema = in_schema.clone();
+                        let out_resolver = Resolver::anonymous(out_schema.clone());
+                        let _ = target_dt;
+                        Ok((
+                            LogicalPlan::InSubqueryFilter {
+                                input: Box::new(ain),
+                                expr: coerced_left,
+                                subquery: Box::new(coerced_subquery),
+                                negated,
+                                correlation: SubqueryCorrelation::Uncorrelated,
+                            },
+                            out_schema,
+                            out_resolver,
+                        ))
+                    }
+                    Err(err) => {
+                        if let Some(rewritten) = self.try_decorrelate_in_subquery(
+                            ain,
+                            aexpr,
+                            raw_subquery,
+                            negated,
+                            provider,
+                            &in_resolver,
+                        )? {
+                            let (aplan, schema, resolver) = self.analyze_plan(rewritten, provider)?;
+                            return Ok((aplan, schema, resolver));
+                        }
+                        Err(err)
+                    }
                 }
-                let sub_col_name = sub_schema.field(0).name().clone();
-                let sub_col_dt = sub_schema.field(0).data_type().clone();
-                let (aexpr, expr_dt) = self.analyze_expr(expr, &in_resolver)?;
-                let sub_expr = Expr::ColumnRef {
-                    name: sub_col_name.clone(),
-                    index: 0,
-                };
-                let (coerced_left, coerced_sub, target_dt) =
-                    coerce_for_compare(aexpr, expr_dt, sub_expr, sub_col_dt)?;
-                let coerced_subquery = LogicalPlan::Projection {
-                    exprs: vec![(coerced_sub, "__in_key".to_string())],
-                    input: Box::new(asub),
-                };
-                let out_schema = in_schema.clone();
-                let out_resolver = Resolver::anonymous(out_schema.clone());
-                let _ = target_dt;
-                Ok((
-                    LogicalPlan::InSubqueryFilter {
-                        input: Box::new(ain),
-                        expr: coerced_left,
-                        subquery: Box::new(coerced_subquery),
-                        negated,
-                        correlation: SubqueryCorrelation::Uncorrelated,
-                    },
-                    out_schema,
-                    out_resolver,
-                ))
             }
             LogicalPlan::ExistsSubqueryFilter {
                 input,
@@ -636,6 +655,115 @@ impl Analyzer {
         Ok(Some((analyzed_subquery, join_keys)))
     }
 
+    fn try_decorrelate_in_subquery(
+        &self,
+        input: LogicalPlan,
+        expr: Expr,
+        subquery: LogicalPlan,
+        negated: bool,
+        _provider: &dyn SchemaProvider,
+        outer_resolver: &Resolver,
+    ) -> Result<Option<LogicalPlan>> {
+        let lhs_name = column_name_from_expr(&expr)
+            .ok_or_else(|| FfqError::Unsupported("correlated IN currently requires column lhs".to_string()))?
+            .clone();
+
+        let (inner_value_col, mut core) = extract_subquery_projection_col(subquery)?;
+        let (base_input, mut predicates) = match core {
+            LogicalPlan::Filter { predicate, input } => (*input, split_conjuncts(predicate)),
+            other => (other, Vec::new()),
+        };
+        core = base_input;
+        if let LogicalPlan::TableScan {
+            table,
+            projection,
+            filters,
+        } = core
+        {
+            predicates.extend(filters.into_iter().flat_map(split_conjuncts));
+            core = LogicalPlan::TableScan {
+                table,
+                projection,
+                filters: Vec::new(),
+            };
+        }
+
+        let mut corr_keys = Vec::<(String, String)>::new();
+        let mut inner_only = Vec::<Expr>::new();
+        for pred in predicates {
+            if let Some((outer_col, inner_col)) =
+                extract_outer_inner_eq_pair(&pred, outer_resolver)
+            {
+                corr_keys.push((outer_col, inner_col));
+                continue;
+            }
+            if predicate_has_outer_ref(&pred, outer_resolver) {
+                return Err(FfqError::Unsupported(format!(
+                    "IN subquery correlated predicate shape is not supported yet: {pred:?}"
+                )));
+            }
+            inner_only.push(strip_inner_qualifiers(pred, outer_resolver));
+        }
+        if corr_keys.is_empty() {
+            return Ok(None);
+        }
+
+        let inner_base = if inner_only.is_empty() {
+            core
+        } else {
+            LogicalPlan::Filter {
+                predicate: combine_conjuncts(inner_only),
+                input: Box::new(core),
+            }
+        };
+        let mut needed_inner_cols: std::collections::HashSet<String> = corr_keys
+            .iter()
+            .map(|(_, inner)| split_qual(inner).1.to_string())
+            .collect();
+        needed_inner_cols.insert(split_qual(&inner_value_col).1.to_string());
+        let inner_base = ensure_scan_projection_contains(inner_base, &needed_inner_cols);
+
+        let inner_non_null = LogicalPlan::Filter {
+            predicate: Expr::IsNotNull(Box::new(Expr::Column(inner_value_col.clone()))),
+            input: Box::new(inner_base.clone()),
+        };
+        let mut eq_on = corr_keys.clone();
+        eq_on.push((lhs_name.clone(), inner_value_col.clone()));
+
+        if !negated {
+            return Ok(Some(LogicalPlan::Join {
+                left: Box::new(input),
+                right: Box::new(inner_non_null),
+                on: eq_on,
+                join_type: crate::logical_plan::JoinType::Semi,
+                strategy_hint: crate::logical_plan::JoinStrategyHint::Auto,
+            }));
+        }
+
+        let left_non_null = LogicalPlan::Filter {
+            predicate: Expr::IsNotNull(Box::new(Expr::Column(lhs_name))),
+            input: Box::new(input),
+        };
+        let anti_equal = LogicalPlan::Join {
+            left: Box::new(left_non_null),
+            right: Box::new(inner_non_null),
+            on: eq_on,
+            join_type: crate::logical_plan::JoinType::Anti,
+            strategy_hint: crate::logical_plan::JoinStrategyHint::Auto,
+        };
+        let inner_null = LogicalPlan::Filter {
+            predicate: Expr::IsNull(Box::new(Expr::Column(inner_value_col))),
+            input: Box::new(inner_base),
+        };
+        Ok(Some(LogicalPlan::Join {
+            left: Box::new(anti_equal),
+            right: Box::new(inner_null),
+            on: corr_keys,
+            join_type: crate::logical_plan::JoinType::Anti,
+            strategy_hint: crate::logical_plan::JoinStrategyHint::Auto,
+        }))
+    }
+
     fn analyze_agg(&self, agg: AggExpr, resolver: &Resolver) -> Result<(AggExpr, DataType)> {
         match agg {
             AggExpr::Count(e) => {
@@ -717,6 +845,14 @@ impl Analyzer {
                     ));
                 }
                 Ok((Expr::Not(Box::new(ae)), DataType::Boolean))
+            }
+            Expr::IsNull(e) => {
+                let (ae, _dt) = self.analyze_expr(*e, resolver)?;
+                Ok((Expr::IsNull(Box::new(ae)), DataType::Boolean))
+            }
+            Expr::IsNotNull(e) => {
+                let (ae, _dt) = self.analyze_expr(*e, resolver)?;
+                Ok((Expr::IsNotNull(Box::new(ae)), DataType::Boolean))
             }
             Expr::CaseWhen {
                 branches,
@@ -938,23 +1074,32 @@ impl Resolver {
     fn resolve(&self, col: &str) -> Result<(usize, DataType)> {
         let (rel_opt, name) = split_qual(col);
 
-        let mut found: Vec<(usize, DataType)> = vec![];
-        let mut base = 0usize;
+        let resolve_with_rel = |rel_opt: Option<&str>| {
+            let mut found: Vec<(usize, DataType)> = vec![];
+            let mut base = 0usize;
 
-        for r in &self.relations {
-            let rel_match = match rel_opt {
-                Some(rel) => r.name == rel,
-                None => true,
-            };
+            for r in &self.relations {
+                let rel_match = match rel_opt {
+                    Some(rel) => r.name == rel,
+                    None => true,
+                };
 
-            if rel_match {
-                for (i, f) in r.fields.iter().enumerate() {
-                    if f.name() == name {
-                        found.push((base + i, f.data_type().clone()));
+                if rel_match {
+                    for (i, f) in r.fields.iter().enumerate() {
+                        if f.name() == name {
+                            found.push((base + i, f.data_type().clone()));
+                        }
                     }
                 }
+                base += r.fields.len();
             }
-            base += r.fields.len();
+            found
+        };
+
+        let mut found = resolve_with_rel(rel_opt);
+        if found.is_empty() && rel_opt.is_some() {
+            // Be tolerant after rewrites that can drop relation qualifiers.
+            found = resolve_with_rel(None);
         }
 
         match found.len() {
@@ -1030,6 +1175,9 @@ fn predicate_has_outer_ref(expr: &Expr, outer_resolver: &Resolver) -> bool {
                 || predicate_has_outer_ref(right, outer_resolver)
         }
         Expr::Cast { expr, .. } => predicate_has_outer_ref(expr, outer_resolver),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            predicate_has_outer_ref(inner, outer_resolver)
+        }
         Expr::And(left, right) | Expr::Or(left, right) => {
             predicate_has_outer_ref(left, outer_resolver)
                 || predicate_has_outer_ref(right, outer_resolver)
@@ -1085,6 +1233,63 @@ fn column_name_from_expr(expr: &Expr) -> Option<&String> {
     }
 }
 
+fn extract_subquery_projection_col(subquery: LogicalPlan) -> Result<(String, LogicalPlan)> {
+    match subquery {
+        LogicalPlan::Projection { exprs, input } => {
+            if exprs.len() != 1 {
+                return Err(FfqError::Planning(
+                    "IN subquery must return exactly one column".to_string(),
+                ));
+            }
+            let (expr, _alias) = exprs.into_iter().next().expect("single projection expr");
+            let col = column_name_from_expr(&expr).ok_or_else(|| {
+                FfqError::Unsupported(
+                    "correlated IN subquery currently requires projected column expression"
+                        .to_string(),
+                )
+            })?;
+            Ok((split_qual(col).1.to_string(), *input))
+        }
+        _ => Err(FfqError::Planning(
+            "IN subquery must return exactly one projected column".to_string(),
+        )),
+    }
+}
+
+fn ensure_scan_projection_contains(
+    plan: LogicalPlan,
+    needed: &std::collections::HashSet<String>,
+) -> LogicalPlan {
+    match plan {
+        LogicalPlan::TableScan {
+            table,
+            projection,
+            filters,
+        } => {
+            let mut cols = projection.unwrap_or_default();
+            for col in needed {
+                if !cols.iter().any(|c| split_qual(c).1 == split_qual(col).1) {
+                    cols.push(split_qual(col).1.to_string());
+                }
+            }
+            LogicalPlan::TableScan {
+                table,
+                projection: Some(cols),
+                filters,
+            }
+        }
+        LogicalPlan::Filter { predicate, input } => LogicalPlan::Filter {
+            predicate,
+            input: Box::new(ensure_scan_projection_contains(*input, needed)),
+        },
+        LogicalPlan::Projection { exprs, input } => LogicalPlan::Projection {
+            exprs,
+            input: Box::new(ensure_scan_projection_contains(*input, needed)),
+        },
+        other => other,
+    }
+}
+
 fn resolver_has_col(resolver: &Resolver, col: &str) -> bool {
     resolver.resolve(col).is_ok() || resolver.resolve(split_qual(col).1).is_ok()
 }
@@ -1117,6 +1322,14 @@ fn strip_inner_qualifiers(expr: Expr, outer_resolver: &Resolver) -> Expr {
             expr: Box::new(strip_inner_qualifiers(*expr, outer_resolver)),
             to_type,
         },
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(strip_inner_qualifiers(
+            *inner,
+            outer_resolver,
+        ))),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(strip_inner_qualifiers(
+            *inner,
+            outer_resolver,
+        ))),
         Expr::And(left, right) => Expr::And(
             Box::new(strip_inner_qualifiers(*left, outer_resolver)),
             Box::new(strip_inner_qualifiers(*right, outer_resolver)),
@@ -1378,6 +1591,78 @@ mod tests {
                     .contains("correlated outer reference is not supported yet"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn analyze_decorrelates_correlated_in_to_semijoin() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("k", DataType::Int64, true),
+            ])),
+        );
+        schemas.insert(
+            "s".to_string(),
+            Arc::new(Schema::new(vec![
+                Field::new("g", DataType::Int64, false),
+                Field::new("k2", DataType::Int64, true),
+            ])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT k FROM t WHERE k IN (SELECT k2 FROM s WHERE s.g = t.a)",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let analyzed = analyzer.analyze(plan, &provider).expect("analyze");
+        match analyzed {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Join { join_type, .. } => {
+                    assert_eq!(*join_type, JoinType::Semi);
+                }
+                other => panic!("expected decorrelated Join, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_decorrelates_correlated_not_in_to_anti_pipeline() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("k", DataType::Int64, true),
+            ])),
+        );
+        schemas.insert(
+            "s".to_string(),
+            Arc::new(Schema::new(vec![
+                Field::new("g", DataType::Int64, false),
+                Field::new("k2", DataType::Int64, true),
+            ])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT k FROM t WHERE k NOT IN (SELECT k2 FROM s WHERE s.g = t.a)",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let analyzed = analyzer.analyze(plan, &provider).expect("analyze");
+        match analyzed {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Join { join_type, .. } => {
+                    assert_eq!(*join_type, JoinType::Anti);
+                }
+                other => panic!("expected top-level anti Join, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "vector")]

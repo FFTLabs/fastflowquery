@@ -309,6 +309,71 @@ fn make_engine_with_in_null_fixtures() -> (Engine, Vec<std::path::PathBuf>) {
     )
 }
 
+fn make_engine_with_correlated_in_null_fixtures() -> (Engine, Vec<std::path::PathBuf>) {
+    let t_path = support::unique_path("ffq_corr_in_t", "parquet");
+    let s_path = support::unique_path("ffq_corr_in_s", "parquet");
+
+    let t_schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int64, false),
+        Field::new("k", DataType::Int64, true),
+    ]));
+    support::write_parquet(
+        &t_path,
+        t_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 1, 2, 2, 3, 4])),
+            Arc::new(Int64Array::from(vec![
+                Some(1_i64),
+                Some(2),
+                Some(2),
+                None,
+                Some(5),
+                Some(9),
+            ])),
+        ],
+    );
+
+    let s_schema = Arc::new(Schema::new(vec![
+        Field::new("g", DataType::Int64, false),
+        Field::new("k2", DataType::Int64, true),
+    ]));
+    support::write_parquet(
+        &s_path,
+        s_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 1, 2, 2, 3])),
+            Arc::new(Int64Array::from(vec![Some(2_i64), None, Some(3), None, Some(7)])),
+        ],
+    );
+
+    let engine = Engine::new(EngineConfig::default()).expect("engine");
+    engine.register_table(
+        "t_corr",
+        TableDef {
+            name: "ignored".to_string(),
+            uri: t_path.to_string_lossy().into_owned(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: Some((*t_schema).clone()),
+            stats: ffq_storage::TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+    engine.register_table(
+        "s_corr",
+        TableDef {
+            name: "ignored".to_string(),
+            uri: s_path.to_string_lossy().into_owned(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: Some((*s_schema).clone()),
+            stats: ffq_storage::TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+    (engine, vec![t_path, s_path])
+}
+
 #[test]
 fn in_not_in_null_semantics_with_null_in_rhs() {
     let (engine, paths) = make_engine_with_in_null_fixtures();
@@ -389,6 +454,37 @@ fn in_not_in_null_semantics_with_empty_rhs_and_all_null_rhs() {
         not_in_all_null_values.is_empty(),
         "unexpected rows: {not_in_all_null_values:?}"
     );
+
+    for p in paths {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn correlated_in_not_in_null_semantics() {
+    let (engine, paths) = make_engine_with_correlated_in_null_fixtures();
+
+    let in_sql = "SELECT k FROM t_corr WHERE k IN (SELECT k2 FROM s_corr WHERE s_corr.g = t_corr.a)";
+    let in_batches =
+        futures::executor::block_on(engine.sql(in_sql).expect("sql").collect()).expect("collect");
+    let in_values = in_batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    assert_eq!(in_values, vec![2]);
+
+    let not_in_sql =
+        "SELECT k FROM t_corr WHERE k NOT IN (SELECT k2 FROM s_corr WHERE s_corr.g = t_corr.a)";
+    let not_in_batches = futures::executor::block_on(
+        engine.sql(not_in_sql).expect("sql").collect(),
+    )
+    .expect("collect");
+    let mut not_in_values = not_in_batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    not_in_values.sort_unstable();
+    assert_eq!(not_in_values, vec![5, 9]);
 
     for p in paths {
         let _ = std::fs::remove_file(p);

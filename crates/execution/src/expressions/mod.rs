@@ -77,6 +77,20 @@ pub fn compile_expr(expr: &Expr, input_schema: &SchemaRef) -> Result<Arc<dyn Phy
             let inner = compile_expr(e, input_schema)?;
             Ok(Arc::new(NotExpr { inner }))
         }
+        Expr::IsNull(e) => {
+            let inner = compile_expr(e, input_schema)?;
+            Ok(Arc::new(IsNullExpr {
+                inner,
+                negated: false,
+            }))
+        }
+        Expr::IsNotNull(e) => {
+            let inner = compile_expr(e, input_schema)?;
+            Ok(Arc::new(IsNullExpr {
+                inner,
+                negated: true,
+            }))
+        }
 
         Expr::And(a, b) => {
             let left = compile_expr(a, input_schema)?;
@@ -256,6 +270,27 @@ impl PhysicalExpr for NotExpr {
 
         let out = not(b).map_err(|e| FfqError::Execution(format!("not failed: {e}")))?;
         Ok(Arc::new(out))
+    }
+}
+
+struct IsNullExpr {
+    inner: Arc<dyn PhysicalExpr>,
+    negated: bool,
+}
+
+impl PhysicalExpr for IsNullExpr {
+    fn data_type(&self) -> DataType {
+        DataType::Boolean
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
+        let arr = self.inner.evaluate(batch)?;
+        let mut out = BooleanBuilder::with_capacity(arr.len());
+        for i in 0..arr.len() {
+            let is_null = arr.is_null(i);
+            out.append_value(if self.negated { !is_null } else { is_null });
+        }
+        Ok(Arc::new(out.finish()))
     }
 }
 

@@ -180,6 +180,8 @@ fn fmt_expr(e: &Expr) -> String {
         Expr::Literal(v) => format!("{v:?}"),
         Expr::Cast { expr, to_type } => format!("cast({} as {to_type:?})", fmt_expr(expr)),
         Expr::Not(x) => format!("NOT ({})", fmt_expr(x)),
+        Expr::IsNull(x) => format!("({}) IS NULL", fmt_expr(x)),
+        Expr::IsNotNull(x) => format!("({}) IS NOT NULL", fmt_expr(x)),
         Expr::And(a, b) => format!("({}) AND ({})", fmt_expr(a), fmt_expr(b)),
         Expr::Or(a, b) => format!("({}) OR ({})", fmt_expr(a), fmt_expr(b)),
         Expr::CaseWhen { branches, else_expr } => {

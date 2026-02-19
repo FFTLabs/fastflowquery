@@ -70,6 +70,10 @@ pub enum Expr {
     Or(Box<Expr>, Box<Expr>),
     /// Boolean negation.
     Not(Box<Expr>),
+    /// `expr IS NULL`
+    IsNull(Box<Expr>),
+    /// `expr IS NOT NULL`
+    IsNotNull(Box<Expr>),
     /// Searched CASE expression.
     ///
     /// SQL form:
