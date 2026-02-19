@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use ffq_common::{FfqError, Result};
 use futures::future::{BoxFuture, FutureExt};
-use qdrant_client::qdrant::{point_id, Condition, Filter, SearchPointsBuilder, Value};
 use qdrant_client::Qdrant;
+use qdrant_client::qdrant::{Condition, Filter, SearchPointsBuilder, Value, point_id};
 
 use crate::vector_index::{VectorIndexProvider, VectorTopKRow};
 

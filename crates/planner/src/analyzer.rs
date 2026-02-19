@@ -8,21 +8,31 @@ use crate::logical_plan::{AggExpr, BinaryOp, Expr, JoinType, LiteralValue, Logic
 /// The analyzer needs schemas to resolve columns.
 /// The client (Engine) will provide this from its Catalog.
 pub trait SchemaProvider {
+    /// Return schema for a table by name.
     fn table_schema(&self, table: &str) -> Result<SchemaRef>;
 }
 
 #[derive(Debug, Default)]
+/// Logical-plan semantic analyzer.
 pub struct Analyzer;
 
 impl Analyzer {
+    /// Create a new analyzer.
     pub fn new() -> Self {
         Self
     }
 
-    /// Analyze:
-    /// - resolve columns -> ColumnRef { index }
-    /// - infer types
-    /// - insert minimal casts
+    /// Analyze a logical plan and return a semantically validated plan.
+    ///
+    /// Guarantees:
+    /// - unresolved `Expr::Column` references become `Expr::ColumnRef`;
+    /// - expression/aggregate types are inferred and checked;
+    /// - required casts are inserted for supported coercions;
+    /// - join and insert contracts are validated early.
+    ///
+    /// Error taxonomy:
+    /// - `Planning`: semantic/type/name resolution failures
+    /// - `Unsupported`: valid SQL shape that analyzer intentionally does not support in v1
     pub fn analyze(&self, plan: LogicalPlan, provider: &dyn SchemaProvider) -> Result<LogicalPlan> {
         let (p, _schema, _resolver) = self.analyze_plan(plan, provider)?;
         Ok(p)

@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_planner::{
-    explain_logical, BinaryOp, Expr, JoinStrategyHint, LogicalPlan, Optimizer, OptimizerConfig,
-    OptimizerContext, SchemaProvider, TableMetadata,
+    BinaryOp, Expr, JoinStrategyHint, LogicalPlan, Optimizer, OptimizerConfig, OptimizerContext,
+    SchemaProvider, TableMetadata, explain_logical,
 };
 
 #[derive(Clone)]

@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow::array::{Int64Array, StringArray};
 use arrow::array::Int32Array;
+use arrow::array::{Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use ffq_client::Engine;
@@ -106,13 +106,9 @@ fn sql_collect_works_when_parquet_schema_is_missing_in_catalog() {
         },
     );
 
-    let batches = futures::executor::block_on(
-        engine
-            .sql("SELECT id, name FROM t")
-            .expect("sql")
-            .collect(),
-    )
-    .expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql("SELECT id, name FROM t").expect("sql").collect())
+            .expect("collect");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 3);
 
@@ -218,10 +214,8 @@ fn schema_cache_refreshes_on_drift_when_policy_allows_refresh() {
         },
     );
 
-    let first = futures::executor::block_on(
-        engine.sql("SELECT id FROM t").expect("sql").collect(),
-    )
-    .expect("collect first");
+    let first = futures::executor::block_on(engine.sql("SELECT id FROM t").expect("sql").collect())
+        .expect("collect first");
     assert_eq!(first.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
 
     sleep(Duration::from_millis(2));
@@ -261,10 +255,8 @@ fn schema_cache_can_fail_on_drift_when_configured() {
         },
     );
 
-    let _ = futures::executor::block_on(
-        engine.sql("SELECT id FROM t").expect("sql").collect(),
-    )
-    .expect("collect first");
+    let _ = futures::executor::block_on(engine.sql("SELECT id FROM t").expect("sql").collect())
+        .expect("collect first");
 
     sleep(Duration::from_millis(2));
     write_id_name_city_parquet(&parquet_path);
@@ -307,23 +299,28 @@ fn inferred_schema_writeback_persists_across_restart() {
     cfg.schema_writeback = true;
     let engine = Engine::new(cfg.clone()).expect("engine");
 
-    let rows = futures::executor::block_on(
-        engine
-            .sql("SELECT id, name FROM t")
-            .expect("sql")
-            .collect(),
-    )
-    .expect("collect");
+    let rows =
+        futures::executor::block_on(engine.sql("SELECT id, name FROM t").expect("sql").collect())
+            .expect("collect");
     assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
 
     let saved = std::fs::read_to_string(&catalog_path).expect("read catalog");
-    assert!(saved.contains("schema.inferred_at"), "missing inferred_at marker");
-    assert!(saved.contains("schema.fingerprint"), "missing fingerprint marker");
+    assert!(
+        saved.contains("schema.inferred_at"),
+        "missing inferred_at marker"
+    );
+    assert!(
+        saved.contains("schema.fingerprint"),
+        "missing fingerprint marker"
+    );
     assert!(saved.contains("\"schema\""), "missing persisted schema");
 
     let restarted = Engine::new(cfg).expect("restart engine");
     let persisted_schema = restarted.table_schema("t").expect("table schema");
-    assert!(persisted_schema.is_some(), "schema should be loaded from writeback");
+    assert!(
+        persisted_schema.is_some(),
+        "schema should be loaded from writeback"
+    );
 
     let _ = std::fs::remove_file(parquet_path);
     let _ = std::fs::remove_file(catalog_path);
@@ -350,13 +347,8 @@ fn schema_inference_off_requires_predeclared_schema() {
         },
     );
 
-    let err = futures::executor::block_on(
-        engine
-            .sql("SELECT id FROM t")
-            .expect("sql")
-            .collect(),
-    )
-    .expect_err("must fail without schema inference");
+    let err = futures::executor::block_on(engine.sql("SELECT id FROM t").expect("sql").collect())
+        .expect_err("must fail without schema inference");
     assert!(format!("{err}").contains("has no schema"));
 
     let _ = std::fs::remove_file(parquet_path);
@@ -374,20 +366,20 @@ fn schema_inference_strict_rejects_numeric_widening_across_files() {
     let engine = Engine::new(cfg).expect("engine");
     let err = engine
         .register_table_checked(
-        "t",
-        TableDef {
-            name: "ignored".to_string(),
-            uri: String::new(),
-            paths: vec![
-                p1.to_string_lossy().to_string(),
-                p2.to_string_lossy().to_string(),
-            ],
-            format: "parquet".to_string(),
-            schema: None,
-            stats: ffq_storage::TableStats::default(),
-            options: HashMap::new(),
-        },
-    )
+            "t",
+            TableDef {
+                name: "ignored".to_string(),
+                uri: String::new(),
+                paths: vec![
+                    p1.to_string_lossy().to_string(),
+                    p2.to_string_lossy().to_string(),
+                ],
+                format: "parquet".to_string(),
+                schema: None,
+                stats: ffq_storage::TableStats::default(),
+                options: HashMap::new(),
+            },
+        )
         .expect_err("strict should fail registration");
     assert!(format!("{err}").contains("strict policy"));
 
@@ -479,8 +471,11 @@ fn write_id_name_city_parquet(path: &std::path::Path) {
 
 fn write_single_numeric_parquet_i32(path: &std::path::Path) {
     let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
-    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1_i32, 2]))])
-        .expect("build batch");
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int32Array::from(vec![1_i32, 2]))],
+    )
+    .expect("build batch");
     let file = File::create(path).expect("create parquet file");
     let mut writer = ArrowWriter::try_new(file, schema, None).expect("create parquet writer");
     writer.write(&batch).expect("write parquet batch");
@@ -489,8 +484,11 @@ fn write_single_numeric_parquet_i32(path: &std::path::Path) {
 
 fn write_single_numeric_parquet_i64(path: &std::path::Path) {
     let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![3_i64, 4]))])
-        .expect("build batch");
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![3_i64, 4]))],
+    )
+    .expect("build batch");
     let file = File::create(path).expect("create parquet file");
     let mut writer = ArrowWriter::try_new(file, schema, None).expect("create parquet writer");
     writer.write(&batch).expect("write parquet batch");

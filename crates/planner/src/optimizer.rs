@@ -4,8 +4,10 @@ use std::collections::{HashMap, HashSet};
 use crate::analyzer::SchemaProvider;
 use crate::logical_plan::{BinaryOp, Expr, JoinStrategyHint, JoinType, LiteralValue, LogicalPlan};
 
+/// Configuration knobs for rule-based optimization.
 #[derive(Debug, Clone, Copy)]
 pub struct OptimizerConfig {
+    /// Max table byte size eligible for broadcast join hinting.
     pub broadcast_threshold_bytes: u64,
 }
 
@@ -18,36 +20,62 @@ impl Default for OptimizerConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Table metadata exposed to optimizer rewrite rules.
 pub struct TableMetadata {
+    /// Storage format (for example `parquet`, `qdrant`).
     pub format: String,
+    /// Provider-specific options used by rewrite rules.
     pub options: HashMap<String, String>,
 }
 
 /// Provide table stats for join hinting + schemas for pushdown decisions.
 pub trait OptimizerContext: SchemaProvider {
+    /// Return `(bytes, rows)` estimates for a table.
     fn table_stats(&self, table: &str) -> Result<(Option<u64>, Option<u64>)>; // (bytes, rows)
 
+    /// Return table metadata used by rewrite rules.
     fn table_metadata(&self, _table: &str) -> Result<Option<TableMetadata>> {
         Ok(None)
     }
 
+    /// Convenience getter for table format.
     fn table_format(&self, table: &str) -> Result<Option<String>> {
         Ok(self.table_metadata(table)?.map(|m| m.format))
     }
 
+    /// Convenience getter for table options map.
     fn table_options(&self, table: &str) -> Result<Option<HashMap<String, String>>> {
         Ok(self.table_metadata(table)?.map(|m| m.options))
     }
 }
 
 #[derive(Debug, Default)]
+/// Rule-based optimizer for v1 logical plans.
+///
+/// The implementation is intentionally conservative: pushdowns and rewrites are
+/// applied only when correctness preconditions are satisfied; otherwise, the
+/// original logical behavior is preserved.
 pub struct Optimizer;
 
 impl Optimizer {
+    /// Create a new optimizer.
     pub fn new() -> Self {
         Self
     }
 
+    /// Apply v1 rule pipeline to a logical plan.
+    ///
+    /// Pass order is fixed and intentionally conservative:
+    /// 1. constant folding
+    /// 2. filter merge
+    /// 3. projection pushdown
+    /// 4. predicate pushdown
+    /// 5. join strategy hinting
+    /// 6. vector index rewrite
+    ///
+    /// Rewrite contract:
+    /// - When rewrite preconditions are not met, optimizer must preserve a
+    ///   valid fallback plan (for example `TopKByScore`).
     pub fn optimize(
         &self,
         plan: LogicalPlan,
@@ -965,7 +993,7 @@ fn evaluate_vector_topk_rewrite(
         Err(_) => {
             return Ok(VectorRewriteDecision::Fallback {
                 _reason: "filter translation unsupported",
-            })
+            });
         }
     };
 

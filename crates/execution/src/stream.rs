@@ -1,27 +1,31 @@
+//! Record-batch stream abstractions and channel adapters.
+
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use ffq_common::Result;
-use futures::channel::mpsc;
 use futures::Stream;
+use futures::channel::mpsc;
 
 /// A stream of RecordBatches that also knows its output schema.
 pub trait RecordBatchStream: Stream<Item = Result<RecordBatch>> + Send {
+    /// Output schema for every batch yielded by this stream.
     fn schema(&self) -> SchemaRef;
 }
 
 /// The standard "stream you can return from operators".
 pub type SendableRecordBatchStream = Pin<Box<dyn RecordBatchStream>>;
 
-/// Adapter that attaches a schema to any Stream<Item=Result<RecordBatch>>.
+/// Adapter that attaches a schema to any `Stream<Item = Result<RecordBatch>>`.
 pub struct StreamAdapter<S> {
     schema: SchemaRef,
     inner: S,
 }
 
 impl<S> StreamAdapter<S> {
+    /// Create a new schema-attached stream adapter.
     pub fn new(schema: SchemaRef, inner: S) -> Self {
         Self { schema, inner }
     }

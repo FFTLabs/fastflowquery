@@ -1,4 +1,4 @@
-use ffq_planner::{create_physical_plan, LogicalPlan, PhysicalPlan, PhysicalPlannerConfig};
+use ffq_planner::{LogicalPlan, PhysicalPlan, PhysicalPlannerConfig, create_physical_plan};
 
 #[test]
 fn physical_plan_is_serializable() {

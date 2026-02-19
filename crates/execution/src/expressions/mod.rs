@@ -1,3 +1,12 @@
+//! Expression compilation and evaluation for execution operators.
+//!
+//! Input contract:
+//! - analyzer has resolved/typed expressions (primarily `ColumnRef`);
+//! - execution may still accept unresolved `Column` as a compatibility fallback.
+//!
+//! Output contract:
+//! - each evaluation returns an `ArrayRef` aligned to input batch row count.
+
 use std::sync::Arc;
 
 use arrow::array::{
@@ -23,7 +32,9 @@ use ffq_planner::{BinaryOp, Expr, LiteralValue};
 /// - execution compiles Expr -> PhysicalExpr
 /// - evaluation returns Arrow ArrayRef aligned with the input RecordBatch length
 pub trait PhysicalExpr: Send + Sync {
+    /// Static output data type of this expression.
     fn data_type(&self) -> DataType;
+    /// Evaluate the expression for every row in `batch`.
     fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef>;
 }
 
@@ -462,7 +473,7 @@ fn eval_cmp(op: BinaryOp, l: &ArrayRef, r: &ArrayRef) -> Result<ArrayRef> {
                 _ => {
                     return Err(FfqError::Unsupported(
                         "ordering comparisons not supported for boolean in v1".to_string(),
-                    ))
+                    ));
                 }
             }
             .map_err(|e| FfqError::Execution(format!("cmp kernel failed: {e}")))?;

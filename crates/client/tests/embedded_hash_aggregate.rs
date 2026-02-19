@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use ffq_client::expr::col;
 use ffq_client::Engine;
+use ffq_client::expr::col;
 use ffq_common::EngineConfig;
 use ffq_planner::AggExpr;
 use ffq_storage::TableDef;
@@ -163,7 +163,9 @@ fn hash_aggregate_deterministic_with_spill_and_non_spill_parity() {
     groups.sort();
     assert_eq!(
         groups,
-        vec!["group_0", "group_1", "group_2", "group_3", "group_4", "group_5", "group_6"]
+        vec![
+            "group_0", "group_1", "group_2", "group_3", "group_4", "group_5", "group_6"
+        ]
     );
     assert_eq!(seen, 840);
 

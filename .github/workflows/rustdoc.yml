@@ -1,0 +1,57 @@
+name: rustdoc-gate
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  rustdoc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Rustdoc warnings as errors (selected crates)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          cargo doc --no-deps -p ffq-common
+          cargo doc --no-deps -p ffq-planner
+          cargo doc --no-deps -p ffq-execution
+          cargo doc --no-deps -p ffq-storage
+          cargo doc --no-deps -p ffq-client
+          cargo doc --no-deps -p ffq-distributed
+
+      - name: Missing docs gate - ffq-common
+        run: cargo rustc -p ffq-common --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-storage
+        run: cargo rustc -p ffq-storage --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-planner
+        run: cargo rustc -p ffq-planner --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-execution
+        run: cargo rustc -p ffq-execution --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-shuffle
+        run: cargo rustc -p ffq-shuffle --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-sql
+        run: cargo rustc -p ffq-sql --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-client
+        run: cargo rustc -p ffq-client --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-distributed (no grpc)
+        run: cargo rustc -p ffq-distributed --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-distributed (grpc)
+        run: cargo rustc -p ffq-distributed --features grpc --lib -- -D missing-docs

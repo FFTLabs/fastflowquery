@@ -1,32 +1,51 @@
+//! Stage DAG construction from physical plans.
+//!
+//! Contract:
+//! - stage boundaries are cut at `ShuffleRead` exchanges;
+//! - each stage contains operator names reachable without crossing another
+//!   `ShuffleRead`;
+//! - edges represent upstream (map) -> downstream (reduce) dependencies.
+
 use ffq_planner::{ExchangeExec, PhysicalPlan};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Stable stage identifier inside one query DAG.
 pub struct StageId(pub usize);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// One stage node and its dependency links.
 pub struct StageNode {
+    /// Stage identifier.
     pub id: StageId,
+    /// Physical operator names assigned to this stage.
     pub operators: Vec<String>,
+    /// Upstream dependencies that must complete before this stage.
     pub parents: Vec<StageId>,
+    /// Downstream stages that consume this stage outputs.
     pub children: Vec<StageId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Query stage DAG used by coordinator task scheduling.
 pub struct StageDag {
+    /// All stage nodes in this query DAG.
     pub stages: Vec<StageNode>,
 }
 
 impl StageDag {
+    /// Create an empty DAG.
     pub fn new() -> Self {
         Self { stages: vec![] }
     }
 
+    /// Returns root stage id if present.
     pub fn root_id(&self) -> Option<StageId> {
         self.stages.first().map(|s| s.id)
     }
 }
 
+/// Build stage DAG by traversing a physical plan and cutting at shuffle reads.
 pub fn build_stage_dag(plan: &PhysicalPlan) -> StageDag {
     let mut dag = StageDag::new();
     let root = new_stage(&mut dag);
@@ -118,7 +137,7 @@ mod tests {
     use std::collections::HashSet;
 
     use ffq_planner::{
-        create_physical_plan, AggExpr, Expr, LogicalPlan, PhysicalPlan, PhysicalPlannerConfig,
+        AggExpr, Expr, LogicalPlan, PhysicalPlan, PhysicalPlannerConfig, create_physical_plan,
     };
 
     #[test]

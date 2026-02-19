@@ -10,8 +10,8 @@ use arrow_schema::{DataType, Field, Schema};
 use ffq_client::{Engine, WriteMode};
 use ffq_common::EngineConfig;
 use ffq_storage::TableDef;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 fn unique_path(prefix: &str, ext: &str) -> std::path::PathBuf {
     let nanos = SystemTime::now()

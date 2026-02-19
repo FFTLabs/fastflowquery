@@ -44,12 +44,18 @@ impl<'a> ffq_planner::OptimizerContext for CatalogProvider<'a> {
     }
 }
 
+/// Write behavior for parquet outputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteMode {
+    /// Replace destination data atomically.
     Overwrite,
+    /// Append a new deterministic part file to destination directory.
     Append,
 }
 
+/// Query plan handle used for relational transformations and execution.
+///
+/// `DataFrame` is immutable. Each transformation returns a new plan.
 #[derive(Debug, Clone)]
 pub struct DataFrame {
     session: SharedSession,
@@ -64,6 +70,7 @@ impl DataFrame {
         }
     }
 
+    /// Returns the current logical plan.
     pub fn logical_plan(&self) -> &LogicalPlan {
         &self.logical_plan
     }
@@ -78,6 +85,7 @@ impl DataFrame {
         Self::new(session, plan)
     }
 
+    /// Adds a filter predicate.
     /// df.filter(expr)
     pub fn filter(self, predicate: Expr) -> Self {
         let plan = LogicalPlan::Filter {
@@ -87,6 +95,10 @@ impl DataFrame {
         Self::new(self.session, plan)
     }
 
+    /// Adds an inner join between two dataframes.
+    ///
+    /// # Errors
+    /// Returns an error when joining dataframes from different engine sessions.
     /// df.join(df2, on)
     /// on = vec![("left_key", "right_key"), ...]
     pub fn join(self, right: DataFrame, on: Vec<(String, String)>) -> Result<Self> {
@@ -107,6 +119,7 @@ impl DataFrame {
         Ok(Self::new(self.session, plan))
     }
 
+    /// Starts grouped aggregation builder for the given grouping keys.
     /// df.groupby(keys)
     pub fn groupby(self, keys: Vec<Expr>) -> GroupedDataFrame {
         GroupedDataFrame {
@@ -116,6 +129,10 @@ impl DataFrame {
         }
     }
 
+    /// Returns optimized logical plan text.
+    ///
+    /// # Errors
+    /// Returns an error when schema inference, optimization, or catalog lookup fails.
     pub fn explain(&self) -> Result<String> {
         self.ensure_inferred_parquet_schemas()?;
         let cat = self.session.catalog.read().expect("catalog lock poisoned");
@@ -131,16 +148,55 @@ impl DataFrame {
     }
 
     /// df.collect() (async)
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use ffq_client::Engine;
+    /// use ffq_common::EngineConfig;
+    ///
+    /// let engine = Engine::new(EngineConfig::default())?;
+    /// let df = engine.sql("SELECT 1 as one")?;
+    /// let batches = futures::executor::block_on(df.collect())?;
+    /// assert!(!batches.is_empty());
+    /// # Ok::<(), ffq_common::FfqError>(())
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an error when planning or execution fails.
     pub async fn collect(&self) -> Result<Vec<RecordBatch>> {
         let (_schema, batches) = self.execute_with_schema().await?;
         Ok(batches)
     }
 
+    /// Executes this plan and writes output to parquet, replacing destination by default.
+    ///
+    /// If `path` ends with `.parquet`, output is written to that file.
+    /// Otherwise, `path` is treated as output directory.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use ffq_client::Engine;
+    /// use ffq_common::EngineConfig;
+    ///
+    /// let engine = Engine::new(EngineConfig::default())?;
+    /// let df = engine.sql("SELECT 1 as id")?;
+    /// futures::executor::block_on(df.write_parquet("/tmp/ffq_out"))?;
+    /// # Ok::<(), ffq_common::FfqError>(())
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an error when planning, execution, or file commit fails.
     pub async fn write_parquet<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         self.write_parquet_with_mode(path, WriteMode::Overwrite)
             .await
     }
 
+    /// Executes this plan and writes output to parquet with explicit write mode.
+    ///
+    /// Append is only supported for directory paths.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported file append mode or write/commit failures.
     pub async fn write_parquet_with_mode<P: AsRef<Path>>(
         &self,
         path: P,
@@ -167,11 +223,34 @@ impl DataFrame {
         Ok(())
     }
 
+    /// Executes this plan and saves output as a managed table with overwrite mode.
+    ///
+    /// # Errors
+    /// Returns an error when execution, persistence, or catalog update fails.
     pub async fn save_as_table(&self, name: &str) -> Result<()> {
         self.save_as_table_with_mode(name, WriteMode::Overwrite)
             .await
     }
 
+    /// Executes this plan and saves output as a managed table with explicit write mode.
+    ///
+    /// Overwrite replaces table data paths; append adds new parts and deduplicates paths.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use ffq_client::Engine;
+    /// use ffq_common::EngineConfig;
+    ///
+    /// let engine = Engine::new(EngineConfig::default())?;
+    /// let df = engine.sql("SELECT 42 as answer")?;
+    /// futures::executor::block_on(df.save_as_table("answers"))?;
+    /// let rows = futures::executor::block_on(engine.sql("SELECT answer FROM answers")?.collect())?;
+    /// assert!(!rows.is_empty());
+    /// # Ok::<(), ffq_common::FfqError>(())
+    /// ```
+    ///
+    /// # Errors
+    /// Returns an error when name validation, execution, write, or catalog persistence fails.
     pub async fn save_as_table_with_mode(&self, name: &str, mode: WriteMode) -> Result<()> {
         if name.trim().is_empty() {
             return Err(FfqError::Planning("table name cannot be empty".to_string()));
@@ -273,7 +352,8 @@ impl DataFrame {
                 if !table.format.eq_ignore_ascii_case("parquet") {
                     continue;
                 }
-                if !self.session.config.schema_inference.allows_inference() && table.schema.is_none()
+                if !self.session.config.schema_inference.allows_inference()
+                    && table.schema.is_none()
                 {
                     continue;
                 }
@@ -380,6 +460,7 @@ impl DataFrame {
     }
 }
 
+/// Builder for grouped aggregations produced by [`DataFrame::groupby`].
 #[derive(Debug, Clone)]
 pub struct GroupedDataFrame {
     session: SharedSession,
@@ -388,6 +469,7 @@ pub struct GroupedDataFrame {
 }
 
 impl GroupedDataFrame {
+    /// Adds aggregate expressions and returns the resulting query dataframe.
     /// df.groupby(keys).agg(...)
     pub fn agg(self, aggs: Vec<(AggExpr, String)>) -> DataFrame {
         let plan = LogicalPlan::Aggregate {

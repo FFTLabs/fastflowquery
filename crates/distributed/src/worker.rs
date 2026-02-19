@@ -1,5 +1,20 @@
+//! Worker runtime and task execution loop.
+//!
+//! Responsibilities:
+//! - pull task attempts from coordinator (`GetTask`);
+//! - execute stage fragments with shared planner/runtime semantics;
+//! - write/register shuffle outputs for map stages;
+//! - publish final query results for sink stages;
+//! - report task state transitions and heartbeat.
+//!
+//! Retry/attempt semantics:
+//! - each assignment carries an explicit `attempt`;
+//! - map outputs are keyed by `(query, stage, map_task, attempt)`;
+//! - coordinator-side status updates use the same attempt key so stale
+//!   attempts are not mistaken for current progress.
+
 use std::cmp::{Ordering, Reverse};
-use std::collections::{hash_map::DefaultHasher, BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, hash_map::DefaultHasher};
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -16,7 +31,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result};
-use ffq_execution::{compile_expr, TaskContext as ExecTaskContext};
+use ffq_execution::{TaskContext as ExecTaskContext, compile_expr};
 use ffq_planner::{AggExpr, BuildSide, ExchangeExec, Expr, PartitioningSpec, PhysicalPlan};
 use ffq_shuffle::{ShuffleReader, ShuffleWriter};
 use ffq_storage::parquet_provider::ParquetProvider;
@@ -35,11 +50,17 @@ use crate::coordinator::{Coordinator, MapOutputPartitionMeta, TaskAssignment, Ta
 use crate::grpc::v1;
 
 #[derive(Debug, Clone)]
+/// Worker resource/configuration controls.
 pub struct WorkerConfig {
+    /// Stable worker id used in scheduling and heartbeats.
     pub worker_id: String,
+    /// Max concurrent task executions.
     pub cpu_slots: usize,
+    /// Per-task soft memory budget.
     pub per_task_memory_budget_bytes: usize,
+    /// Local spill directory for memory-pressure fallback paths.
     pub spill_dir: PathBuf,
+    /// Root directory containing shuffle data.
     pub shuffle_root: PathBuf,
 }
 
@@ -56,27 +77,43 @@ impl Default for WorkerConfig {
 }
 
 #[derive(Debug, Clone)]
+/// Task-scoped execution context provided to task executors.
 pub struct TaskContext {
+    /// Query id for this task attempt.
     pub query_id: String,
+    /// Stage id for this task attempt.
     pub stage_id: u64,
+    /// Task id within stage.
     pub task_id: u64,
+    /// Attempt number for retries.
     pub attempt: u32,
+    /// Per-task soft memory budget.
     pub per_task_memory_budget_bytes: usize,
+    /// Local spill directory.
     pub spill_dir: PathBuf,
+    /// Root directory containing shuffle data.
     pub shuffle_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
+/// Task execution outputs returned by [`TaskExecutor`].
 pub struct TaskExecutionResult {
+    /// Map output partition metadata emitted by map stages.
     pub map_output_partitions: Vec<MapOutputPartitionMeta>,
+    /// Output batches emitted by sink/final stages.
     pub output_batches: Vec<RecordBatch>,
+    /// Whether result batches should be published to coordinator.
     pub publish_results: bool,
+    /// Human-readable completion message.
     pub message: String,
 }
 
 #[async_trait]
+/// Control-plane contract used by worker runtime.
 pub trait WorkerControlPlane: Send + Sync {
+    /// Pull up to `capacity` task assignments for `worker_id`.
     async fn get_task(&self, worker_id: &str, capacity: u32) -> Result<Vec<TaskAssignment>>;
+    /// Report a task state transition and status message.
     async fn report_task_status(
         &self,
         worker_id: &str,
@@ -84,17 +121,22 @@ pub trait WorkerControlPlane: Send + Sync {
         state: TaskState,
         message: String,
     ) -> Result<()>;
+    /// Register map output partition metadata for a completed map task.
     async fn register_map_output(
         &self,
         assignment: &TaskAssignment,
         partitions: Vec<MapOutputPartitionMeta>,
     ) -> Result<()>;
+    /// Publish final query results payload for client fetching.
     async fn register_query_results(&self, query_id: &str, ipc_payload: Vec<u8>) -> Result<()>;
+    /// Send periodic heartbeat with currently running task count.
     async fn heartbeat(&self, worker_id: &str, running_tasks: u32) -> Result<()>;
 }
 
 #[async_trait]
+/// Task execution contract for worker-assigned plan fragments.
 pub trait TaskExecutor: Send + Sync {
+    /// Execute one task assignment and return map/sink outputs.
     async fn execute(
         &self,
         assignment: &TaskAssignment,
@@ -103,6 +145,7 @@ pub trait TaskExecutor: Send + Sync {
 }
 
 #[derive(Clone, Default)]
+/// Default task executor that evaluates physical plan fragments in-process.
 pub struct DefaultTaskExecutor {
     catalog: Arc<Catalog>,
     sink_outputs: Arc<Mutex<HashMap<String, Vec<RecordBatch>>>>,
@@ -115,6 +158,7 @@ impl std::fmt::Debug for DefaultTaskExecutor {
 }
 
 impl DefaultTaskExecutor {
+    /// Construct executor backed by provided catalog.
     pub fn new(catalog: Arc<Catalog>) -> Self {
         Self {
             catalog,
@@ -122,6 +166,7 @@ impl DefaultTaskExecutor {
         }
     }
 
+    /// Take and clear sink output batches for a query (test helper).
     pub async fn take_query_output(&self, query_id: &str) -> Option<Vec<RecordBatch>> {
         self.sink_outputs.lock().await.remove(query_id)
     }
@@ -203,6 +248,7 @@ impl TaskExecutor for DefaultTaskExecutor {
 }
 
 #[derive(Clone)]
+/// Worker runtime that orchestrates pull scheduling and task execution.
 pub struct Worker<C, E>
 where
     C: WorkerControlPlane + 'static,
@@ -219,6 +265,7 @@ where
     C: WorkerControlPlane + 'static,
     E: TaskExecutor + 'static,
 {
+    /// Build worker runtime with control plane and task executor.
     pub fn new(config: WorkerConfig, control_plane: Arc<C>, task_executor: Arc<E>) -> Self {
         let slots = config.cpu_slots.max(1);
         Self {
@@ -229,6 +276,10 @@ where
         }
     }
 
+    /// Perform one poll cycle:
+    /// - pull assignments
+    /// - execute up to available CPU slots
+    /// - report status/map outputs/results
     pub async fn poll_once(&self) -> Result<usize> {
         let capacity = self.cpu_slots.available_permits() as u32;
         if capacity == 0 {
@@ -342,17 +393,20 @@ where
 }
 
 #[derive(Clone)]
+/// In-process control-plane adapter for embedded/distributed tests.
 pub struct InProcessControlPlane {
     coordinator: Arc<Mutex<Coordinator>>,
 }
 
 impl InProcessControlPlane {
+    /// Create adapter backed by shared in-memory coordinator.
     pub fn new(coordinator: Arc<Mutex<Coordinator>>) -> Self {
         Self { coordinator }
     }
 }
 
 #[derive(Debug)]
+/// gRPC-based control-plane adapter for remote coordinator connectivity.
 pub struct GrpcControlPlane {
     control: Mutex<crate::grpc::ControlPlaneClient<tonic::transport::Channel>>,
     shuffle: Mutex<crate::grpc::ShuffleServiceClient<tonic::transport::Channel>>,
@@ -360,6 +414,7 @@ pub struct GrpcControlPlane {
 }
 
 impl GrpcControlPlane {
+    /// Connect gRPC control/shuffle/heartbeat clients to a coordinator endpoint.
     pub async fn connect(endpoint: &str) -> Result<Self> {
         let control = crate::grpc::ControlPlaneClient::connect(endpoint.to_string())
             .await
@@ -549,6 +604,7 @@ fn proto_task_state(state: TaskState) -> v1::TaskState {
     }
 }
 
+/// Encode a set of record batches as Arrow IPC stream bytes.
 pub fn encode_record_batches_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
     if batches.is_empty() {
         return Ok(Vec::new());
@@ -2593,8 +2649,8 @@ mod tests {
     use super::*;
     use crate::coordinator::CoordinatorConfig;
     use ffq_planner::{
-        create_physical_plan, AggExpr, Expr, JoinStrategyHint, JoinType, LogicalPlan,
-        ParquetScanExec, ParquetWriteExec, PhysicalPlan, PhysicalPlannerConfig,
+        AggExpr, Expr, JoinStrategyHint, JoinType, LogicalPlan, ParquetScanExec, ParquetWriteExec,
+        PhysicalPlan, PhysicalPlannerConfig, create_physical_plan,
     };
     use ffq_storage::{TableDef, TableStats};
     use parquet::arrow::ArrowWriter;

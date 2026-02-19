@@ -1,29 +1,54 @@
+//! Interactive FFQ SQL REPL.
+//!
+//! UX behavior:
+//! - accepts SQL statements terminated by `;`
+//! - supports shell commands when not in multiline SQL mode:
+//!   - `\help`, `\q`, `\tables`, `\schema <table>`
+//!   - `\plan on|off`, `\timing on|off`, `\mode table|csv|json`
+//! - multiline SQL prompt switches from `ffq> ` to ` ...> ` until a trailing
+//!   semicolon is seen
+//! - comment-only lines (`-- ...`) are ignored
+//! - write queries (`INSERT INTO ... SELECT ...`) print `OK` when sink output
+//!   is empty instead of rendering an empty table
+//!
+//! Error taxonomy:
+//! - planning/config/unsupported/io/execution errors are classified and
+//!   rendered with short hints for common recovery paths.
+
 use std::path::PathBuf;
 use std::time::Instant;
 
-use arrow::util::pretty::pretty_format_batches;
-use arrow::util::display::array_value_to_string;
 use arrow::record_batch::RecordBatch;
+use arrow::util::display::array_value_to_string;
+use arrow::util::pretty::pretty_format_batches;
 use ffq_common::{EngineConfig, FfqError};
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use serde_json::{Map, Value};
 
-use crate::engine::TableSchemaOrigin;
 use crate::Engine;
+use crate::engine::TableSchemaOrigin;
 
+/// REPL startup options.
 #[derive(Debug, Clone)]
 pub struct ReplOptions {
+    /// Engine configuration used for the session.
     pub config: EngineConfig,
 }
 
+/// Runs the interactive FFQ SQL REPL.
+///
+/// The REPL supports SQL statements and shell-style commands (for example `\help`, `\tables`,
+/// `\schema`, `\mode`), with persistent history via `~/.ffq_history`.
+///
+/// # Errors
+/// Returns an error if engine bootstrap or line-editor initialization fails.
 pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine::new(opts.config)?;
     let mut rl = DefaultEditor::new()?;
     let history_path = repl_history_path();
     if let Err(err) = rl.load_history(&history_path) {
-        if !matches!(err, ReadlineError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound)
-        {
+        if !matches!(err, ReadlineError::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound) {
             eprintln!(
                 "warning: failed to load history '{}': {err}",
                 history_path.display()
@@ -38,7 +63,11 @@ pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("FFQ REPL (type \\q to quit)");
     loop {
-        let prompt = if sql_buffer.is_empty() { "ffq> " } else { " ...> " };
+        let prompt = if sql_buffer.is_empty() {
+            "ffq> "
+        } else {
+            " ...> "
+        };
         let line = match rl.readline(prompt) {
             Ok(line) => {
                 if !line.trim().is_empty() {
@@ -95,7 +124,11 @@ pub fn run_repl(opts: ReplOptions) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let sql = sql_buffer.trim_end().trim_end_matches(';').trim().to_string();
+        let sql = sql_buffer
+            .trim_end()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
         sql_buffer.clear();
         if sql.is_empty() {
             continue;
@@ -150,6 +183,7 @@ fn statement_terminated(sql: &str) -> bool {
     sql.trim_end().ends_with(';')
 }
 
+/// Append one user input line to multiline SQL buffer.
 fn append_sql_line(sql_buffer: &mut String, raw: &str) {
     if !sql_buffer.is_empty() {
         sql_buffer.push('\n');
@@ -174,12 +208,16 @@ enum CommandResult {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+/// Output rendering mode for query result batches.
 enum OutputMode {
     Table,
     Csv,
     Json,
 }
 
+/// Handle one REPL shell command.
+///
+/// Command parsing is intentionally strict and usage errors are reported inline.
 fn handle_command(
     raw: &str,
     engine: &Engine,
@@ -288,10 +326,8 @@ fn print_help() {
     println!("  \\mode table|csv|json  set output rendering mode");
 }
 
-fn print_batches(
-    batches: &[RecordBatch],
-    mode: OutputMode,
-) -> Result<(), FfqError> {
+/// Render batches according to selected output mode.
+fn print_batches(batches: &[RecordBatch], mode: OutputMode) -> Result<(), FfqError> {
     match mode {
         OutputMode::Table => {
             let rendered = pretty_format_batches(batches)
@@ -308,6 +344,7 @@ fn print_batches(
     Ok(())
 }
 
+/// Render batches as CSV with header.
 fn print_batches_csv(batches: &[RecordBatch]) -> Result<(), FfqError> {
     if batches.is_empty() {
         return Ok(());
@@ -335,6 +372,7 @@ fn print_batches_csv(batches: &[RecordBatch]) -> Result<(), FfqError> {
     Ok(())
 }
 
+/// Render batches as JSON array of row objects.
 fn print_batches_json(batches: &[RecordBatch]) -> Result<(), FfqError> {
     let mut rows = Vec::<Value>::new();
     for batch in batches {
@@ -363,6 +401,7 @@ fn print_batches_json(batches: &[RecordBatch]) -> Result<(), FfqError> {
     Ok(())
 }
 
+/// Escape one CSV field.
 fn csv_escape(s: &str) -> String {
     if s.contains([',', '"', '\n']) {
         format!("\"{}\"", s.replace('"', "\"\""))
@@ -371,6 +410,7 @@ fn csv_escape(s: &str) -> String {
     }
 }
 
+/// Print classified REPL error with optional hint.
 fn print_repl_error(stage: &str, err: &FfqError) {
     let (category, hint) = classify_error(err);
     eprintln!("[{category}] {stage}: {err}");
@@ -379,6 +419,14 @@ fn print_repl_error(stage: &str, err: &FfqError) {
     }
 }
 
+/// Classify engine errors into user-facing REPL categories.
+///
+/// Taxonomy mapping:
+/// - `Planning` -> `[planning]`
+/// - `Execution` -> `[execution]`
+/// - `InvalidConfig` -> `[config]`
+/// - `Unsupported` -> `[unsupported]`
+/// - `Io` -> `[io]`
 fn classify_error(err: &FfqError) -> (&'static str, Option<&'static str>) {
     match err {
         FfqError::Planning(msg) => ("planning", planning_hint(msg)),
@@ -429,7 +477,9 @@ fn execution_hint(msg: &str) -> Option<&'static str> {
         );
     }
     if m.contains("query vector dim") {
-        return Some("ensure query vector length matches embedding column fixed-size list dimension");
+        return Some(
+            "ensure query vector length matches embedding column fixed-size list dimension",
+        );
     }
     None
 }
@@ -474,7 +524,9 @@ fn unsupported_hint(msg: &str) -> Option<&'static str> {
         return Some("v1 supports ORDER BY only for cosine_similarity(...) DESC LIMIT k pattern");
     }
     if m.contains("qdrant") {
-        return Some("enable required feature flags (vector/qdrant) or use brute-force fallback shape");
+        return Some(
+            "enable required feature flags (vector/qdrant) or use brute-force fallback shape",
+        );
     }
     None
 }
@@ -616,13 +668,9 @@ mod tests {
             },
         );
 
-        let batches = futures::executor::block_on(
-            engine
-                .sql("SELECT a FROM t")
-                .expect("sql")
-                .collect(),
-        )
-        .expect("collect");
+        let batches =
+            futures::executor::block_on(engine.sql("SELECT a FROM t").expect("sql").collect())
+                .expect("collect");
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 3);

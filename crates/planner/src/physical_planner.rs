@@ -8,8 +8,11 @@ use crate::physical_plan::{
 };
 
 #[derive(Debug, Clone)]
+/// Physical planning knobs that control exchange fanout and output batch sizing.
 pub struct PhysicalPlannerConfig {
+    /// Number of hash partitions used by shuffle exchanges.
     pub shuffle_partitions: usize,
+    /// Target row count for coalescing output batches.
     pub target_batch_rows: usize,
 }
 
@@ -22,6 +25,14 @@ impl Default for PhysicalPlannerConfig {
     }
 }
 
+/// Lower analyzed/optimized logical plan to executable physical operators.
+///
+/// Contracts:
+/// - logical semantics are preserved;
+/// - aggregate lowers to `PartialHashAggregate -> Exchange -> FinalHashAggregate`;
+/// - join hints are honored where possible, with `Auto` safely falling back to
+///   shuffle shape;
+/// - unsupported logical shapes return a planning error.
 pub fn create_physical_plan(
     logical: &LogicalPlan,
     cfg: &PhysicalPlannerConfig,

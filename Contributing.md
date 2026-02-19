@@ -27,6 +27,9 @@ Open an issue describing:
 - Update docs/README if you change usage.
 - Be respectful in review discussions.
 
+Source-level Rust documentation standard:
+- `docs/dev/rustdoc-style.md`
+
 ## Distributed Compose Smoke Test
 Use the v1 coordinator + 2 worker topology:
 

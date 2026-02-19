@@ -1,6 +1,6 @@
 use std::fs::File;
-use std::time::UNIX_EPOCH;
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -12,24 +12,55 @@ use serde::{Deserialize, Serialize};
 use crate::catalog::TableDef;
 use crate::provider::{Stats, StorageExecNode, StorageProvider};
 
+/// Local parquet-backed [`StorageProvider`] implementation.
+///
+/// Supports:
+/// - schema inference from parquet footers
+/// - deterministic multi-file schema merge with strict/permissive policy
+/// - basic projection pushdown by column selection
+///
+/// Drift semantics:
+/// - drift detection itself is handled by client-side schema-fingerprint policy
+/// - this provider exposes [`FileFingerprint`] helpers used by that logic
 pub struct ParquetProvider;
 
+/// Stable per-file fingerprint used for schema drift detection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFingerprint {
+    /// File path.
     pub path: String,
+    /// File size in bytes.
     pub size_bytes: u64,
+    /// File modification timestamp (nanoseconds since Unix epoch).
     pub mtime_ns: u128,
 }
 
 impl ParquetProvider {
+    /// Creates a parquet provider instance.
     pub fn new() -> Self {
         Self
     }
 
+    /// Infers schema for a parquet path list using permissive merge policy.
+    ///
+    /// Equivalent to [`ParquetProvider::infer_parquet_schema_with_policy`] with
+    /// `permissive_merge = true`.
+    ///
+    /// # Errors
+    /// Returns an error for empty path lists, read/decode failures, or incompatible schemas.
     pub fn infer_parquet_schema(paths: &[String]) -> Result<arrow_schema::Schema> {
         Self::infer_parquet_schema_with_policy(paths, true)
     }
 
+    /// Infers schema for one or more parquet files and merges them deterministically.
+    ///
+    /// Policy:
+    /// - strict mode (`permissive_merge = false`): requires exact type compatibility
+    /// - permissive mode (`permissive_merge = true`): allows nullable widening and
+    ///   limited numeric widening (for example int32 + int64 => int64)
+    ///
+    /// # Errors
+    /// Returns an error for empty path list, parquet read failures, or incompatible schemas.
     pub fn infer_parquet_schema_with_policy(
         paths: &[String],
         permissive_merge: bool,
@@ -63,28 +94,23 @@ impl ParquetProvider {
         })
     }
 
+    /// Builds per-file fingerprints for schema drift checks.
+    ///
+    /// # Errors
+    /// Returns an error when file metadata cannot be read.
     pub fn fingerprint_paths(paths: &[String]) -> Result<Vec<FileFingerprint>> {
         let mut out = Vec::with_capacity(paths.len());
         for path in paths {
             let md = std::fs::metadata(path).map_err(|e| {
-                FfqError::InvalidConfig(format!(
-                    "failed to stat parquet path '{}': {e}",
-                    path
-                ))
+                FfqError::InvalidConfig(format!("failed to stat parquet path '{}': {e}", path))
             })?;
             let modified = md.modified().map_err(|e| {
-                FfqError::InvalidConfig(format!(
-                    "failed to read modified time for '{}': {e}",
-                    path
-                ))
+                FfqError::InvalidConfig(format!("failed to read modified time for '{}': {e}", path))
             })?;
             let mtime_ns = modified
                 .duration_since(UNIX_EPOCH)
                 .map_err(|e| {
-                    FfqError::InvalidConfig(format!(
-                        "invalid modified time for '{}': {e}",
-                        path
-                    ))
+                    FfqError::InvalidConfig(format!("invalid modified time for '{}': {e}", path))
                 })?
                 .as_nanos();
             out.push(FileFingerprint {
@@ -97,7 +123,12 @@ impl ParquetProvider {
     }
 }
 
-fn merge_schemas(base: &Schema, next: &Schema, path: &str, permissive_merge: bool) -> Result<Schema> {
+fn merge_schemas(
+    base: &Schema,
+    next: &Schema,
+    path: &str,
+    permissive_merge: bool,
+) -> Result<Schema> {
     if base.fields().len() != next.fields().len() {
         return Err(FfqError::InvalidConfig(format!(
             "incompatible parquet files: schema mismatch across table paths; '{}' has {} fields but expected {}",
@@ -307,6 +338,7 @@ impl StorageProvider for ParquetProvider {
     }
 }
 
+/// Execution node that scans parquet files and emits Arrow record batches.
 pub struct ParquetScanNode {
     paths: Vec<String>,
     schema: SchemaRef,
@@ -338,8 +370,8 @@ impl ExecNode for ParquetScanNode {
                 .map_err(|e| FfqError::Execution(format!("parquet reader open failed: {e}")))?;
 
             for batch in reader {
-                let batch =
-                    batch.map_err(|e| FfqError::Execution(format!("parquet decode failed: {e}")))?;
+                let batch = batch
+                    .map_err(|e| FfqError::Execution(format!("parquet decode failed: {e}")))?;
                 if batch.schema().fields().len() != self.source_schema.fields().len() {
                     return Err(FfqError::Execution(format!(
                         "parquet scan schema mismatch for '{}': expected {} columns, got {}",
@@ -426,7 +458,10 @@ mod tests {
 
     #[test]
     fn infer_parquet_schema_rejects_incompatible_files() {
-        let paths = vec![fixture_path("lineitem.parquet"), fixture_path("orders.parquet")];
+        let paths = vec![
+            fixture_path("lineitem.parquet"),
+            fixture_path("orders.parquet"),
+        ];
         let err = ParquetProvider::infer_parquet_schema(&paths).expect_err("must reject");
         let msg = format!("{err}");
         assert!(msg.contains("incompatible parquet files"));
