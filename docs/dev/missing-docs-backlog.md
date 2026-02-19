@@ -5,28 +5,28 @@ This tracks incremental `#![warn(missing_docs)]` rollout across crates.
 ## Enabled now
 
 - `ffq-client`
-  - status: enabled in `crates/client/src/lib.rs`
+  - status: `deny(missing_docs)` in `crates/client/src/lib.rs`
   - current gate: `cargo check -p ffq-client` clean for `missing_docs`
 - `ffq-common`
-  - status: enabled in `crates/common/src/lib.rs`
+  - status: `deny(missing_docs)` in `crates/common/src/lib.rs`
   - current gate: `cargo rustc -p ffq-common --lib -- -D missing-docs` clean
 - `ffq-storage`
-  - status: enabled in `crates/storage/src/lib.rs`
+  - status: `deny(missing_docs)` in `crates/storage/src/lib.rs`
   - current gate: `cargo rustc -p ffq-storage --lib -- -D missing-docs` clean
 - `ffq-planner`
-  - status: enabled in `crates/planner/src/lib.rs`
+  - status: `deny(missing_docs)` in `crates/planner/src/lib.rs`
   - current gate: `cargo rustc -p ffq-planner --lib -- -D missing-docs` clean
 - `ffq-execution`
-  - status: enabled in `crates/execution/src/lib.rs`
+  - status: `deny(missing_docs)` in `crates/execution/src/lib.rs`
   - current gate: `cargo rustc -p ffq-execution --lib -- -D missing-docs` clean
 - `ffq-distributed`
-  - status: enabled in `crates/distributed/src/lib.rs`
+  - status: `deny(missing_docs)` in `crates/distributed/src/lib.rs`
   - current gate: `cargo rustc -p ffq-distributed --lib -- -D missing-docs` clean
 - `ffq-shuffle`
-  - status: enabled in `crates/shuffle/src/lib.rs`
+  - status: `deny(missing_docs)` in `crates/shuffle/src/lib.rs`
   - current gate: `cargo rustc -p ffq-shuffle --lib -- -D missing-docs` clean
 - `ffq-sql`
-  - status: enabled in `crates/sql/src/lib.rs`
+  - status: `deny(missing_docs)` in `crates/sql/src/lib.rs`
   - current gate: `cargo rustc -p ffq-sql --lib -- -D missing-docs` clean
 
 ## Next crates

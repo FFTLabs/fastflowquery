@@ -1,4 +1,4 @@
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 //! Shared configuration, error types, IDs, and observability primitives for FFQ crates.
 //!

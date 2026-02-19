@@ -1,4 +1,4 @@
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 //! Storage providers, catalog model, and table metadata APIs.
 //!

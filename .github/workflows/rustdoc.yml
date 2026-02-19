@@ -29,6 +29,29 @@ jobs:
           cargo doc --no-deps -p ffq-client
           cargo doc --no-deps -p ffq-distributed
 
-      - name: Missing docs gate (incremental rollout)
-        run: |
-          cargo rustc -p ffq-client --lib -- -D missing-docs
+      - name: Missing docs gate - ffq-common
+        run: cargo rustc -p ffq-common --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-storage
+        run: cargo rustc -p ffq-storage --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-planner
+        run: cargo rustc -p ffq-planner --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-execution
+        run: cargo rustc -p ffq-execution --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-shuffle
+        run: cargo rustc -p ffq-shuffle --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-sql
+        run: cargo rustc -p ffq-sql --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-client
+        run: cargo rustc -p ffq-client --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-distributed (no grpc)
+        run: cargo rustc -p ffq-distributed --lib -- -D missing-docs
+
+      - name: Missing docs gate - ffq-distributed (grpc)
+        run: cargo rustc -p ffq-distributed --features grpc --lib -- -D missing-docs

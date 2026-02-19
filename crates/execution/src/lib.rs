@@ -1,4 +1,4 @@
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 //! Execution-layer primitives used by runtimes and physical operators.
 //!

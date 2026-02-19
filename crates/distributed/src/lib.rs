@@ -1,4 +1,4 @@
-#![warn(missing_docs)]
+#![deny(missing_docs)]
 
 //! Distributed coordinator/worker runtime building blocks.
 //!
