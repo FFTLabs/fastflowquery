@@ -35,6 +35,16 @@ pub struct CoordinatorConfig {
     pub shuffle_root: PathBuf,
     /// Coordinator-side schema inference policy for schema-less parquet scans.
     pub schema_inference: SchemaInferencePolicy,
+    /// Max runnable tasks a worker may own at once.
+    pub max_concurrent_tasks_per_worker: u32,
+    /// Max runnable tasks per query across all workers.
+    pub max_concurrent_tasks_per_query: u32,
+    /// Max attempts before a logical task is considered terminally failed.
+    pub max_task_attempts: u32,
+    /// Base retry backoff in milliseconds.
+    pub retry_backoff_base_ms: u64,
+    /// Liveness timeout after which worker-owned running tasks are requeued.
+    pub worker_liveness_timeout_ms: u64,
 }
 
 impl Default for CoordinatorConfig {
@@ -43,6 +53,11 @@ impl Default for CoordinatorConfig {
             blacklist_failure_threshold: 3,
             shuffle_root: PathBuf::from("."),
             schema_inference: SchemaInferencePolicy::On,
+            max_concurrent_tasks_per_worker: 8,
+            max_concurrent_tasks_per_query: 32,
+            max_task_attempts: 3,
+            retry_backoff_base_ms: 250,
+            worker_liveness_timeout_ms: 15_000,
         }
     }
 }
@@ -154,7 +169,6 @@ pub struct QueryStatus {
 #[derive(Debug, Clone)]
 struct StageRuntime {
     parents: Vec<u64>,
-    children: Vec<u64>,
     metrics: StageMetrics,
 }
 
@@ -166,8 +180,14 @@ struct TaskRuntime {
     attempt: u32,
     state: TaskState,
     assigned_worker: Option<String>,
+    ready_at_ms: u64,
     plan_fragment_json: Vec<u8>,
     message: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WorkerHeartbeat {
+    last_seen_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -191,9 +211,127 @@ pub struct Coordinator {
     query_results: HashMap<String, Vec<u8>>,
     blacklisted_workers: HashSet<String>,
     worker_failures: HashMap<String, u32>,
+    worker_heartbeats: HashMap<String, WorkerHeartbeat>,
 }
 
 impl Coordinator {
+    fn running_tasks_for_worker(&self, worker_id: &str) -> u32 {
+        self.queries
+            .values()
+            .flat_map(|q| q.tasks.values())
+            .filter(|t| {
+                t.state == TaskState::Running && t.assigned_worker.as_deref() == Some(worker_id)
+            })
+            .count() as u32
+    }
+
+    fn touch_worker(&mut self, worker_id: &str, now: u64) {
+        self.worker_heartbeats
+            .insert(worker_id.to_string(), WorkerHeartbeat { last_seen_ms: now });
+    }
+
+    fn requeue_stale_workers(&mut self, now: u64) -> Result<()> {
+        if self.config.worker_liveness_timeout_ms == 0 {
+            return Ok(());
+        }
+        let stale_workers = self
+            .worker_heartbeats
+            .iter()
+            .filter_map(|(worker, hb)| {
+                let stale =
+                    now.saturating_sub(hb.last_seen_ms) > self.config.worker_liveness_timeout_ms;
+                if stale && !self.blacklisted_workers.contains(worker) {
+                    Some(worker.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        for worker in stale_workers {
+            warn!(
+                worker_id = %worker,
+                operator = "CoordinatorRequeue",
+                "worker considered stale; requeueing running tasks"
+            );
+            self.requeue_worker_tasks(&worker, now)?;
+            self.worker_heartbeats.remove(&worker);
+        }
+        Ok(())
+    }
+
+    fn requeue_worker_tasks(&mut self, worker_id: &str, now: u64) -> Result<()> {
+        for (query_id, query) in self.queries.iter_mut() {
+            if !matches!(query.state, QueryState::Queued | QueryState::Running) {
+                continue;
+            }
+            let latest_attempts = latest_attempt_map(query);
+            let mut to_retry = Vec::new();
+            for t in query.tasks.values_mut() {
+                if t.state == TaskState::Running
+                    && t.assigned_worker.as_deref() == Some(worker_id)
+                    && latest_attempts
+                        .get(&(t.stage_id, t.task_id))
+                        .is_some_and(|a| *a == t.attempt)
+                {
+                    let stage = query
+                        .stages
+                        .get_mut(&t.stage_id)
+                        .ok_or_else(|| FfqError::Execution("task stage not found".to_string()))?;
+                    stage.metrics.running_tasks = stage.metrics.running_tasks.saturating_sub(1);
+                    stage.metrics.failed_tasks += 1;
+                    update_scheduler_metrics(query_id, t.stage_id, &stage.metrics);
+                    t.state = TaskState::Failed;
+                    t.message = "worker lost heartbeat".to_string();
+                    to_retry.push((
+                        t.stage_id,
+                        t.task_id,
+                        t.attempt,
+                        t.plan_fragment_json.clone(),
+                    ));
+                }
+            }
+
+            for (stage_id, task_id, attempt, fragment) in to_retry {
+                if attempt < self.config.max_task_attempts {
+                    let next_attempt = attempt + 1;
+                    let backoff_ms = self
+                        .config
+                        .retry_backoff_base_ms
+                        .saturating_mul(1_u64 << (attempt.saturating_sub(1).min(10)));
+                    query.tasks.insert(
+                        (stage_id, task_id, next_attempt),
+                        TaskRuntime {
+                            query_id: query_id.clone(),
+                            stage_id,
+                            task_id,
+                            attempt: next_attempt,
+                            state: TaskState::Queued,
+                            assigned_worker: None,
+                            ready_at_ms: now.saturating_add(backoff_ms),
+                            plan_fragment_json: fragment,
+                            message: "retry scheduled after worker timeout".to_string(),
+                        },
+                    );
+                    let stage = query
+                        .stages
+                        .get_mut(&stage_id)
+                        .ok_or_else(|| FfqError::Execution("task stage not found".to_string()))?;
+                    stage.metrics.queued_tasks += 1;
+                    update_scheduler_metrics(query_id, stage_id, &stage.metrics);
+                    global_metrics().inc_scheduler_retries(query_id, stage_id);
+                } else {
+                    query.state = QueryState::Failed;
+                    query.finished_at_ms = now;
+                    query.message = format!(
+                        "task stage={stage_id} task={task_id} exhausted retries after worker timeout"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Construct coordinator with an empty catalog.
     pub fn new(config: CoordinatorConfig) -> Self {
         Self {
@@ -309,6 +447,9 @@ impl Coordinator {
     /// Returns up to `capacity` runnable task attempts for the requesting
     /// worker, skipping blacklisted workers.
     pub fn get_task(&mut self, worker_id: &str, capacity: u32) -> Result<Vec<TaskAssignment>> {
+        let now = now_ms()?;
+        self.requeue_stale_workers(now)?;
+
         if self.blacklisted_workers.contains(worker_id) || capacity == 0 {
             debug!(
                 worker_id = %worker_id,
@@ -318,7 +459,17 @@ impl Coordinator {
             );
             return Ok(Vec::new());
         }
+        let running_for_worker = self.running_tasks_for_worker(worker_id);
+        let worker_budget = self
+            .config
+            .max_concurrent_tasks_per_worker
+            .saturating_sub(running_for_worker);
+        let mut remaining = capacity.min(worker_budget);
         let mut out = Vec::new();
+        self.touch_worker(worker_id, now);
+        if remaining == 0 {
+            return Ok(out);
+        }
 
         for query in self.queries.values_mut() {
             if !matches!(query.state, QueryState::Queued | QueryState::Running) {
@@ -330,14 +481,27 @@ impl Coordinator {
                 query.started_at_ms = now_ms()?;
             }
 
+            let running_for_query = running_tasks_for_query_latest(query);
+            if running_for_query >= self.config.max_concurrent_tasks_per_query {
+                continue;
+            }
+            let mut query_budget = self
+                .config
+                .max_concurrent_tasks_per_query
+                .saturating_sub(running_for_query);
+            let latest_attempts = latest_attempt_map(query);
             for stage_id in runnable_stages(query) {
-                for task in query
-                    .tasks
-                    .values_mut()
-                    .filter(|t| t.stage_id == stage_id && t.state == TaskState::Queued)
-                {
-                    if out.len() as u32 >= capacity {
+                for task in query.tasks.values_mut().filter(|t| {
+                    t.stage_id == stage_id && t.state == TaskState::Queued && t.ready_at_ms <= now
+                }) {
+                    if remaining == 0 || query_budget == 0 {
                         return Ok(out);
+                    }
+                    if latest_attempts
+                        .get(&(task.stage_id, task.task_id))
+                        .is_some_and(|a| *a != task.attempt)
+                    {
+                        continue;
                     }
                     task.state = TaskState::Running;
                     task.assigned_worker = Some(worker_id.to_string());
@@ -359,6 +523,8 @@ impl Coordinator {
                         attempt: task.attempt,
                         plan_fragment_json: task.plan_fragment_json.clone(),
                     });
+                    remaining = remaining.saturating_sub(1);
+                    query_budget = query_budget.saturating_sub(1);
                     debug!(
                         worker_id = %worker_id,
                         query_id = %task.query_id,
@@ -386,29 +552,58 @@ impl Coordinator {
         worker_id: Option<&str>,
         message: String,
     ) -> Result<()> {
+        let now = now_ms()?;
+        self.requeue_stale_workers(now)?;
         let query = self
             .queries
             .get_mut(query_id)
             .ok_or_else(|| FfqError::Planning(format!("unknown query: {query_id}")))?;
+        let latest_attempt = latest_attempt_map(query)
+            .get(&(stage_id, task_id))
+            .copied()
+            .unwrap_or(attempt);
+        if attempt < latest_attempt {
+            debug!(
+                query_id = %query_id,
+                stage_id,
+                task_id,
+                attempt,
+                operator = "CoordinatorReportTaskStatus",
+                "ignoring stale status report from old attempt"
+            );
+            return Ok(());
+        }
         let key = (stage_id, task_id, attempt);
-        let task = query
+        let prev_state = query
             .tasks
-            .get_mut(&key)
+            .get(&key)
+            .map(|t| t.state)
             .ok_or_else(|| FfqError::Planning("unknown task status report".to_string()))?;
 
-        if task.state == state {
+        if prev_state == state {
             return Ok(());
         }
         let stage = query
             .stages
             .get_mut(&stage_id)
             .ok_or_else(|| FfqError::Execution("task stage not found".to_string()))?;
-        if task.state == TaskState::Running {
+        if prev_state == TaskState::Running {
             stage.metrics.running_tasks = stage.metrics.running_tasks.saturating_sub(1);
         }
 
-        task.state = state;
-        task.message = message.clone();
+        let task_plan_fragment = query
+            .tasks
+            .get(&key)
+            .map(|t| t.plan_fragment_json.clone())
+            .ok_or_else(|| FfqError::Planning("unknown task status report".to_string()))?;
+        let assigned_worker_cached = query
+            .tasks
+            .get(&key)
+            .and_then(|t| t.assigned_worker.clone());
+        if let Some(task) = query.tasks.get_mut(&key) {
+            task.state = state;
+            task.message = message.clone();
+        }
         match state {
             TaskState::Queued => {
                 stage.metrics.queued_tasks += 1;
@@ -417,10 +612,15 @@ impl Coordinator {
                 }
             }
             TaskState::Running => stage.metrics.running_tasks += 1,
-            TaskState::Succeeded => stage.metrics.succeeded_tasks += 1,
+            TaskState::Succeeded => {
+                stage.metrics.succeeded_tasks += 1;
+                if let Some(worker) = worker_id.or(assigned_worker_cached.as_deref()) {
+                    self.worker_failures.remove(worker);
+                }
+            }
             TaskState::Failed => {
                 stage.metrics.failed_tasks += 1;
-                if let Some(worker) = worker_id.or(task.assigned_worker.as_deref()) {
+                if let Some(worker) = worker_id.or(assigned_worker_cached.as_deref()) {
                     let failures = self.worker_failures.entry(worker.to_string()).or_default();
                     *failures += 1;
                     if *failures >= self.config.blacklist_failure_threshold {
@@ -434,16 +634,42 @@ impl Coordinator {
                         self.blacklisted_workers.insert(worker.to_string());
                     }
                 }
-                query.state = QueryState::Failed;
-                query.finished_at_ms = now_ms()?;
-                query.message = message;
+                if attempt < self.config.max_task_attempts {
+                    let next_attempt = attempt + 1;
+                    let backoff_ms = self
+                        .config
+                        .retry_backoff_base_ms
+                        .saturating_mul(1_u64 << (attempt.saturating_sub(1).min(10)));
+                    let retry_key = (stage_id, task_id, next_attempt);
+                    query.tasks.insert(
+                        retry_key,
+                        TaskRuntime {
+                            query_id: query_id.to_string(),
+                            stage_id,
+                            task_id,
+                            attempt: next_attempt,
+                            state: TaskState::Queued,
+                            assigned_worker: None,
+                            ready_at_ms: now.saturating_add(backoff_ms),
+                            plan_fragment_json: task_plan_fragment,
+                            message: format!("retry scheduled after failure: {message}"),
+                        },
+                    );
+                    stage.metrics.queued_tasks += 1;
+                    query.state = QueryState::Running;
+                    query.message = format!("retrying failed task stage={stage_id} task={task_id}");
+                } else {
+                    query.state = QueryState::Failed;
+                    query.finished_at_ms = now;
+                    query.message = message;
+                }
             }
         }
         update_scheduler_metrics(query_id, stage_id, &stage.metrics);
 
         if query.state != QueryState::Failed && is_query_succeeded(query) {
             query.state = QueryState::Succeeded;
-            query.finished_at_ms = now_ms()?;
+            query.finished_at_ms = now;
             info!(
                 query_id = %query_id,
                 operator = "CoordinatorReportTaskStatus",
@@ -451,6 +677,14 @@ impl Coordinator {
             );
         }
 
+        Ok(())
+    }
+
+    /// Record worker heartbeat and liveness metadata.
+    pub fn heartbeat(&mut self, worker_id: &str, _running_tasks: u32) -> Result<()> {
+        let now = now_ms()?;
+        self.worker_heartbeats
+            .insert(worker_id.to_string(), WorkerHeartbeat { last_seen_ms: now });
         Ok(())
     }
 
@@ -576,7 +810,6 @@ fn build_query_runtime(
             sid,
             StageRuntime {
                 parents: node.parents.iter().map(|p| p.0 as u64).collect(),
-                children: node.children.iter().map(|c| c.0 as u64).collect(),
                 metrics: StageMetrics {
                     queued_tasks: 1,
                     ..StageMetrics::default()
@@ -595,6 +828,7 @@ fn build_query_runtime(
                 attempt: 1,
                 state: TaskState::Queued,
                 assigned_worker: None,
+                ready_at_ms: submitted_at_ms,
                 plan_fragment_json: fragment,
                 message: String::new(),
             },
@@ -616,11 +850,10 @@ fn runnable_stages(query: &QueryRuntime) -> Vec<u64> {
     let mut out = Vec::new();
     for (sid, stage) in &query.stages {
         let all_parents_done = stage.parents.iter().all(|pid| {
-            query
-                .tasks
-                .values()
-                .filter(|t| t.stage_id == *pid)
-                .all(|t| t.state == TaskState::Succeeded)
+            latest_task_states(query)
+                .into_iter()
+                .filter(|((stage_id, _), _)| stage_id == pid)
+                .all(|(_, state)| state == TaskState::Succeeded)
         });
         if all_parents_done {
             out.push(*sid);
@@ -630,10 +863,44 @@ fn runnable_stages(query: &QueryRuntime) -> Vec<u64> {
 }
 
 fn is_query_succeeded(query: &QueryRuntime) -> bool {
-    query
-        .tasks
+    latest_task_states(query)
         .values()
-        .all(|t| t.state == TaskState::Succeeded)
+        .all(|s| *s == TaskState::Succeeded)
+}
+
+fn latest_task_states(query: &QueryRuntime) -> HashMap<(u64, u64), TaskState> {
+    let mut out = HashMap::<(u64, u64), (u32, TaskState)>::new();
+    for t in query.tasks.values() {
+        let key = (t.stage_id, t.task_id);
+        match out.get(&key) {
+            Some((existing_attempt, _)) if *existing_attempt >= t.attempt => {}
+            _ => {
+                out.insert(key, (t.attempt, t.state));
+            }
+        }
+    }
+    out.into_iter().map(|(k, (_, s))| (k, s)).collect()
+}
+
+fn latest_attempt_map(query: &QueryRuntime) -> HashMap<(u64, u64), u32> {
+    let mut out = HashMap::<(u64, u64), u32>::new();
+    for t in query.tasks.values() {
+        out.entry((t.stage_id, t.task_id))
+            .and_modify(|a| {
+                if *a < t.attempt {
+                    *a = t.attempt;
+                }
+            })
+            .or_insert(t.attempt);
+    }
+    out
+}
+
+fn running_tasks_for_query_latest(query: &QueryRuntime) -> u32 {
+    latest_task_states(query)
+        .values()
+        .filter(|s| **s == TaskState::Running)
+        .count() as u32
 }
 
 fn build_query_status(query_id: &str, q: &QueryRuntime) -> QueryStatus {
@@ -688,6 +955,9 @@ fn now_ms() -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
     use arrow_schema::Schema;
     use ffq_planner::{ParquetScanExec, PhysicalPlan};
@@ -766,5 +1036,75 @@ mod tests {
 
         assert!(c.is_worker_blacklisted("wbad"));
         assert!(c.get_task("wbad", 10).expect("blocked").is_empty());
+    }
+
+    #[test]
+    fn coordinator_requeues_tasks_from_stale_worker() {
+        let mut c = Coordinator::new(CoordinatorConfig {
+            worker_liveness_timeout_ms: 5,
+            retry_backoff_base_ms: 0,
+            ..CoordinatorConfig::default()
+        });
+        let plan = serde_json::to_vec(&PhysicalPlan::ParquetScan(ParquetScanExec {
+            table: "t".to_string(),
+            schema: Some(Schema::empty()),
+            projection: None,
+            filters: vec![],
+        }))
+        .expect("plan");
+        c.submit_query("10".to_string(), &plan).expect("submit");
+        c.heartbeat("w1", 0).expect("heartbeat");
+
+        let assigned = c.get_task("w1", 1).expect("assign");
+        assert_eq!(assigned.len(), 1);
+        let first = assigned[0].clone();
+        assert_eq!(first.attempt, 1);
+
+        thread::sleep(Duration::from_millis(10));
+        let reassigned = c.get_task("w2", 1).expect("reassign");
+        assert_eq!(reassigned.len(), 1);
+        assert_eq!(reassigned[0].query_id, "10");
+        assert_eq!(reassigned[0].stage_id, first.stage_id);
+        assert_eq!(reassigned[0].task_id, first.task_id);
+        assert_eq!(reassigned[0].attempt, 2);
+    }
+
+    #[test]
+    fn coordinator_enforces_worker_and_query_concurrency_limits() {
+        let mut c = Coordinator::new(CoordinatorConfig {
+            max_concurrent_tasks_per_worker: 1,
+            max_concurrent_tasks_per_query: 1,
+            ..CoordinatorConfig::default()
+        });
+        let plan = serde_json::to_vec(&PhysicalPlan::ParquetScan(ParquetScanExec {
+            table: "t".to_string(),
+            schema: Some(Schema::empty()),
+            projection: None,
+            filters: vec![],
+        }))
+        .expect("plan");
+        c.submit_query("20".to_string(), &plan).expect("submit q20");
+        c.submit_query("21".to_string(), &plan).expect("submit q21");
+
+        let first_pull = c.get_task("w1", 10).expect("first pull");
+        assert_eq!(first_pull.len(), 1);
+
+        let second_pull = c.get_task("w1", 10).expect("second pull");
+        assert!(second_pull.is_empty());
+
+        let t = &first_pull[0];
+        c.report_task_status(
+            &t.query_id,
+            t.stage_id,
+            t.task_id,
+            t.attempt,
+            TaskState::Succeeded,
+            Some("w1"),
+            "ok".to_string(),
+        )
+        .expect("mark success");
+
+        let third_pull = c.get_task("w1", 10).expect("third pull");
+        assert_eq!(third_pull.len(), 1);
     }
 }

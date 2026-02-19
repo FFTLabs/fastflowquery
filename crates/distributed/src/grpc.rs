@@ -250,8 +250,13 @@ impl ShuffleService for CoordinatorServices {
 impl HeartbeatService for CoordinatorServices {
     async fn heartbeat(
         &self,
-        _request: Request<v1::HeartbeatRequest>,
+        request: Request<v1::HeartbeatRequest>,
     ) -> Result<Response<v1::HeartbeatResponse>, Status> {
+        let req = request.into_inner();
+        let mut coordinator = self.coordinator.lock().await;
+        coordinator
+            .heartbeat(&req.worker_id, req.running_tasks)
+            .map_err(to_status)?;
         Ok(Response::new(v1::HeartbeatResponse { accepted: true }))
     }
 }

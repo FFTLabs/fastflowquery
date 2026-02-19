@@ -1,0 +1,31 @@
+name: feature-matrix
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build-matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build core-only (no default features)
+        run: cargo build --no-default-features
+
+      - name: Build minimal preset
+        run: cargo build -p ffq-client --no-default-features --features minimal
+
+      - name: Build distributed + python + s3
+        run: cargo build --features distributed,python,s3
+
+      - name: Build full feature matrix
+        run: cargo build -p ffq-client --no-default-features --features core,distributed,s3,vector,qdrant,python,ffi

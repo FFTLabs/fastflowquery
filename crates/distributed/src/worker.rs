@@ -474,8 +474,9 @@ impl WorkerControlPlane for InProcessControlPlane {
         )
     }
 
-    async fn heartbeat(&self, _worker_id: &str, _running_tasks: u32) -> Result<()> {
-        Ok(())
+    async fn heartbeat(&self, worker_id: &str, running_tasks: u32) -> Result<()> {
+        let mut c = self.coordinator.lock().await;
+        c.heartbeat(worker_id, running_tasks)
     }
 
     async fn register_query_results(&self, query_id: &str, ipc_payload: Vec<u8>) -> Result<()> {
