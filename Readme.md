@@ -1,18 +1,24 @@
-# FFQ (FastFlowQuery) — Workspace Skeleton
+# FFQ (FastFlowQuery)
 
-This is a v1 repo skeleton with feature-gated optional components:
+This repository provides a library-first query engine with feature-gated optional components:
 - distributed (gRPC coordinator/worker)
 - vector (vector datatype + similarity kernels)
 - qdrant (vector connector)
 - s3 (object-store provider)
 
-By default, `cargo build` builds the lightweight `ffq-client` crate (embedded-only).
+By default, `cargo build` builds `ffq-client` with the core embedded runtime surface.
+
+## Documentation (Canonical)
+
+Canonical docs entry for current work:
+
+1. `docs/v2/README.md`
+
+Archived v1 docs:
+
+1. `docs/v1/README.md`
 
 ## Quick Start
-
-For a practical step-by-step v1 run guide (embedded, distributed, synthetic and official benchmarks):
-
-1. `docs/v1/quickstart.md`
 
 Quick REPL start:
 
@@ -28,7 +34,7 @@ SELECT l_orderkey, l_quantity FROM lineitem LIMIT 5;
 
 Full REPL reference:
 
-1. `docs/v1/repl.md`
+1. `docs/v2/README.md` (documentation map)
 
 FFI (C ABI) reference:
 
