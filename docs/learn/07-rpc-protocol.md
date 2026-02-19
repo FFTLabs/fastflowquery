@@ -1,6 +1,6 @@
 # LEARN-08: gRPC Protocol and Data Exchange
 
-This chapter explains FFQ's distributed gRPC protocol from a learner perspective: what each RPC does, how calls are sequenced, and how bytes move for shuffle/results.
+This chapter explains FFQ distributed gRPC protocol in v2: what each RPC does, how calls are sequenced, and how capability/liveness signals affect scheduling.
 
 ## 1) Protocol Surface
 
@@ -19,208 +19,161 @@ Services:
 ### Control-plane lifecycle RPCs
 
 1. `SubmitQuery`
-   - client submits `physical_plan_json` + `query_id`.
-   - coordinator validates/records query and returns initial query state.
+   - submit serialized physical plan + query id
 2. `GetTask`
-   - worker pulls task assignments using `worker_id` + `capacity`.
-   - response is a list of `TaskAssignment` entries with plan fragment bytes.
+   - worker pulls assignments with `worker_id` and `capacity`
 3. `ReportTaskStatus`
-   - worker reports `{query_id, stage_id, task_id, attempt, state, message}`.
-   - coordinator updates task/query state machine and metrics.
+   - worker reports attempt state transition
 4. `GetQueryStatus`
-   - client polls query state transitions and terminal message.
+   - client polls query lifecycle state
 5. `CancelQuery`
-   - requester asks coordinator to cancel query with reason.
-   - coordinator returns updated terminal state.
+   - cancel queued/running query
 
-### Data/result RPCs
+### Result and shuffle RPCs
 
-1. `RegisterMapOutput` (`ShuffleService`)
-   - worker reports produced reduce-partition metadata for map stage attempt.
-2. `FetchShufflePartition` (`ShuffleService`, server-streaming)
-   - consumer fetches partition bytes for `{query, stage, map_task, attempt, reduce_partition}`.
+1. `RegisterMapOutput`
+   - worker registers map partition metadata for exact attempt
+2. `FetchShufflePartition` (stream)
+   - fetch partition bytes by `(query, stage, map_task, attempt, reduce_partition)`
 3. `RegisterQueryResults`
-   - final-stage worker registers full final-result IPC payload on coordinator.
-4. `FetchQueryResults` (server-streaming)
-   - client receives final query result bytes as chunk stream.
+   - final-stage worker uploads final result IPC payload
+4. `FetchQueryResults` (stream)
+   - client reads final result payload in chunks
 
-### Liveness RPC
+### Heartbeat RPC
 
 1. `Heartbeat`
-   - worker sends periodic liveness/capacity signal (`worker_id`, timestamp, running tasks).
-   - v1 coordinator currently acknowledges but does not enforce lease timeout logic.
+   - worker reports liveness plus capability metadata
 
-## 3) Data Exchange Contracts
+## 3) Heartbeat Payload Contract (Important)
 
-### 3.1 Plan submission payload
+`HeartbeatRequest` carries:
 
-`SubmitQueryRequest.physical_plan_json`:
+1. `worker_id`
+2. `at_ms`
+3. `running_tasks`
+4. `custom_operator_capabilities`
 
-1. serialized physical plan bytes
-2. decoded by coordinator before scheduling
+Coordinator uses heartbeat data actively:
 
-### 3.2 Task assignment payload
+1. liveness timeout / stale worker detection
+2. capability-aware filtering in `GetTask`
 
-`TaskAssignment.plan_fragment_json`:
-
-1. serialized plan fragment bytes (v1 currently carries submitted physical plan bytes)
-2. worker decodes this and executes by stage context
-
-### 3.3 Shuffle payload
-
-`FetchShufflePartition` stream:
-
-1. each message is `ShufflePartitionChunk { payload: bytes }`
-2. payload chunks are concatenated by receiver
-3. concatenated bytes decode as Arrow IPC stream for that partition
-
-### 3.4 Final query result payload
-
-`FetchQueryResults` stream:
-
-1. each message is `QueryResultsChunk { payload: bytes }`
-2. client concatenates all chunks
-3. concatenated bytes decode as Arrow IPC stream of final batches
+This is not advisory-only behavior.
 
 ## 4) Query Submission Sequence
 
 ```mermaid
 sequenceDiagram
-    participant Client as FFQ Client Runtime
-    participant Coord as Coordinator(ControlPlane)
+    participant Client as FFQ Client
+    participant Coord as Coordinator
 
     Client->>Coord: SubmitQuery(query_id, physical_plan_json)
     Coord-->>Client: SubmitQueryResponse(state=QUEUED)
 
-    loop Poll until terminal
-        Client->>Coord: GetQueryStatus(query_id)
-        Coord-->>Client: QueryStatus(state=QUEUED/RUNNING/...)
+    loop poll status
+      Client->>Coord: GetQueryStatus(query_id)
+      Coord-->>Client: QueryStatus(...)
     end
 
-    alt state == SUCCEEDED
-        Client->>Coord: FetchQueryResults(query_id)
-        Coord-->>Client: stream QueryResultsChunk(payload)
-    else state == FAILED/CANCELED
-        Coord-->>Client: terminal message in QueryStatus
+    alt SUCCEEDED
+      Client->>Coord: FetchQueryResults(query_id)
+      Coord-->>Client: stream QueryResultsChunk
+    else FAILED/CANCELED
+      Coord-->>Client: terminal status/message
     end
 ```
-
-Implementation references:
-
-1. client polling/result fetch: `crates/client/src/runtime.rs`
-2. coordinator RPC handlers: `crates/distributed/src/grpc.rs`
 
 ## 5) Worker Task Loop Sequence
 
 ```mermaid
 sequenceDiagram
-    participant Worker as Worker Loop
-    participant Coord as Coordinator(ControlPlane)
-    participant Shuffle as Coordinator/Worker ShuffleService
+    participant Worker as Worker
+    participant Coord as Coordinator
+    participant Shuffle as ShuffleService
 
     loop poll_once
-        Worker->>Coord: GetTask(worker_id, capacity)
-        alt no tasks
-            Worker->>Coord: Heartbeat(worker_id, running_tasks=0)
-            Coord-->>Worker: HeartbeatResponse(accepted=true)
-        else assignments returned
-            Worker->>Worker: execute TaskAssignment(s)
-            opt map stage produced shuffle partitions
-                Worker->>Shuffle: RegisterMapOutput(query, stage, task, attempt, partitions)
-                Shuffle-->>Worker: RegisterMapOutputResponse
-            end
-            Worker->>Coord: ReportTaskStatus(..., state=SUCCEEDED/FAILED, message)
-            Coord-->>Worker: ReportTaskStatusResponse
+      Worker->>Coord: Heartbeat(worker_id, running_tasks, capabilities)
+      Worker->>Coord: GetTask(worker_id, capacity)
+      alt assignments returned
+        Worker->>Worker: execute task attempts
+        opt map stage
+          Worker->>Shuffle: RegisterMapOutput(...attempt..., partitions)
         end
+        Worker->>Coord: ReportTaskStatus(...)
+      else no work
+        Worker-->>Worker: idle
+      end
     end
 ```
 
-Implementation references:
+## 6) Capability-Aware Routing Over RPC
 
-1. worker loop/control-plane calls: `crates/distributed/src/worker.rs`
-2. coordinator status handling: `crates/distributed/src/coordinator.rs`
+Custom operator tasks are represented in plan fragments with required operator names.
 
-## 6) Shuffle Partition Fetch Sequence
+Coordinator routing behavior on `GetTask`:
 
-```mermaid
-sequenceDiagram
-    participant Consumer as Shuffle Consumer
-    participant Shuffle as ShuffleService
-    participant Store as Shuffle Files
+1. if task has no required custom ops: no capability constraint
+2. if task has required custom ops: assign only when heartbeat capability set covers all required names
 
-    Consumer->>Shuffle: FetchShufflePartition(query, stage, map_task, attempt, reduce)
-    Shuffle->>Store: resolve partition path/index
-    Store-->>Shuffle: partition bytes
-    Shuffle-->>Consumer: stream ShufflePartitionChunk(payload)
-    Consumer->>Consumer: concat chunks -> Arrow IPC decode -> RecordBatch[]
-```
+If no worker matches:
 
-Important v1 details:
+1. assignment is withheld
+2. task remains queued
 
-1. attempt is part of fetch identity.
-2. worker shuffle gRPC supports `attempt==0` as latest-attempt sentinel.
-3. unknown/unregistered attempt returns explicit error.
+## 7) Failure and Recovery Semantics Over RPC
 
-## 7) Result Return Sequence
+### Task failure path
 
-```mermaid
-sequenceDiagram
-    participant Worker as Final-stage Worker
-    participant Coord as Coordinator(ControlPlane)
-    participant Client as FFQ Client Runtime
+1. worker sends `ReportTaskStatus(..., Failed, message)`
+2. coordinator increments worker failure counter
+3. retry is enqueued with backoff (if attempts remain)
+4. worker may be blacklisted on repeated failures
 
-    Worker->>Coord: RegisterQueryResults(query_id, ipc_payload)
-    Coord-->>Worker: RegisterQueryResultsResponse
+### Liveness failure path
 
-    Client->>Coord: GetQueryStatus(query_id)
-    Coord-->>Client: QueryStatus(state=SUCCEEDED)
+1. no heartbeat beyond timeout -> worker considered stale
+2. coordinator requeues running tasks from stale worker as new attempts
+3. subsequent `GetTask` can assign retries elsewhere
 
-    Client->>Coord: FetchQueryResults(query_id)
-    Coord-->>Client: stream QueryResultsChunk(payload)
-    Client->>Client: concat -> Arrow IPC decode -> RecordBatch[]
-```
+## 8) Data Payload Contracts
 
-## 8) Cancel Flow
+### Plan payloads
 
-`CancelQuery` semantics:
+1. `SubmitQueryRequest.physical_plan_json`
+2. `TaskAssignment.plan_fragment_json`
 
-1. caller sends `CancelQueryRequest { query_id, reason }`
-2. coordinator updates query state to `CANCELED`
-3. future `GetQueryStatus` reports canceled state
-4. client distributed runtime treats canceled as terminal error
+### Shuffle payloads
 
-Note:
+1. `ShufflePartitionChunk.payload` bytes are streamed and concatenated by receiver
 
-1. v1 cancellation is coordinator-state based; deep in-flight task preemption behavior is intentionally minimal.
+### Final result payloads
 
-## 9) Error Mapping and Status Semantics
+1. `QueryResultsChunk.payload` bytes are streamed and concatenated by client
 
-gRPC layer maps domain errors (`FfqError`) to RPC status:
+All payloads use deterministic id keys (`query/stage/task/attempt`) to avoid stale-attempt ambiguity.
 
-1. `InvalidConfig` -> `invalid_argument`
-2. `Planning` -> `failed_precondition`
-3. `Execution`/`Io` -> `internal`
-4. `Unsupported` -> `unimplemented`
+## 9) Error Mapping
 
-This mapping is implemented in `crates/distributed/src/grpc.rs` (`to_status`).
+gRPC layer maps domain errors to status codes in `crates/distributed/src/grpc.rs`.
 
-## 10) Why This Protocol Design Works (v1)
+Examples:
 
-Correctness points:
+1. invalid config -> `invalid_argument`
+2. planning errors -> `failed_precondition`
+3. execution/io errors -> `internal`
+4. unsupported path -> `unimplemented`
 
-1. explicit IDs (`query/stage/task/attempt`) disambiguate every mutable event.
-2. pull scheduling (`GetTask`) gives workers backpressure control.
-3. map output registration separates "task finished" from "shuffle data visible".
-4. server-streaming for shuffle/results avoids single giant response payloads.
+## 10) Code References
 
-Fault-tolerance assumptions:
+1. `crates/distributed/proto/ffq_distributed.proto`
+2. `crates/distributed/src/grpc.rs`
+3. `crates/distributed/src/coordinator.rs`
+4. `crates/distributed/src/worker.rs`
 
-1. clients/workers retry RPCs at call-site or next poll loop.
-2. coordinator in-memory state is authoritative for active query lifecycle.
-3. attempt-based keys prevent stale output confusion when retries occur.
-
-## Runnable command
+## Runnable commands
 
 ```bash
-cargo test -p ffq-client --test distributed_runtime_roundtrip --features distributed
+cargo test -p ffq-distributed --features grpc coordinator_assigns_custom_operator_tasks_only_to_capable_workers
+cargo test -p ffq-distributed --features grpc coordinator_requeues_tasks_from_stale_worker
 ```

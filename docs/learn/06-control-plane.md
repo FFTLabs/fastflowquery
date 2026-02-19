@@ -1,6 +1,6 @@
 # LEARN-07: Coordinator/Worker Control Plane
 
-This chapter explains FFQ v1 control-plane behavior: coordinator state transitions, pull scheduling, heartbeats, task status flow, map output registry, and worker blacklisting.
+This chapter explains FFQ v2 control-plane behavior: coordinator state transitions, pull scheduling, heartbeat/liveness handling, task retry/backoff, map output registry, blacklisting, and capability-aware routing.
 
 ## 1) Control-Plane Surface (RPCs)
 
@@ -12,7 +12,7 @@ Services:
 2. `ShuffleService`
 3. `HeartbeatService`
 
-Key `ControlPlane` RPCs:
+Key control-plane RPCs:
 
 1. `SubmitQuery`
 2. `GetTask`
@@ -48,9 +48,9 @@ Implementation: `crates/distributed/src/coordinator.rs`
 Transitions:
 
 1. `SubmitQuery` -> `Queued`
-2. first scheduling pass (`GetTask`) moves query to `Running`
-3. all tasks succeeded -> `Succeeded`
-4. any task failed -> `Failed`
+2. first assignment moves query to `Running`
+3. all latest task attempts succeeded -> `Succeeded`
+4. retry budget exhausted or unrecoverable failure -> `Failed`
 5. explicit cancel -> `Canceled`
 
 ### Task state machine
@@ -62,172 +62,147 @@ Transitions:
 3. `Succeeded`
 4. `Failed`
 
-Tasks are keyed by `(stage_id, task_id, attempt)` inside each query runtime.
+Tasks are keyed by `(stage_id, task_id, attempt)`.
+Latest-attempt rules prevent stale attempts from winning state updates.
 
-## 3) Query Submission and Runtime Materialization
+## 3) Pull Scheduling and Assignment Gates
 
-`submit_query(...)`:
+Workers pull tasks with `GetTask(worker_id, capacity)`.
 
-1. validates unique `query_id`
-2. decodes physical plan JSON
-3. builds stage DAG
-4. creates stage runtimes and initial queued tasks
+Coordinator assignment gates in `get_task(...)`:
 
-v1 simplification:
+1. worker is not blacklisted
+2. worker capacity > 0
+3. worker under `max_concurrent_tasks_per_worker`
+4. query under `max_concurrent_tasks_per_query`
+5. stage is runnable (all parent stages succeeded)
+6. task is queued/latest attempt and ready by backoff timestamp
+7. worker satisfies required custom operator capabilities
 
-1. each stage gets one task (`task_id=0`) per attempt
-2. initial attempt is `1`
-3. task carries physical plan bytes as fragment payload
+Why this works:
 
-## 4) Pull Scheduling Model
+1. pull scheduling gives worker-side backpressure
+2. coordinator caps prevent unbounded runnable assignment
+3. capability filtering prevents assigning unsupported custom-op work
 
-Workers do not get pushed tasks; they pull with capacity.
+## 4) Heartbeats and Liveness (Active, Not Advisory)
 
-Worker side:
+Worker loop sends heartbeat every poll cycle with:
 
-1. `Worker::poll_once()` computes available capacity from CPU semaphore
-2. calls `GetTask(worker_id, capacity)`
-3. if empty, sends heartbeat
+1. `worker_id`
+2. `running_tasks`
+3. `custom_operator_capabilities`
 
-Coordinator side (`get_task(...)`):
+Coordinator heartbeat behavior:
 
-1. skips blacklisted workers
-2. considers only `Queued`/`Running` queries
-3. computes runnable stages (all parent stages succeeded)
-4. assigns queued tasks up to requested capacity
-5. marks assigned task `Running` and updates stage metrics
+1. updates `last_seen_ms`
+2. stores worker capability set
+3. uses liveness timeout to detect stale workers
 
-Why pull scheduling:
+Stale-worker handling (`requeue_stale_workers`):
 
-1. workers self-advertise available capacity
-2. coordinator remains simple and stateless per worker connection
+1. find workers past `worker_liveness_timeout_ms`
+2. requeue their `Running` tasks as new attempts
+3. clear stale worker heartbeat record
 
-## 5) Task Status Reporting Path
+This is active correctness/fault handling, not just metadata.
 
-Worker reports terminal/intermediate status via `ReportTaskStatus`.
+## 5) Retry/Backoff and Blacklisting
 
-Coordinator `report_task_status(...)`:
+On `ReportTaskStatus(..., Failed, ...)`:
 
-1. validates task key `(query, stage, task, attempt)` exists
-2. updates task state and message
-3. updates stage counters (queued/running/succeeded/failed)
-4. on failure:
-   - increments worker failure count
-   - possibly blacklists worker
-   - marks query failed
-5. if all tasks succeeded and query not failed:
-   - marks query succeeded
+1. increment worker failure counter
+2. blacklist worker once `blacklist_failure_threshold` is reached
+3. if attempts remain (`attempt < max_task_attempts`):
+   - enqueue next attempt
+   - apply exponential backoff from `retry_backoff_base_ms`
+4. if attempts exhausted: query -> `Failed`
 
-Result:
+On `Succeeded`:
 
-1. query status polling (`GetQueryStatus`) reflects scheduler progress
-2. terminal outcome is derived from explicit task reports
+1. clear worker failure counter for that worker
 
-## 6) Heartbeats
+## 6) Capability-Aware Scheduling for Custom Operators
 
-Worker sends heartbeat when idle in polling loop.
+Worker advertises available custom operator names from registry.
 
-Current v1 behavior:
+Coordinator compares:
 
-1. `HeartbeatService::heartbeat` returns `accepted=true`
-2. coordinator does not yet use heartbeats for timeout-based liveness eviction
+1. task `required_custom_ops`
+2. worker `custom_operator_capabilities`
 
-Interpretation:
+Assignment rule:
 
-1. heartbeat exists as control-plane compatibility/extension point
-2. correctness does not currently depend on heartbeat processing
+1. tasks with no custom-op requirement can run anywhere
+2. custom-op tasks only go to workers advertising all required op names
 
-## 7) Map Output Registry
+Operational consequence:
 
-Coordinator map output registry key:
+1. if no capable worker exists, task remains queued
+2. once capable worker heartbeats, task becomes assignable
+
+## 7) Map Output Registry and Attempt Safety
+
+Map output key:
 
 1. `(query_id, stage_id, map_task, attempt)`
 
 Flow:
 
-1. worker executes map stage and calls `RegisterMapOutput`
-2. coordinator stores partition metadata and aggregates stage shuffle metrics
-3. later `FetchShufflePartition` requests validate attempt key exists
-4. unknown key returns explicit planning error
+1. worker runs map stage and registers partition metadata
+2. fetch requests validate exact attempt identity
+3. stale/non-registered attempt lookup fails explicitly
 
 Why this matters:
 
-1. protects consumers from reading unregistered/incorrect shuffle outputs
-2. ties shuffle visibility to explicit task success path
+1. prevents stale shuffle outputs from contaminating reduce stages
+2. ties data visibility to attempt identity
 
-## 8) Blacklisting
+## 8) End-to-End Sequence
 
-Coordinator tracks worker failures:
-
-1. per-worker counter increments on reported task failures
-2. if failures reach `blacklist_failure_threshold`, worker is blacklisted
-3. blacklisted worker gets no further assignments
-
-Config:
-
-1. `CoordinatorConfig.blacklist_failure_threshold` (default `3`)
-
-Purpose:
-
-1. isolate repeatedly failing workers
-2. reduce repeated task loss from same bad executor
-
-## 9) End-to-End Control-Plane Sequence
-
-Minimal successful path:
+Successful path:
 
 1. client `SubmitQuery`
-2. worker `GetTask` pull
-3. worker executes task
-4. worker `RegisterMapOutput` (for map stages)
-5. worker `ReportTaskStatus(Succeeded)`
-6. final-stage worker `RegisterQueryResults`
-7. query becomes `Succeeded`
-8. client polls `GetQueryStatus` and then `FetchQueryResults`
+2. workers heartbeat + `GetTask`
+3. coordinator assigns runnable tasks respecting limits/capabilities
+4. workers execute and report status
+5. map stages register shuffle outputs
+6. final stage registers results
+7. query reaches `Succeeded`
 
-Failure path (simplified):
+Failure path:
 
-1. worker reports `TaskState::Failed`
-2. coordinator marks task/stage failed and query failed
-3. optional blacklisting if worker repeatedly fails
-4. client polling sees terminal `Failed` state
+1. task fails -> retry/backoff or terminal fail
+2. repeated worker failures -> blacklist
+3. stale worker -> requeue running tasks as new attempts
 
-## 10) Why This Works (Correctness + Fault Assumptions)
+## 9) Why This Works (Correctness + Fault Assumptions)
 
-### Core correctness points
+Correctness anchors:
 
-1. stage dependencies enforce parent-before-child execution
-2. task identity includes attempt, preventing ambiguous status/output updates
-3. map outputs are visible only after explicit registration
-4. terminal query state derives from explicit task completion reports
+1. stage dependency gating
+2. latest-attempt state tracking
+3. map output attempt identity
+4. capability-aware custom-op routing
+5. bounded scheduler concurrency
 
-### Fault-handling assumptions in v1
+Fault handling assumptions:
 
-1. workers eventually report terminal status for assigned tasks
-2. network/RPC errors surface as execution errors to caller
-3. coordinator process is authoritative in-memory source of query/task state
-4. retries/reattempt orchestration is minimal; attempt field exists and is tracked, but advanced resubmission policy is intentionally simple in v1
-5. heartbeat is advisory today (not yet used for lease-expiry requeue logic)
+1. workers continue polling/reporting unless crashed
+2. coordinator heartbeat timeout detects dead/stuck workers
+3. retry budget and blacklist policy isolate bad workers and transient failures
 
-Under these assumptions, v1 provides a minimal but coherent control plane.
-
-## 11) Observability Hooks in Control Plane
-
-Coordinator and worker emit:
-
-1. structured logs for assignment, start, success/failure, blacklisting
-2. scheduler metrics (queued/running/retries)
-3. stage-level map output metrics (rows/bytes/batches)
-
-Relevant files:
+## 10) Code References
 
 1. `crates/distributed/src/coordinator.rs`
 2. `crates/distributed/src/worker.rs`
 3. `crates/distributed/src/grpc.rs`
-4. `docs/v1/observability.md`
+4. `crates/distributed/proto/ffq_distributed.proto`
 
-## Runnable command
+## Runnable commands
 
 ```bash
-cargo test -p ffq-client --test distributed_runtime_roundtrip --features distributed
+cargo test -p ffq-distributed --features grpc coordinator_requeues_tasks_from_stale_worker
+cargo test -p ffq-distributed --features grpc coordinator_enforces_worker_and_query_concurrency_limits
+cargo test -p ffq-distributed --features grpc coordinator_assigns_custom_operator_tasks_only_to_capable_workers
 ```

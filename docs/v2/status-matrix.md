@@ -1,9 +1,9 @@
 # Plan v2 -> Implementation Status Matrix
 
-- Status: draft
+- Status: verified
 - Owner: @ffq-docs
-- Last Verified Commit: TBD
-- Last Verified Date: TBD
+- Last Verified Commit: dd45319
+- Last Verified Date: 2026-02-19
 
 Source plan: `tickets/eng/Plan_v2.md`.
 
@@ -80,3 +80,33 @@ Status legend:
 
 1. This matrix is tied to current repository state and should be updated as each v2 ticket lands.
 2. Headings are mapped from `tickets/eng/Plan_v2.md` and appear once each in the table above.
+
+## DOCV2-17 Audit Record
+
+Structured audit executed for v2 standalone guarantee:
+
+1. required v2 page existence check: `python3 scripts/validate-docs-v2.py` -> pass
+2. markdown link/anchor integrity check (v2 docs + root entry docs): pass
+3. Plan_v2 heading coverage lint vs this matrix: pass
+4. root/contributor entrypoint policy update (`Readme.md`, `Contributing.md`): complete
+5. learner-track synchronization for v2 runtime/control-plane/extensibility: complete
+
+### Closures (this audit)
+
+1. v2 docs guardrail CI added: `.github/workflows/docs-v2-guardrails.yml`
+2. local guardrail command added: `make docs-v2-guardrails`
+3. migration, quickstart, testing, API, runtime, bindings, extensibility, deployment docs now exist in `docs/v2/*`
+4. contributor policy explicitly requires v2 doc updates on behavior/API/config/runtime changes
+
+### Unresolved gaps (tracked)
+
+1. `docs/v2/distributed-capabilities.md` is still placeholder (`TBD` sections) and should be completed.
+2. Many `docs/v2/*` metadata headers still have `Last Verified Commit/Date: TBD`; process-level follow-up is needed to keep verification metadata current.
+3. Plan_v2 epics not implemented in code (for example EPIC 3+, most of EPIC 4-11) remain intentionally documented as `not started`/`partial`.
+
+### Sign-off
+
+Sign-off for implemented scope:
+
+1. v2 documentation is self-sufficient for currently implemented v2 scope (EPIC 1/2 plus completed docs tracks), without requiring `docs/v1/*` for execution or contributor workflow.
+2. unresolved items above are explicitly tracked and do not block standalone use of implemented scope.

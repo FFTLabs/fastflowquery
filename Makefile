@@ -37,7 +37,8 @@ SHELL := /bin/bash
 	ffi-build \
 	ffi-example \
 	python-wheel \
-	python-dev-install
+	python-dev-install \
+	docs-v2-guardrails
 
 clean:
 	cargo clean
@@ -169,3 +170,6 @@ python-wheel:
 python-dev-install:
 	python -m pip install --upgrade maturin
 	maturin develop --features python
+
+docs-v2-guardrails:
+	python3 scripts/validate-docs-v2.py

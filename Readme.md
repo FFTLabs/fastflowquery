@@ -13,6 +13,13 @@ By default, `cargo build` builds `ffq-client` with the core embedded runtime sur
 Canonical docs entry for current work:
 
 1. `docs/v2/README.md`
+2. `docs/v2/quickstart.md` (first runnable path)
+3. `docs/v2/testing.md` (validation checklist)
+
+Documentation policy:
+
+1. `docs/v2/*` is the source of truth for current behavior.
+2. Any behavior/API/config change must update at least one relevant `docs/v2/*` page in the same change.
 
 Archived v1 docs:
 
@@ -34,15 +41,15 @@ SELECT l_orderkey, l_quantity FROM lineitem LIMIT 5;
 
 Full REPL reference:
 
-1. `docs/v2/README.md` (documentation map)
+1. `docs/v2/repl.md`
 
 FFI (C ABI) reference:
 
-1. `docs/dev/ffi-c-api.md`
+1. `docs/v2/ffi-python.md`
 
 Python bindings reference:
 
-1. `docs/dev/python-bindings.md`
+1. `docs/v2/ffi-python.md`
 
 For a concept-first deep guide (architecture, optimizer, distributed control plane, labs, glossary, FAQ):
 
