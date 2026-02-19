@@ -223,23 +223,25 @@ fn from_to_plan(
 
     for j in &twj.joins {
         let right = table_factor_to_scan(&j.relation)?;
-        match &j.join_operator {
-            JoinOperator::Inner(constraint) => {
-                let on_pairs = join_constraint_to_on_pairs(constraint)?;
-                left = LogicalPlan::Join {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                    on: on_pairs,
-                    join_type: crate::logical_plan::JoinType::Inner,
-                    strategy_hint: JoinStrategyHint::Auto,
-                };
-            }
+        let (constraint, join_type) = match &j.join_operator {
+            JoinOperator::Inner(c) => (c, crate::logical_plan::JoinType::Inner),
+            JoinOperator::LeftOuter(c) => (c, crate::logical_plan::JoinType::Left),
+            JoinOperator::RightOuter(c) => (c, crate::logical_plan::JoinType::Right),
+            JoinOperator::FullOuter(c) => (c, crate::logical_plan::JoinType::Full),
             _ => {
                 return Err(FfqError::Unsupported(
-                    "only INNER JOIN is supported in v1".to_string(),
+                    "only INNER/LEFT/RIGHT/FULL OUTER JOIN are supported in v1".to_string(),
                 ));
             }
-        }
+        };
+        let on_pairs = join_constraint_to_on_pairs(constraint)?;
+        left = LogicalPlan::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            on: on_pairs,
+            join_type,
+            strategy_hint: JoinStrategyHint::Auto,
+        };
     }
 
     // (Note: params are not used here yet; kept for future join filters, etc.)
@@ -412,6 +414,39 @@ fn sql_expr_to_expr(e: &SqlExpr, params: &HashMap<String, LiteralValue>) -> Resu
                     "unsupported unary op in v1: {op}"
                 )))
             }
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if operand.is_some() {
+                return Err(FfqError::Unsupported(
+                    "CASE <expr> WHEN ... form is not supported in v1; use CASE WHEN ...".to_string(),
+                ));
+            }
+            if conditions.len() != results.len() {
+                return Err(FfqError::Planning(
+                    "CASE has mismatched WHEN/THEN branch count".to_string(),
+                ));
+            }
+            let mut branches = Vec::with_capacity(conditions.len());
+            for (cond, result) in conditions.iter().zip(results.iter()) {
+                branches.push((
+                    sql_expr_to_expr(cond, params)?,
+                    sql_expr_to_expr(result, params)?,
+                ));
+            }
+            let else_expr = else_result
+                .as_ref()
+                .map(|e| sql_expr_to_expr(e, params))
+                .transpose()?
+                .map(Box::new);
+            Ok(Expr::CaseWhen {
+                branches,
+                else_expr,
+            })
         }
         _ => Err(FfqError::Unsupported(format!(
             "unsupported SQL expression in v1: {e}"
@@ -590,7 +625,6 @@ mod tests {
     use std::collections::HashMap;
 
     use super::sql_to_logical;
-    #[cfg(feature = "vector")]
     use crate::logical_plan::LiteralValue;
     use crate::logical_plan::LogicalPlan;
 
@@ -648,6 +682,65 @@ mod tests {
             LogicalPlan::Projection { input, .. } => match *input {
                 LogicalPlan::TopKByScore { k, .. } => assert_eq!(k, 5),
                 other => panic!("expected TopKByScore input, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_case_when_expression() {
+        let plan = sql_to_logical(
+            "SELECT CASE WHEN a > 1 THEN a ELSE 0 END AS c FROM t",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        match plan {
+            LogicalPlan::Projection { exprs, .. } => {
+                assert_eq!(exprs.len(), 1);
+                match &exprs[0].0 {
+                    crate::logical_plan::Expr::CaseWhen { branches, else_expr } => {
+                        assert_eq!(branches.len(), 1);
+                        assert!(else_expr.is_some());
+                    }
+                    other => panic!("expected CASE expression, got {other:?}"),
+                }
+            }
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_case_when_in_where_expression_shape() {
+        let plan = sql_to_logical(
+            "SELECT k FROM t WHERE CASE WHEN k > 1 THEN true ELSE false END",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        match plan {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Filter { predicate, .. } => match predicate {
+                    crate::logical_plan::Expr::CaseWhen { branches, else_expr } => {
+                        assert_eq!(branches.len(), 1);
+                        match &branches[0].0 {
+                            crate::logical_plan::Expr::BinaryOp { op, .. } => {
+                                assert_eq!(*op, crate::logical_plan::BinaryOp::Gt);
+                            }
+                            other => panic!("expected WHEN condition binary gt, got {other:?}"),
+                        }
+                        match &branches[0].1 {
+                            crate::logical_plan::Expr::Literal(LiteralValue::Boolean(true)) => {}
+                            other => panic!("expected THEN true, got {other:?}"),
+                        }
+                        match else_expr.as_deref() {
+                            Some(crate::logical_plan::Expr::Literal(LiteralValue::Boolean(
+                                false,
+                            ))) => {}
+                            other => panic!("expected ELSE false, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected CASE predicate, got {other:?}"),
+                },
+                other => panic!("expected Filter input, got {other:?}"),
             },
             other => panic!("expected Projection, got {other:?}"),
         }

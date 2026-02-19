@@ -30,7 +30,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result};
 use ffq_execution::{SendableRecordBatchStream, StreamAdapter, TaskContext, compile_expr};
-use ffq_planner::{AggExpr, BuildSide, ExchangeExec, Expr, PhysicalPlan};
+use ffq_planner::{AggExpr, BuildSide, ExchangeExec, Expr, JoinType, PhysicalPlan};
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
 use ffq_storage::qdrant_provider::QdrantProvider;
@@ -467,6 +467,7 @@ fn execute_plan(
                     left: left_plan,
                     right: right_plan,
                     on,
+                    join_type,
                     build_side,
                     ..
                 } = join;
@@ -489,7 +490,7 @@ fn execute_plan(
                 let (l_rows, l_batches, l_bytes) = batch_stats(&left.batches);
                 let (r_rows, r_batches, r_bytes) = batch_stats(&right.batches);
                 Ok(OpEval {
-                    out: run_hash_join(left, right, on, build_side, &ctx, &trace)?,
+                    out: run_hash_join(left, right, on, join_type, build_side, &ctx, &trace)?,
                     in_rows: l_rows + r_rows,
                     in_batches: l_batches + r_batches,
                     in_bytes: l_bytes + r_bytes,
@@ -863,6 +864,7 @@ fn rows_to_vector_topk_output(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JoinSpillRow {
+    row_id: usize,
     key: Vec<ScalarValue>,
     row: Vec<ScalarValue>,
 }
@@ -879,6 +881,13 @@ enum JoinExecSide {
     Probe,
 }
 
+#[derive(Debug)]
+struct JoinMatchOutput {
+    rows: Vec<Vec<ScalarValue>>,
+    matched_left: Vec<bool>,
+    matched_right: Vec<bool>,
+}
+
 #[cfg_attr(feature = "profiling", inline(never))]
 /// Execute `HashJoinExec` with optional spill to grace-hash mode.
 ///
@@ -891,6 +900,7 @@ fn run_hash_join(
     left: ExecOutput,
     right: ExecOutput,
     on: Vec<(String, String)>,
+    join_type: JoinType,
     build_side: BuildSide,
     ctx: &QueryContext,
     trace: &TraceIds,
@@ -933,12 +943,24 @@ fn run_hash_join(
         left.schema
             .fields()
             .iter()
-            .chain(right.schema.fields().iter())
-            .map(|f| (**f).clone())
+            .map(|f| {
+                let nullable = match join_type {
+                    JoinType::Right | JoinType::Full => true,
+                    JoinType::Inner | JoinType::Left => f.is_nullable(),
+                };
+                f.as_ref().clone().with_nullable(nullable)
+            })
+            .chain(right.schema.fields().iter().map(|f| {
+                let nullable = match join_type {
+                    JoinType::Left | JoinType::Full => true,
+                    JoinType::Inner | JoinType::Right => f.is_nullable(),
+                };
+                f.as_ref().clone().with_nullable(nullable)
+            }))
             .collect::<Vec<_>>(),
     ));
 
-    let joined_rows = if ctx.mem_budget_bytes > 0
+    let mut match_output = if ctx.mem_budget_bytes > 0
         && estimate_join_rows_bytes(build_rows) > ctx.mem_budget_bytes
     {
         grace_hash_join(
@@ -947,6 +969,8 @@ fn run_hash_join(
             &build_key_idx,
             &probe_key_idx,
             build_input_side,
+            left_rows.len(),
+            right_rows.len(),
             ctx,
             trace,
         )?
@@ -957,14 +981,88 @@ fn run_hash_join(
             &build_key_idx,
             &probe_key_idx,
             build_input_side,
+            left_rows.len(),
+            right_rows.len(),
         )
     };
 
-    let batch = rows_to_batch(&output_schema, &joined_rows)?;
+    apply_outer_join_null_extension(
+        &mut match_output.rows,
+        &match_output.matched_left,
+        &match_output.matched_right,
+        &left_rows,
+        &right_rows,
+        join_type,
+    );
+
+    let batch = rows_to_batch(&output_schema, &match_output.rows)?;
     Ok(ExecOutput {
         schema: output_schema,
         batches: vec![batch],
     })
+}
+
+fn apply_outer_join_null_extension(
+    out_rows: &mut Vec<Vec<ScalarValue>>,
+    matched_left: &[bool],
+    matched_right: &[bool],
+    left_rows: &[Vec<ScalarValue>],
+    right_rows: &[Vec<ScalarValue>],
+    join_type: JoinType,
+) {
+    let left_nulls = vec![ScalarValue::Null; left_rows.first().map_or(0, Vec::len)];
+    let right_nulls = vec![ScalarValue::Null; right_rows.first().map_or(0, Vec::len)];
+    match join_type {
+        JoinType::Inner => {}
+        JoinType::Left => {
+            for (idx, left) in left_rows.iter().enumerate() {
+                if !matched_left[idx] {
+                    out_rows.push(
+                        left.iter()
+                            .cloned()
+                            .chain(right_nulls.iter().cloned())
+                            .collect(),
+                    );
+                }
+            }
+        }
+        JoinType::Right => {
+            for (idx, right) in right_rows.iter().enumerate() {
+                if !matched_right[idx] {
+                    out_rows.push(
+                        left_nulls
+                            .iter()
+                            .cloned()
+                            .chain(right.iter().cloned())
+                            .collect(),
+                    );
+                }
+            }
+        }
+        JoinType::Full => {
+            for (idx, left) in left_rows.iter().enumerate() {
+                if !matched_left[idx] {
+                    out_rows.push(
+                        left.iter()
+                            .cloned()
+                            .chain(right_nulls.iter().cloned())
+                            .collect(),
+                    );
+                }
+            }
+            for (idx, right) in right_rows.iter().enumerate() {
+                if !matched_right[idx] {
+                    out_rows.push(
+                        left_nulls
+                            .iter()
+                            .cloned()
+                            .chain(right.iter().cloned())
+                            .collect(),
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn rows_from_batches(input: &ExecOutput) -> Result<Vec<Vec<ScalarValue>>> {
@@ -1054,7 +1152,9 @@ fn in_memory_hash_join(
     build_key_idx: &[usize],
     probe_key_idx: &[usize],
     build_side: JoinInputSide,
-) -> Vec<Vec<ScalarValue>> {
+    left_len: usize,
+    right_len: usize,
+) -> JoinMatchOutput {
     let mut ht: HashMap<Vec<ScalarValue>, Vec<usize>> = HashMap::new();
     for (idx, row) in build_rows.iter().enumerate() {
         ht.entry(join_key_from_row(row, build_key_idx))
@@ -1063,16 +1163,48 @@ fn in_memory_hash_join(
     }
 
     let mut out = Vec::new();
-    for probe in probe_rows {
+    let mut matched_left = vec![false; left_len];
+    let mut matched_right = vec![false; right_len];
+    for (probe_idx, probe) in probe_rows.iter().enumerate() {
         let probe_key = join_key_from_row(probe, probe_key_idx);
         if let Some(build_matches) = ht.get(&probe_key) {
             for build_idx in build_matches {
                 let build = &build_rows[*build_idx];
                 out.push(combine_join_rows(build, probe, build_side));
+                mark_join_match(
+                    &mut matched_left,
+                    &mut matched_right,
+                    build_side,
+                    *build_idx,
+                    probe_idx,
+                );
             }
         }
     }
-    out
+    JoinMatchOutput {
+        rows: out,
+        matched_left,
+        matched_right,
+    }
+}
+
+fn mark_join_match(
+    matched_left: &mut [bool],
+    matched_right: &mut [bool],
+    build_side: JoinInputSide,
+    build_idx: usize,
+    probe_idx: usize,
+) {
+    match build_side {
+        JoinInputSide::Left => {
+            matched_left[build_idx] = true;
+            matched_right[probe_idx] = true;
+        }
+        JoinInputSide::Right => {
+            matched_left[probe_idx] = true;
+            matched_right[build_idx] = true;
+        }
+    }
 }
 
 fn combine_join_rows(
@@ -1103,9 +1235,11 @@ fn grace_hash_join(
     build_key_idx: &[usize],
     probe_key_idx: &[usize],
     build_side: JoinInputSide,
+    left_len: usize,
+    right_len: usize,
     ctx: &QueryContext,
     trace: &TraceIds,
-) -> Result<Vec<Vec<ScalarValue>>> {
+) -> Result<JoinMatchOutput> {
     #[cfg(feature = "profiling")]
     let _profile_span = info_span!(
         "profile_grace_hash_join",
@@ -1142,8 +1276,10 @@ fn grace_hash_join(
     );
 
     let mut out = Vec::<Vec<ScalarValue>>::new();
+    let mut matched_left = vec![false; left_len];
+    let mut matched_right = vec![false; right_len];
     for p in 0..parts {
-        let mut ht: HashMap<Vec<ScalarValue>, Vec<Vec<ScalarValue>>> = HashMap::new();
+        let mut ht: HashMap<Vec<ScalarValue>, Vec<JoinSpillRow>> = HashMap::new();
 
         if let Ok(file) = File::open(&build_paths[p]) {
             let reader = BufReader::new(file);
@@ -1154,7 +1290,7 @@ fn grace_hash_join(
                 }
                 let rec: JoinSpillRow = serde_json::from_str(&line)
                     .map_err(|e| FfqError::Execution(format!("join spill decode failed: {e}")))?;
-                ht.entry(rec.key).or_default().push(rec.row);
+                ht.entry(rec.key.clone()).or_default().push(rec);
             }
         }
 
@@ -1169,7 +1305,14 @@ fn grace_hash_join(
                     .map_err(|e| FfqError::Execution(format!("join spill decode failed: {e}")))?;
                 if let Some(build_matches) = ht.get(&rec.key) {
                     for build in build_matches {
-                        out.push(combine_join_rows(build, &rec.row, build_side));
+                        out.push(combine_join_rows(&build.row, &rec.row, build_side));
+                        mark_join_match(
+                            &mut matched_left,
+                            &mut matched_right,
+                            build_side,
+                            build.row_id,
+                            rec.row_id,
+                        );
                     }
                 }
             }
@@ -1179,7 +1322,11 @@ fn grace_hash_join(
         let _ = fs::remove_file(&probe_paths[p]);
     }
 
-    Ok(out)
+    Ok(JoinMatchOutput {
+        rows: out,
+        matched_left,
+        matched_right,
+    })
 }
 
 fn spill_join_partitions(
@@ -1193,10 +1340,11 @@ fn spill_join_partitions(
         writers.push(BufWriter::new(file));
     }
 
-    for row in rows {
+    for (row_id, row) in rows.iter().enumerate() {
         let key = join_key_from_row(row, key_idx);
         let part = (hash_key(&key) as usize) % writers.len();
         let rec = JoinSpillRow {
+            row_id,
             key,
             row: row.clone(),
         };

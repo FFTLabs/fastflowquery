@@ -1,6 +1,6 @@
 use ffq_common::{FfqError, Result};
 
-use crate::logical_plan::{Expr, JoinStrategyHint, JoinType, LogicalPlan};
+use crate::logical_plan::{Expr, JoinStrategyHint, LogicalPlan};
 use crate::physical_plan::{
     BroadcastExchange, BuildSide, ExchangeExec, FilterExec, FinalHashAggregateExec, HashJoinExec,
     LimitExec, ParquetScanExec, ParquetWriteExec, PartialHashAggregateExec, PartitioningSpec,
@@ -146,12 +146,6 @@ pub fn create_physical_plan(
             join_type,
             strategy_hint,
         } => {
-            if *join_type != JoinType::Inner {
-                return Err(FfqError::Unsupported(
-                    "only INNER join supported in v1".to_string(),
-                ));
-            }
-
             let l = create_physical_plan(left, cfg)?;
             let r = create_physical_plan(right, cfg)?;
 

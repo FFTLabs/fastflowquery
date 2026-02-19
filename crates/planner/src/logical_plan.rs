@@ -2,12 +2,16 @@ use arrow_schema::DataType;
 use serde::{Deserialize, Serialize};
 
 /// Join semantics supported by the logical planner.
-///
-/// v1 currently only supports [`JoinType::Inner`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinType {
     /// Keep only rows where join keys match on both sides.
     Inner,
+    /// Keep all rows from the left input, null-extending unmatched right rows.
+    Left,
+    /// Keep all rows from the right input, null-extending unmatched left rows.
+    Right,
+    /// Keep all rows from both inputs, null-extending non-matching rows.
+    Full,
 }
 
 /// Optimizer hint controlling join distribution strategy.
@@ -62,6 +66,16 @@ pub enum Expr {
     Or(Box<Expr>, Box<Expr>),
     /// Boolean negation.
     Not(Box<Expr>),
+    /// Searched CASE expression.
+    ///
+    /// SQL form:
+    /// `CASE WHEN <cond> THEN <value> [WHEN ...] [ELSE <value>] END`
+    CaseWhen {
+        /// Ordered `WHEN`/`THEN` branches.
+        branches: Vec<(Expr, Expr)>,
+        /// Optional `ELSE` branch; defaults to `NULL` when omitted.
+        else_expr: Option<Box<Expr>>,
+    },
 
     #[cfg(feature = "vector")]
     /// Cosine similarity between a vector expression and query vector literal.

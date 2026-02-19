@@ -123,6 +123,17 @@ fn fmt_expr(e: &Expr) -> String {
         Expr::Not(x) => format!("NOT ({})", fmt_expr(x)),
         Expr::And(a, b) => format!("({}) AND ({})", fmt_expr(a), fmt_expr(b)),
         Expr::Or(a, b) => format!("({}) OR ({})", fmt_expr(a), fmt_expr(b)),
+        Expr::CaseWhen { branches, else_expr } => {
+            let mut parts = vec!["CASE".to_string()];
+            for (cond, value) in branches {
+                parts.push(format!("WHEN {} THEN {}", fmt_expr(cond), fmt_expr(value)));
+            }
+            if let Some(e) = else_expr {
+                parts.push(format!("ELSE {}", fmt_expr(e)));
+            }
+            parts.push("END".to_string());
+            parts.join(" ")
+        }
         Expr::BinaryOp { left, op, right } => {
             format!("({}) {:?} ({})", fmt_expr(left), op, fmt_expr(right))
         }

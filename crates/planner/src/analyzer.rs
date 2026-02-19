@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::{FfqError, Result};
 
-use crate::logical_plan::{AggExpr, BinaryOp, Expr, JoinType, LiteralValue, LogicalPlan};
+use crate::logical_plan::{AggExpr, BinaryOp, Expr, LiteralValue, LogicalPlan};
 
 /// The analyzer needs schemas to resolve columns.
 /// The client (Engine) will provide this from its Catalog.
@@ -233,12 +233,6 @@ impl Analyzer {
                 join_type,
                 strategy_hint,
             } => {
-                if join_type != JoinType::Inner {
-                    return Err(FfqError::Unsupported(
-                        "only INNER join supported in v1".to_string(),
-                    ));
-                }
-
                 let (al, _ls, lres) = self.analyze_plan(*left, provider)?;
                 let (ar, _rs, rres) = self.analyze_plan(*right, provider)?;
 
@@ -484,6 +478,52 @@ impl Analyzer {
                     ));
                 }
                 Ok((Expr::Not(Box::new(ae)), DataType::Boolean))
+            }
+            Expr::CaseWhen {
+                branches,
+                else_expr,
+            } => {
+                if branches.is_empty() {
+                    return Err(FfqError::Planning(
+                        "CASE requires at least one WHEN/THEN branch".to_string(),
+                    ));
+                }
+                let mut analyzed_branches = Vec::with_capacity(branches.len());
+                let mut result_types = Vec::with_capacity(branches.len() + 1);
+                for (cond, result) in branches {
+                    let (acond, cdt) = self.analyze_expr(cond, resolver)?;
+                    if cdt != DataType::Boolean {
+                        return Err(FfqError::Planning(
+                            "CASE WHEN condition must be boolean".to_string(),
+                        ));
+                    }
+                    let (aresult, rdt) = self.analyze_expr(result, resolver)?;
+                    analyzed_branches.push((acond, aresult));
+                    result_types.push(rdt);
+                }
+
+                let (analyzed_else, else_dt) = if let Some(e) = else_expr {
+                    self.analyze_expr(*e, resolver)?
+                } else {
+                    (Expr::Literal(LiteralValue::Null), DataType::Null)
+                };
+                result_types.push(else_dt.clone());
+                let target_dt = coerce_case_result_type(&result_types)?;
+
+                let coerced_branches = analyzed_branches
+                    .into_iter()
+                    .zip(result_types.iter())
+                    .map(|((cond, result), rdt)| (cond, cast_if_needed(result, rdt, &target_dt)))
+                    .collect::<Vec<_>>();
+                let coerced_else = cast_if_needed(analyzed_else, &else_dt, &target_dt);
+
+                Ok((
+                    Expr::CaseWhen {
+                        branches: coerced_branches,
+                        else_expr: Some(Box::new(coerced_else)),
+                    },
+                    target_dt,
+                ))
             }
             Expr::BinaryOp { left, op, right } => {
                 let (al, ldt) = self.analyze_expr(*left, resolver)?;
@@ -992,6 +1032,33 @@ fn coerce_for_arith(
         cast_if_needed(right, &rdt, &target),
         target,
     ))
+}
+
+fn coerce_case_result_type(types: &[DataType]) -> Result<DataType> {
+    let mut target: Option<DataType> = None;
+    for dt in types {
+        if *dt == DataType::Null {
+            continue;
+        }
+        target = Some(match target {
+            None => dt.clone(),
+            Some(t) if t == *dt => t,
+            Some(t) if is_numeric(&t) && is_numeric(dt) => wider_numeric(&t, dt).ok_or_else(|| {
+                FfqError::Planning("failed to determine CASE numeric widening type".to_string())
+            })?,
+            Some(DataType::Utf8) if *dt == DataType::LargeUtf8 => DataType::LargeUtf8,
+            Some(DataType::LargeUtf8) if *dt == DataType::Utf8 => DataType::LargeUtf8,
+            Some(DataType::Utf8) if *dt == DataType::Utf8 => DataType::Utf8,
+            Some(DataType::LargeUtf8) if *dt == DataType::LargeUtf8 => DataType::LargeUtf8,
+            Some(DataType::Boolean) if *dt == DataType::Boolean => DataType::Boolean,
+            Some(t) => {
+                return Err(FfqError::Planning(format!(
+                    "CASE branch type mismatch: cannot unify {t:?} and {dt:?}"
+                )));
+            }
+        });
+    }
+    Ok(target.unwrap_or(DataType::Null))
 }
 
 fn types_compatible_for_equality(a: &DataType, b: &DataType) -> bool {
