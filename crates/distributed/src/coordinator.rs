@@ -430,6 +430,14 @@ impl Coordinator {
             }
             PhysicalPlan::ParquetWrite(x) => self.resolve_parquet_scan_schemas(&mut x.input),
             PhysicalPlan::Filter(x) => self.resolve_parquet_scan_schemas(&mut x.input),
+            PhysicalPlan::InSubqueryFilter(x) => {
+                self.resolve_parquet_scan_schemas(&mut x.input)?;
+                self.resolve_parquet_scan_schemas(&mut x.subquery)
+            }
+            PhysicalPlan::ExistsSubqueryFilter(x) => {
+                self.resolve_parquet_scan_schemas(&mut x.input)?;
+                self.resolve_parquet_scan_schemas(&mut x.subquery)
+            }
             PhysicalPlan::Project(x) => self.resolve_parquet_scan_schemas(&mut x.input),
             PhysicalPlan::CoalesceBatches(x) => self.resolve_parquet_scan_schemas(&mut x.input),
             PhysicalPlan::PartialHashAggregate(x) => {
@@ -894,6 +902,14 @@ fn collect_custom_ops(plan: &PhysicalPlan, out: &mut HashSet<String>) {
         PhysicalPlan::ParquetScan(_) | PhysicalPlan::VectorTopK(_) => {}
         PhysicalPlan::ParquetWrite(x) => collect_custom_ops(&x.input, out),
         PhysicalPlan::Filter(x) => collect_custom_ops(&x.input, out),
+        PhysicalPlan::InSubqueryFilter(x) => {
+            collect_custom_ops(&x.input, out);
+            collect_custom_ops(&x.subquery, out);
+        }
+        PhysicalPlan::ExistsSubqueryFilter(x) => {
+            collect_custom_ops(&x.input, out);
+            collect_custom_ops(&x.subquery, out);
+        }
         PhysicalPlan::Project(x) => collect_custom_ops(&x.input, out),
         PhysicalPlan::CoalesceBatches(x) => collect_custom_ops(&x.input, out),
         PhysicalPlan::PartialHashAggregate(x) => collect_custom_ops(&x.input, out),

@@ -191,6 +191,28 @@ pub enum LogicalPlan {
         /// Input plan.
         input: Box<LogicalPlan>,
     },
+    /// Uncorrelated `IN (SELECT ...)` filter.
+    ///
+    /// The subquery must project exactly one column.
+    InSubqueryFilter {
+        /// Left input.
+        input: Box<LogicalPlan>,
+        /// Left expression to check for membership.
+        expr: Expr,
+        /// Uncorrelated subquery plan.
+        subquery: Box<LogicalPlan>,
+        /// `true` for `NOT IN`.
+        negated: bool,
+    },
+    /// Uncorrelated `EXISTS (SELECT ...)` filter.
+    ExistsSubqueryFilter {
+        /// Left input.
+        input: Box<LogicalPlan>,
+        /// Uncorrelated subquery plan.
+        subquery: Box<LogicalPlan>,
+        /// `true` for `NOT EXISTS`.
+        negated: bool,
+    },
     /// Equi-join two inputs using `on` key pairs.
     Join {
         /// Left input.

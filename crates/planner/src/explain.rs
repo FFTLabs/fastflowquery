@@ -26,6 +26,32 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!("{pad}Filter {}\n", fmt_expr(predicate)));
             fmt_plan(input, indent + 1, out);
         }
+        LogicalPlan::InSubqueryFilter {
+            input,
+            expr,
+            subquery,
+            negated,
+        } => {
+            out.push_str(&format!(
+                "{pad}InSubqueryFilter negated={negated} expr={}\n",
+                fmt_expr(expr)
+            ));
+            out.push_str(&format!("{pad}  input:\n"));
+            fmt_plan(input, indent + 2, out);
+            out.push_str(&format!("{pad}  subquery:\n"));
+            fmt_plan(subquery, indent + 2, out);
+        }
+        LogicalPlan::ExistsSubqueryFilter {
+            input,
+            subquery,
+            negated,
+        } => {
+            out.push_str(&format!("{pad}ExistsSubqueryFilter negated={negated}\n"));
+            out.push_str(&format!("{pad}  input:\n"));
+            fmt_plan(input, indent + 2, out);
+            out.push_str(&format!("{pad}  subquery:\n"));
+            fmt_plan(subquery, indent + 2, out);
+        }
         LogicalPlan::Projection { exprs, input } => {
             out.push_str(&format!("{pad}Projection\n"));
             for (e, name) in exprs {

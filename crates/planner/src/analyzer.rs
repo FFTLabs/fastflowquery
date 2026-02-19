@@ -164,6 +164,65 @@ impl Analyzer {
                     resolver,
                 ))
             }
+            LogicalPlan::InSubqueryFilter {
+                input,
+                expr,
+                subquery,
+                negated,
+            } => {
+                let (ain, in_schema, in_resolver) = self.analyze_plan(*input, provider)?;
+                let (asub, sub_schema, _sub_resolver) = self.analyze_plan(*subquery, provider)?;
+                if sub_schema.fields().len() != 1 {
+                    return Err(FfqError::Planning(
+                        "IN subquery must return exactly one column".to_string(),
+                    ));
+                }
+                let sub_col_name = sub_schema.field(0).name().clone();
+                let sub_col_dt = sub_schema.field(0).data_type().clone();
+                let (aexpr, expr_dt) = self.analyze_expr(expr, &in_resolver)?;
+                let sub_expr = Expr::ColumnRef {
+                    name: sub_col_name.clone(),
+                    index: 0,
+                };
+                let (coerced_left, coerced_sub, target_dt) =
+                    coerce_for_compare(aexpr, expr_dt, sub_expr, sub_col_dt)?;
+                let coerced_subquery = LogicalPlan::Projection {
+                    exprs: vec![(coerced_sub, "__in_key".to_string())],
+                    input: Box::new(asub),
+                };
+                let out_schema = in_schema.clone();
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                let _ = target_dt;
+                Ok((
+                    LogicalPlan::InSubqueryFilter {
+                        input: Box::new(ain),
+                        expr: coerced_left,
+                        subquery: Box::new(coerced_subquery),
+                        negated,
+                    },
+                    out_schema,
+                    out_resolver,
+                ))
+            }
+            LogicalPlan::ExistsSubqueryFilter {
+                input,
+                subquery,
+                negated,
+            } => {
+                let (ain, in_schema, _in_resolver) = self.analyze_plan(*input, provider)?;
+                let (asub, _sub_schema, _sub_resolver) = self.analyze_plan(*subquery, provider)?;
+                let out_schema = in_schema.clone();
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                Ok((
+                    LogicalPlan::ExistsSubqueryFilter {
+                        input: Box::new(ain),
+                        subquery: Box::new(asub),
+                        negated,
+                    },
+                    out_schema,
+                    out_resolver,
+                ))
+            }
 
             LogicalPlan::Projection { exprs, input } => {
                 let (ain, _in_schema, in_resolver) = self.analyze_plan(*input, provider)?;

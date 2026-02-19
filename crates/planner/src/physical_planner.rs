@@ -3,8 +3,9 @@ use ffq_common::{FfqError, Result};
 use crate::logical_plan::{Expr, JoinStrategyHint, LogicalPlan};
 use crate::physical_plan::{
     BroadcastExchange, BuildSide, ExchangeExec, FilterExec, FinalHashAggregateExec, HashJoinExec,
-    LimitExec, ParquetScanExec, ParquetWriteExec, PartialHashAggregateExec, PartitioningSpec,
-    PhysicalPlan, ProjectExec, ShuffleReadExchange, ShuffleWriteExchange, TopKByScoreExec,
+    InSubqueryFilterExec, ExistsSubqueryFilterExec, LimitExec, ParquetScanExec, ParquetWriteExec,
+    PartialHashAggregateExec, PartitioningSpec, PhysicalPlan, ProjectExec, ShuffleReadExchange,
+    ShuffleWriteExchange, TopKByScoreExec,
 };
 
 #[derive(Debug, Clone)]
@@ -54,6 +55,34 @@ pub fn create_physical_plan(
             Ok(PhysicalPlan::Filter(FilterExec {
                 predicate: predicate.clone(),
                 input: Box::new(child),
+            }))
+        }
+        LogicalPlan::InSubqueryFilter {
+            input,
+            expr,
+            subquery,
+            negated,
+        } => {
+            let child = create_physical_plan(input, cfg)?;
+            let sub = create_physical_plan(subquery, cfg)?;
+            Ok(PhysicalPlan::InSubqueryFilter(InSubqueryFilterExec {
+                input: Box::new(child),
+                expr: expr.clone(),
+                subquery: Box::new(sub),
+                negated: *negated,
+            }))
+        }
+        LogicalPlan::ExistsSubqueryFilter {
+            input,
+            subquery,
+            negated,
+        } => {
+            let child = create_physical_plan(input, cfg)?;
+            let sub = create_physical_plan(subquery, cfg)?;
+            Ok(PhysicalPlan::ExistsSubqueryFilter(ExistsSubqueryFilterExec {
+                input: Box::new(child),
+                subquery: Box::new(sub),
+                negated: *negated,
             }))
         }
 

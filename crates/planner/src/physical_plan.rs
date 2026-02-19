@@ -15,6 +15,10 @@ pub enum PhysicalPlan {
     ParquetWrite(ParquetWriteExec),
     /// Row filter.
     Filter(FilterExec),
+    /// Uncorrelated IN-subquery filter.
+    InSubqueryFilter(InSubqueryFilterExec),
+    /// Uncorrelated EXISTS-subquery filter.
+    ExistsSubqueryFilter(ExistsSubqueryFilterExec),
     /// Projection.
     Project(ProjectExec),
     /// Batch coalescing.
@@ -51,6 +55,8 @@ impl PhysicalPlan {
             PhysicalPlan::ParquetScan(_) => vec![],
             PhysicalPlan::ParquetWrite(x) => vec![x.input.as_ref()],
             PhysicalPlan::Filter(x) => vec![x.input.as_ref()],
+            PhysicalPlan::InSubqueryFilter(x) => vec![x.input.as_ref(), x.subquery.as_ref()],
+            PhysicalPlan::ExistsSubqueryFilter(x) => vec![x.input.as_ref(), x.subquery.as_ref()],
             PhysicalPlan::Project(x) => vec![x.input.as_ref()],
             PhysicalPlan::CoalesceBatches(x) => vec![x.input.as_ref()],
             PhysicalPlan::PartialHashAggregate(x) => vec![x.input.as_ref()],
@@ -102,6 +108,30 @@ pub struct FilterExec {
     pub predicate: Expr,
     /// Input plan.
     pub input: Box<PhysicalPlan>,
+}
+
+/// Physical uncorrelated IN-subquery filter operator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InSubqueryFilterExec {
+    /// Input plan.
+    pub input: Box<PhysicalPlan>,
+    /// Left expression evaluated on input batches.
+    pub expr: Expr,
+    /// Uncorrelated subquery plan (must output one column).
+    pub subquery: Box<PhysicalPlan>,
+    /// `true` for NOT IN behavior.
+    pub negated: bool,
+}
+
+/// Physical uncorrelated EXISTS-subquery filter operator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExistsSubqueryFilterExec {
+    /// Input plan.
+    pub input: Box<PhysicalPlan>,
+    /// Uncorrelated subquery plan.
+    pub subquery: Box<PhysicalPlan>,
+    /// `true` for NOT EXISTS behavior.
+    pub negated: bool,
 }
 
 /// Projection operator.

@@ -10,7 +10,7 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
-use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::fmt::Debug;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
@@ -283,6 +283,56 @@ fn execute_plan(
                     in_bytes,
                 })
             }
+            PhysicalPlan::InSubqueryFilter(exec) => {
+                let child = execute_plan(
+                    *exec.input,
+                    ctx.clone(),
+                    catalog.clone(),
+                    Arc::clone(&physical_registry),
+                    Arc::clone(&trace),
+                )
+                .await?;
+                let sub = execute_plan(
+                    *exec.subquery,
+                    ctx,
+                    catalog,
+                    Arc::clone(&physical_registry),
+                    Arc::clone(&trace),
+                )
+                .await?;
+                let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                Ok(OpEval {
+                    out: run_in_subquery_filter(child, exec.expr, sub, exec.negated)?,
+                    in_rows,
+                    in_batches,
+                    in_bytes,
+                })
+            }
+            PhysicalPlan::ExistsSubqueryFilter(exec) => {
+                let child = execute_plan(
+                    *exec.input,
+                    ctx.clone(),
+                    catalog.clone(),
+                    Arc::clone(&physical_registry),
+                    Arc::clone(&trace),
+                )
+                .await?;
+                let sub = execute_plan(
+                    *exec.subquery,
+                    ctx,
+                    catalog,
+                    Arc::clone(&physical_registry),
+                    Arc::clone(&trace),
+                )
+                .await?;
+                let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                Ok(OpEval {
+                    out: run_exists_subquery_filter(child, sub, exec.negated),
+                    in_rows,
+                    in_batches,
+                    in_bytes,
+                })
+            }
             PhysicalPlan::Limit(limit) => {
                 let child = execute_plan(
                     *limit.input,
@@ -547,6 +597,8 @@ fn operator_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::ParquetScan(_) => "ParquetScan",
         PhysicalPlan::ParquetWrite(_) => "ParquetWrite",
         PhysicalPlan::Filter(_) => "Filter",
+        PhysicalPlan::InSubqueryFilter(_) => "InSubqueryFilter",
+        PhysicalPlan::ExistsSubqueryFilter(_) => "ExistsSubqueryFilter",
         PhysicalPlan::Project(_) => "Project",
         PhysicalPlan::CoalesceBatches(_) => "CoalesceBatches",
         PhysicalPlan::PartialHashAggregate(_) => "PartialHashAggregate",
@@ -1074,6 +1126,76 @@ fn rows_from_batches(input: &ExecOutput) -> Result<Vec<Vec<ScalarValue>>> {
                 values.push(scalar_from_array(batch.column(col), row)?);
             }
             out.push(values);
+        }
+    }
+    Ok(out)
+}
+
+fn run_exists_subquery_filter(input: ExecOutput, subquery: ExecOutput, negated: bool) -> ExecOutput {
+    let sub_rows = subquery.batches.iter().map(|b| b.num_rows()).sum::<usize>();
+    let exists = sub_rows > 0;
+    let keep = if negated { !exists } else { exists };
+    if keep {
+        input
+    } else {
+        ExecOutput {
+            schema: input.schema.clone(),
+            batches: vec![RecordBatch::new_empty(input.schema)],
+        }
+    }
+}
+
+fn run_in_subquery_filter(
+    input: ExecOutput,
+    expr: Expr,
+    subquery: ExecOutput,
+    negated: bool,
+) -> Result<ExecOutput> {
+    let sub_set = subquery_membership_set(&subquery)?;
+    let eval = compile_expr(&expr, &input.schema)?;
+    let mut out_batches = Vec::with_capacity(input.batches.len());
+    for batch in &input.batches {
+        let values = eval.evaluate(batch)?;
+        let mut mask_builder = BooleanBuilder::with_capacity(batch.num_rows());
+        for row in 0..batch.num_rows() {
+            let keep = if values.is_null(row) {
+                false
+            } else {
+                let value = scalar_from_array(&values, row)?;
+                let contains = value != ScalarValue::Null && sub_set.contains(&value);
+                if negated { !contains } else { contains }
+            };
+            mask_builder.append_value(keep);
+        }
+        let mask = mask_builder.finish();
+        let filtered = arrow::compute::filter_record_batch(batch, &mask)
+            .map_err(|e| FfqError::Execution(format!("in-subquery filter batch failed: {e}")))?;
+        out_batches.push(filtered);
+    }
+    Ok(ExecOutput {
+        schema: input.schema,
+        batches: out_batches,
+    })
+}
+
+fn subquery_membership_set(subquery: &ExecOutput) -> Result<HashSet<ScalarValue>> {
+    if subquery.schema.fields().len() != 1 {
+        return Err(FfqError::Planning(
+            "IN subquery must produce exactly one column".to_string(),
+        ));
+    }
+    let mut out = HashSet::new();
+    for batch in &subquery.batches {
+        if batch.num_columns() != 1 {
+            return Err(FfqError::Planning(
+                "IN subquery must produce exactly one column".to_string(),
+            ));
+        }
+        for row in 0..batch.num_rows() {
+            let value = scalar_from_array(batch.column(0), row)?;
+            if value != ScalarValue::Null {
+                out.insert(value);
+            }
         }
     }
     Ok(out)

@@ -392,6 +392,43 @@ fn proj_rewrite(
                 child_req,
             ))
         }
+        LogicalPlan::InSubqueryFilter {
+            input,
+            expr,
+            subquery,
+            negated,
+        } => {
+            let mut req = required.unwrap_or_default();
+            req.extend(expr_columns(&expr));
+            let (new_in, child_req) = proj_rewrite(*input, Some(req), ctx)?;
+            let (new_sub, _sub_req) = proj_rewrite(*subquery, None, ctx)?;
+            Ok((
+                LogicalPlan::InSubqueryFilter {
+                    input: Box::new(new_in),
+                    expr,
+                    subquery: Box::new(new_sub),
+                    negated,
+                },
+                child_req,
+            ))
+        }
+        LogicalPlan::ExistsSubqueryFilter {
+            input,
+            subquery,
+            negated,
+        } => {
+            let req = required.unwrap_or_default();
+            let (new_in, child_req) = proj_rewrite(*input, Some(req), ctx)?;
+            let (new_sub, _sub_req) = proj_rewrite(*subquery, None, ctx)?;
+            Ok((
+                LogicalPlan::ExistsSubqueryFilter {
+                    input: Box::new(new_in),
+                    subquery: Box::new(new_sub),
+                    negated,
+                },
+                child_req,
+            ))
+        }
 
         LogicalPlan::Projection { exprs, input } => {
             // Optional column pruning: if parent only needs subset of projection outputs,
@@ -786,6 +823,26 @@ fn vector_index_rewrite(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result
         LogicalPlan::Filter { predicate, input } => Ok(LogicalPlan::Filter {
             predicate,
             input: Box::new(vector_index_rewrite(*input, ctx)?),
+        }),
+        LogicalPlan::InSubqueryFilter {
+            input,
+            expr,
+            subquery,
+            negated,
+        } => Ok(LogicalPlan::InSubqueryFilter {
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+            expr,
+            subquery: Box::new(vector_index_rewrite(*subquery, ctx)?),
+            negated,
+        }),
+        LogicalPlan::ExistsSubqueryFilter {
+            input,
+            subquery,
+            negated,
+        } => Ok(LogicalPlan::ExistsSubqueryFilter {
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+            subquery: Box::new(vector_index_rewrite(*subquery, ctx)?),
+            negated,
         }),
         LogicalPlan::Projection { exprs, input } => {
             let rewritten_input = vector_index_rewrite(*input, ctx)?;
@@ -1206,6 +1263,26 @@ fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy
             predicate,
             input: Box::new(f(*input)),
         },
+        LogicalPlan::InSubqueryFilter {
+            input,
+            expr,
+            subquery,
+            negated,
+        } => LogicalPlan::InSubqueryFilter {
+            input: Box::new(f(*input)),
+            expr,
+            subquery: Box::new(f(*subquery)),
+            negated,
+        },
+        LogicalPlan::ExistsSubqueryFilter {
+            input,
+            subquery,
+            negated,
+        } => LogicalPlan::ExistsSubqueryFilter {
+            input: Box::new(f(*input)),
+            subquery: Box::new(f(*subquery)),
+            negated,
+        },
         LogicalPlan::Projection { exprs, input } => LogicalPlan::Projection {
             exprs,
             input: Box::new(f(*input)),
@@ -1274,6 +1351,26 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
         LogicalPlan::Filter { predicate, input } => LogicalPlan::Filter {
             predicate: rewrite_expr(predicate, rewrite),
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+        },
+        LogicalPlan::InSubqueryFilter {
+            input,
+            expr,
+            subquery,
+            negated,
+        } => LogicalPlan::InSubqueryFilter {
+            input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+            expr: rewrite_expr(expr, rewrite),
+            subquery: Box::new(rewrite_plan_exprs(*subquery, rewrite)),
+            negated,
+        },
+        LogicalPlan::ExistsSubqueryFilter {
+            input,
+            subquery,
+            negated,
+        } => LogicalPlan::ExistsSubqueryFilter {
+            input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+            subquery: Box::new(rewrite_plan_exprs(*subquery, rewrite)),
+            negated,
         },
         LogicalPlan::Projection { exprs, input } => LogicalPlan::Projection {
             exprs: exprs
@@ -1528,6 +1625,8 @@ fn plan_output_columns(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result
             Ok(set)
         }
         LogicalPlan::Filter { input, .. } => plan_output_columns(input, ctx),
+        LogicalPlan::InSubqueryFilter { input, .. } => plan_output_columns(input, ctx),
+        LogicalPlan::ExistsSubqueryFilter { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::Limit { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::TopKByScore { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::Projection { exprs, .. } => Ok(exprs.iter().map(|(_, n)| n.clone()).collect()),
@@ -1559,6 +1658,8 @@ fn estimate_bytes(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result<Opti
             Ok(None)
         }
         LogicalPlan::Filter { input, .. }
+        | LogicalPlan::InSubqueryFilter { input, .. }
+        | LogicalPlan::ExistsSubqueryFilter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Limit { input, .. }

@@ -503,6 +503,18 @@ fn collect_table_refs(plan: &LogicalPlan, out: &mut Vec<String>) {
         LogicalPlan::TableScan { table, .. } => out.push(table.clone()),
         LogicalPlan::Projection { input, .. } => collect_table_refs(input, out),
         LogicalPlan::Filter { input, .. } => collect_table_refs(input, out),
+        LogicalPlan::InSubqueryFilter {
+            input, subquery, ..
+        } => {
+            collect_table_refs(input, out);
+            collect_table_refs(subquery, out);
+        }
+        LogicalPlan::ExistsSubqueryFilter {
+            input, subquery, ..
+        } => {
+            collect_table_refs(input, out);
+            collect_table_refs(subquery, out);
+        }
         LogicalPlan::Join { left, right, .. } => {
             collect_table_refs(left, out);
             collect_table_refs(right, out);

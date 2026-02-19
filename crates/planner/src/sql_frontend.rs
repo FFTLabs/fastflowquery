@@ -72,6 +72,14 @@ fn insert_to_logical(
 }
 
 fn query_to_logical(q: &Query, params: &HashMap<String, LiteralValue>) -> Result<LogicalPlan> {
+    query_to_logical_with_ctes(q, params, &HashMap::new())
+}
+
+fn query_to_logical_with_ctes(
+    q: &Query,
+    params: &HashMap<String, LiteralValue>,
+    parent_ctes: &HashMap<String, LogicalPlan>,
+) -> Result<LogicalPlan> {
     // We only support plain SELECT in v1.
     let select = match &*q.body {
         SetExpr::Select(s) => s.as_ref(),
@@ -82,16 +90,21 @@ fn query_to_logical(q: &Query, params: &HashMap<String, LiteralValue>) -> Result
         }
     };
 
+    let mut cte_map = parent_ctes.clone();
+    if let Some(with) = &q.with {
+        for cte in &with.cte_tables {
+            let name = cte.alias.name.value.clone();
+            let cte_plan = query_to_logical_with_ctes(&cte.query, params, &cte_map)?;
+            cte_map.insert(name, cte_plan);
+        }
+    }
+
     // FROM + JOINs
-    let mut plan = from_to_plan(&select.from, params)?;
+    let mut plan = from_to_plan(&select.from, params, &cte_map)?;
 
     // WHERE
     if let Some(selection) = &select.selection {
-        let pred = sql_expr_to_expr(selection, params)?;
-        plan = LogicalPlan::Filter {
-            predicate: pred,
-            input: Box::new(plan),
-        };
+        plan = where_to_plan(plan, selection, params, &cte_map)?;
     }
 
     // GROUP BY
@@ -211,6 +224,7 @@ fn query_to_logical(q: &Query, params: &HashMap<String, LiteralValue>) -> Result
 fn from_to_plan(
     from: &[TableWithJoins],
     params: &HashMap<String, LiteralValue>,
+    ctes: &HashMap<String, LogicalPlan>,
 ) -> Result<LogicalPlan> {
     if from.len() != 1 {
         return Err(FfqError::Unsupported(
@@ -219,10 +233,10 @@ fn from_to_plan(
     }
     let twj = &from[0];
 
-    let mut left = table_factor_to_scan(&twj.relation)?;
+    let mut left = table_factor_to_scan(&twj.relation, ctes)?;
 
     for j in &twj.joins {
-        let right = table_factor_to_scan(&j.relation)?;
+        let right = table_factor_to_scan(&j.relation, ctes)?;
         let (constraint, join_type) = match &j.join_operator {
             JoinOperator::Inner(c) => (c, crate::logical_plan::JoinType::Inner),
             JoinOperator::LeftOuter(c) => (c, crate::logical_plan::JoinType::Left),
@@ -249,10 +263,13 @@ fn from_to_plan(
     Ok(left)
 }
 
-fn table_factor_to_scan(tf: &TableFactor) -> Result<LogicalPlan> {
+fn table_factor_to_scan(tf: &TableFactor, ctes: &HashMap<String, LogicalPlan>) -> Result<LogicalPlan> {
     match tf {
         TableFactor::Table { name, .. } => {
             let t = object_name_to_string(name);
+            if let Some(cte_plan) = ctes.get(&t) {
+                return Ok(cte_plan.clone());
+            }
             Ok(LogicalPlan::TableScan {
                 table: t,
                 projection: None,
@@ -262,6 +279,38 @@ fn table_factor_to_scan(tf: &TableFactor) -> Result<LogicalPlan> {
         _ => Err(FfqError::Unsupported(
             "only simple table names in FROM are supported in v1".to_string(),
         )),
+    }
+}
+
+fn where_to_plan(
+    input: LogicalPlan,
+    selection: &SqlExpr,
+    params: &HashMap<String, LiteralValue>,
+    ctes: &HashMap<String, LogicalPlan>,
+) -> Result<LogicalPlan> {
+    match selection {
+        SqlExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Ok(LogicalPlan::InSubqueryFilter {
+            input: Box::new(input),
+            expr: sql_expr_to_expr(expr, params)?,
+            subquery: Box::new(query_to_logical_with_ctes(subquery, params, ctes)?),
+            negated: *negated,
+        }),
+        SqlExpr::Exists { subquery, negated } => Ok(LogicalPlan::ExistsSubqueryFilter {
+            input: Box::new(input),
+            subquery: Box::new(query_to_logical_with_ctes(subquery, params, ctes)?),
+            negated: *negated,
+        }),
+        _ => {
+            let pred = sql_expr_to_expr(selection, params)?;
+            Ok(LogicalPlan::Filter {
+                predicate: pred,
+                input: Box::new(input),
+            })
+        }
     }
 }
 
@@ -741,6 +790,51 @@ mod tests {
                     other => panic!("expected CASE predicate, got {other:?}"),
                 },
                 other => panic!("expected Filter input, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_cte_query() {
+        let plan = sql_to_logical("WITH c AS (SELECT a FROM t) SELECT a FROM c", &HashMap::new())
+            .expect("parse");
+        match plan {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Projection {
+                    input: cte_input, ..
+                } => match cte_input.as_ref() {
+                    LogicalPlan::TableScan { table, .. } => assert_eq!(table, "t"),
+                    other => panic!("expected expanded CTE table scan, got {other:?}"),
+                },
+                other => panic!("expected cte projection, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_in_subquery_filter() {
+        let plan = sql_to_logical("SELECT a FROM t WHERE a IN (SELECT b FROM s)", &HashMap::new())
+            .expect("parse");
+        match plan {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::InSubqueryFilter { .. } => {}
+                other => panic!("expected InSubqueryFilter, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_exists_subquery_filter() {
+        let plan =
+            sql_to_logical("SELECT a FROM t WHERE EXISTS (SELECT b FROM s)", &HashMap::new())
+                .expect("parse");
+        match plan {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::ExistsSubqueryFilter { .. } => {}
+                other => panic!("expected ExistsSubqueryFilter, got {other:?}"),
             },
             other => panic!("expected Projection, got {other:?}"),
         }
