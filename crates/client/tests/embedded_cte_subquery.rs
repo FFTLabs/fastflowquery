@@ -103,6 +103,86 @@ fn uncorrelated_exists_subquery_runs() {
 }
 
 #[test]
+fn uncorrelated_exists_truth_table_non_empty_subquery() {
+    let (engine, t_path, s_path) = make_engine();
+
+    let exists_sql = "SELECT k FROM t WHERE EXISTS (SELECT k2 FROM s)";
+    let exists_batches =
+        futures::executor::block_on(engine.sql(exists_sql).expect("sql").collect()).expect("collect");
+    let mut exists_values = exists_batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    exists_values.sort_unstable();
+    assert_eq!(exists_values, vec![1, 2, 3]);
+
+    let not_exists_sql = "SELECT k FROM t WHERE NOT EXISTS (SELECT k2 FROM s)";
+    let not_exists_batches = futures::executor::block_on(
+        engine.sql(not_exists_sql).expect("sql").collect(),
+    )
+    .expect("collect");
+    let not_exists_values = not_exists_batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    assert!(not_exists_values.is_empty(), "unexpected rows: {not_exists_values:?}");
+
+    let _ = std::fs::remove_file(t_path);
+    let _ = std::fs::remove_file(s_path);
+}
+
+#[test]
+fn uncorrelated_exists_truth_table_empty_subquery() {
+    let (engine, t_path, s_path) = make_engine();
+    let sempty_path = support::unique_path("ffq_cte_sempty", "parquet");
+    let sempty_schema = Arc::new(Schema::new(vec![Field::new("k2", DataType::Int64, false)]));
+    support::write_parquet(
+        &sempty_path,
+        sempty_schema.clone(),
+        vec![Arc::new(Int64Array::from(Vec::<i64>::new()))],
+    );
+    engine.register_table(
+        "sempty_exists",
+        TableDef {
+            name: "ignored".to_string(),
+            uri: sempty_path.to_string_lossy().into_owned(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: Some((*sempty_schema).clone()),
+            stats: ffq_storage::TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+
+    let exists_empty_sql = "SELECT k FROM t WHERE EXISTS (SELECT k2 FROM sempty_exists)";
+    let exists_empty_batches = futures::executor::block_on(
+        engine.sql(exists_empty_sql).expect("sql").collect(),
+    )
+    .expect("collect");
+    let exists_empty_values = exists_empty_batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    assert!(exists_empty_values.is_empty(), "unexpected rows: {exists_empty_values:?}");
+
+    let not_exists_empty_sql = "SELECT k FROM t WHERE NOT EXISTS (SELECT k2 FROM sempty_exists)";
+    let not_exists_empty_batches = futures::executor::block_on(
+        engine.sql(not_exists_empty_sql).expect("sql").collect(),
+    )
+    .expect("collect");
+    let mut not_exists_empty_values = not_exists_empty_batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
+    not_exists_empty_values.sort_unstable();
+    assert_eq!(not_exists_empty_values, vec![1, 2, 3]);
+
+    let _ = std::fs::remove_file(t_path);
+    let _ = std::fs::remove_file(s_path);
+    let _ = std::fs::remove_file(sempty_path);
+}
+
+#[test]
 fn scalar_subquery_comparison_runs() {
     let (engine, t_path, s_path) = make_engine();
     let sql = "SELECT k FROM t WHERE k = (SELECT max(k2) FROM s)";

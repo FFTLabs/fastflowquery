@@ -889,7 +889,23 @@ mod tests {
                 .expect("parse");
         match plan {
             LogicalPlan::Projection { input, .. } => match input.as_ref() {
-                LogicalPlan::ExistsSubqueryFilter { .. } => {}
+                LogicalPlan::ExistsSubqueryFilter { negated, .. } => assert!(!negated),
+                other => panic!("expected ExistsSubqueryFilter, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_not_exists_subquery_filter() {
+        let plan = sql_to_logical(
+            "SELECT a FROM t WHERE NOT EXISTS (SELECT b FROM s)",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        match plan {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::ExistsSubqueryFilter { negated, .. } => assert!(*negated),
                 other => panic!("expected ExistsSubqueryFilter, got {other:?}"),
             },
             other => panic!("expected Projection, got {other:?}"),
