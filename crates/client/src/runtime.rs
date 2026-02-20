@@ -33,7 +33,7 @@ use ffq_common::{FfqError, Result};
 use ffq_execution::{SendableRecordBatchStream, StreamAdapter, TaskContext, compile_expr};
 use ffq_planner::{
     AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, JoinType, PhysicalPlan, WindowExpr,
-    WindowFunction,
+    WindowFunction, WindowOrderExpr,
 };
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
@@ -1355,12 +1355,12 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
     let order_keys = w
         .order_by
         .iter()
-        .map(|e| evaluate_expr_rows(input, e))
+        .map(|o| evaluate_expr_rows(input, &o.expr))
         .collect::<Result<Vec<_>>>()?;
     let mut order_idx: Vec<usize> = (0..row_count).collect();
     order_idx.sort_by(|a, b| {
         cmp_key_sets(&partition_keys, *a, *b)
-            .then_with(|| cmp_key_sets(&order_keys, *a, *b))
+            .then_with(|| cmp_order_key_sets(&order_keys, &w.order_by, *a, *b))
             .then_with(|| a.cmp(b))
     });
 
@@ -1398,7 +1398,7 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                 let mut part_i = 0usize;
                 while part_i < part.len() {
                     if part_i > 0
-                        && cmp_key_sets(&order_keys, part[part_i - 1], part[part_i])
+                        && cmp_order_key_sets(&order_keys, &w.order_by, part[part_i - 1], part[part_i])
                             != Ordering::Equal
                     {
                         rank = (part_i as i64) + 1;
@@ -1465,7 +1465,7 @@ fn evaluate_expr_rows(input: &ExecOutput, expr: &Expr) -> Result<Vec<ScalarValue
 
 fn cmp_key_sets(keys: &[Vec<ScalarValue>], a: usize, b: usize) -> Ordering {
     for col in keys {
-        let ord = cmp_scalar_for_window(&col[a], &col[b]);
+        let ord = cmp_scalar_for_window(&col[a], &col[b], false, true);
         if ord != Ordering::Equal {
             return ord;
         }
@@ -1473,12 +1473,52 @@ fn cmp_key_sets(keys: &[Vec<ScalarValue>], a: usize, b: usize) -> Ordering {
     Ordering::Equal
 }
 
-fn cmp_scalar_for_window(a: &ScalarValue, b: &ScalarValue) -> Ordering {
+fn cmp_order_key_sets(
+    keys: &[Vec<ScalarValue>],
+    order_exprs: &[WindowOrderExpr],
+    a: usize,
+    b: usize,
+) -> Ordering {
+    for (idx, col) in keys.iter().enumerate() {
+        let ord = cmp_scalar_for_window(
+            &col[a],
+            &col[b],
+            !order_exprs[idx].asc,
+            order_exprs[idx].nulls_first,
+        );
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+fn cmp_scalar_for_window(
+    a: &ScalarValue,
+    b: &ScalarValue,
+    descending: bool,
+    nulls_first: bool,
+) -> Ordering {
     use ScalarValue::*;
     match (a, b) {
-        (Null, Null) => Ordering::Equal,
-        (Null, _) => Ordering::Greater,
-        (_, Null) => Ordering::Less,
+        (Null, Null) => return Ordering::Equal,
+        (Null, _) => {
+            return if nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+        (_, Null) => {
+            return if nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+        _ => {}
+    }
+    let ord = match (a, b) {
         (Int64(x), Int64(y)) => x.cmp(y),
         (Float64Bits(x), Float64Bits(y)) => f64::from_bits(*x)
             .partial_cmp(&f64::from_bits(*y))
@@ -1492,6 +1532,11 @@ fn cmp_scalar_for_window(a: &ScalarValue, b: &ScalarValue) -> Ordering {
         (Utf8(x), Utf8(y)) => x.cmp(y),
         (Boolean(x), Boolean(y)) => x.cmp(y),
         _ => format!("{a:?}").cmp(&format!("{b:?}")),
+    };
+    if descending {
+        ord.reverse()
+    } else {
+        ord
     }
 }
 

@@ -535,7 +535,7 @@ fn proj_rewrite(
                     child_req.extend(expr_columns(p));
                 }
                 for o in &w.order_by {
-                    child_req.extend(expr_columns(o));
+                    child_req.extend(expr_columns(&o.expr));
                 }
                 if let crate::logical_plan::WindowFunction::Sum(arg) = &w.func {
                     child_req.extend(expr_columns(arg));
@@ -1739,7 +1739,10 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
                     w.order_by = w
                         .order_by
                         .into_iter()
-                        .map(|e| rewrite_expr(e, rewrite))
+                        .map(|mut o| {
+                            o.expr = rewrite_expr(o.expr, rewrite);
+                            o
+                        })
                         .collect();
                     w.func = match w.func {
                         crate::logical_plan::WindowFunction::Sum(arg) => {

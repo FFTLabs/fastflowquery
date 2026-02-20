@@ -6,7 +6,7 @@ use ffq_common::{FfqError, Result};
 
 use crate::logical_plan::{
     AggExpr, BinaryOp, Expr, LiteralValue, LogicalPlan, SubqueryCorrelation, WindowExpr,
-    WindowFunction,
+    WindowFunction, WindowOrderExpr,
 };
 
 const E_SUBQUERY_UNSUPPORTED_CORRELATION: &str = "E_SUBQUERY_UNSUPPORTED_CORRELATION";
@@ -891,7 +891,13 @@ impl Analyzer {
         let order_by = w
             .order_by
             .into_iter()
-            .map(|e| self.analyze_expr(e, resolver).map(|(ae, _)| ae))
+            .map(|o| {
+                self.analyze_expr(o.expr, resolver).map(|(ae, _)| WindowOrderExpr {
+                    expr: ae,
+                    asc: o.asc,
+                    nulls_first: o.nulls_first,
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         let func = match w.func {
             WindowFunction::RowNumber => WindowFunction::RowNumber,

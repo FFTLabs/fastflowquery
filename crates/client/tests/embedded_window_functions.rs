@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Float64Array, Int64Array, StringArray};
+use arrow::array::{Array, Float64Array, Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use ffq_client::Engine;
 use ffq_common::EngineConfig;
@@ -26,6 +26,38 @@ fn make_engine_with_window_fixture() -> (Engine, std::path::PathBuf) {
             Arc::new(Int64Array::from(vec![1_i64, 2, 3, 1, 2])),
             Arc::new(Int64Array::from(vec![10_i64, 10, 20, 7, 9])),
             Arc::new(Int64Array::from(vec![2_i64, 3, 5, 1, 4])),
+        ],
+    );
+    let engine = Engine::new(EngineConfig::default()).expect("engine");
+    engine.register_table(
+        "t",
+        TableDef {
+            name: "ignored".to_string(),
+            uri: path.to_string_lossy().into_owned(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: Some((*schema).clone()),
+            stats: ffq_storage::TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+    (engine, path)
+}
+
+fn make_engine_with_window_null_fixture() -> (Engine, std::path::PathBuf) {
+    let path = support::unique_path("ffq_window_mvp_nulls", "parquet");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("grp", DataType::Utf8, false),
+        Field::new("ord", DataType::Int64, true),
+        Field::new("score", DataType::Int64, false),
+    ]));
+    support::write_parquet(
+        &path,
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["A", "A", "A"])),
+            Arc::new(Int64Array::from(vec![Some(3_i64), None, Some(1_i64)])),
+            Arc::new(Int64Array::from(vec![10_i64, 20, 30])),
         ],
     );
     let engine = Engine::new(EngineConfig::default()).expect("engine");
@@ -179,5 +211,37 @@ fn cumulative_sum_over_partition_order_is_correct() {
             ("B".to_string(), 2, 5.0),
         ]
     );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn named_window_desc_nulls_first_executes_correctly() {
+    let (engine, path) = make_engine_with_window_null_fixture();
+    let sql = "SELECT ord, ROW_NUMBER() OVER w AS rn FROM t WINDOW w AS (PARTITION BY grp ORDER BY ord DESC NULLS FIRST)";
+    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let ord = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("ord");
+        let rn = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("rn");
+        for row in 0..batch.num_rows() {
+            let ord_v = if ord.is_null(row) {
+                None
+            } else {
+                Some(ord.value(row))
+            };
+            rows.push((ord_v, rn.value(row)));
+        }
+    }
+    rows.sort_unstable_by_key(|(_, rn)| *rn);
+    assert_eq!(rows, vec![(None, 1), (Some(3), 2), (Some(1), 3)]);
     let _ = std::fs::remove_file(path);
 }

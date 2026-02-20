@@ -10,7 +10,7 @@ use sqlparser::ast::{
 
 use crate::logical_plan::{
     AggExpr, BinaryOp, Expr, JoinStrategyHint, LiteralValue, LogicalPlan, SubqueryCorrelation,
-    WindowExpr, WindowFunction,
+    WindowExpr, WindowFunction, WindowOrderExpr,
 };
 
 const E_RECURSIVE_CTE_OVERFLOW: &str = "E_RECURSIVE_CTE_OVERFLOW";
@@ -210,10 +210,13 @@ fn query_to_logical_with_ctes(
     // Parse SELECT list.
     // If we see aggregate functions or GROUP BY exists, we build Aggregate + Projection.
     let mut saw_agg = false;
+    let named_windows = parse_named_windows(select, params)?;
     for item in &select.projection {
         match item {
             SelectItem::UnnamedExpr(e) => {
-                if let Some((wexpr, out_name)) = try_parse_window_expr(e, params, None)? {
+                if let Some((wexpr, out_name)) =
+                    try_parse_window_expr(e, params, &named_windows, None)?
+                {
                     window_exprs.push(wexpr);
                     proj_exprs.push((Expr::Column(out_name.clone()), out_name));
                     continue;
@@ -231,7 +234,7 @@ fn query_to_logical_with_ctes(
             SelectItem::ExprWithAlias { expr, alias } => {
                 let alias_name = alias.value.clone();
                 if let Some((wexpr, out_name)) =
-                    try_parse_window_expr(expr, params, Some(alias_name.clone()))?
+                    try_parse_window_expr(expr, params, &named_windows, Some(alias_name.clone()))?
                 {
                     window_exprs.push(wexpr);
                     proj_exprs.push((Expr::Column(out_name.clone()), out_name));
@@ -1008,6 +1011,7 @@ fn try_parse_agg(
 fn try_parse_window_expr(
     e: &SqlExpr,
     params: &HashMap<String, LiteralValue>,
+    named_windows: &HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>)>,
     explicit_alias: Option<String>,
 ) -> Result<Option<(WindowExpr, String)>> {
     let SqlExpr::Function(func) = e else {
@@ -1025,12 +1029,15 @@ fn try_parse_window_expr(
     });
 
     let (partition_by, order_by) = match over {
-        sqlparser::ast::WindowType::WindowSpec(spec) => parse_window_spec(spec, params)?,
-        _ => {
-            return Err(FfqError::Unsupported(
-                "named window references are not supported in v1".to_string(),
-            ))
+        sqlparser::ast::WindowType::WindowSpec(spec) => {
+            parse_window_spec(spec, params, named_windows)?
         }
+        sqlparser::ast::WindowType::NamedWindow(name) => named_windows
+            .get(&name.value)
+            .cloned()
+            .ok_or_else(|| {
+                FfqError::Planning(format!("unknown named window in OVER clause: '{}'", name))
+            })?,
     };
 
     let func_kind = match fname.as_str() {
@@ -1074,35 +1081,178 @@ fn try_parse_window_expr(
     )))
 }
 
+fn parse_named_windows(
+    select: &sqlparser::ast::Select,
+    params: &HashMap<String, LiteralValue>,
+) -> Result<HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>)>> {
+    let mut defs = HashMap::new();
+    for def in &select.named_window {
+        let name = def.0.value.clone();
+        if defs
+            .insert(name.clone(), def.1.clone())
+            .is_some()
+        {
+            return Err(FfqError::Planning(format!(
+                "duplicate named window definition: '{name}'"
+            )));
+        }
+    }
+
+    let mut resolved = HashMap::new();
+    let mut resolving = std::collections::HashSet::new();
+    let names = defs.keys().cloned().collect::<Vec<_>>();
+    for name in names {
+        resolve_named_window_spec(&name, &defs, params, &mut resolving, &mut resolved)?;
+    }
+    Ok(resolved)
+}
+
+fn resolve_named_window_spec(
+    name: &str,
+    defs: &HashMap<String, sqlparser::ast::NamedWindowExpr>,
+    params: &HashMap<String, LiteralValue>,
+    resolving: &mut std::collections::HashSet<String>,
+    resolved: &mut HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>)>,
+) -> Result<(Vec<Expr>, Vec<WindowOrderExpr>)> {
+    if let Some(v) = resolved.get(name) {
+        return Ok(v.clone());
+    }
+    if !resolving.insert(name.to_string()) {
+        return Err(FfqError::Planning(format!(
+            "named window reference cycle detected at '{name}'"
+        )));
+    }
+    let named_expr = defs.get(name).ok_or_else(|| {
+        FfqError::Planning(format!("unknown named window reference: '{name}'"))
+    })?;
+    let resolved_spec = match named_expr {
+        sqlparser::ast::NamedWindowExpr::NamedWindow(parent) => {
+            resolve_named_window_spec(&parent.value, defs, params, resolving, resolved)?
+        }
+        sqlparser::ast::NamedWindowExpr::WindowSpec(spec) => {
+            parse_window_spec_with_refs(spec, params, defs, resolving, resolved)?
+        }
+    };
+    resolving.remove(name);
+    resolved.insert(name.to_string(), resolved_spec.clone());
+    Ok(resolved_spec)
+}
+
 fn parse_window_spec(
     spec: &sqlparser::ast::WindowSpec,
     params: &HashMap<String, LiteralValue>,
-) -> Result<(Vec<Expr>, Vec<Expr>)> {
+    named_windows: &HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>)>,
+) -> Result<(Vec<Expr>, Vec<WindowOrderExpr>)> {
     if spec.window_frame.is_some() {
         return Err(FfqError::Unsupported(
             "window frames are not supported in v1 window MVP".to_string(),
         ));
     }
-    let partition_by = spec
+    let base = if let Some(base_name) = &spec.window_name {
+        named_windows
+            .get(&base_name.value)
+            .cloned()
+            .ok_or_else(|| {
+                FfqError::Planning(format!(
+                    "unknown named window referenced in OVER spec: '{}'",
+                    base_name
+                ))
+            })?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let local_partition_by = spec
         .partition_by
         .iter()
         .map(|e| sql_expr_to_expr(e, params))
         .collect::<Result<Vec<_>>>()?;
-    let mut order_by = Vec::with_capacity(spec.order_by.len());
-    for ob in &spec.order_by {
-        if ob.asc == Some(false) {
-            return Err(FfqError::Unsupported(
-                "window ORDER BY DESC is not supported in v1 window MVP".to_string(),
-            ));
-        }
-        if ob.nulls_first.is_some() {
-            return Err(FfqError::Unsupported(
-                "window ORDER BY NULLS FIRST/LAST is not supported in v1 window MVP".to_string(),
-            ));
-        }
-        order_by.push(sql_expr_to_expr(&ob.expr, params)?);
+    let local_order_by = parse_window_order_by(&spec.order_by, params)?;
+    if !local_partition_by.is_empty() && !base.0.is_empty() {
+        return Err(FfqError::Planning(
+            "window spec cannot override PARTITION BY of referenced named window".to_string(),
+        ));
     }
-    Ok((partition_by, order_by))
+    if !local_order_by.is_empty() && !base.1.is_empty() {
+        return Err(FfqError::Planning(
+            "window spec cannot override ORDER BY of referenced named window".to_string(),
+        ));
+    }
+    Ok((
+        if local_partition_by.is_empty() {
+            base.0
+        } else {
+            local_partition_by
+        },
+        if local_order_by.is_empty() {
+            base.1
+        } else {
+            local_order_by
+        },
+    ))
+}
+
+fn parse_window_spec_with_refs(
+    spec: &sqlparser::ast::WindowSpec,
+    params: &HashMap<String, LiteralValue>,
+    defs: &HashMap<String, sqlparser::ast::NamedWindowExpr>,
+    resolving: &mut std::collections::HashSet<String>,
+    resolved: &mut HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>)>,
+) -> Result<(Vec<Expr>, Vec<WindowOrderExpr>)> {
+    if spec.window_frame.is_some() {
+        return Err(FfqError::Unsupported(
+            "window frames are not supported in v1 window MVP".to_string(),
+        ));
+    }
+    let base = if let Some(base_name) = &spec.window_name {
+        resolve_named_window_spec(&base_name.value, defs, params, resolving, resolved)?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let local_partition_by = spec
+        .partition_by
+        .iter()
+        .map(|e| sql_expr_to_expr(e, params))
+        .collect::<Result<Vec<_>>>()?;
+    let local_order_by = parse_window_order_by(&spec.order_by, params)?;
+    if !local_partition_by.is_empty() && !base.0.is_empty() {
+        return Err(FfqError::Planning(
+            "named window cannot override PARTITION BY of referenced named window".to_string(),
+        ));
+    }
+    if !local_order_by.is_empty() && !base.1.is_empty() {
+        return Err(FfqError::Planning(
+            "named window cannot override ORDER BY of referenced named window".to_string(),
+        ));
+    }
+    Ok((
+        if local_partition_by.is_empty() {
+            base.0
+        } else {
+            local_partition_by
+        },
+        if local_order_by.is_empty() {
+            base.1
+        } else {
+            local_order_by
+        },
+    ))
+}
+
+fn parse_window_order_by(
+    order_by: &[sqlparser::ast::OrderByExpr],
+    params: &HashMap<String, LiteralValue>,
+) -> Result<Vec<WindowOrderExpr>> {
+    let mut out = Vec::with_capacity(order_by.len());
+    for ob in order_by {
+        let asc = ob.asc.unwrap_or(true);
+        let nulls_first = ob.nulls_first.unwrap_or(!asc);
+        out.push(WindowOrderExpr {
+            expr: sql_expr_to_expr(&ob.expr, params)?,
+            asc,
+            nulls_first,
+        });
+    }
+    Ok(out)
 }
 
 fn required_arg<'a>(a: Option<&'a FunctionArg>, name: &str) -> Result<&'a FunctionArg> {
@@ -1787,5 +1937,72 @@ mod tests {
             },
             other => panic!("expected Projection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_window_order_desc_nulls_last() {
+        let plan = sql_to_logical(
+            "SELECT ROW_NUMBER() OVER (PARTITION BY a ORDER BY b DESC NULLS LAST) AS rn FROM t",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        match plan {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Window { exprs, .. } => {
+                    assert_eq!(exprs.len(), 1);
+                    assert_eq!(exprs[0].order_by.len(), 1);
+                    assert!(!exprs[0].order_by[0].asc);
+                    assert!(!exprs[0].order_by[0].nulls_first);
+                }
+                other => panic!("expected Window, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_named_window_reference_over_name() {
+        let plan = sql_to_logical(
+            "SELECT ROW_NUMBER() OVER w AS rn FROM t WINDOW w AS (PARTITION BY a ORDER BY b DESC NULLS FIRST)",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        match plan {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Window { exprs, .. } => {
+                    assert_eq!(exprs.len(), 1);
+                    assert_eq!(exprs[0].partition_by.len(), 1);
+                    assert_eq!(exprs[0].order_by.len(), 1);
+                    assert!(!exprs[0].order_by[0].asc);
+                    assert!(exprs[0].order_by[0].nulls_first);
+                }
+                other => panic!("expected Window, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_named_window_reference() {
+        let err = sql_to_logical("SELECT ROW_NUMBER() OVER w FROM t", &HashMap::new())
+            .expect_err("unknown window should fail");
+        assert!(
+            err.to_string().contains("unknown named window in OVER clause"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_window_spec_overriding_named_window_order_by() {
+        let err = sql_to_logical(
+            "SELECT ROW_NUMBER() OVER (w ORDER BY c) FROM t WINDOW w AS (ORDER BY b)",
+            &HashMap::new(),
+        )
+        .expect_err("override should fail");
+        assert!(
+            err.to_string()
+                .contains("cannot override ORDER BY"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -99,7 +99,14 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 let ord = w
                     .order_by
                     .iter()
-                    .map(fmt_expr)
+                    .map(|o| {
+                        format!(
+                            "{} {} NULLS {}",
+                            fmt_expr(&o.expr),
+                            if o.asc { "ASC" } else { "DESC" },
+                            if o.nulls_first { "FIRST" } else { "LAST" }
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 out.push_str(&format!(

@@ -176,6 +176,17 @@ pub enum WindowFunction {
     Sum(Expr),
 }
 
+/// One ORDER BY element inside a window specification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowOrderExpr {
+    /// Sort key expression.
+    pub expr: Expr,
+    /// `true` for ascending order, `false` for descending.
+    pub asc: bool,
+    /// `true` when nulls are ordered first, `false` when nulls are ordered last.
+    pub nulls_first: bool,
+}
+
 /// One window expression with partition/order specification and output name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowExpr {
@@ -184,7 +195,7 @@ pub struct WindowExpr {
     /// Partition key expressions.
     pub partition_by: Vec<Expr>,
     /// Order key expressions.
-    pub order_by: Vec<Expr>,
+    pub order_by: Vec<WindowOrderExpr>,
     /// Output column name.
     pub output_name: String,
 }
