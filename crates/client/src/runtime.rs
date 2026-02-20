@@ -273,7 +273,7 @@ fn execute_plan_with_cache(
             PhysicalPlan::Window(window) => {
                 let child = execute_plan_with_cache(
                     *window.input,
-                    ctx,
+                    ctx.clone(),
                     catalog,
                     Arc::clone(&physical_registry),
                     Arc::clone(&trace),
@@ -281,7 +281,8 @@ fn execute_plan_with_cache(
                 )
                 .await?;
                 let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
-                let out = run_window_exec(child, &window.exprs)?;
+                let out =
+                    run_window_exec_with_ctx(child, &window.exprs, &ctx, Some(trace.as_ref()))?;
                 Ok(OpEval {
                     out,
                     in_rows,
@@ -1313,9 +1314,23 @@ fn rows_from_batches(input: &ExecOutput) -> Result<Vec<Vec<ScalarValue>>> {
     Ok(out)
 }
 
+#[cfg(test)]
 fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput> {
-    let mut rows = rows_from_batches(&input)?;
-    let row_count = rows.len();
+    let default_ctx = QueryContext {
+        batch_size_rows: 8192,
+        mem_budget_bytes: usize::MAX,
+        spill_dir: "./ffq_spill".to_string(),
+    };
+    run_window_exec_with_ctx(input, exprs, &default_ctx, None)
+}
+
+fn run_window_exec_with_ctx(
+    input: ExecOutput,
+    exprs: &[WindowExpr],
+    ctx: &QueryContext,
+    trace: Option<&TraceIds>,
+) -> Result<ExecOutput> {
+    let row_count = input.batches.iter().map(|b| b.num_rows()).sum::<usize>();
     let mut eval_ctx_cache: HashMap<String, WindowEvalContext> = HashMap::new();
     let mut out_fields: Vec<Field> = input
         .schema
@@ -1323,17 +1338,32 @@ fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput
         .iter()
         .map(|f| f.as_ref().clone())
         .collect();
-    for w in exprs {
+    let mut out_columns: Vec<ArrayRef> = if input.batches.is_empty() {
+        RecordBatch::new_empty(input.schema.clone()).columns().to_vec()
+    } else if input.batches.len() == 1 {
+        input.batches[0].columns().to_vec()
+    } else {
+        concat_batches(&input.schema, &input.batches)
+            .map_err(|e| FfqError::Execution(format!("window concat batches failed: {e}")))?
+            .columns()
+            .to_vec()
+    };
+    for (window_idx, w) in exprs.iter().enumerate() {
         let cache_key = window_compatibility_key(w);
         if !eval_ctx_cache.contains_key(&cache_key) {
             eval_ctx_cache.insert(cache_key.clone(), build_window_eval_context(&input, w)?);
         }
-        let output = evaluate_window_expr_with_ctx(
+        let dt = window_output_type(&input.schema, w)?;
+        let output = evaluate_window_expr_spill_aware(
             &input,
             w,
             eval_ctx_cache
                 .get(&cache_key)
                 .expect("window eval ctx must exist"),
+            &dt,
+            ctx,
+            trace,
+            window_idx,
         )?;
         if output.len() != row_count {
             return Err(FfqError::Execution(format!(
@@ -1341,18 +1371,60 @@ fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput
                 output.len()
             )));
         }
-        let dt = window_output_type(&input.schema, w)?;
         out_fields.push(Field::new(&w.output_name, dt, window_output_nullable(w)));
-        for (idx, value) in output.into_iter().enumerate() {
-            rows[idx].push(value);
-        }
+        out_columns.push(scalars_to_array(&output, out_fields.last().expect("field").data_type()).map_err(
+            |e| {
+                FfqError::Execution(format!(
+                    "window output column '{}' build failed: {e}",
+                    w.output_name
+                ))
+            },
+        )?);
     }
     let out_schema = Arc::new(Schema::new(out_fields));
-    let batch = rows_to_batch(&out_schema, &rows)?;
+    let batch = RecordBatch::try_new(out_schema.clone(), out_columns)
+        .map_err(|e| FfqError::Execution(format!("window output batch failed: {e}")))?;
     Ok(ExecOutput {
         schema: out_schema,
         batches: vec![batch],
     })
+}
+
+fn evaluate_window_expr_spill_aware(
+    input: &ExecOutput,
+    w: &WindowExpr,
+    eval_ctx: &WindowEvalContext,
+    output_type: &DataType,
+    ctx: &QueryContext,
+    trace: Option<&TraceIds>,
+    window_idx: usize,
+) -> Result<Vec<ScalarValue>> {
+    let row_count = input.batches.iter().map(|b| b.num_rows()).sum::<usize>();
+    let estimated = estimate_window_eval_context_bytes(eval_ctx)
+        + estimate_window_output_bytes(row_count, output_type);
+    if ctx.mem_budget_bytes == 0 || estimated <= ctx.mem_budget_bytes {
+        return evaluate_window_expr_with_ctx(input, w, eval_ctx);
+    }
+
+    let spill_started = Instant::now();
+    fs::create_dir_all(&ctx.spill_dir)?;
+    let spill_path = window_spill_path(&ctx.spill_dir, trace, window_idx, &w.output_name);
+    let output = evaluate_window_expr_with_ctx(input, w, eval_ctx)?;
+    write_window_spill_file(&spill_path, &output)?;
+    let spill_bytes = fs::metadata(&spill_path).map(|m| m.len()).unwrap_or(0);
+    if let Some(t) = trace {
+        global_metrics().record_spill(
+            &t.query_id,
+            t.stage_id,
+            t.task_id,
+            "window",
+            spill_bytes,
+            spill_started.elapsed().as_secs_f64(),
+        );
+    }
+    let restored = read_window_spill_file(&spill_path)?;
+    let _ = fs::remove_file(&spill_path);
+    Ok(restored)
 }
 
 #[derive(Debug, Clone)]
@@ -1376,6 +1448,92 @@ fn window_compatibility_key(w: &WindowExpr) -> String {
         .collect::<Vec<_>>()
         .join("|");
     format!("P[{partition_sig}]O[{order_sig}]")
+}
+
+fn estimate_window_eval_context_bytes(eval_ctx: &WindowEvalContext) -> usize {
+    let order_keys = eval_ctx
+        .order_keys
+        .iter()
+        .map(|col| col.iter().map(scalar_estimate_bytes).sum::<usize>())
+        .sum::<usize>();
+    let order_idx = eval_ctx.order_idx.len() * std::mem::size_of::<usize>();
+    let partitions = eval_ctx.partitions.len() * (std::mem::size_of::<usize>() * 2);
+    order_keys + order_idx + partitions
+}
+
+fn estimate_window_output_bytes(row_count: usize, dt: &DataType) -> usize {
+    let per_row = match dt {
+        DataType::Int64 | DataType::Float64 => 8,
+        DataType::Boolean => 1,
+        DataType::Utf8 => 24,
+        DataType::FixedSizeList(_, len) => (*len as usize) * 4,
+        _ => 16,
+    };
+    row_count.saturating_mul(per_row)
+}
+
+fn sanitize_spill_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() { "_".to_string() } else { out }
+}
+
+fn window_spill_path(
+    spill_dir: &str,
+    trace: Option<&TraceIds>,
+    window_idx: usize,
+    output_name: &str,
+) -> PathBuf {
+    let (query_id, stage_id, task_id) = match trace {
+        Some(t) => (t.query_id.as_str(), t.stage_id, t.task_id),
+        None => ("local", 0, 0),
+    };
+    PathBuf::from(spill_dir).join(format!(
+        "window_spill_q{}_s{}_t{}_w{:04}_{}.jsonl",
+        sanitize_spill_component(query_id),
+        stage_id,
+        task_id,
+        window_idx,
+        sanitize_spill_component(output_name),
+    ))
+}
+
+fn write_window_spill_file(path: &PathBuf, values: &[ScalarValue]) -> Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    for value in values {
+        let line = serde_json::to_string(value)
+            .map_err(|e| FfqError::Execution(format!("window spill serialize failed: {e}")))?;
+        writer
+            .write_all(line.as_bytes())
+            .map_err(|e| FfqError::Execution(format!("window spill write failed: {e}")))?;
+        writer
+            .write_all(b"\n")
+            .map_err(|e| FfqError::Execution(format!("window spill write failed: {e}")))?;
+    }
+    writer
+        .flush()
+        .map_err(|e| FfqError::Execution(format!("window spill flush failed: {e}")))?;
+    Ok(())
+}
+
+fn read_window_spill_file(path: &PathBuf) -> Result<Vec<ScalarValue>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut out = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|e| FfqError::Execution(format!("window spill read failed: {e}")))?;
+        let value = serde_json::from_str::<ScalarValue>(&line)
+            .map_err(|e| FfqError::Execution(format!("window spill deserialize failed: {e}")))?;
+        out.push(value);
+    }
+    Ok(out)
 }
 
 fn build_window_eval_context(input: &ExecOutput, w: &WindowExpr) -> Result<WindowEvalContext> {
@@ -3938,7 +4096,7 @@ fn decode_record_batches_ipc(payload: &[u8]) -> Result<(SchemaRef, Vec<RecordBat
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::fs::File;
+    use std::fs::{self, File};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3966,8 +4124,8 @@ mod tests {
     #[cfg(feature = "vector")]
     use super::run_topk_by_score;
     use super::{
-        EmbeddedRuntime, ExecOutput, QueryContext, Runtime, rows_to_vector_topk_output,
-        run_vector_topk_with_provider, run_window_exec,
+        EmbeddedRuntime, ExecOutput, QueryContext, Runtime, TraceIds, rows_to_vector_topk_output,
+        run_vector_topk_with_provider, run_window_exec, run_window_exec_with_ctx,
     };
     use crate::physical_registry::PhysicalOperatorRegistry;
 
@@ -4210,6 +4368,84 @@ mod tests {
             .expect("i64");
         let vals = (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>();
         assert_eq!(vals, vec![1, 1, 3]);
+    }
+
+    #[test]
+    fn window_exec_spills_under_tight_memory_budget_and_cleans_temp_files() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ord", DataType::Int64, false),
+            Field::new("score", DataType::Int64, false),
+        ]));
+        let n = 2048_i64;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(1_i64..=n)),
+                Arc::new(Int64Array::from_iter_values((1_i64..=n).map(|v| (v % 17) + 1))),
+            ],
+        )
+        .expect("batch");
+        let input = ExecOutput {
+            schema: schema.clone(),
+            batches: vec![batch],
+        };
+        let w = WindowExpr {
+            func: WindowFunction::Sum(Expr::ColumnRef {
+                name: "score".to_string(),
+                index: 1,
+            }),
+            partition_by: vec![],
+            order_by: vec![WindowOrderExpr {
+                expr: Expr::ColumnRef {
+                    name: "ord".to_string(),
+                    index: 0,
+                },
+                asc: true,
+                nulls_first: false,
+            }],
+            frame: Some(WindowFrameSpec {
+                units: WindowFrameUnits::Rows,
+                start_bound: WindowFrameBound::UnboundedPreceding,
+                end_bound: WindowFrameBound::CurrentRow,
+                exclusion: WindowFrameExclusion::NoOthers,
+            }),
+            output_name: "running_sum".to_string(),
+        };
+        let spill_dir = std::env::temp_dir().join(format!(
+            "ffq_window_spill_test_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let ctx = QueryContext {
+            batch_size_rows: 512,
+            mem_budget_bytes: 256,
+            spill_dir: spill_dir.to_string_lossy().into_owned(),
+        };
+        let trace = TraceIds {
+            query_id: "window-spill-test".to_string(),
+            stage_id: 7,
+            task_id: 9,
+        };
+        let out =
+            run_window_exec_with_ctx(input, &[w], &ctx, Some(&trace)).expect("window with spill");
+        let arr = out.batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("running sum");
+        assert_eq!(arr.len(), n as usize);
+        assert!(arr.value(arr.len() - 1) > 0.0);
+
+        let leftover = fs::read_dir(&ctx.spill_dir)
+            .ok()
+            .into_iter()
+            .flat_map(|it| it.filter_map(|e| e.ok()))
+            .filter(|e| e.file_name().to_string_lossy().contains("window_spill_q"))
+            .count();
+        assert_eq!(leftover, 0, "window spill files must be cleaned up");
+        let _ = fs::remove_dir_all(&ctx.spill_dir);
     }
 
     #[test]
