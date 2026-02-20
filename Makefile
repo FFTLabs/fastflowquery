@@ -30,6 +30,7 @@ SHELL := /bin/bash
 	bench-v2-adaptive-shuffle-distributed \
 	bench-v2-adaptive-shuffle-compare \
 	bench-v2-join-radix \
+	bench-v2-join-bloom \
 	bench-13.4-official-embedded \
 	bench-13.4-official-distributed \
 	bench-13.4-official \
@@ -150,6 +151,9 @@ bench-v2-adaptive-shuffle-compare:
 
 bench-v2-join-radix:
 	cargo run -p ffq-client --example bench_join_radix
+
+bench-v2-join-bloom:
+	cargo run -p ffq-client --example bench_join_bloom
 
 bench-13.4-official-embedded:
 	FFQ_BENCH_MODE=embedded FFQ_BENCH_TPCH_SUBDIR="$${FFQ_BENCH_TPCH_SUBDIR:-tpch_dbgen_sf1_parquet}" ./scripts/run-bench-13.4-tpch-official.sh

@@ -64,6 +64,22 @@ fn apply_config_map(
                     FfqError::InvalidConfig(format!("invalid join_radix_bits '{value}': {e}"))
                 })?
             }
+            "join_bloom_enabled" => {
+                config.join_bloom_enabled = match value.to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" | "on" => true,
+                    "false" | "0" | "no" | "off" => false,
+                    other => {
+                        return Err(FfqError::InvalidConfig(format!(
+                            "invalid join_bloom_enabled '{other}'"
+                        )));
+                    }
+                };
+            }
+            "join_bloom_bits" => {
+                config.join_bloom_bits = value.parse().map_err(|e| {
+                    FfqError::InvalidConfig(format!("invalid join_bloom_bits '{value}': {e}"))
+                })?
+            }
             "spill_dir" => config.spill_dir = value.clone(),
             "catalog_path" => config.catalog_path = Some(value.clone()),
             "coordinator_endpoint" => config.coordinator_endpoint = Some(value.clone()),

@@ -28,7 +28,7 @@ use parquet::arrow::ArrowWriter;
 #[cfg(feature = "vector")]
 use super::run_topk_by_score;
 use super::{
-    EmbeddedRuntime, ExecOutput, QueryContext, Runtime, TraceIds,
+    EmbeddedRuntime, ExecOutput, JoinBloomFilter, QueryContext, Runtime, ScalarValue, TraceIds,
     embedded_adaptive_plan_for_partitioning_with_target, hash_key, join_key_from_row,
     resolve_key_indexes, rows_from_batches, rows_to_vector_topk_output,
     run_vector_topk_with_provider, run_window_exec, run_window_exec_with_ctx,
@@ -335,6 +335,8 @@ fn window_exec_spills_under_tight_memory_budget_and_cleans_temp_files() {
         mem_budget_bytes: 256,
         broadcast_threshold_bytes: u64::MAX,
         join_radix_bits: 8,
+        join_bloom_enabled: true,
+        join_bloom_bits: 20,
         spill_dir: spill_dir.to_string_lossy().into_owned(),
         stats_collector: None,
     };
@@ -429,6 +431,8 @@ fn materialized_cte_ref_executes_shared_subplan_once() {
             mem_budget_bytes: 64 * 1024 * 1024,
             broadcast_threshold_bytes: u64::MAX,
             join_radix_bits: 8,
+            join_bloom_enabled: true,
+            join_bloom_bits: 20,
             spill_dir: "./ffq_spill_test".to_string(),
             stats_collector: None,
         },
@@ -497,6 +501,40 @@ fn embedded_adaptive_partitioning_matches_shared_planner_on_same_stats() {
         embedded.partition_bytes_histogram,
         shared.partition_bytes_histogram
     );
+}
+
+#[test]
+fn join_bloom_filter_prefilters_selective_probe_keys() {
+    let build_rows = vec![
+        vec![ScalarValue::Int64(1)],
+        vec![ScalarValue::Int64(2)],
+        vec![ScalarValue::Int64(3)],
+    ];
+    let probe_rows = (0_i64..100_i64)
+        .map(|k| vec![ScalarValue::Int64(k)])
+        .collect::<Vec<_>>();
+    let build_key_idx = vec![0_usize];
+    let probe_key_idx = vec![0_usize];
+
+    let mut bloom = JoinBloomFilter::new(10, 3);
+    for row in &build_rows {
+        let key = join_key_from_row(row, &build_key_idx);
+        bloom.insert(&key);
+    }
+    let filtered = probe_rows
+        .iter()
+        .filter(|row| {
+            let key = join_key_from_row(row, &probe_key_idx);
+            bloom.may_contain(&key)
+        })
+        .collect::<Vec<_>>();
+
+    assert!(filtered.len() < probe_rows.len());
+    // Known build keys should always pass.
+    for k in [1_i64, 2, 3] {
+        let key = vec![ScalarValue::Int64(k)];
+        assert!(bloom.may_contain(&key));
+    }
 }
 
 #[cfg(feature = "vector")]

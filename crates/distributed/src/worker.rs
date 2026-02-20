@@ -69,6 +69,10 @@ pub struct WorkerConfig {
     pub per_task_memory_budget_bytes: usize,
     /// Number of radix bits for in-memory hash join partitioning.
     pub join_radix_bits: u8,
+    /// Enables build-side bloom prefiltering on probe rows for join execution.
+    pub join_bloom_enabled: bool,
+    /// Bloom filter bit-width as log2(number_of_bits) for join prefiltering.
+    pub join_bloom_bits: u8,
     /// Local spill directory for memory-pressure fallback paths.
     pub spill_dir: PathBuf,
     /// Root directory containing shuffle data.
@@ -82,6 +86,8 @@ impl Default for WorkerConfig {
             cpu_slots: 2,
             per_task_memory_budget_bytes: 64 * 1024 * 1024,
             join_radix_bits: 8,
+            join_bloom_enabled: true,
+            join_bloom_bits: 20,
             spill_dir: PathBuf::from(".ffq_spill"),
             shuffle_root: PathBuf::from("."),
         }
@@ -103,6 +109,10 @@ pub struct TaskContext {
     pub per_task_memory_budget_bytes: usize,
     /// Number of radix bits for in-memory hash join partitioning.
     pub join_radix_bits: u8,
+    /// Enables build-side bloom prefiltering on probe rows for join execution.
+    pub join_bloom_enabled: bool,
+    /// Bloom filter bit-width as log2(number_of_bits) for join prefiltering.
+    pub join_bloom_bits: u8,
     /// Local spill directory.
     pub spill_dir: PathBuf,
     /// Root directory containing shuffle data.
@@ -362,6 +372,8 @@ where
                 attempt: assignment.attempt,
                 per_task_memory_budget_bytes: self.config.per_task_memory_budget_bytes,
                 join_radix_bits: self.config.join_radix_bits,
+                join_bloom_enabled: self.config.join_bloom_enabled,
+                join_bloom_bits: self.config.join_bloom_bits,
                 spill_dir: self.config.spill_dir.clone(),
                 shuffle_root: self.config.shuffle_root.clone(),
                 assigned_reduce_partitions: assignment.assigned_reduce_partitions.clone(),
@@ -1957,6 +1969,51 @@ enum JoinExecSide {
     Probe,
 }
 
+#[derive(Debug, Clone)]
+struct JoinBloomFilter {
+    bits: Vec<u64>,
+    bit_mask: u64,
+    hash_count: u8,
+}
+
+impl JoinBloomFilter {
+    fn new(log2_bits: u8, hash_count: u8) -> Self {
+        let eff_bits = log2_bits.clamp(8, 26);
+        let bit_count = 1usize << eff_bits;
+        let words = bit_count.div_ceil(64);
+        Self {
+            bits: vec![0_u64; words],
+            bit_mask: (bit_count as u64) - 1,
+            hash_count: hash_count.max(1),
+        }
+    }
+
+    fn insert(&mut self, key: &[ScalarValue]) {
+        let h1 = hash_key(key);
+        let h2 = hash_key_with_seed(key, 0x9e37_79b9_7f4a_7c15);
+        for i in 0..self.hash_count {
+            let bit = h1.wrapping_add((i as u64).wrapping_mul(h2 | 1)) & self.bit_mask;
+            let word = (bit / 64) as usize;
+            let offset = (bit % 64) as u32;
+            self.bits[word] |= 1_u64 << offset;
+        }
+    }
+
+    fn may_contain(&self, key: &[ScalarValue]) -> bool {
+        let h1 = hash_key(key);
+        let h2 = hash_key_with_seed(key, 0x9e37_79b9_7f4a_7c15);
+        for i in 0..self.hash_count {
+            let bit = h1.wrapping_add((i as u64).wrapping_mul(h2 | 1)) & self.bit_mask;
+            let word = (bit / 64) as usize;
+            let offset = (bit % 64) as u32;
+            if (self.bits[word] & (1_u64 << offset)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[cfg_attr(feature = "profiling", inline(never))]
 fn run_hash_join(
     left: ExecOutput,
@@ -2007,6 +2064,43 @@ fn run_hash_join(
             .map(|f| (**f).clone())
             .collect::<Vec<_>>(),
     ));
+
+    let probe_prefilter_storage = if ctx.join_bloom_enabled && !build_rows.is_empty() {
+        let mut bloom = JoinBloomFilter::new(ctx.join_bloom_bits, 3);
+        for row in build_rows.iter() {
+            let key = join_key_from_row(row, &build_key_idx);
+            if !key.iter().any(|v| *v == ScalarValue::Null) {
+                bloom.insert(&key);
+            }
+        }
+        let filtered = probe_rows
+            .iter()
+            .filter(|row| {
+                let key = join_key_from_row(row, &probe_key_idx);
+                !key.iter().any(|v| *v == ScalarValue::Null) && bloom.may_contain(&key)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if filtered.len() < probe_rows.len() {
+            info!(
+                query_id = %ctx.query_id,
+                stage_id = ctx.stage_id,
+                task_id = ctx.task_id,
+                probe_rows_before = probe_rows.len(),
+                probe_rows_after = filtered.len(),
+                probe_bytes_before = estimate_join_rows_bytes(probe_rows),
+                probe_bytes_after = estimate_join_rows_bytes(&filtered),
+                "worker hash join bloom prefilter reduced probe side"
+            );
+        }
+        Some(filtered)
+    } else {
+        None
+    };
+    let probe_rows = probe_prefilter_storage
+        .as_ref()
+        .map(|v| v.as_slice())
+        .unwrap_or(probe_rows);
 
     let joined_rows = if ctx.per_task_memory_budget_bytes > 0
         && estimate_join_rows_bytes(build_rows) > ctx.per_task_memory_budget_bytes
@@ -3363,6 +3457,13 @@ fn spill_join_partitions(
 
 fn hash_key(key: &[ScalarValue]) -> u64 {
     let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
+fn hash_key_with_seed(key: &[ScalarValue], seed: u64) -> u64 {
+    let mut h = DefaultHasher::new();
+    seed.hash(&mut h);
     key.hash(&mut h);
     h.finish()
 }

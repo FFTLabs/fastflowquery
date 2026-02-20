@@ -63,6 +63,8 @@ pub struct QueryContext {
     pub mem_budget_bytes: usize,
     pub broadcast_threshold_bytes: u64,
     pub join_radix_bits: u8,
+    pub join_bloom_enabled: bool,
+    pub join_bloom_bits: u8,
     pub spill_dir: String,
     pub(crate) stats_collector: Option<Arc<RuntimeStatsCollector>>,
 }
@@ -1443,6 +1445,51 @@ struct JoinMatchOutput {
     matched_right: Vec<bool>,
 }
 
+#[derive(Debug, Clone)]
+struct JoinBloomFilter {
+    bits: Vec<u64>,
+    bit_mask: u64,
+    hash_count: u8,
+}
+
+impl JoinBloomFilter {
+    fn new(log2_bits: u8, hash_count: u8) -> Self {
+        let eff_bits = log2_bits.clamp(8, 26);
+        let bit_count = 1usize << eff_bits;
+        let words = bit_count.div_ceil(64);
+        Self {
+            bits: vec![0_u64; words],
+            bit_mask: (bit_count as u64) - 1,
+            hash_count: hash_count.max(1),
+        }
+    }
+
+    fn insert(&mut self, key: &[ScalarValue]) {
+        let h1 = hash_key(key);
+        let h2 = hash_key_with_seed(key, 0x9e37_79b9_7f4a_7c15);
+        for i in 0..self.hash_count {
+            let bit = h1.wrapping_add((i as u64).wrapping_mul(h2 | 1)) & self.bit_mask;
+            let word = (bit / 64) as usize;
+            let offset = (bit % 64) as u32;
+            self.bits[word] |= 1_u64 << offset;
+        }
+    }
+
+    fn may_contain(&self, key: &[ScalarValue]) -> bool {
+        let h1 = hash_key(key);
+        let h2 = hash_key_with_seed(key, 0x9e37_79b9_7f4a_7c15);
+        for i in 0..self.hash_count {
+            let bit = h1.wrapping_add((i as u64).wrapping_mul(h2 | 1)) & self.bit_mask;
+            let word = (bit / 64) as usize;
+            let offset = (bit % 64) as u32;
+            if (self.bits[word] & (1_u64 << offset)) == 0 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 #[cfg_attr(feature = "profiling", inline(never))]
 /// Execute `HashJoinExec` with optional spill to grace-hash mode.
 ///
@@ -1521,6 +1568,49 @@ fn run_hash_join(
                 .collect::<Vec<_>>(),
         )),
     };
+
+    let probe_prefilter_storage =
+        if matches!(join_type, JoinType::Inner) && ctx.join_bloom_enabled && !build_rows.is_empty()
+        {
+            let mut bloom = JoinBloomFilter::new(ctx.join_bloom_bits, 3);
+            for row in build_rows.iter() {
+                let key = join_key_from_row(row, &build_key_idx);
+                if !join_key_has_null(&key) {
+                    bloom.insert(&key);
+                }
+            }
+            let filtered = probe_rows
+                .iter()
+                .filter(|row| {
+                    let key = join_key_from_row(row, &probe_key_idx);
+                    !join_key_has_null(&key) && bloom.may_contain(&key)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if filtered.len() < probe_rows.len() {
+                let before_rows = probe_rows.len() as u64;
+                let after_rows = filtered.len() as u64;
+                let before_bytes = estimate_join_rows_bytes(probe_rows) as u64;
+                let after_bytes = estimate_join_rows_bytes(&filtered) as u64;
+                info!(
+                    query_id = %trace.query_id,
+                    stage_id = trace.stage_id,
+                    task_id = trace.task_id,
+                    probe_rows_before = before_rows,
+                    probe_rows_after = after_rows,
+                    probe_bytes_before = before_bytes,
+                    probe_bytes_after = after_bytes,
+                    "hash join bloom prefilter reduced probe side"
+                );
+            }
+            Some(filtered)
+        } else {
+            None
+        };
+    let probe_rows = probe_prefilter_storage
+        .as_ref()
+        .map(|v| v.as_slice())
+        .unwrap_or(probe_rows);
 
     let mut match_output = if ctx.mem_budget_bytes > 0
         && estimate_join_rows_bytes(build_rows) > ctx.mem_budget_bytes
@@ -1710,6 +1800,8 @@ fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput
         mem_budget_bytes: usize::MAX,
         broadcast_threshold_bytes: u64::MAX,
         join_radix_bits: 8,
+        join_bloom_enabled: true,
+        join_bloom_bits: 20,
         spill_dir: "./ffq_spill".to_string(),
         stats_collector: None,
     };
@@ -3591,6 +3683,13 @@ fn spill_join_partitions(
 
 fn hash_key(key: &[ScalarValue]) -> u64 {
     let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
+fn hash_key_with_seed(key: &[ScalarValue], seed: u64) -> u64 {
+    let mut h = DefaultHasher::new();
+    seed.hash(&mut h);
     key.hash(&mut h);
     h.finish()
 }

@@ -80,6 +80,12 @@ pub struct EngineConfig {
     ///
     /// `0` disables radix partitioning and uses the baseline hash-join table.
     pub join_radix_bits: u8,
+    /// Enables build-side bloom prefiltering on probe rows for join execution.
+    pub join_bloom_enabled: bool,
+    /// Bloom filter bit-width as log2(number_of_bits) for join prefiltering.
+    ///
+    /// For example `20` means `1 << 20` bits (128KiB bitset).
+    pub join_bloom_bits: u8,
 
     /// Directory used for spill files.
     pub spill_dir: String,
@@ -116,6 +122,8 @@ impl Default for EngineConfig {
             shuffle_partitions: 64,
             broadcast_threshold_bytes: 64 * 1024 * 1024, // 64MB
             join_radix_bits: 8,
+            join_bloom_enabled: true,
+            join_bloom_bits: 20,
             spill_dir: "./ffq_spill".to_string(),
             catalog_path: None,
             coordinator_endpoint: None,
