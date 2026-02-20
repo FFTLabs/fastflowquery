@@ -1356,10 +1356,12 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
         .iter()
         .map(|o| evaluate_expr_rows(input, &o.expr))
         .collect::<Result<Vec<_>>>()?;
+    let fallback_keys = build_stable_row_fallback_keys(input)?;
     let mut order_idx: Vec<usize> = (0..row_count).collect();
     order_idx.sort_by(|a, b| {
         cmp_key_sets(&partition_keys, *a, *b)
             .then_with(|| cmp_order_key_sets(&order_keys, &w.order_by, *a, *b))
+            .then_with(|| fallback_keys[*a].cmp(&fallback_keys[*b]))
             .then_with(|| a.cmp(b))
     });
 
@@ -2196,15 +2198,9 @@ fn cmp_scalar_for_window(
     }
     let ord = match (a, b) {
         (Int64(x), Int64(y)) => x.cmp(y),
-        (Float64Bits(x), Float64Bits(y)) => f64::from_bits(*x)
-            .partial_cmp(&f64::from_bits(*y))
-            .unwrap_or(Ordering::Equal),
-        (Int64(x), Float64Bits(y)) => (*x as f64)
-            .partial_cmp(&f64::from_bits(*y))
-            .unwrap_or(Ordering::Equal),
-        (Float64Bits(x), Int64(y)) => f64::from_bits(*x)
-            .partial_cmp(&(*y as f64))
-            .unwrap_or(Ordering::Equal),
+        (Float64Bits(x), Float64Bits(y)) => cmp_f64_for_window(f64::from_bits(*x), f64::from_bits(*y)),
+        (Int64(x), Float64Bits(y)) => cmp_f64_for_window(*x as f64, f64::from_bits(*y)),
+        (Float64Bits(x), Int64(y)) => cmp_f64_for_window(f64::from_bits(*x), *y as f64),
         (Utf8(x), Utf8(y)) => x.cmp(y),
         (Boolean(x), Boolean(y)) => x.cmp(y),
         _ => format!("{a:?}").cmp(&format!("{b:?}")),
@@ -2214,6 +2210,31 @@ fn cmp_scalar_for_window(
     } else {
         ord
     }
+}
+
+fn cmp_f64_for_window(a: f64, b: f64) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        // Treat all NaNs as peers for rank/tie semantics.
+        (true, true) => Ordering::Equal,
+        // SQL-style total ordering choice: NaN sorts above finite values (ascending).
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.total_cmp(&b),
+    }
+}
+
+fn build_stable_row_fallback_keys(input: &ExecOutput) -> Result<Vec<u64>> {
+    let rows = rows_from_batches(input)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut hasher = DefaultHasher::new();
+        for value in row {
+            format!("{value:?}").hash(&mut hasher);
+            "|".hash(&mut hasher);
+        }
+        out.push(hasher.finish());
+    }
+    Ok(out)
 }
 
 fn run_exists_subquery_filter(input: ExecOutput, subquery: ExecOutput, negated: bool) -> ExecOutput {

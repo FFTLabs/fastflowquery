@@ -646,3 +646,84 @@ fn window_output_types_and_nullability_follow_rules() {
 
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn window_null_ordering_truth_table_is_honored() {
+    let (engine, path) = make_engine_with_window_null_fixture();
+    let sql = "SELECT ord, \
+                    ROW_NUMBER() OVER (ORDER BY ord ASC NULLS FIRST) AS rn_af, \
+                    ROW_NUMBER() OVER (ORDER BY ord ASC NULLS LAST) AS rn_al, \
+                    ROW_NUMBER() OVER (ORDER BY ord DESC NULLS FIRST) AS rn_df, \
+                    ROW_NUMBER() OVER (ORDER BY ord DESC NULLS LAST) AS rn_dl \
+               FROM t";
+    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let ord = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("ord");
+        let rn_af = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("rn_af");
+        let rn_al = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("rn_al");
+        let rn_df = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("rn_df");
+        let rn_dl = batch.column(4).as_any().downcast_ref::<Int64Array>().expect("rn_dl");
+        for i in 0..batch.num_rows() {
+            rows.push((
+                if ord.is_null(i) { None } else { Some(ord.value(i)) },
+                rn_af.value(i),
+                rn_al.value(i),
+                rn_df.value(i),
+                rn_dl.value(i),
+            ));
+        }
+    }
+    rows.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    assert_eq!(
+        rows,
+        vec![
+            (None, 1, 3, 1, 3),
+            (Some(1), 2, 1, 3, 2),
+            (Some(3), 3, 2, 2, 1),
+        ]
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn window_tie_ordering_is_deterministic_across_runs() {
+    let (engine, path) = make_engine_with_window_fixture();
+    let sql = "SELECT grp, ord, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score) AS rn FROM t";
+
+    let run_once = |engine: &Engine| {
+        let batches =
+            futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let grp = batch.column(0).as_any().downcast_ref::<StringArray>().expect("grp");
+            let ord = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("ord");
+            let rn = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("rn");
+            for i in 0..batch.num_rows() {
+                rows.push((grp.value(i).to_string(), ord.value(i), rn.value(i)));
+            }
+        }
+        rows.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        rows
+    };
+
+    let first = run_once(&engine);
+    let second = run_once(&engine);
+    assert_eq!(first, second);
+    assert_eq!(first.len(), 5);
+    let a1 = first.iter().find(|(g, o, _)| g == "A" && *o == 1).expect("A/1");
+    let a2 = first.iter().find(|(g, o, _)| g == "A" && *o == 2).expect("A/2");
+    let a3 = first.iter().find(|(g, o, _)| g == "A" && *o == 3).expect("A/3");
+    let b1 = first.iter().find(|(g, o, _)| g == "B" && *o == 1).expect("B/1");
+    let b2 = first.iter().find(|(g, o, _)| g == "B" && *o == 2).expect("B/2");
+    assert!(a1.2 == 1 || a1.2 == 2);
+    assert!(a2.2 == 1 || a2.2 == 2);
+    assert_ne!(a1.2, a2.2);
+    assert_eq!(a3.2, 3);
+    assert_eq!(b1.2, 1);
+    assert_eq!(b2.2, 2);
+
+    let _ = std::fs::remove_file(path);
+}
