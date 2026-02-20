@@ -10,7 +10,8 @@ use sqlparser::ast::{
 
 use crate::logical_plan::{
     AggExpr, BinaryOp, Expr, JoinStrategyHint, LiteralValue, LogicalPlan, SubqueryCorrelation,
-    WindowExpr, WindowFunction, WindowOrderExpr,
+    WindowExpr, WindowFrameBound, WindowFrameSpec, WindowFrameUnits, WindowFunction,
+    WindowOrderExpr,
 };
 
 const E_RECURSIVE_CTE_OVERFLOW: &str = "E_RECURSIVE_CTE_OVERFLOW";
@@ -1020,7 +1021,7 @@ fn try_parse_agg(
 fn try_parse_window_expr(
     e: &SqlExpr,
     params: &HashMap<String, LiteralValue>,
-    named_windows: &HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>)>,
+    named_windows: &HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>, Option<WindowFrameSpec>)>,
     explicit_alias: Option<String>,
 ) -> Result<Option<(WindowExpr, String)>> {
     let SqlExpr::Function(func) = e else {
@@ -1050,7 +1051,7 @@ fn try_parse_window_expr(
         _ => format!("window_{}", fname.to_lowercase()),
     });
 
-    let (partition_by, order_by) = match over {
+    let (partition_by, order_by, frame) = match over {
         sqlparser::ast::WindowType::WindowSpec(spec) => {
             parse_window_spec(spec, params, named_windows)?
         }
@@ -1224,6 +1225,7 @@ fn try_parse_window_expr(
             func: func_kind,
             partition_by,
             order_by,
+            frame,
             output_name: output_name.clone(),
         },
         output_name,
@@ -1233,7 +1235,7 @@ fn try_parse_window_expr(
 fn parse_named_windows(
     select: &sqlparser::ast::Select,
     params: &HashMap<String, LiteralValue>,
-) -> Result<HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>)>> {
+) -> Result<HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>, Option<WindowFrameSpec>)>> {
     let mut defs = HashMap::new();
     for def in &select.named_window {
         let name = def.0.value.clone();
@@ -1261,8 +1263,8 @@ fn resolve_named_window_spec(
     defs: &HashMap<String, sqlparser::ast::NamedWindowExpr>,
     params: &HashMap<String, LiteralValue>,
     resolving: &mut std::collections::HashSet<String>,
-    resolved: &mut HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>)>,
-) -> Result<(Vec<Expr>, Vec<WindowOrderExpr>)> {
+    resolved: &mut HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>, Option<WindowFrameSpec>)>,
+) -> Result<(Vec<Expr>, Vec<WindowOrderExpr>, Option<WindowFrameSpec>)> {
     if let Some(v) = resolved.get(name) {
         return Ok(v.clone());
     }
@@ -1290,13 +1292,8 @@ fn resolve_named_window_spec(
 fn parse_window_spec(
     spec: &sqlparser::ast::WindowSpec,
     params: &HashMap<String, LiteralValue>,
-    named_windows: &HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>)>,
-) -> Result<(Vec<Expr>, Vec<WindowOrderExpr>)> {
-    if spec.window_frame.is_some() {
-        return Err(FfqError::Unsupported(
-            "window frames are not supported in v1 window MVP".to_string(),
-        ));
-    }
+    named_windows: &HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>, Option<WindowFrameSpec>)>,
+) -> Result<(Vec<Expr>, Vec<WindowOrderExpr>, Option<WindowFrameSpec>)> {
     let base = if let Some(base_name) = &spec.window_name {
         named_windows
             .get(&base_name.value)
@@ -1308,7 +1305,7 @@ fn parse_window_spec(
                 ))
             })?
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), None)
     };
     let local_partition_by = spec
         .partition_by
@@ -1316,6 +1313,11 @@ fn parse_window_spec(
         .map(|e| sql_expr_to_expr(e, params))
         .collect::<Result<Vec<_>>>()?;
     let local_order_by = parse_window_order_by(&spec.order_by, params)?;
+    let local_frame = spec
+        .window_frame
+        .as_ref()
+        .map(|f| parse_window_frame(f, params))
+        .transpose()?;
     if !local_partition_by.is_empty() && !base.0.is_empty() {
         return Err(FfqError::Planning(
             "window spec cannot override PARTITION BY of referenced named window".to_string(),
@@ -1326,6 +1328,11 @@ fn parse_window_spec(
             "window spec cannot override ORDER BY of referenced named window".to_string(),
         ));
     }
+    if local_frame.is_some() && base.2.is_some() {
+        return Err(FfqError::Planning(
+            "window spec cannot override frame of referenced named window".to_string(),
+        ));
+    }
     Ok((
         if local_partition_by.is_empty() {
             base.0
@@ -1337,6 +1344,7 @@ fn parse_window_spec(
         } else {
             local_order_by
         },
+        if local_frame.is_none() { base.2 } else { local_frame },
     ))
 }
 
@@ -1345,17 +1353,12 @@ fn parse_window_spec_with_refs(
     params: &HashMap<String, LiteralValue>,
     defs: &HashMap<String, sqlparser::ast::NamedWindowExpr>,
     resolving: &mut std::collections::HashSet<String>,
-    resolved: &mut HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>)>,
-) -> Result<(Vec<Expr>, Vec<WindowOrderExpr>)> {
-    if spec.window_frame.is_some() {
-        return Err(FfqError::Unsupported(
-            "window frames are not supported in v1 window MVP".to_string(),
-        ));
-    }
+    resolved: &mut HashMap<String, (Vec<Expr>, Vec<WindowOrderExpr>, Option<WindowFrameSpec>)>,
+) -> Result<(Vec<Expr>, Vec<WindowOrderExpr>, Option<WindowFrameSpec>)> {
     let base = if let Some(base_name) = &spec.window_name {
         resolve_named_window_spec(&base_name.value, defs, params, resolving, resolved)?
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), None)
     };
     let local_partition_by = spec
         .partition_by
@@ -1363,6 +1366,11 @@ fn parse_window_spec_with_refs(
         .map(|e| sql_expr_to_expr(e, params))
         .collect::<Result<Vec<_>>>()?;
     let local_order_by = parse_window_order_by(&spec.order_by, params)?;
+    let local_frame = spec
+        .window_frame
+        .as_ref()
+        .map(|f| parse_window_frame(f, params))
+        .transpose()?;
     if !local_partition_by.is_empty() && !base.0.is_empty() {
         return Err(FfqError::Planning(
             "named window cannot override PARTITION BY of referenced named window".to_string(),
@@ -1373,6 +1381,11 @@ fn parse_window_spec_with_refs(
             "named window cannot override ORDER BY of referenced named window".to_string(),
         ));
     }
+    if local_frame.is_some() && base.2.is_some() {
+        return Err(FfqError::Planning(
+            "named window cannot override frame of referenced named window".to_string(),
+        ));
+    }
     Ok((
         if local_partition_by.is_empty() {
             base.0
@@ -1384,7 +1397,106 @@ fn parse_window_spec_with_refs(
         } else {
             local_order_by
         },
+        if local_frame.is_none() { base.2 } else { local_frame },
     ))
+}
+
+fn parse_window_frame(
+    frame: &sqlparser::ast::WindowFrame,
+    params: &HashMap<String, LiteralValue>,
+) -> Result<WindowFrameSpec> {
+    let units = match frame.units {
+        sqlparser::ast::WindowFrameUnits::Rows => WindowFrameUnits::Rows,
+        sqlparser::ast::WindowFrameUnits::Range => WindowFrameUnits::Range,
+        sqlparser::ast::WindowFrameUnits::Groups => WindowFrameUnits::Groups,
+    };
+    let start_bound = parse_window_frame_bound(&frame.start_bound, params)?;
+    let end_bound = parse_window_frame_bound(
+        frame
+            .end_bound
+            .as_ref()
+            .unwrap_or(&sqlparser::ast::WindowFrameBound::CurrentRow),
+        params,
+    )?;
+    validate_window_frame_bounds(&start_bound, &end_bound)?;
+    Ok(WindowFrameSpec {
+        units,
+        start_bound,
+        end_bound,
+    })
+}
+
+fn parse_window_frame_bound(
+    bound: &sqlparser::ast::WindowFrameBound,
+    params: &HashMap<String, LiteralValue>,
+) -> Result<WindowFrameBound> {
+    match bound {
+        sqlparser::ast::WindowFrameBound::CurrentRow => Ok(WindowFrameBound::CurrentRow),
+        sqlparser::ast::WindowFrameBound::Preceding(None) => {
+            Ok(WindowFrameBound::UnboundedPreceding)
+        }
+        sqlparser::ast::WindowFrameBound::Following(None) => {
+            Ok(WindowFrameBound::UnboundedFollowing)
+        }
+        sqlparser::ast::WindowFrameBound::Preceding(Some(expr)) => {
+            Ok(WindowFrameBound::Preceding(parse_positive_usize_expr(
+                expr, params, "window frame",
+            )?))
+        }
+        sqlparser::ast::WindowFrameBound::Following(Some(expr)) => {
+            Ok(WindowFrameBound::Following(parse_positive_usize_expr(
+                expr, params, "window frame",
+            )?))
+        }
+    }
+}
+
+fn parse_positive_usize_expr(
+    expr: &SqlExpr,
+    params: &HashMap<String, LiteralValue>,
+    ctx: &str,
+) -> Result<usize> {
+    let parsed = sql_expr_to_expr(expr, params)?;
+    let Expr::Literal(LiteralValue::Int64(v)) = parsed else {
+        return Err(FfqError::Planning(format!(
+            "{ctx} bound requires positive integer literal in v1"
+        )));
+    };
+    if v < 0 {
+        return Err(FfqError::Planning(format!(
+            "{ctx} bound must be >= 0"
+        )));
+    }
+    Ok(v as usize)
+}
+
+fn validate_window_frame_bounds(start: &WindowFrameBound, end: &WindowFrameBound) -> Result<()> {
+    if matches!(start, WindowFrameBound::UnboundedFollowing) {
+        return Err(FfqError::Planning(
+            "window frame start cannot be UNBOUNDED FOLLOWING".to_string(),
+        ));
+    }
+    if matches!(end, WindowFrameBound::UnboundedPreceding) {
+        return Err(FfqError::Planning(
+            "window frame end cannot be UNBOUNDED PRECEDING".to_string(),
+        ));
+    }
+    if frame_bound_order(start) > frame_bound_order(end) {
+        return Err(FfqError::Planning(
+            "window frame start bound must be <= end bound".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn frame_bound_order(bound: &WindowFrameBound) -> i32 {
+    match bound {
+        WindowFrameBound::UnboundedPreceding => -10_000,
+        WindowFrameBound::Preceding(v) => -(*v as i32) - 1,
+        WindowFrameBound::CurrentRow => 0,
+        WindowFrameBound::Following(v) => *v as i32 + 1,
+        WindowFrameBound::UnboundedFollowing => 10_000,
+    }
 }
 
 fn parse_window_order_by(
@@ -2198,6 +2310,43 @@ mod tests {
         match plan {
             LogicalPlan::Projection { input, .. } => match input.as_ref() {
                 LogicalPlan::Window { exprs, .. } => assert_eq!(exprs.len(), 13),
+                other => panic!("expected Window, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_window_frame_bounds() {
+        let err = sql_to_logical(
+            "SELECT SUM(a) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED FOLLOWING AND CURRENT ROW) FROM t",
+            &HashMap::new(),
+        )
+        .expect_err("invalid frame should fail");
+        assert!(
+            err.to_string()
+                .contains("UNBOUNDED FOLLOWING"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parses_rows_range_groups_frames() {
+        let plan = sql_to_logical(
+            "SELECT \
+                SUM(a) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS r1, \
+                SUM(a) OVER (ORDER BY a RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS r2, \
+                SUM(a) OVER (ORDER BY a GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS r3 \
+             FROM t",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        match plan {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Window { exprs, .. } => {
+                    assert_eq!(exprs.len(), 3);
+                    assert!(exprs.iter().all(|w| w.frame.is_some()));
+                }
                 other => panic!("expected Window, got {other:?}"),
             },
             other => panic!("expected Projection, got {other:?}"),

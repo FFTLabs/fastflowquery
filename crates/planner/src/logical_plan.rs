@@ -232,6 +232,43 @@ pub struct WindowOrderExpr {
     pub nulls_first: bool,
 }
 
+/// Window frame units.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WindowFrameUnits {
+    /// `ROWS`
+    Rows,
+    /// `RANGE`
+    Range,
+    /// `GROUPS`
+    Groups,
+}
+
+/// Window frame bound.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WindowFrameBound {
+    /// `UNBOUNDED PRECEDING`
+    UnboundedPreceding,
+    /// `n PRECEDING`
+    Preceding(usize),
+    /// `CURRENT ROW`
+    CurrentRow,
+    /// `n FOLLOWING`
+    Following(usize),
+    /// `UNBOUNDED FOLLOWING`
+    UnboundedFollowing,
+}
+
+/// Window frame specification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowFrameSpec {
+    /// Frame unit kind.
+    pub units: WindowFrameUnits,
+    /// Frame lower bound.
+    pub start_bound: WindowFrameBound,
+    /// Frame upper bound.
+    pub end_bound: WindowFrameBound,
+}
+
 /// One window expression with partition/order specification and output name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowExpr {
@@ -241,6 +278,8 @@ pub struct WindowExpr {
     pub partition_by: Vec<Expr>,
     /// Order key expressions.
     pub order_by: Vec<WindowOrderExpr>,
+    /// Optional explicit frame clause from SQL.
+    pub frame: Option<WindowFrameSpec>,
     /// Output column name.
     pub output_name: String,
 }

@@ -1,4 +1,7 @@
-use crate::logical_plan::{Expr, JoinStrategyHint, LogicalPlan, SubqueryCorrelation, WindowFunction};
+use crate::logical_plan::{
+    Expr, JoinStrategyHint, LogicalPlan, SubqueryCorrelation, WindowFrameBound, WindowFrameSpec,
+    WindowFrameUnits, WindowFunction,
+};
 
 /// Render logical plan as human-readable multiline text.
 pub fn explain_logical(plan: &LogicalPlan) -> String {
@@ -153,8 +156,15 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                     .collect::<Vec<_>>()
                     .join(", ");
                 out.push_str(&format!(
-                    "{pad}  {} := {} OVER (PARTITION BY [{}] ORDER BY [{}])\n",
-                    w.output_name, func, part, ord
+                    "{pad}  {} := {} OVER (PARTITION BY [{}] ORDER BY [{}]{} )\n",
+                    w.output_name,
+                    func,
+                    part,
+                    ord,
+                    w.frame
+                        .as_ref()
+                        .map(|f| format!(" FRAME {}", fmt_window_frame(f)))
+                        .unwrap_or_default()
                 ));
             }
             fmt_plan(input, indent + 1, out);
@@ -407,5 +417,28 @@ fn fmt_expr(e: &Expr) -> String {
             name,
             args.iter().map(fmt_expr).collect::<Vec<_>>().join(", ")
         ),
+    }
+}
+
+fn fmt_window_frame(f: &WindowFrameSpec) -> String {
+    format!(
+        "{} BETWEEN {} AND {}",
+        match f.units {
+            WindowFrameUnits::Rows => "ROWS",
+            WindowFrameUnits::Range => "RANGE",
+            WindowFrameUnits::Groups => "GROUPS",
+        },
+        fmt_window_bound(&f.start_bound),
+        fmt_window_bound(&f.end_bound)
+    )
+}
+
+fn fmt_window_bound(b: &WindowFrameBound) -> String {
+    match b {
+        WindowFrameBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+        WindowFrameBound::Preceding(n) => format!("{n} PRECEDING"),
+        WindowFrameBound::CurrentRow => "CURRENT ROW".to_string(),
+        WindowFrameBound::Following(n) => format!("{n} FOLLOWING"),
+        WindowFrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
     }
 }

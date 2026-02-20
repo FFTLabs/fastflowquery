@@ -6,7 +6,7 @@ use ffq_common::{FfqError, Result};
 
 use crate::logical_plan::{
     AggExpr, BinaryOp, Expr, LiteralValue, LogicalPlan, SubqueryCorrelation, WindowExpr,
-    WindowFunction, WindowOrderExpr,
+    WindowFrameBound, WindowFrameSpec, WindowFrameUnits, WindowFunction, WindowOrderExpr,
 };
 
 const E_SUBQUERY_UNSUPPORTED_CORRELATION: &str = "E_SUBQUERY_UNSUPPORTED_CORRELATION";
@@ -1023,10 +1023,24 @@ impl Analyzer {
                 WindowFunction::NthValue { expr: arg, n }
             }
         };
+        let frame = if let Some(frame) = w.frame {
+            validate_window_frame(&frame)?;
+            if matches!(frame.units, WindowFrameUnits::Range | WindowFrameUnits::Groups)
+                && order_by.is_empty()
+            {
+                return Err(FfqError::Planning(
+                    "RANGE/GROUPS frame requires ORDER BY".to_string(),
+                ));
+            }
+            Some(frame)
+        } else {
+            None
+        };
         Ok(WindowExpr {
             func,
             partition_by,
             order_by,
+            frame,
             output_name: w.output_name,
         })
     }
@@ -1659,6 +1673,38 @@ fn is_numeric(dt: &DataType) -> bool {
             | DataType::Float32
             | DataType::Float64
     )
+}
+
+fn validate_window_frame(frame: &WindowFrameSpec) -> Result<()> {
+    use WindowFrameBound::*;
+    if matches!(frame.start_bound, UnboundedFollowing) {
+        return Err(FfqError::Planning(
+            "window frame start cannot be UNBOUNDED FOLLOWING".to_string(),
+        ));
+    }
+    if matches!(frame.end_bound, UnboundedPreceding) {
+        return Err(FfqError::Planning(
+            "window frame end cannot be UNBOUNDED PRECEDING".to_string(),
+        ));
+    }
+    let start_rank = frame_bound_rank(&frame.start_bound);
+    let end_rank = frame_bound_rank(&frame.end_bound);
+    if start_rank > end_rank {
+        return Err(FfqError::Planning(
+            "window frame start bound must be <= end bound".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn frame_bound_rank(bound: &WindowFrameBound) -> i32 {
+    match bound {
+        WindowFrameBound::UnboundedPreceding => -10_000,
+        WindowFrameBound::Preceding(v) => -(*v as i32) - 1,
+        WindowFrameBound::CurrentRow => 0,
+        WindowFrameBound::Following(v) => *v as i32 + 1,
+        WindowFrameBound::UnboundedFollowing => 10_000,
+    }
 }
 
 fn insert_type_compatible(src: &DataType, dst: &DataType) -> bool {

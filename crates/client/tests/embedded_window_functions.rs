@@ -257,8 +257,8 @@ fn expanded_window_functions_ranking_and_value_semantics() {
                     LAG(score) OVER (PARTITION BY grp ORDER BY ord) AS lag_s, \
                     LEAD(score, 2, 999) OVER (PARTITION BY grp ORDER BY ord) AS lead_s, \
                     FIRST_VALUE(score) OVER (PARTITION BY grp ORDER BY ord) AS fv, \
-                    LAST_VALUE(score) OVER (PARTITION BY grp ORDER BY ord) AS lv, \
-                    NTH_VALUE(score, 2) OVER (PARTITION BY grp ORDER BY ord) AS nv \
+                    LAST_VALUE(score) OVER (PARTITION BY grp ORDER BY ord ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lv, \
+                    NTH_VALUE(score, 2) OVER (PARTITION BY grp ORDER BY ord ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS nv \
                FROM t";
     let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
 
@@ -404,6 +404,60 @@ fn expanded_window_functions_ranking_and_value_semantics() {
         assert_eq!(actual.nv, exp.nv);
     }
 
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn window_frames_rows_range_groups_are_correct() {
+    let (engine, path) = make_engine_with_window_fixture();
+    let sql = "SELECT grp, ord, score, \
+                    SUM(score) OVER (PARTITION BY grp ORDER BY ord ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s_rows, \
+                    SUM(score) OVER (PARTITION BY grp ORDER BY ord RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s_range, \
+                    SUM(score) OVER (PARTITION BY grp ORDER BY score GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS s_groups \
+               FROM t";
+    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+
+    #[derive(Debug)]
+    struct Row {
+        grp: String,
+        ord: i64,
+        s_rows: f64,
+        s_range: f64,
+        s_groups: f64,
+    }
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let grp = batch.column(0).as_any().downcast_ref::<StringArray>().expect("grp");
+        let ord = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("ord");
+        let s_rows = batch.column(3).as_any().downcast_ref::<Float64Array>().expect("s_rows");
+        let s_range = batch.column(4).as_any().downcast_ref::<Float64Array>().expect("s_range");
+        let s_groups = batch.column(5).as_any().downcast_ref::<Float64Array>().expect("s_groups");
+        for i in 0..batch.num_rows() {
+            rows.push(Row {
+                grp: grp.value(i).to_string(),
+                ord: ord.value(i),
+                s_rows: s_rows.value(i),
+                s_range: s_range.value(i),
+                s_groups: s_groups.value(i),
+            });
+        }
+    }
+    rows.sort_unstable_by(|a, b| a.grp.cmp(&b.grp).then(a.ord.cmp(&b.ord)));
+
+    let expected = [
+        ("A", 1, 20.0, 10.0, 40.0),
+        ("A", 2, 40.0, 20.0, 40.0),
+        ("A", 3, 30.0, 30.0, 20.0),
+        ("B", 1, 16.0, 7.0, 16.0),
+        ("B", 2, 16.0, 16.0, 9.0),
+    ];
+    for (actual, exp) in rows.iter().zip(expected.iter()) {
+        assert_eq!(actual.grp, exp.0);
+        assert_eq!(actual.ord, exp.1);
+        assert!((actual.s_rows - exp.2).abs() < 1e-9);
+        assert!((actual.s_range - exp.3).abs() < 1e-9);
+        assert!((actual.s_groups - exp.4).abs() < 1e-9);
+    }
     let _ = std::fs::remove_file(path);
 }
 
