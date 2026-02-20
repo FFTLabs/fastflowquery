@@ -106,6 +106,15 @@ pub enum TaskState {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StageBarrierState {
+    NotApplicable,
+    MapRunning,
+    MapDone,
+    LayoutFinalized,
+    ReduceSchedulable,
+}
+
 #[derive(Debug, Clone)]
 /// One schedulable task assignment returned to workers.
 pub struct TaskAssignment {
@@ -205,6 +214,8 @@ struct StageRuntime {
     parents: Vec<u64>,
     children: Vec<u64>,
     layout_version: u32,
+    barrier_state: StageBarrierState,
+    layout_finalize_count: u32,
     metrics: StageMetrics,
 }
 
@@ -590,7 +601,7 @@ impl Coordinator {
                 .config
                 .max_concurrent_tasks_per_query
                 .saturating_sub(running_for_query);
-            maybe_apply_adaptive_partition_layout(
+            advance_stage_barriers_and_finalize_layout(
                 query_id,
                 query,
                 &map_outputs_snapshot,
@@ -602,6 +613,15 @@ impl Coordinator {
             );
             let latest_attempts = latest_attempt_map(query);
             for stage_id in runnable_stages(query) {
+                let Some(stage_runtime) = query.stages.get(&stage_id) else {
+                    continue;
+                };
+                if !matches!(
+                    stage_runtime.barrier_state,
+                    StageBarrierState::NotApplicable | StageBarrierState::ReduceSchedulable
+                ) {
+                    continue;
+                }
                 for task in query.tasks.values_mut().filter(|t| {
                     t.stage_id == stage_id && t.state == TaskState::Queued && t.ready_at_ms <= now
                 }) {
@@ -1118,6 +1138,12 @@ fn build_query_runtime(
                 parents: node.parents.iter().map(|p| p.0 as u64).collect(),
                 children: node.children.iter().map(|c| c.0 as u64).collect(),
                 layout_version: 1,
+                barrier_state: if is_reduce_stage {
+                    StageBarrierState::MapRunning
+                } else {
+                    StageBarrierState::NotApplicable
+                },
+                layout_finalize_count: 0,
                 metrics: StageMetrics {
                     queued_tasks: task_count,
                     planned_reduce_tasks: task_count,
@@ -1205,7 +1231,7 @@ fn collect_stage_reduce_task_counts_visit(
     }
 }
 
-fn maybe_apply_adaptive_partition_layout(
+fn advance_stage_barriers_and_finalize_layout(
     query_id: &str,
     query: &mut QueryRuntime,
     map_outputs: &HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>,
@@ -1217,10 +1243,31 @@ fn maybe_apply_adaptive_partition_layout(
 ) {
     let latest_states = latest_task_states(query);
     let mut stages_to_rewire = Vec::new();
-    for stage_id in runnable_stages(query) {
-        let Some(stage) = query.stages.get(&stage_id) else {
+    let mut stage_ids = query.stages.keys().copied().collect::<Vec<_>>();
+    stage_ids.sort_unstable();
+    for stage_id in stage_ids {
+        let Some(stage) = query.stages.get_mut(&stage_id) else {
             continue;
         };
+        if !matches!(
+            stage.barrier_state,
+            StageBarrierState::MapRunning | StageBarrierState::MapDone
+        ) {
+            continue;
+        }
+        let all_parents_done = stage.parents.iter().all(|pid| {
+            latest_states
+                .iter()
+                .filter(|((stage_id, _), _)| stage_id == pid)
+                .all(|(_, state)| *state == TaskState::Succeeded)
+        });
+        if !all_parents_done {
+            stage.barrier_state = StageBarrierState::MapRunning;
+            continue;
+        }
+        if stage.barrier_state == StageBarrierState::MapRunning {
+            stage.barrier_state = StageBarrierState::MapDone;
+        }
         let stage_tasks_queued = latest_states
             .iter()
             .filter(|((sid, _), _)| *sid == stage_id)
@@ -1233,27 +1280,32 @@ fn maybe_apply_adaptive_partition_layout(
         };
         let bytes_by_partition =
             latest_partition_bytes_for_stage(query_id, parent_stage_id, map_outputs);
-        if bytes_by_partition.is_empty() {
-            continue;
-        }
-        let groups = deterministic_coalesce_split_groups(
-            stage.metrics.planned_reduce_tasks,
-            target_bytes,
-            &bytes_by_partition,
-            min_reduce_tasks,
-            max_reduce_tasks,
-            max_partitions_per_task,
-        );
+        let groups = if bytes_by_partition.is_empty() {
+            (0..stage.metrics.planned_reduce_tasks.max(1))
+                .map(|p| ReduceTaskAssignmentSpec {
+                    assigned_reduce_partitions: vec![p],
+                    assigned_reduce_split_index: 0,
+                    assigned_reduce_split_count: 1,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            deterministic_coalesce_split_groups(
+                stage.metrics.planned_reduce_tasks,
+                target_bytes,
+                &bytes_by_partition,
+                min_reduce_tasks,
+                max_reduce_tasks,
+                max_partitions_per_task,
+            )
+        };
         let current_tasks = latest_states
             .iter()
             .filter(|((sid, _), _)| *sid == stage_id)
             .count() as u32;
-        if (groups.len() as u32) != current_tasks {
-            stages_to_rewire.push((stage_id, groups));
-        }
+        stages_to_rewire.push((stage_id, groups, current_tasks));
     }
 
-    for (stage_id, groups) in stages_to_rewire {
+    for (stage_id, groups, current_tasks) in stages_to_rewire {
         let Some(template) = query
             .tasks
             .values()
@@ -1274,37 +1326,47 @@ fn maybe_apply_adaptive_partition_layout(
             .map(|s| s.layout_version.saturating_add(1))
             .unwrap_or(1);
         let layout_fingerprint = compute_layout_fingerprint_from_specs(stage_id, &groups);
-        query.tasks.retain(|(sid, _, _), _| *sid != stage_id);
-        for (task_id, assignment) in groups.into_iter().enumerate() {
-            query.tasks.insert(
-                (stage_id, task_id as u64, 1),
-                TaskRuntime {
-                    query_id: template.2.clone(),
-                    stage_id,
-                    task_id: task_id as u64,
-                    attempt: 1,
-                    state: TaskState::Queued,
-                    assigned_worker: None,
-                    ready_at_ms,
-                    plan_fragment_json: template.0.clone(),
-                    assigned_reduce_partitions: assignment.assigned_reduce_partitions,
-                    assigned_reduce_split_index: assignment.assigned_reduce_split_index,
-                    assigned_reduce_split_count: assignment.assigned_reduce_split_count,
-                    layout_version,
-                    layout_fingerprint,
-                    required_custom_ops: template.1.clone(),
-                    message: String::new(),
-                },
-            );
+        if (groups.len() as u32) != current_tasks {
+            query.tasks.retain(|(sid, _, _), _| *sid != stage_id);
+            for (task_id, assignment) in groups.into_iter().enumerate() {
+                query.tasks.insert(
+                    (stage_id, task_id as u64, 1),
+                    TaskRuntime {
+                        query_id: template.2.clone(),
+                        stage_id,
+                        task_id: task_id as u64,
+                        attempt: 1,
+                        state: TaskState::Queued,
+                        assigned_worker: None,
+                        ready_at_ms,
+                        plan_fragment_json: template.0.clone(),
+                        assigned_reduce_partitions: assignment.assigned_reduce_partitions,
+                        assigned_reduce_split_index: assignment.assigned_reduce_split_index,
+                        assigned_reduce_split_count: assignment.assigned_reduce_split_count,
+                        layout_version,
+                        layout_fingerprint,
+                        required_custom_ops: template.1.clone(),
+                        message: String::new(),
+                    },
+                );
+            }
+        } else {
+            for task in query.tasks.values_mut().filter(|t| t.stage_id == stage_id) {
+                task.layout_version = layout_version;
+                task.layout_fingerprint = layout_fingerprint;
+            }
         }
         if let Some(stage) = query.stages.get_mut(&stage_id) {
             stage.layout_version = layout_version;
+            stage.barrier_state = StageBarrierState::LayoutFinalized;
+            stage.layout_finalize_count = stage.layout_finalize_count.saturating_add(1);
             stage.metrics.queued_tasks = query
                 .tasks
                 .values()
                 .filter(|t| t.stage_id == stage_id && t.state == TaskState::Queued)
                 .count() as u32;
             stage.metrics.adaptive_reduce_tasks = stage.metrics.queued_tasks;
+            stage.barrier_state = StageBarrierState::ReduceSchedulable;
         }
     }
 }
@@ -2511,5 +2573,102 @@ mod tests {
             })
             .count();
         assert_eq!(hot_splits, 4);
+    }
+
+    #[test]
+    fn coordinator_finalizes_adaptive_layout_once_before_reduce_scheduling() {
+        let mut c = Coordinator::new(CoordinatorConfig {
+            adaptive_shuffle_target_bytes: 30,
+            ..CoordinatorConfig::default()
+        });
+        let plan = PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
+            input: Box::new(PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(
+                ShuffleWriteExchange {
+                    input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
+                        table: "t".to_string(),
+                        schema: Some(Schema::empty()),
+                        projection: None,
+                        filters: vec![],
+                    })),
+                    partitioning: PartitioningSpec::HashKeys {
+                        keys: vec!["k".to_string()],
+                        partitions: 4,
+                    },
+                },
+            ))),
+            partitioning: PartitioningSpec::HashKeys {
+                keys: vec!["k".to_string()],
+                partitions: 4,
+            },
+        }));
+        let bytes = serde_json::to_vec(&plan).expect("plan");
+        c.submit_query("304".to_string(), &bytes).expect("submit");
+
+        let map_task = c.get_task("w1", 10).expect("map").remove(0);
+        let while_map_running = c.get_task("w2", 10).expect("no reduce before barrier");
+        assert!(while_map_running.is_empty());
+
+        c.register_map_output(
+            "304".to_string(),
+            map_task.stage_id,
+            map_task.task_id,
+            map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
+            vec![
+                MapOutputPartitionMeta {
+                    reduce_partition: 0,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 1,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 2,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 3,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+            ],
+        )
+        .expect("register");
+        c.report_task_status(
+            &map_task.query_id,
+            map_task.stage_id,
+            map_task.task_id,
+            map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
+            TaskState::Succeeded,
+            Some("w1"),
+            "map done".to_string(),
+        )
+        .expect("map success");
+
+        let reduce_tasks = c.get_task("w2", 10).expect("reduce tasks");
+        assert!(!reduce_tasks.is_empty());
+        let query = c.queries.get("304").expect("query runtime");
+        let reduce_stage = query.stages.get(&0).expect("reduce stage");
+        assert_eq!(reduce_stage.layout_finalize_count, 1);
+        assert_eq!(
+            reduce_stage.barrier_state,
+            StageBarrierState::ReduceSchedulable
+        );
+
+        let _ = c.get_task("w3", 10).expect("subsequent poll");
+        let query = c.queries.get("304").expect("query runtime");
+        let reduce_stage = query.stages.get(&0).expect("reduce stage");
+        assert_eq!(reduce_stage.layout_finalize_count, 1);
     }
 }
