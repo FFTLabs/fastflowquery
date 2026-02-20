@@ -1,0 +1,38 @@
+## nested_in_subquery
+schema:k:Int64:true
+rows:
+k=2
+
+## nested_scalar_subquery
+schema:k:Int64:true
+rows:
+k=3
+
+## mixed_cte_plus_subquery
+schema:k:Int64:true
+rows:
+k=2
+
+## not_in_null_rhs_pitfall
+schema:k:Int64:true
+rows:
+
+## not_in_empty_rhs
+schema:k:Int64:true
+rows:
+k=1
+k=2
+k=3
+
+## in_empty_rhs
+schema:k:Int64:true
+rows:
+
+## in_all_null_rhs
+schema:k:Int64:true
+rows:
+
+## not_in_all_null_rhs
+schema:k:Int64:true
+rows:
+
