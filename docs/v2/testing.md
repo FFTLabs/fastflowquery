@@ -284,6 +284,7 @@ Primary references:
 3. `scripts/run-bench-v2-adaptive-shuffle.sh`
 4. `tests/bench/thresholds/window_regression_thresholds.json`
 5. `tests/bench/thresholds/adaptive_shuffle_regression_thresholds.json`
+6. `docs/v2/adaptive-shuffle-tuning.md`
 
 Pass criteria:
 

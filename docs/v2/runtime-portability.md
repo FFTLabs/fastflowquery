@@ -14,6 +14,10 @@ This chapter documents EPIC 1 runtime/portability behavior in v2:
 3. distributed runtime hardening (liveness, requeue, retry/backoff, scheduler limits)
 4. reproducible acceptance commands and expected outcomes
 
+Adaptive shuffle tuning reference:
+
+1. `docs/v2/adaptive-shuffle-tuning.md`
+
 ## Feature Matrix
 
 Primary feature definitions live in:
@@ -114,6 +118,7 @@ Implementation focus:
 3. retry/backoff and blacklist thresholds
 4. scheduler concurrency limits (per worker and per query)
 5. capability-aware assignment for custom physical operators
+6. adaptive shuffle reduce-layout planning and reduce-stage fanout
 
 Primary implementation:
 
@@ -121,6 +126,7 @@ Primary implementation:
 2. `crates/distributed/src/worker.rs`
 3. `crates/distributed/src/grpc.rs`
 4. `crates/distributed/proto/ffq_distributed.proto`
+5. `crates/common/src/adaptive.rs`
 
 ### Runtime behavior contract
 

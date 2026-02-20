@@ -14,8 +14,10 @@ This page documents the distributed runtime execution contract in v2:
 3. map output registry and shuffle lookup
 4. liveness, retry/backoff, blacklisting
 5. capability-aware custom-operator assignment
+6. adaptive shuffle reduce-layout behavior (barrier-time planning)
 
 Related control-plane RPC details are documented in `docs/v2/control-plane.md`.
+Adaptive operator playbook and tuning profiles are documented in `docs/v2/adaptive-shuffle-tuning.md`.
 
 Core implementation references:
 
@@ -126,6 +128,31 @@ Map output metadata is keyed by:
 `FetchShufflePartition` requires an exact key match for the requested attempt.
 This ensures stale map attempts are not used by downstream stages.
 
+## Adaptive Shuffle (Barrier-Time Layout Finalization)
+
+Adaptive shuffle is finalized exactly once after map completion and before reduce scheduling.
+
+1. map stage collects per-partition bytes via map-output registration
+2. coordinator computes adaptive reduce assignments from observed bytes
+3. stage transitions:
+   - `MapRunning -> MapDone -> LayoutFinalized -> ReduceSchedulable`
+4. reduce assignments include:
+   - `assigned_reduce_partitions`
+   - `assigned_reduce_split_index`
+   - `assigned_reduce_split_count`
+   - `layout_version` and `layout_fingerprint`
+5. workers only read assigned partitions/splits
+
+Exposed diagnostics in stage metrics:
+
+1. `planned_reduce_tasks`
+2. `adaptive_reduce_tasks`
+3. `adaptive_target_bytes`
+4. `aqe_events`
+5. `partition_bytes_histogram`
+6. `skew_split_tasks`
+7. `layout_finalize_count`
+
 ## Minimal Runtime Walkthrough (Coordinator + 2 Workers)
 
 1. client submits query plan
@@ -145,6 +172,8 @@ cargo test -p ffq-distributed --features grpc coordinator_requeues_tasks_from_st
 cargo test -p ffq-distributed --features grpc coordinator_blacklists_failing_worker
 cargo test -p ffq-distributed --features grpc coordinator_enforces_worker_and_query_concurrency_limits
 cargo test -p ffq-distributed --features grpc coordinator_assigns_custom_operator_tasks_only_to_capable_workers
+cargo test -p ffq-distributed --features grpc coordinator_applies_barrier_time_adaptive_partition_coalescing
+cargo test -p ffq-distributed --features grpc coordinator_barrier_time_hot_partition_splitting_increases_reduce_tasks
 ```
 
 Expected:
