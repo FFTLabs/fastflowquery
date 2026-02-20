@@ -1,0 +1,60 @@
+## ranking_nulls_ties
+schema:grp:Utf8:false,ord:Int64:false,score:Int64:true,rn:Int64:false,rnk:Int64:false,dr:Int64:false
+rows:
+grp=A|ord=1|score=10|rn=2|rnk=1|dr=1
+grp=A|ord=2|score=10|rn=1|rnk=1|dr=1
+grp=A|ord=3|score=NULL|rn=4|rnk=4|dr=3
+grp=A|ord=4|score=20|rn=3|rnk=3|dr=2
+grp=B|ord=1|score=NULL|rn=4|rnk=4|dr=3
+grp=B|ord=2|score=5|rn=2|rnk=1|dr=1
+grp=B|ord=3|score=5|rn=1|rnk=1|dr=1
+grp=B|ord=4|score=8|rn=3|rnk=3|dr=2
+
+## frames_rows_range_groups
+schema:grp:Utf8:false,ord:Int64:false,score:Int64:true,s_rows:Float64:true,s_range:Float64:true,s_groups:Float64:true
+rows:
+grp=A|ord=1|score=10|s_rows=2.000000000000|s_range=5.000000000000|s_groups=10.000000000000
+grp=A|ord=2|score=10|s_rows=5.000000000000|s_range=9.000000000000|s_groups=10.000000000000
+grp=A|ord=3|score=NULL|s_rows=7.000000000000|s_range=12.000000000000|s_groups=4.000000000000
+grp=A|ord=4|score=20|s_rows=9.000000000000|s_range=9.000000000000|s_groups=9.000000000000
+grp=B|ord=1|score=NULL|s_rows=1.000000000000|s_range=3.000000000000|s_groups=1.000000000000
+grp=B|ord=2|score=5|s_rows=3.000000000000|s_range=6.000000000000|s_groups=9.000000000000
+grp=B|ord=3|score=5|s_rows=5.000000000000|s_range=9.000000000000|s_groups=9.000000000000
+grp=B|ord=4|score=8|s_rows=7.000000000000|s_range=7.000000000000|s_groups=5.000000000000
+
+## offsets_and_value_windows
+schema:grp:Utf8:false,ord:Int64:false,score:Int64:true,lag_s:Int64:true,lead_s:Int64:true,fv:Int64:true,lv:Int64:true,nv2:Int64:true
+rows:
+grp=A|ord=1|score=10|lag_s=999|lead_s=NULL|fv=10|lv=20|nv2=10
+grp=A|ord=2|score=10|lag_s=10|lead_s=20|fv=10|lv=20|nv2=10
+grp=A|ord=3|score=NULL|lag_s=10|lead_s=111|fv=10|lv=20|nv2=10
+grp=A|ord=4|score=20|lag_s=NULL|lead_s=111|fv=10|lv=20|nv2=10
+grp=B|ord=1|score=NULL|lag_s=999|lead_s=5|fv=NULL|lv=8|nv2=5
+grp=B|ord=2|score=5|lag_s=NULL|lead_s=8|fv=NULL|lv=8|nv2=5
+grp=B|ord=3|score=5|lag_s=5|lead_s=111|fv=NULL|lv=8|nv2=5
+grp=B|ord=4|score=8|lag_s=5|lead_s=111|fv=NULL|lv=8|nv2=5
+
+## exclusion_modes
+schema:grp:Utf8:false,ord:Int64:false,s_all:Float64:true,s_cur:Float64:true,s_group:Float64:true,s_ties:Float64:true
+rows:
+grp=A|ord=1|s_all=14.000000000000|s_cur=12.000000000000|s_group=9.000000000000|s_ties=11.000000000000
+grp=A|ord=2|s_all=14.000000000000|s_cur=11.000000000000|s_group=9.000000000000|s_ties=12.000000000000
+grp=A|ord=3|s_all=14.000000000000|s_cur=10.000000000000|s_group=10.000000000000|s_ties=14.000000000000
+grp=A|ord=4|s_all=14.000000000000|s_cur=9.000000000000|s_group=9.000000000000|s_ties=14.000000000000
+grp=B|ord=1|s_all=10.000000000000|s_cur=9.000000000000|s_group=9.000000000000|s_ties=10.000000000000
+grp=B|ord=2|s_all=10.000000000000|s_cur=8.000000000000|s_group=5.000000000000|s_ties=7.000000000000
+grp=B|ord=3|s_all=10.000000000000|s_cur=7.000000000000|s_group=5.000000000000|s_ties=8.000000000000
+grp=B|ord=4|s_all=10.000000000000|s_cur=6.000000000000|s_group=6.000000000000|s_ties=10.000000000000
+
+## mixed_window_join_filter
+schema:w.grp:Utf8:false,w.ord:Int64:false,o.o_custkey:Int64:false,rn:Int64:false,running_sum:Float64:true
+rows:
+w.grp=A|w.ord=1|o.o_custkey=100|rn=1|running_sum=2.000000000000
+w.grp=A|w.ord=2|o.o_custkey=200|rn=2|running_sum=5.000000000000
+w.grp=A|w.ord=3|o.o_custkey=300|rn=3|running_sum=9.000000000000
+w.grp=A|w.ord=4|o.o_custkey=400|rn=4|running_sum=14.000000000000
+w.grp=B|w.ord=1|o.o_custkey=100|rn=1|running_sum=1.000000000000
+w.grp=B|w.ord=2|o.o_custkey=200|rn=2|running_sum=3.000000000000
+w.grp=B|w.ord=3|o.o_custkey=300|rn=3|running_sum=6.000000000000
+w.grp=B|w.ord=4|o.o_custkey=400|rn=4|running_sum=10.000000000000
+
