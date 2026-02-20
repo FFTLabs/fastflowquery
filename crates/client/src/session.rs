@@ -36,6 +36,7 @@ pub struct Session {
     pub physical_registry: Arc<PhysicalOperatorRegistry>,
     pub runtime: Arc<dyn Runtime>,
     pub(crate) schema_cache: RwLock<HashMap<String, SchemaCacheEntry>>,
+    pub(crate) last_query_stats_report: RwLock<Option<String>>,
 }
 
 impl Session {
@@ -95,6 +96,7 @@ impl Session {
             physical_registry: global_physical_operator_registry(),
             runtime,
             schema_cache: RwLock::new(HashMap::new()),
+            last_query_stats_report: RwLock::new(None),
         })
     }
 

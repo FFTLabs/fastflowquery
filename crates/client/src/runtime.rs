@@ -61,6 +61,145 @@ pub struct QueryContext {
     pub batch_size_rows: usize,
     pub mem_budget_bytes: usize,
     pub spill_dir: String,
+    pub(crate) stats_collector: Option<Arc<RuntimeStatsCollector>>,
+}
+
+#[derive(Debug, Clone)]
+struct OperatorExecutionStats {
+    stage_id: u64,
+    task_id: u64,
+    operator: &'static str,
+    rows_in: u64,
+    rows_out: u64,
+    batches_in: u64,
+    batches_out: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    elapsed_ms: f64,
+    partition_sizes_bytes: Vec<u64>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct StageExecutionSummary {
+    operator_count: u64,
+    task_count: u64,
+    rows_in: u64,
+    rows_out: u64,
+    batches_in: u64,
+    batches_out: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    partition_sizes_bytes: Vec<u64>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeStatsInner {
+    query_id: Option<String>,
+    operators: Vec<OperatorExecutionStats>,
+    stages: HashMap<u64, StageExecutionSummary>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeStatsCollector {
+    inner: Mutex<RuntimeStatsInner>,
+}
+
+impl RuntimeStatsCollector {
+    fn record_operator(&self, query_id: &str, op: OperatorExecutionStats) {
+        let mut guard = self.inner.lock().expect("stats collector lock poisoned");
+        if guard.query_id.is_none() {
+            guard.query_id = Some(query_id.to_string());
+        }
+        let stage = guard.stages.entry(op.stage_id).or_default();
+        stage.operator_count = stage.operator_count.saturating_add(1);
+        stage.rows_in = stage.rows_in.saturating_add(op.rows_in);
+        stage.rows_out = stage.rows_out.saturating_add(op.rows_out);
+        stage.batches_in = stage.batches_in.saturating_add(op.batches_in);
+        stage.batches_out = stage.batches_out.saturating_add(op.batches_out);
+        stage.bytes_in = stage.bytes_in.saturating_add(op.bytes_in);
+        stage.bytes_out = stage.bytes_out.saturating_add(op.bytes_out);
+        stage.task_count = stage.task_count.max(op.task_id.saturating_add(1));
+        stage
+            .partition_sizes_bytes
+            .extend(op.partition_sizes_bytes.iter().copied());
+        guard.operators.push(op);
+    }
+
+    #[cfg(feature = "distributed")]
+    fn record_stage_summary(
+        &self,
+        query_id: &str,
+        stage_id: u64,
+        task_count: u64,
+        rows_out: u64,
+        bytes_out: u64,
+        batches_out: u64,
+    ) {
+        let mut guard = self.inner.lock().expect("stats collector lock poisoned");
+        if guard.query_id.is_none() {
+            guard.query_id = Some(query_id.to_string());
+        }
+        let stage = guard.stages.entry(stage_id).or_default();
+        stage.task_count = stage.task_count.max(task_count);
+        stage.rows_out = stage.rows_out.max(rows_out);
+        stage.bytes_out = stage.bytes_out.max(bytes_out);
+        stage.batches_out = stage.batches_out.max(batches_out);
+    }
+
+    pub(crate) fn render_report(&self) -> Option<String> {
+        let guard = self.inner.lock().ok()?;
+        if guard.operators.is_empty() {
+            return None;
+        }
+        let query_id = guard
+            .query_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut stage_ids = guard.stages.keys().copied().collect::<Vec<_>>();
+        stage_ids.sort_unstable();
+
+        let mut out = String::new();
+        out.push_str(&format!("query_id={query_id}\n"));
+        out.push_str("stages:\n");
+        for sid in stage_ids {
+            let s = guard.stages.get(&sid).expect("stage exists");
+            let (part_min, part_max, part_avg, part_n) = if s.partition_sizes_bytes.is_empty() {
+                (0_u64, 0_u64, 0.0_f64, 0_usize)
+            } else {
+                let min = *s.partition_sizes_bytes.iter().min().unwrap_or(&0);
+                let max = *s.partition_sizes_bytes.iter().max().unwrap_or(&0);
+                let sum = s.partition_sizes_bytes.iter().sum::<u64>() as f64;
+                let n = s.partition_sizes_bytes.len();
+                (min, max, sum / (n as f64), n)
+            };
+            out.push_str(&format!(
+                "- stage={sid} ops={} tasks={} rows_in={} rows_out={} bytes_in={} bytes_out={} batches_in={} batches_out={} partition_sizes={{n:{part_n},min:{part_min},max:{part_max},avg:{part_avg:.1}}}\n",
+                s.operator_count,
+                s.task_count,
+                s.rows_in,
+                s.rows_out,
+                s.bytes_in,
+                s.bytes_out,
+                s.batches_in,
+                s.batches_out,
+            ));
+        }
+        out.push_str("operators:\n");
+        for op in &guard.operators {
+            out.push_str(&format!(
+                "- stage={} task={} op={} rows_in={} rows_out={} bytes_in={} bytes_out={} ms={:.3}\n",
+                op.stage_id,
+                op.task_id,
+                op.operator,
+                op.rows_in,
+                op.rows_out,
+                op.bytes_in,
+                op.bytes_out,
+                op.elapsed_ms
+            ));
+        }
+        Some(out)
+    }
 }
 
 /// Runtime = something that can execute a PhysicalPlan and return a stream of RecordBatches.
@@ -182,6 +321,7 @@ fn execute_plan_with_cache(
     );
     async move {
         let started = Instant::now();
+        let stats_collector = ctx.stats_collector.clone();
         let eval = match plan {
             PhysicalPlan::ParquetScan(scan) => {
                 let table = catalog.get(&scan.table)?.clone();
@@ -711,6 +851,7 @@ fn execute_plan_with_cache(
             ))),
         }?;
         let (out_rows, out_batches, out_bytes) = batch_stats(&eval.out.batches);
+        let elapsed_secs = started.elapsed().as_secs_f64();
         global_metrics().record_operator(
             &trace.query_id,
             trace.stage_id,
@@ -722,8 +863,36 @@ fn execute_plan_with_cache(
             out_batches,
             eval.in_bytes,
             out_bytes,
-            started.elapsed().as_secs_f64(),
+            elapsed_secs,
         );
+        if let Some(collector) = &stats_collector {
+            collector.record_operator(
+                &trace.query_id,
+                OperatorExecutionStats {
+                    stage_id: trace.stage_id,
+                    task_id: trace.task_id,
+                    operator,
+                    rows_in: eval.in_rows,
+                    rows_out: out_rows,
+                    batches_in: eval.in_batches,
+                    batches_out: out_batches,
+                    bytes_in: eval.in_bytes,
+                    bytes_out: out_bytes,
+                    elapsed_ms: elapsed_secs * 1_000.0,
+                    partition_sizes_bytes: eval
+                        .out
+                        .batches
+                        .iter()
+                        .map(|b| {
+                            b.columns()
+                                .iter()
+                                .map(|a| a.get_array_memory_size() as u64)
+                                .sum::<u64>()
+                        })
+                        .collect(),
+                },
+            );
+        }
         Ok(eval.out)
     }
     .instrument(span)
@@ -1324,6 +1493,7 @@ fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput
         batch_size_rows: 8192,
         mem_budget_bytes: usize::MAX,
         spill_dir: "./ffq_spill".to_string(),
+        stats_collector: None,
     };
     run_window_exec_with_ctx(input, exprs, &default_ctx, None)
 }
@@ -3956,7 +4126,7 @@ impl Runtime for DistributedRuntime {
     fn execute(
         &self,
         plan: PhysicalPlan,
-        _ctx: QueryContext,
+        ctx: QueryContext,
         _catalog: Arc<Catalog>,
         _physical_registry: Arc<PhysicalOperatorRegistry>,
     ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
@@ -4017,7 +4187,7 @@ impl Runtime for DistributedRuntime {
                             | DistQueryState::Failed
                             | DistQueryState::Canceled
                     ) {
-                        break (qstate, status.message);
+                        break (qstate, status.message, status.stage_metrics);
                     }
 
                     polls = polls.saturating_add(1);
@@ -4056,7 +4226,7 @@ impl Runtime for DistributedRuntime {
 
                 let mut stream = client
                     .fetch_query_results(ffq_distributed::grpc::v1::FetchQueryResultsRequest {
-                        query_id,
+                        query_id: query_id.clone(),
                     })
                     .await
                     .map_err(|e| FfqError::Execution(format!("fetch query results failed: {e}")))?
@@ -4072,6 +4242,47 @@ impl Runtime for DistributedRuntime {
                 }
 
                 let (schema, batches) = decode_record_batches_ipc(&payload)?;
+                if let Some(collector) = &ctx.stats_collector {
+                    for sm in &terminal.2 {
+                        let tasks = (sm.queued_tasks as u64)
+                            .saturating_add(sm.running_tasks as u64)
+                            .saturating_add(sm.succeeded_tasks as u64)
+                            .saturating_add(sm.failed_tasks as u64);
+                        collector.record_stage_summary(
+                            &query_id,
+                            sm.stage_id,
+                            tasks,
+                            sm.map_output_rows,
+                            sm.map_output_bytes,
+                            sm.map_output_batches,
+                        );
+                    }
+                    let (rows_out, batches_out, bytes_out) = batch_stats(&batches);
+                    collector.record_operator(
+                        &query_id,
+                        OperatorExecutionStats {
+                            stage_id: 0,
+                            task_id: 0,
+                            operator: "DistributedRuntime",
+                            rows_in: 0,
+                            rows_out,
+                            batches_in: 0,
+                            batches_out,
+                            bytes_in: 0,
+                            bytes_out,
+                            elapsed_ms: 0.0,
+                            partition_sizes_bytes: batches
+                                .iter()
+                                .map(|b| {
+                                    b.columns()
+                                        .iter()
+                                        .map(|a| a.get_array_memory_size() as u64)
+                                        .sum::<u64>()
+                                })
+                                .collect(),
+                        },
+                    );
+                }
                 info!(batches = batches.len(), "received distributed query results");
                 let out_stream = futures::stream::iter(batches.into_iter().map(Ok));
                 Ok(Box::pin(StreamAdapter::new(schema, out_stream)) as SendableRecordBatchStream)
@@ -4441,6 +4652,7 @@ mod tests {
             batch_size_rows: 512,
             mem_budget_bytes: 256,
             spill_dir: spill_dir.to_string_lossy().into_owned(),
+            stats_collector: None,
         };
         let trace = TraceIds {
             query_id: "window-spill-test".to_string(),
@@ -4533,6 +4745,7 @@ mod tests {
                 batch_size_rows: 1024,
                 mem_budget_bytes: 64 * 1024 * 1024,
                 spill_dir: "./ffq_spill_test".to_string(),
+                stats_collector: None,
             },
             Arc::clone(&catalog),
             Arc::clone(&registry),

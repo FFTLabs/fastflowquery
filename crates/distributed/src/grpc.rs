@@ -298,6 +298,21 @@ fn proto_task_assignment(task: CoreTaskAssignment) -> v1::TaskAssignment {
 }
 
 fn proto_query_status(status: CoreQueryStatus) -> v1::QueryStatus {
+    let mut stage_metrics = status
+        .stage_metrics
+        .into_iter()
+        .map(|(stage_id, m)| v1::StageMetrics {
+            stage_id,
+            queued_tasks: m.queued_tasks,
+            running_tasks: m.running_tasks,
+            succeeded_tasks: m.succeeded_tasks,
+            failed_tasks: m.failed_tasks,
+            map_output_rows: m.map_output_rows,
+            map_output_bytes: m.map_output_bytes,
+            map_output_batches: m.map_output_batches,
+        })
+        .collect::<Vec<_>>();
+    stage_metrics.sort_by_key(|m| m.stage_id);
     v1::QueryStatus {
         query_id: status.query_id,
         state: proto_query_state(status.state) as i32,
@@ -305,6 +320,7 @@ fn proto_query_status(status: CoreQueryStatus) -> v1::QueryStatus {
         started_at_ms: status.started_at_ms,
         finished_at_ms: status.finished_at_ms,
         message: status.message,
+        stage_metrics,
     }
 }
 

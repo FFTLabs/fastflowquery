@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::{annotate_schema_inference_metadata, read_schema_fingerprint_metadata};
-use crate::runtime::QueryContext;
+use crate::runtime::{QueryContext, RuntimeStatsCollector};
 use crate::session::SchemaCacheEntry;
 use crate::session::SharedSession;
 
@@ -151,6 +151,23 @@ impl DataFrame {
             ffq_planner::explain_logical(&opt),
             ffq_planner::explain_physical(&physical)
         ))
+    }
+
+    /// Executes this query and returns explain text with runtime stage/operator statistics.
+    ///
+    /// # Errors
+    /// Returns an error when planning or execution fails.
+    pub async fn explain_analyze(&self) -> Result<String> {
+        let _ = self.collect().await?;
+        let explain = self.explain()?;
+        let stats = self
+            .session
+            .last_query_stats_report
+            .read()
+            .expect("query stats lock poisoned")
+            .clone()
+            .unwrap_or_else(|| "no runtime stats captured".to_string());
+        Ok(format!("{explain}\n== Runtime Stats ==\n{stats}"))
     }
 
     /// df.collect() (async)
@@ -336,13 +353,16 @@ impl DataFrame {
 
         let physical = self.session.planner.create_physical_plan(&analyzed)?;
 
+        let stats_collector = Arc::new(RuntimeStatsCollector::default());
         let ctx = QueryContext {
             batch_size_rows: self.session.config.batch_size_rows,
             mem_budget_bytes: self.session.config.mem_budget_bytes,
             spill_dir: self.session.config.spill_dir.clone(),
+            stats_collector: Some(Arc::clone(&stats_collector)),
         };
 
-        self.session
+        let stream = self
+            .session
             .runtime
             .execute(
                 physical,
@@ -350,7 +370,17 @@ impl DataFrame {
                 catalog_snapshot,
                 Arc::clone(&self.session.physical_registry),
             )
-            .await
+            .await?;
+        let report = stats_collector.render_report();
+        {
+            let mut slot = self
+                .session
+                .last_query_stats_report
+                .write()
+                .expect("query stats lock poisoned");
+            *slot = report;
+        }
+        Ok(stream)
     }
 
     fn ensure_inferred_parquet_schemas(&self) -> Result<()> {

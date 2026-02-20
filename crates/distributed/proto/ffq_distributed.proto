@@ -87,6 +87,18 @@ message QueryStatus {
   uint64 started_at_ms = 4;
   uint64 finished_at_ms = 5;
   string message = 6;
+  repeated StageMetrics stage_metrics = 7;
+}
+
+message StageMetrics {
+  uint64 stage_id = 1;
+  uint32 queued_tasks = 2;
+  uint32 running_tasks = 3;
+  uint32 succeeded_tasks = 4;
+  uint32 failed_tasks = 5;
+  uint64 map_output_rows = 6;
+  uint64 map_output_bytes = 7;
+  uint64 map_output_batches = 8;
 }
 
 message GetQueryStatusResponse {

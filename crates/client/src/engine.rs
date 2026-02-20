@@ -262,6 +262,17 @@ impl Engine {
         self.session.prometheus_metrics()
     }
 
+    /// Returns the most recent query execution stats report captured by this engine session.
+    ///
+    /// The report is populated by query execution paths (`collect`, write methods).
+    pub fn last_query_stats_report(&self) -> Option<String> {
+        self.session
+            .last_query_stats_report
+            .read()
+            .expect("query stats lock poisoned")
+            .clone()
+    }
+
     /// Register a custom optimizer rule.
     ///
     /// Rules are applied after built-in optimizer passes in deterministic name order.
