@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result, SchemaInferencePolicy};
-use ffq_planner::{ExchangeExec, PhysicalPlan};
+use ffq_planner::{ExchangeExec, PartitioningSpec, PhysicalPlan};
 use ffq_shuffle::ShuffleReader;
 use ffq_storage::Catalog;
 use ffq_storage::parquet_provider::ParquetProvider;
@@ -936,18 +936,20 @@ fn build_query_runtime(
     collect_custom_ops(&plan, &mut required_custom_ops);
     let mut required_custom_ops = required_custom_ops.into_iter().collect::<Vec<_>>();
     required_custom_ops.sort();
+    let stage_reduce_task_counts = collect_stage_reduce_task_counts(&plan);
 
     for node in dag.stages {
         let sid = node.id.0 as u64;
+        let task_count = stage_reduce_task_counts.get(&sid).copied().unwrap_or(1);
         stages.insert(
             sid,
             StageRuntime {
                 parents: node.parents.iter().map(|p| p.0 as u64).collect(),
                 children: node.children.iter().map(|c| c.0 as u64).collect(),
                 metrics: StageMetrics {
-                    queued_tasks: 1,
-                    planned_reduce_tasks: 1,
-                    adaptive_reduce_tasks: 1,
+                    queued_tasks: task_count,
+                    planned_reduce_tasks: task_count,
+                    adaptive_reduce_tasks: task_count,
                     ..StageMetrics::default()
                 },
             },
@@ -955,21 +957,23 @@ fn build_query_runtime(
         // v1 simplification: each scheduled task carries the submitted physical plan bytes.
         // Stage boundaries are still respected by coordinator scheduling.
         let fragment = physical_plan_json.to_vec();
-        tasks.insert(
-            (sid, 0, 1),
-            TaskRuntime {
-                query_id: query_id.to_string(),
-                stage_id: sid,
-                task_id: 0,
-                attempt: 1,
-                state: TaskState::Queued,
-                assigned_worker: None,
-                ready_at_ms: submitted_at_ms,
-                plan_fragment_json: fragment,
-                required_custom_ops: required_custom_ops.clone(),
-                message: String::new(),
-            },
-        );
+        for task_id in 0..task_count {
+            tasks.insert(
+                (sid, task_id as u64, 1),
+                TaskRuntime {
+                    query_id: query_id.to_string(),
+                    stage_id: sid,
+                    task_id: task_id as u64,
+                    attempt: 1,
+                    state: TaskState::Queued,
+                    assigned_worker: None,
+                    ready_at_ms: submitted_at_ms,
+                    plan_fragment_json: fragment.clone(),
+                    required_custom_ops: required_custom_ops.clone(),
+                    message: String::new(),
+                },
+            );
+        }
     }
 
     Ok(QueryRuntime {
@@ -981,6 +985,40 @@ fn build_query_runtime(
         stages,
         tasks,
     })
+}
+
+fn collect_stage_reduce_task_counts(plan: &PhysicalPlan) -> HashMap<u64, u32> {
+    let mut out = HashMap::new();
+    let mut next_stage_id = 1_u64;
+    collect_stage_reduce_task_counts_visit(plan, 0, &mut next_stage_id, &mut out);
+    out
+}
+
+fn collect_stage_reduce_task_counts_visit(
+    plan: &PhysicalPlan,
+    current_stage_id: u64,
+    next_stage_id: &mut u64,
+    out: &mut HashMap<u64, u32>,
+) {
+    match plan {
+        PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(read)) => {
+            let partitions = match &read.partitioning {
+                PartitioningSpec::HashKeys { partitions, .. } => (*partitions).max(1) as u32,
+                PartitioningSpec::Single => 1,
+            };
+            out.entry(current_stage_id)
+                .and_modify(|v| *v = (*v).max(partitions))
+                .or_insert(partitions);
+            let upstream = *next_stage_id;
+            *next_stage_id += 1;
+            collect_stage_reduce_task_counts_visit(&read.input, upstream, next_stage_id, out);
+        }
+        _ => {
+            for child in plan.children() {
+                collect_stage_reduce_task_counts_visit(child, current_stage_id, next_stage_id, out);
+            }
+        }
+    }
 }
 
 fn collect_custom_ops(plan: &PhysicalPlan, out: &mut HashSet<String>) {
@@ -1346,6 +1384,62 @@ mod tests {
             .expect("heartbeat custom");
         let custom_assignments = c.get_task("w_custom", 10).expect("custom assignments");
         assert_eq!(custom_assignments.len(), 1);
+    }
+
+    #[test]
+    fn coordinator_fans_out_reduce_stage_tasks_from_shuffle_layout() {
+        let mut c = Coordinator::new(CoordinatorConfig::default());
+        let plan = serde_json::to_vec(&PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(
+            ffq_planner::ShuffleReadExchange {
+                input: Box::new(PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(
+                    ffq_planner::ShuffleWriteExchange {
+                        input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
+                            table: "t".to_string(),
+                            schema: Some(Schema::empty()),
+                            projection: None,
+                            filters: vec![],
+                        })),
+                        partitioning: ffq_planner::PartitioningSpec::HashKeys {
+                            keys: vec!["k".to_string()],
+                            partitions: 4,
+                        },
+                    },
+                ))),
+                partitioning: ffq_planner::PartitioningSpec::HashKeys {
+                    keys: vec!["k".to_string()],
+                    partitions: 4,
+                },
+            },
+        )))
+        .expect("plan");
+        c.submit_query("qfanout".to_string(), &plan)
+            .expect("submit");
+
+        let map_assignments = c.get_task("w1", 10).expect("get map task");
+        assert_eq!(map_assignments.len(), 1);
+        let map = &map_assignments[0];
+        c.report_task_status(
+            &map.query_id,
+            map.stage_id,
+            map.task_id,
+            map.attempt,
+            TaskState::Succeeded,
+            Some("w1"),
+            "map done".to_string(),
+        )
+        .expect("mark map success");
+
+        let assignments = c.get_task("w1", 10).expect("get reduce tasks");
+        assert_eq!(assignments.len(), 4);
+        let mut task_ids = assignments.iter().map(|t| t.task_id).collect::<Vec<_>>();
+        task_ids.sort_unstable();
+        assert_eq!(task_ids, vec![0, 1, 2, 3]);
+
+        let status = c.get_query_status("qfanout").expect("status");
+        let root = status.stage_metrics.get(&0).expect("root stage metrics");
+        assert_eq!(root.planned_reduce_tasks, 4);
+        assert_eq!(root.queued_tasks, 0);
+        assert_eq!(root.running_tasks, 4);
     }
 
     #[test]
