@@ -12,6 +12,8 @@ use crate::logical_plan::{
     AggExpr, BinaryOp, Expr, JoinStrategyHint, LiteralValue, LogicalPlan, SubqueryCorrelation,
 };
 
+const E_RECURSIVE_CTE_OVERFLOW: &str = "E_RECURSIVE_CTE_OVERFLOW";
+
 /// SQL frontend planning options.
 #[derive(Debug, Clone, Copy)]
 pub struct SqlFrontendOptions {
@@ -418,7 +420,7 @@ fn build_recursive_cte_plan(
 ) -> Result<LogicalPlan> {
     if opts.recursive_cte_max_depth == 0 {
         return Err(FfqError::Planning(format!(
-            "recursive CTE '{cte_name}' cannot be planned with recursive_cte_max_depth=0"
+            "{E_RECURSIVE_CTE_OVERFLOW}: recursive CTE '{cte_name}' cannot be planned with recursive_cte_max_depth=0"
         )));
     }
     let SetExpr::SetOperation {

@@ -442,6 +442,11 @@ fn classify_error(err: &FfqError) -> (&'static str, Option<&'static str>) {
 
 fn planning_hint(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
+    if m.contains("e_recursive_cte_overflow") {
+        return Some(
+            "increase recursive CTE depth limit (--recursive-cte-max-depth / FFQ_RECURSIVE_CTE_MAX_DEPTH)",
+        );
+    }
     if m.contains("unknown table") {
         return Some("register the table first; try \\tables to inspect current session tables");
     }
@@ -453,6 +458,9 @@ fn planning_hint(msg: &str) -> Option<&'static str> {
 
 fn execution_hint(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
+    if m.contains("e_subquery_scalar_row_violation") {
+        return Some("scalar subquery must return one column and at most one row");
+    }
     if m.contains("schema inference failed") {
         return Some(
             "check parquet path(s) exist/readable and set schema policy (--schema-inference on|strict|permissive)",
@@ -520,6 +528,11 @@ fn config_hint(msg: &str) -> Option<&'static str> {
 
 fn unsupported_hint(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
+    if m.contains("e_subquery_unsupported_correlation") {
+        return Some(
+            "supported correlated subqueries currently require simple equality outer/inner predicates",
+        );
+    }
     if m.contains("order by") {
         return Some("v1 supports ORDER BY only for cosine_similarity(...) DESC LIMIT k pattern");
     }

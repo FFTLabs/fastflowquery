@@ -52,6 +52,8 @@ use tracing::{debug, error, info, info_span};
 use crate::coordinator::{Coordinator, MapOutputPartitionMeta, TaskAssignment, TaskState};
 use crate::grpc::v1;
 
+const E_SUBQUERY_SCALAR_ROW_VIOLATION: &str = "E_SUBQUERY_SCALAR_ROW_VIOLATION";
+
 #[derive(Debug, Clone)]
 /// Worker resource/configuration controls.
 pub struct WorkerConfig {
@@ -1988,7 +1990,9 @@ fn run_scalar_subquery_filter(
 fn scalar_subquery_value(subquery: &ExecOutput) -> Result<ScalarValue> {
     if subquery.schema.fields().len() != 1 {
         return Err(FfqError::Planning(
-            "scalar subquery must produce exactly one column".to_string(),
+            format!(
+                "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery must produce exactly one column"
+            ),
         ));
     }
     let mut seen: Option<ScalarValue> = None;
@@ -1996,14 +2000,18 @@ fn scalar_subquery_value(subquery: &ExecOutput) -> Result<ScalarValue> {
     for batch in &subquery.batches {
         if batch.num_columns() != 1 {
             return Err(FfqError::Planning(
-                "scalar subquery must produce exactly one column".to_string(),
+                format!(
+                    "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery must produce exactly one column"
+                ),
             ));
         }
         for row in 0..batch.num_rows() {
             rows += 1;
             if rows > 1 {
                 return Err(FfqError::Execution(
-                    "scalar subquery returned more than one row".to_string(),
+                    format!(
+                        "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery returned more than one row"
+                    ),
                 ));
             }
             seen = Some(scalar_from_array(batch.column(0), row)?);

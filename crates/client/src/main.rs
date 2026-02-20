@@ -327,6 +327,11 @@ fn classify_ffq_error(err: &FfqError) -> (&'static str, Option<&'static str>) {
 
 fn planning_hint(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
+    if m.contains("e_recursive_cte_overflow") {
+        return Some(
+            "increase recursive CTE depth limit (FFQ_RECURSIVE_CTE_MAX_DEPTH / config.recursive_cte_max_depth)",
+        );
+    }
     if m.contains("unknown table") {
         return Some("table is not registered; pass --catalog or register it before querying");
     }
@@ -338,6 +343,9 @@ fn planning_hint(msg: &str) -> Option<&'static str> {
 
 fn execution_hint(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
+    if m.contains("e_subquery_scalar_row_violation") {
+        return Some("scalar subquery must return one column and at most one row");
+    }
     if m.contains("schema inference failed") {
         return Some(
             "check parquet path(s) exist/readable and set schema policy (--schema-inference on|strict|permissive)",
@@ -392,6 +400,11 @@ fn config_hint(msg: &str) -> Option<&'static str> {
 
 fn unsupported_hint(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
+    if m.contains("e_subquery_unsupported_correlation") {
+        return Some(
+            "rewrite the correlated predicate to supported equality correlation shape, or use uncorrelated subquery form",
+        );
+    }
     if m.contains("qdrant") {
         return Some(
             "enable required feature flags (vector/qdrant) or use brute-force fallback shape",

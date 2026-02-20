@@ -34,7 +34,7 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             correlation,
         } => {
             out.push_str(&format!(
-                "{pad}InSubqueryFilter negated={negated} correlation={} expr={}\n",
+                "{pad}InSubqueryFilter negated={negated} correlation={} rewrite=none expr={}\n",
                 fmt_subquery_correlation(correlation),
                 fmt_expr(expr),
             ));
@@ -50,7 +50,7 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             correlation,
         } => {
             out.push_str(&format!(
-                "{pad}ExistsSubqueryFilter negated={negated} correlation={}\n",
+                "{pad}ExistsSubqueryFilter negated={negated} correlation={} rewrite=none\n",
                 fmt_subquery_correlation(correlation)
             ));
             out.push_str(&format!("{pad}  input:\n"));
@@ -66,7 +66,7 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             correlation,
         } => {
             out.push_str(&format!(
-                "{pad}ScalarSubqueryFilter correlation={} expr={} op={op:?}\n",
+                "{pad}ScalarSubqueryFilter correlation={} rewrite=none expr={} op={op:?}\n",
                 fmt_subquery_correlation(correlation),
                 fmt_expr(expr),
             ));
@@ -105,9 +105,13 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             left,
             right,
         } => {
+            let rewrite_suffix = join_rewrite_hint(plan)
+                .map(|r| format!(" rewrite={r}"))
+                .unwrap_or_default();
             out.push_str(&format!(
-                "{pad}Join type={join_type:?} strategy={}\n",
-                fmt_join_hint(*strategy_hint)
+                "{pad}Join type={join_type:?} strategy={}{}\n",
+                fmt_join_hint(*strategy_hint),
+                rewrite_suffix,
             ));
             out.push_str(&format!("{pad}  on={:?}\n", on));
             out.push_str(&format!("{pad}  left:\n"));
@@ -174,6 +178,60 @@ fn fmt_join_hint(h: JoinStrategyHint) -> &'static str {
     }
 }
 
+fn join_rewrite_hint(plan: &LogicalPlan) -> Option<&'static str> {
+    let LogicalPlan::Join {
+        join_type,
+        left,
+        right,
+        ..
+    } = plan
+    else {
+        return None;
+    };
+    match join_type {
+        crate::logical_plan::JoinType::Semi => {
+            if plan_has_is_not_null_filter(right) {
+                Some("decorrelated_in_subquery")
+            } else {
+                Some("decorrelated_exists_subquery")
+            }
+        }
+        crate::logical_plan::JoinType::Anti => {
+            if matches!(left.as_ref(), LogicalPlan::Join { join_type: crate::logical_plan::JoinType::Anti, .. }) {
+                Some("decorrelated_not_in_subquery")
+            } else {
+                Some("decorrelated_not_exists_subquery")
+            }
+        }
+        _ => None,
+    }
+}
+
+fn plan_has_is_not_null_filter(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Filter { predicate, input } => {
+            matches!(predicate, Expr::IsNotNull(_)) || plan_has_is_not_null_filter(input)
+        }
+        LogicalPlan::Projection { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::TopKByScore { input, .. } => plan_has_is_not_null_filter(input),
+        LogicalPlan::InSubqueryFilter { input, subquery, .. }
+        | LogicalPlan::ExistsSubqueryFilter { input, subquery, .. } => {
+            plan_has_is_not_null_filter(input) || plan_has_is_not_null_filter(subquery)
+        }
+        LogicalPlan::ScalarSubqueryFilter { input, subquery, .. } => {
+            plan_has_is_not_null_filter(input) || plan_has_is_not_null_filter(subquery)
+        }
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::UnionAll { left, right } => {
+            plan_has_is_not_null_filter(left) || plan_has_is_not_null_filter(right)
+        }
+        LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::InsertInto { input, .. }
+        | LogicalPlan::CteRef { plan: input, .. } => plan_has_is_not_null_filter(input),
+        _ => false,
+    }
+}
+
 fn fmt_subquery_correlation(c: &SubqueryCorrelation) -> String {
     match c {
         SubqueryCorrelation::Unresolved => "unresolved".to_string(),
@@ -181,6 +239,50 @@ fn fmt_subquery_correlation(c: &SubqueryCorrelation) -> String {
         SubqueryCorrelation::Correlated { outer_refs } => {
             format!("correlated({})", outer_refs.join(","))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::explain_logical;
+    use crate::logical_plan::{Expr, JoinStrategyHint, JoinType, LogicalPlan};
+
+    fn scan(name: &str) -> LogicalPlan {
+        LogicalPlan::TableScan {
+            table: name.to_string(),
+            projection: None,
+            filters: vec![],
+        }
+    }
+
+    #[test]
+    fn explain_marks_decorrelated_exists_join() {
+        let plan = LogicalPlan::Join {
+            left: Box::new(scan("t")),
+            right: Box::new(scan("s")),
+            on: vec![("t.a".to_string(), "s.b".to_string())],
+            join_type: JoinType::Semi,
+            strategy_hint: JoinStrategyHint::Auto,
+        };
+        let ex = explain_logical(&plan);
+        assert!(ex.contains("rewrite=decorrelated_exists_subquery"), "{ex}");
+    }
+
+    #[test]
+    fn explain_marks_decorrelated_in_join() {
+        let right = LogicalPlan::Filter {
+            predicate: Expr::IsNotNull(Box::new(Expr::Column("s.k".to_string()))),
+            input: Box::new(scan("s")),
+        };
+        let plan = LogicalPlan::Join {
+            left: Box::new(scan("t")),
+            right: Box::new(right),
+            on: vec![("t.k".to_string(), "s.k".to_string())],
+            join_type: JoinType::Semi,
+            strategy_hint: JoinStrategyHint::Auto,
+        };
+        let ex = explain_logical(&plan);
+        assert!(ex.contains("rewrite=decorrelated_in_subquery"), "{ex}");
     }
 }
 

@@ -203,6 +203,12 @@ fn correlated_exists_rewrites_and_runs() {
         .collect::<Vec<_>>();
     assert_eq!(filtered_values, vec![3]);
 
+    let explain = engine.sql(sql).expect("sql").explain().expect("explain");
+    assert!(
+        explain.contains("rewrite=decorrelated_exists_subquery"),
+        "unexpected explain: {explain}"
+    );
+
     let _ = std::fs::remove_file(t_path);
     let _ = std::fs::remove_file(s_path);
 }
@@ -296,6 +302,11 @@ fn scalar_subquery_errors_on_multiple_rows() {
             .contains("scalar subquery returned more than one row"),
         "unexpected error: {err}"
     );
+    assert!(
+        err.to_string()
+            .contains("E_SUBQUERY_SCALAR_ROW_VIOLATION"),
+        "unexpected taxonomy code in error: {err}"
+    );
     let _ = std::fs::remove_file(t_path);
     let _ = std::fs::remove_file(s_path);
 }
@@ -346,6 +357,10 @@ fn recursive_cte_respects_depth_limit_config() {
         err.to_string()
             .contains("recursive_cte_max_depth=0"),
         "unexpected error: {err}"
+    );
+    assert!(
+        err.to_string().contains("E_RECURSIVE_CTE_OVERFLOW"),
+        "unexpected taxonomy code in error: {err}"
     );
     let _ = std::fs::remove_file(t_path);
     let _ = std::fs::remove_file(s_path);

@@ -140,7 +140,7 @@ impl DataFrame {
         let cat = self.session.catalog.read().expect("catalog lock poisoned");
         let provider = CatalogProvider { catalog: &*cat };
 
-        let opt = self.session.planner.optimize_only(
+        let opt = self.session.planner.optimize_analyze(
             self.logical_plan.clone(),
             &provider,
             &self.session.config,

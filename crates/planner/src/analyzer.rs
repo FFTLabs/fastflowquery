@@ -6,6 +6,8 @@ use ffq_common::{FfqError, Result};
 
 use crate::logical_plan::{AggExpr, BinaryOp, Expr, LiteralValue, LogicalPlan, SubqueryCorrelation};
 
+const E_SUBQUERY_UNSUPPORTED_CORRELATION: &str = "E_SUBQUERY_UNSUPPORTED_CORRELATION";
+
 /// The analyzer needs schemas to resolve columns.
 /// The client (Engine) will provide this from its Catalog.
 pub trait SchemaProvider {
@@ -625,7 +627,7 @@ impl Analyzer {
                 if let Some(col) = unknown_column_name(&err) {
                     if resolver_has_col(outer_resolver, col) {
                         return Err(FfqError::Unsupported(format!(
-                            "{subquery_kind} correlated outer reference is not supported yet: {col}"
+                            "{E_SUBQUERY_UNSUPPORTED_CORRELATION}: {subquery_kind} correlated outer reference is not supported yet: {col}"
                         )));
                     }
                 }
@@ -674,7 +676,7 @@ impl Analyzer {
             }
             if predicate_has_outer_ref(&pred, outer_resolver) {
                 return Err(FfqError::Unsupported(format!(
-                    "EXISTS subquery correlated predicate shape is not supported yet: {pred:?}"
+                    "{E_SUBQUERY_UNSUPPORTED_CORRELATION}: EXISTS subquery correlated predicate shape is not supported yet: {pred:?}"
                 )));
             }
             inner_only.push(strip_inner_qualifiers(pred, outer_resolver));
@@ -706,7 +708,11 @@ impl Analyzer {
         outer_resolver: &Resolver,
     ) -> Result<Option<LogicalPlan>> {
         let lhs_name = column_name_from_expr(&expr)
-            .ok_or_else(|| FfqError::Unsupported("correlated IN currently requires column lhs".to_string()))?
+            .ok_or_else(|| {
+                FfqError::Unsupported(format!(
+                    "{E_SUBQUERY_UNSUPPORTED_CORRELATION}: correlated IN currently requires column lhs"
+                ))
+            })?
             .clone();
 
         let (inner_value_col, mut core) = extract_subquery_projection_col(subquery)?;
@@ -740,7 +746,7 @@ impl Analyzer {
             }
             if predicate_has_outer_ref(&pred, outer_resolver) {
                 return Err(FfqError::Unsupported(format!(
-                    "IN subquery correlated predicate shape is not supported yet: {pred:?}"
+                    "{E_SUBQUERY_UNSUPPORTED_CORRELATION}: IN subquery correlated predicate shape is not supported yet: {pred:?}"
                 )));
             }
             inner_only.push(strip_inner_qualifiers(pred, outer_resolver));
@@ -1284,10 +1290,9 @@ fn extract_subquery_projection_col(subquery: LogicalPlan) -> Result<(String, Log
             }
             let (expr, _alias) = exprs.into_iter().next().expect("single projection expr");
             let col = column_name_from_expr(&expr).ok_or_else(|| {
-                FfqError::Unsupported(
-                    "correlated IN subquery currently requires projected column expression"
-                        .to_string(),
-                )
+                FfqError::Unsupported(format!(
+                    "{E_SUBQUERY_UNSUPPORTED_CORRELATION}: correlated IN subquery currently requires projected column expression"
+                ))
             })?;
             Ok((split_qual(col).1.to_string(), *input))
         }
@@ -1624,6 +1629,11 @@ mod tests {
         )
         .expect("parse");
         let err = analyzer.analyze(plan, &provider).expect_err("must reject");
+        assert!(
+            err.to_string()
+                .contains("E_SUBQUERY_UNSUPPORTED_CORRELATION"),
+            "unexpected taxonomy code: {err}"
+        );
         assert!(
             err.to_string()
                 .contains("correlated predicate shape is not supported yet")
