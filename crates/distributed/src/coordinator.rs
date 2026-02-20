@@ -121,6 +121,10 @@ pub struct TaskAssignment {
     pub plan_fragment_json: Vec<u8>,
     /// Reduce partitions assigned to this task for shuffle-read stages.
     pub assigned_reduce_partitions: Vec<u32>,
+    /// Hash-shard split index within assigned partition payloads.
+    pub assigned_reduce_split_index: u32,
+    /// Hash-shard split count within assigned partition payloads.
+    pub assigned_reduce_split_count: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -210,6 +214,8 @@ struct TaskRuntime {
     ready_at_ms: u64,
     plan_fragment_json: Vec<u8>,
     assigned_reduce_partitions: Vec<u32>,
+    assigned_reduce_split_index: u32,
+    assigned_reduce_split_count: u32,
     required_custom_ops: Vec<String>,
     message: String,
 }
@@ -324,6 +330,8 @@ impl Coordinator {
                         t.attempt,
                         t.plan_fragment_json.clone(),
                         t.assigned_reduce_partitions.clone(),
+                        t.assigned_reduce_split_index,
+                        t.assigned_reduce_split_count,
                         t.required_custom_ops.clone(),
                     ));
                 }
@@ -335,6 +343,8 @@ impl Coordinator {
                 attempt,
                 fragment,
                 assigned_reduce_partitions,
+                assigned_reduce_split_index,
+                assigned_reduce_split_count,
                 required_custom_ops,
             ) in to_retry
             {
@@ -356,6 +366,8 @@ impl Coordinator {
                             ready_at_ms: now.saturating_add(backoff_ms),
                             plan_fragment_json: fragment,
                             assigned_reduce_partitions,
+                            assigned_reduce_split_index,
+                            assigned_reduce_split_count,
                             required_custom_ops,
                             message: "retry scheduled after worker timeout".to_string(),
                         },
@@ -612,6 +624,8 @@ impl Coordinator {
                         attempt: task.attempt,
                         plan_fragment_json: task.plan_fragment_json.clone(),
                         assigned_reduce_partitions: task.assigned_reduce_partitions.clone(),
+                        assigned_reduce_split_index: task.assigned_reduce_split_index,
+                        assigned_reduce_split_count: task.assigned_reduce_split_count,
                     });
                     remaining = remaining.saturating_sub(1);
                     query_budget = query_budget.saturating_sub(1);
@@ -691,6 +705,16 @@ impl Coordinator {
             .get(&key)
             .map(|t| t.assigned_reduce_partitions.clone())
             .ok_or_else(|| FfqError::Planning("unknown task status report".to_string()))?;
+        let task_assigned_reduce_split_index = query
+            .tasks
+            .get(&key)
+            .map(|t| t.assigned_reduce_split_index)
+            .ok_or_else(|| FfqError::Planning("unknown task status report".to_string()))?;
+        let task_assigned_reduce_split_count = query
+            .tasks
+            .get(&key)
+            .map(|t| t.assigned_reduce_split_count)
+            .ok_or_else(|| FfqError::Planning("unknown task status report".to_string()))?;
         let task_required_custom_ops = query
             .tasks
             .get(&key)
@@ -753,6 +777,8 @@ impl Coordinator {
                             ready_at_ms: now.saturating_add(backoff_ms),
                             plan_fragment_json: task_plan_fragment,
                             assigned_reduce_partitions: task_assigned_reduce_partitions,
+                            assigned_reduce_split_index: task_assigned_reduce_split_index,
+                            assigned_reduce_split_count: task_assigned_reduce_split_count,
                             required_custom_ops: task_required_custom_ops,
                             message: format!("retry scheduled after failure: {message}"),
                         },
@@ -1022,6 +1048,8 @@ fn build_query_runtime(
                     ready_at_ms: submitted_at_ms,
                     plan_fragment_json: fragment.clone(),
                     assigned_reduce_partitions,
+                    assigned_reduce_split_index: 0,
+                    assigned_reduce_split_count: 1,
                     required_custom_ops: required_custom_ops.clone(),
                     message: String::new(),
                 },
@@ -1090,12 +1118,6 @@ fn maybe_apply_adaptive_partition_layout(
         let Some(stage) = query.stages.get(&stage_id) else {
             continue;
         };
-        if stage.metrics.planned_reduce_tasks <= 1 {
-            continue;
-        }
-        if stage.metrics.adaptive_reduce_tasks >= stage.metrics.planned_reduce_tasks {
-            continue;
-        }
         let stage_tasks_queued = latest_states
             .iter()
             .filter(|((sid, _), _)| *sid == stage_id)
@@ -1119,7 +1141,11 @@ fn maybe_apply_adaptive_partition_layout(
             max_reduce_tasks,
             max_partitions_per_task,
         );
-        if (groups.len() as u32) < stage.metrics.planned_reduce_tasks {
+        let current_tasks = latest_states
+            .iter()
+            .filter(|((sid, _), _)| *sid == stage_id)
+            .count() as u32;
+        if (groups.len() as u32) != current_tasks {
             stages_to_rewire.push((stage_id, groups));
         }
     }
@@ -1140,7 +1166,7 @@ fn maybe_apply_adaptive_partition_layout(
             continue;
         };
         query.tasks.retain(|(sid, _, _), _| *sid != stage_id);
-        for (task_id, assigned_reduce_partitions) in groups.into_iter().enumerate() {
+        for (task_id, assignment) in groups.into_iter().enumerate() {
             query.tasks.insert(
                 (stage_id, task_id as u64, 1),
                 TaskRuntime {
@@ -1152,7 +1178,9 @@ fn maybe_apply_adaptive_partition_layout(
                     assigned_worker: None,
                     ready_at_ms,
                     plan_fragment_json: template.0.clone(),
-                    assigned_reduce_partitions,
+                    assigned_reduce_partitions: assignment.assigned_reduce_partitions,
+                    assigned_reduce_split_index: assignment.assigned_reduce_split_index,
+                    assigned_reduce_split_count: assignment.assigned_reduce_split_count,
                     required_custom_ops: template.1.clone(),
                     message: String::new(),
                 },
@@ -1202,6 +1230,13 @@ fn latest_partition_bytes_for_stage(
     out
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReduceTaskAssignmentSpec {
+    assigned_reduce_partitions: Vec<u32>,
+    assigned_reduce_split_index: u32,
+    assigned_reduce_split_count: u32,
+}
+
 fn deterministic_coalesce_split_groups(
     planned_partitions: u32,
     target_bytes: u64,
@@ -1209,12 +1244,22 @@ fn deterministic_coalesce_split_groups(
     min_reduce_tasks: u32,
     max_reduce_tasks: u32,
     max_partitions_per_task: u32,
-) -> Vec<Vec<u32>> {
+) -> Vec<ReduceTaskAssignmentSpec> {
     if planned_partitions <= 1 {
-        return vec![vec![0]];
+        return vec![ReduceTaskAssignmentSpec {
+            assigned_reduce_partitions: vec![0],
+            assigned_reduce_split_index: 0,
+            assigned_reduce_split_count: 1,
+        }];
     }
     if target_bytes == 0 {
-        return (0..planned_partitions).map(|p| vec![p]).collect();
+        return (0..planned_partitions)
+            .map(|p| ReduceTaskAssignmentSpec {
+                assigned_reduce_partitions: vec![p],
+                assigned_reduce_split_index: 0,
+                assigned_reduce_split_count: 1,
+            })
+            .collect();
     }
     let mut groups = Vec::new();
     let mut current = Vec::new();
@@ -1233,9 +1278,16 @@ fn deterministic_coalesce_split_groups(
         groups.push(current);
     }
     let groups = split_groups_by_max_partitions(groups, max_partitions_per_task);
-    clamp_group_count_to_bounds(
+    let groups = clamp_group_count_to_bounds(
         groups,
         planned_partitions,
+        min_reduce_tasks,
+        max_reduce_tasks,
+    );
+    apply_hot_partition_splitting(
+        groups,
+        bytes_by_partition,
+        target_bytes,
         min_reduce_tasks,
         max_reduce_tasks,
     )
@@ -1302,6 +1354,68 @@ fn clamp_group_count_to_bounds(
         }
     }
     groups
+}
+
+fn apply_hot_partition_splitting(
+    groups: Vec<Vec<u32>>,
+    bytes_by_partition: &HashMap<u32, u64>,
+    target_bytes: u64,
+    min_reduce_tasks: u32,
+    max_reduce_tasks: u32,
+) -> Vec<ReduceTaskAssignmentSpec> {
+    let mut layouts = groups
+        .into_iter()
+        .map(|g| ReduceTaskAssignmentSpec {
+            assigned_reduce_partitions: g,
+            assigned_reduce_split_index: 0,
+            assigned_reduce_split_count: 1,
+        })
+        .collect::<Vec<_>>();
+    if target_bytes == 0 {
+        return layouts;
+    }
+    let min_eff = min_reduce_tasks.max(1);
+    let max_eff = if max_reduce_tasks == 0 {
+        u32::MAX
+    } else {
+        max_reduce_tasks.max(min_eff)
+    };
+    let mut hot = bytes_by_partition
+        .iter()
+        .map(|(p, b)| (*p, *b))
+        .collect::<Vec<_>>();
+    hot.sort_by_key(|(p, _)| *p);
+    for (partition, bytes) in hot {
+        if bytes <= target_bytes {
+            continue;
+        }
+        let Some(idx) = layouts.iter().position(|l| {
+            l.assigned_reduce_split_count == 1
+                && l.assigned_reduce_partitions.len() == 1
+                && l.assigned_reduce_partitions[0] == partition
+        }) else {
+            continue;
+        };
+        let desired = bytes.div_ceil(target_bytes).max(2) as u32;
+        let current_tasks = layouts.len() as u32;
+        let max_for_this = 1 + max_eff.saturating_sub(current_tasks);
+        let split_count = desired.min(max_for_this);
+        if split_count <= 1 {
+            continue;
+        }
+        layouts.remove(idx);
+        for split_index in (0..split_count).rev() {
+            layouts.insert(
+                idx,
+                ReduceTaskAssignmentSpec {
+                    assigned_reduce_partitions: vec![partition],
+                    assigned_reduce_split_index: split_index,
+                    assigned_reduce_split_count: split_count,
+                },
+            );
+        }
+    }
+    layouts
 }
 
 fn collect_custom_ops(plan: &PhysicalPlan, out: &mut HashSet<String>) {
@@ -1734,6 +1848,8 @@ mod tests {
         assert_eq!(task_ids, vec![0, 1, 2, 3]);
         for a in &assignments {
             assert_eq!(a.assigned_reduce_partitions, vec![a.task_id as u32]);
+            assert_eq!(a.assigned_reduce_split_index, 0);
+            assert_eq!(a.assigned_reduce_split_count, 1);
         }
 
         let status = c.get_query_status("qfanout").expect("status");
@@ -1889,6 +2005,7 @@ mod tests {
         let reduce_tasks = c.get_task("w1", 10).expect("reduce tasks");
         assert_eq!(reduce_tasks.len(), 1);
         assert_eq!(reduce_tasks[0].assigned_reduce_partitions, vec![0, 1, 2, 3]);
+        assert_eq!(reduce_tasks[0].assigned_reduce_split_count, 1);
         let status = c.get_query_status("301").expect("status");
         let root = status.stage_metrics.get(&0).expect("root stage");
         assert_eq!(root.planned_reduce_tasks, 4);
@@ -1911,7 +2028,9 @@ mod tests {
         let g1 = deterministic_coalesce_split_groups(4, 25, &a, 1, 0, 0);
         let g2 = deterministic_coalesce_split_groups(4, 25, &b, 1, 0, 0);
         assert_eq!(g1, g2);
-        assert_eq!(g1, vec![vec![0, 1], vec![2, 3]]);
+        assert_eq!(g1.len(), 2);
+        assert_eq!(g1[0].assigned_reduce_partitions, vec![0, 1]);
+        assert_eq!(g1[1].assigned_reduce_partitions, vec![2, 3]);
     }
 
     #[test]
@@ -1923,7 +2042,9 @@ mod tests {
         bytes.insert(3_u32, 5_u64);
 
         let groups = deterministic_coalesce_split_groups(4, 1_000, &bytes, 1, 0, 2);
-        assert_eq!(groups, vec![vec![0, 1], vec![2, 3]]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].assigned_reduce_partitions, vec![0, 1]);
+        assert_eq!(groups[1].assigned_reduce_partitions, vec![2, 3]);
     }
 
     #[test]
@@ -1937,11 +2058,121 @@ mod tests {
         // Natural grouping with high target would be 1 group; min=2 forces deterministic split.
         let min_groups = deterministic_coalesce_split_groups(4, 1_000, &bytes, 2, 0, 0);
         assert_eq!(min_groups.len(), 2);
-        assert_eq!(min_groups, vec![vec![0, 1], vec![2, 3]]);
+        assert_eq!(min_groups[0].assigned_reduce_partitions, vec![0, 1]);
+        assert_eq!(min_groups[1].assigned_reduce_partitions, vec![2, 3]);
 
         // Natural grouping with low target would be 4 groups; max=2 forces deterministic merge.
         let max_groups = deterministic_coalesce_split_groups(4, 1, &bytes, 1, 2, 0);
         assert_eq!(max_groups.len(), 2);
-        assert_eq!(max_groups, vec![vec![0], vec![1, 2, 3]]);
+        assert_eq!(max_groups[0].assigned_reduce_partitions, vec![0]);
+        assert_eq!(max_groups[1].assigned_reduce_partitions, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn deterministic_coalesce_split_groups_splits_hot_singleton_partition() {
+        let mut bytes = HashMap::new();
+        bytes.insert(0_u32, 8_u64);
+        bytes.insert(1_u32, 120_u64);
+        bytes.insert(2_u32, 8_u64);
+        bytes.insert(3_u32, 8_u64);
+
+        let groups = deterministic_coalesce_split_groups(4, 32, &bytes, 1, 8, 0);
+        let hot = groups
+            .iter()
+            .filter(|g| {
+                g.assigned_reduce_partitions == vec![1] && g.assigned_reduce_split_count > 1
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hot.len(), 4);
+        for (i, g) in hot.into_iter().enumerate() {
+            assert_eq!(g.assigned_reduce_split_index, i as u32);
+            assert_eq!(g.assigned_reduce_split_count, 4);
+        }
+    }
+
+    #[test]
+    fn coordinator_barrier_time_hot_partition_splitting_increases_reduce_tasks() {
+        let mut c = Coordinator::new(CoordinatorConfig {
+            adaptive_shuffle_target_bytes: 32,
+            adaptive_shuffle_max_reduce_tasks: 8,
+            ..CoordinatorConfig::default()
+        });
+        let plan = PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
+            input: Box::new(PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(
+                ShuffleWriteExchange {
+                    input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
+                        table: "t".to_string(),
+                        schema: Some(Schema::empty()),
+                        projection: None,
+                        filters: vec![],
+                    })),
+                    partitioning: PartitioningSpec::HashKeys {
+                        keys: vec!["k".to_string()],
+                        partitions: 4,
+                    },
+                },
+            ))),
+            partitioning: PartitioningSpec::HashKeys {
+                keys: vec!["k".to_string()],
+                partitions: 4,
+            },
+        }));
+        let bytes = serde_json::to_vec(&plan).expect("plan");
+        c.submit_query("302".to_string(), &bytes).expect("submit");
+
+        let map_task = c.get_task("w1", 10).expect("map").remove(0);
+        c.register_map_output(
+            "302".to_string(),
+            map_task.stage_id,
+            map_task.task_id,
+            map_task.attempt,
+            vec![
+                MapOutputPartitionMeta {
+                    reduce_partition: 0,
+                    bytes: 8,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 1,
+                    bytes: 120,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 2,
+                    bytes: 8,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 3,
+                    bytes: 8,
+                    rows: 1,
+                    batches: 1,
+                },
+            ],
+        )
+        .expect("register");
+        c.report_task_status(
+            &map_task.query_id,
+            map_task.stage_id,
+            map_task.task_id,
+            map_task.attempt,
+            TaskState::Succeeded,
+            Some("w1"),
+            "map done".to_string(),
+        )
+        .expect("map success");
+
+        let reduce_tasks = c.get_task("w1", 20).expect("reduce tasks");
+        assert!(reduce_tasks.len() > 4);
+        let hot_splits = reduce_tasks
+            .iter()
+            .filter(|t| {
+                t.assigned_reduce_partitions == vec![1] && t.assigned_reduce_split_count > 1
+            })
+            .count();
+        assert_eq!(hot_splits, 4);
     }
 }

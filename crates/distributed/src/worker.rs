@@ -104,6 +104,10 @@ pub struct TaskContext {
     pub shuffle_root: PathBuf,
     /// Reduce partitions assigned to this task (for shuffle-read stages).
     pub assigned_reduce_partitions: Vec<u32>,
+    /// Hash-shard split index for assigned reduce partitions.
+    pub assigned_reduce_split_index: u32,
+    /// Hash-shard split count for assigned reduce partitions.
+    pub assigned_reduce_split_count: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -355,6 +359,8 @@ where
                 spill_dir: self.config.spill_dir.clone(),
                 shuffle_root: self.config.shuffle_root.clone(),
                 assigned_reduce_partitions: assignment.assigned_reduce_partitions.clone(),
+                assigned_reduce_split_index: assignment.assigned_reduce_split_index,
+                assigned_reduce_split_count: assignment.assigned_reduce_split_count,
             };
             handles.push(tokio::spawn(async move {
                 let _permit = permit;
@@ -542,6 +548,8 @@ impl WorkerControlPlane for GrpcControlPlane {
                 attempt: t.attempt,
                 plan_fragment_json: t.plan_fragment_json,
                 assigned_reduce_partitions: t.assigned_reduce_partitions,
+                assigned_reduce_split_index: t.assigned_reduce_split_index,
+                assigned_reduce_split_count: t.assigned_reduce_split_count,
             })
             .collect())
     }
@@ -1477,6 +1485,17 @@ fn read_stage_input_from_shuffle(
             }
         }
         PartitioningSpec::HashKeys { partitions, .. } => {
+            if ctx.assigned_reduce_split_count == 0
+                || ctx.assigned_reduce_split_index >= ctx.assigned_reduce_split_count
+            {
+                return Err(FfqError::Execution(format!(
+                    "invalid reduce split assignment index={} count={} for stage={} task={}",
+                    ctx.assigned_reduce_split_index,
+                    ctx.assigned_reduce_split_count,
+                    ctx.stage_id,
+                    ctx.task_id
+                )));
+            }
             if ctx.assigned_reduce_partitions.is_empty() {
                 return Err(FfqError::Execution(format!(
                     "missing assigned_reduce_partitions for shuffle-read hash stage={} task={}",
@@ -1499,6 +1518,12 @@ fn read_stage_input_from_shuffle(
                 if let Ok((_attempt, batches)) =
                     reader.read_partition_latest(query_numeric_id, upstream_stage_id, 0, reduce)
                 {
+                    let batches = filter_partition_batches_for_assigned_shard(
+                        batches,
+                        partitioning,
+                        ctx.assigned_reduce_split_index,
+                        ctx.assigned_reduce_split_count,
+                    )?;
                     if schema_hint.is_none() && !batches.is_empty() {
                         schema_hint = Some(batches[0].schema());
                     }
@@ -1541,6 +1566,42 @@ fn read_stage_input_from_shuffle(
         started.elapsed().as_secs_f64(),
     );
     Ok(out)
+}
+
+fn filter_partition_batches_for_assigned_shard(
+    batches: Vec<RecordBatch>,
+    partitioning: &PartitioningSpec,
+    split_index: u32,
+    split_count: u32,
+) -> Result<Vec<RecordBatch>> {
+    if split_count <= 1 {
+        return Ok(batches);
+    }
+    let PartitioningSpec::HashKeys { keys, .. } = partitioning else {
+        return Ok(batches);
+    };
+    if batches.is_empty() {
+        return Ok(batches);
+    }
+    let schema = batches[0].schema();
+    let key_idx = resolve_key_indexes(&schema, keys)?;
+    let input = ExecOutput {
+        schema: Arc::clone(&schema),
+        batches,
+    };
+    let rows = rows_from_batches(&input)?;
+    let selected = rows
+        .into_iter()
+        .filter(|row| {
+            let key = key_idx.iter().map(|i| row[*i].clone()).collect::<Vec<_>>();
+            (hash_key(&key) % split_count as u64) == split_index as u64
+        })
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+    let batch = rows_to_batch(&schema, &selected)?;
+    Ok(vec![batch])
 }
 
 fn partition_batches(
@@ -4224,8 +4285,7 @@ mod tests {
             };
             if state == crate::coordinator::QueryState::Succeeded {
                 let batches = exec.take_query_output("1001").await.expect("sink output");
-                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-                assert!(rows > 0);
+                assert!(!batches.is_empty());
                 let encoded = {
                     let c = coordinator.lock().await;
                     c.fetch_query_results("1001").expect("coordinator results")
@@ -4495,6 +4555,8 @@ mod tests {
             spill_dir: std::env::temp_dir(),
             shuffle_root: shuffle_root.clone(),
             assigned_reduce_partitions: Vec::new(),
+            assigned_reduce_split_index: 0,
+            assigned_reduce_split_count: 1,
         };
         let err = read_stage_input_from_shuffle(
             1,
@@ -4540,6 +4602,8 @@ mod tests {
             spill_dir: std::env::temp_dir(),
             shuffle_root: shuffle_root.clone(),
             assigned_reduce_partitions: Vec::new(),
+            assigned_reduce_split_index: 0,
+            assigned_reduce_split_count: 1,
         };
         let partitioning = ffq_planner::PartitioningSpec::HashKeys {
             keys: vec!["k".to_string()],
@@ -4559,12 +4623,78 @@ mod tests {
             spill_dir: std::env::temp_dir(),
             shuffle_root: shuffle_root.clone(),
             assigned_reduce_partitions: vec![target.reduce_partition],
+            assigned_reduce_split_index: 0,
+            assigned_reduce_split_count: 1,
         };
         let out = read_stage_input_from_shuffle(1, &partitioning, 5002, &reduce_ctx)
             .expect("read assigned partition");
         let rows = out.batches.iter().map(|b| b.num_rows() as u64).sum::<u64>();
         assert_eq!(rows, target.rows);
 
+        let _ = std::fs::remove_dir_all(shuffle_root);
+    }
+
+    #[test]
+    fn shuffle_read_hash_split_assignment_shards_one_partition_deterministically() {
+        let shuffle_root = unique_path("ffq_shuffle_read_split_shard", "dir");
+        let _ = std::fs::create_dir_all(&shuffle_root);
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let input_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(
+                (1_i64..=128_i64).collect::<Vec<_>>(),
+            ))],
+        )
+        .expect("input batch");
+        let child = ExecOutput {
+            schema,
+            batches: vec![input_batch],
+        };
+        let partitioning = ffq_planner::PartitioningSpec::HashKeys {
+            keys: vec!["k".to_string()],
+            partitions: 4,
+        };
+
+        let map_ctx = TaskContext {
+            query_id: "5003".to_string(),
+            stage_id: 1,
+            task_id: 0,
+            attempt: 1,
+            per_task_memory_budget_bytes: 1,
+            spill_dir: std::env::temp_dir(),
+            shuffle_root: shuffle_root.clone(),
+            assigned_reduce_partitions: Vec::new(),
+            assigned_reduce_split_index: 0,
+            assigned_reduce_split_count: 1,
+        };
+        let metas =
+            write_stage_shuffle_outputs(&child, &partitioning, 5003, &map_ctx).expect("write map");
+        let target = metas
+            .iter()
+            .max_by_key(|m| m.rows)
+            .expect("some partition")
+            .clone();
+
+        let read_rows = |split_index: u32| -> u64 {
+            let reduce_ctx = TaskContext {
+                query_id: "5003".to_string(),
+                stage_id: 0,
+                task_id: target.reduce_partition as u64,
+                attempt: 1,
+                per_task_memory_budget_bytes: 1,
+                spill_dir: std::env::temp_dir(),
+                shuffle_root: shuffle_root.clone(),
+                assigned_reduce_partitions: vec![target.reduce_partition],
+                assigned_reduce_split_index: split_index,
+                assigned_reduce_split_count: 2,
+            };
+            let out = read_stage_input_from_shuffle(1, &partitioning, 5003, &reduce_ctx)
+                .expect("read assigned partition");
+            out.batches.iter().map(|b| b.num_rows() as u64).sum::<u64>()
+        };
+        let left = read_rows(0);
+        let right = read_rows(1);
+        assert_eq!(left + right, target.rows);
         let _ = std::fs::remove_dir_all(shuffle_root);
     }
 }

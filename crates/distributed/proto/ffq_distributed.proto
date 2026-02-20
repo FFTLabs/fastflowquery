@@ -60,6 +60,8 @@ message TaskAssignment {
   uint32 attempt = 4;
   bytes plan_fragment_json = 5;
   repeated uint32 assigned_reduce_partitions = 6;
+  uint32 assigned_reduce_split_index = 7;
+  uint32 assigned_reduce_split_count = 8;
 }
 
 message GetTaskResponse {
