@@ -386,6 +386,33 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     let sql_scan = support::integration_queries::scan_filter_project();
     let sql_agg = support::integration_queries::join_aggregate();
     let sql_join = support::integration_queries::join_projection();
+    let sql_cte = "WITH filtered AS (
+        SELECT l_orderkey, l_partkey
+        FROM lineitem
+        WHERE l_orderkey >= 2
+    )
+    SELECT l_orderkey, l_partkey FROM filtered";
+    let sql_in_subquery = "SELECT l_orderkey, l_partkey
+        FROM lineitem
+        WHERE l_orderkey IN (
+            SELECT o_orderkey FROM orders WHERE o_custkey >= 100
+        )";
+    let sql_correlated_exists = "SELECT l_orderkey, l_partkey
+        FROM lineitem
+        WHERE EXISTS (
+            SELECT o_orderkey
+            FROM orders
+            WHERE orders.o_orderkey = lineitem.l_orderkey
+        )";
+    let sql_cte_join_heavy = "WITH c AS (
+        SELECT l_orderkey, l_partkey
+        FROM lineitem
+        WHERE l_orderkey >= 2
+    )
+    SELECT a.l_orderkey, a.l_partkey, b.l_partkey AS other_part
+    FROM c a
+    JOIN c b
+      ON a.l_orderkey = b.l_orderkey";
 
     let dist_scan_batches = dist_engine
         .sql(sql_scan)
@@ -406,6 +433,30 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         .collect()
         .await
         .expect("dist join collect");
+    let dist_cte_batches = dist_engine
+        .sql(sql_cte)
+        .expect("dist cte sql")
+        .collect()
+        .await
+        .expect("dist cte collect");
+    let dist_in_subquery_batches = dist_engine
+        .sql(sql_in_subquery)
+        .expect("dist in-subquery sql")
+        .collect()
+        .await
+        .expect("dist in-subquery collect");
+    let dist_correlated_exists_batches = dist_engine
+        .sql(sql_correlated_exists)
+        .expect("dist correlated exists sql")
+        .collect()
+        .await
+        .expect("dist correlated exists collect");
+    let dist_cte_join_heavy_batches = dist_engine
+        .sql(sql_cte_join_heavy)
+        .expect("dist cte join-heavy sql")
+        .collect()
+        .await
+        .expect("dist cte join-heavy collect");
 
     cfg.coordinator_endpoint = None;
 
@@ -429,6 +480,30 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         .collect()
         .await
         .expect("embedded join collect");
+    let embedded_cte_batches = embedded_engine
+        .sql(sql_cte)
+        .expect("embedded cte sql")
+        .collect()
+        .await
+        .expect("embedded cte collect");
+    let embedded_in_subquery_batches = embedded_engine
+        .sql(sql_in_subquery)
+        .expect("embedded in-subquery sql")
+        .collect()
+        .await
+        .expect("embedded in-subquery collect");
+    let embedded_correlated_exists_batches = embedded_engine
+        .sql(sql_correlated_exists)
+        .expect("embedded correlated exists sql")
+        .collect()
+        .await
+        .expect("embedded correlated exists collect");
+    let embedded_cte_join_heavy_batches = embedded_engine
+        .sql(sql_cte_join_heavy)
+        .expect("embedded cte join-heavy sql")
+        .collect()
+        .await
+        .expect("embedded cte join-heavy collect");
 
     let dist_agg_norm = support::snapshot_text(&dist_agg_batches, &["l_orderkey"], 1e-9);
     let emb_agg_norm = support::snapshot_text(&embedded_agg_batches, &["l_orderkey"], 1e-9);
@@ -459,6 +534,52 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     assert_eq!(
         dist_scan_norm, emb_scan_norm,
         "distributed and embedded scan/filter/project outputs differ"
+    );
+
+    let dist_cte_norm = support::snapshot_text(&dist_cte_batches, &["l_orderkey", "l_partkey"], 1e-9);
+    let emb_cte_norm = support::snapshot_text(&embedded_cte_batches, &["l_orderkey", "l_partkey"], 1e-9);
+    assert_eq!(
+        dist_cte_norm, emb_cte_norm,
+        "distributed and embedded CTE outputs differ"
+    );
+
+    let dist_in_norm =
+        support::snapshot_text(&dist_in_subquery_batches, &["l_orderkey", "l_partkey"], 1e-9);
+    let emb_in_norm =
+        support::snapshot_text(&embedded_in_subquery_batches, &["l_orderkey", "l_partkey"], 1e-9);
+    assert_eq!(
+        dist_in_norm, emb_in_norm,
+        "distributed and embedded IN-subquery outputs differ"
+    );
+
+    let dist_exists_norm = support::snapshot_text(
+        &dist_correlated_exists_batches,
+        &["l_orderkey", "l_partkey"],
+        1e-9,
+    );
+    let emb_exists_norm = support::snapshot_text(
+        &embedded_correlated_exists_batches,
+        &["l_orderkey", "l_partkey"],
+        1e-9,
+    );
+    assert_eq!(
+        dist_exists_norm, emb_exists_norm,
+        "distributed and embedded correlated EXISTS outputs differ"
+    );
+
+    let dist_cte_join_heavy_norm = support::snapshot_text(
+        &dist_cte_join_heavy_batches,
+        &["l_orderkey", "l_partkey", "other_part"],
+        1e-9,
+    );
+    let emb_cte_join_heavy_norm = support::snapshot_text(
+        &embedded_cte_join_heavy_batches,
+        &["l_orderkey", "l_partkey", "other_part"],
+        1e-9,
+    );
+    assert_eq!(
+        dist_cte_join_heavy_norm, emb_cte_join_heavy_norm,
+        "distributed and embedded CTE join-heavy outputs differ"
     );
 
     let dist_agg = collect_group_counts(&dist_agg_batches);

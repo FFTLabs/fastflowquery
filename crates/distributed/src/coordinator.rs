@@ -459,6 +459,11 @@ impl Coordinator {
             },
             PhysicalPlan::Limit(x) => self.resolve_parquet_scan_schemas(&mut x.input),
             PhysicalPlan::TopKByScore(x) => self.resolve_parquet_scan_schemas(&mut x.input),
+            PhysicalPlan::UnionAll(x) => {
+                self.resolve_parquet_scan_schemas(&mut x.left)?;
+                self.resolve_parquet_scan_schemas(&mut x.right)
+            }
+            PhysicalPlan::CteRef(x) => self.resolve_parquet_scan_schemas(&mut x.plan),
             PhysicalPlan::VectorTopK(_) => Ok(()),
             PhysicalPlan::Custom(x) => self.resolve_parquet_scan_schemas(&mut x.input),
         }
@@ -933,6 +938,11 @@ fn collect_custom_ops(plan: &PhysicalPlan, out: &mut HashSet<String>) {
         },
         PhysicalPlan::Limit(x) => collect_custom_ops(&x.input, out),
         PhysicalPlan::TopKByScore(x) => collect_custom_ops(&x.input, out),
+        PhysicalPlan::UnionAll(x) => {
+            collect_custom_ops(&x.left, out);
+            collect_custom_ops(&x.right, out);
+        }
+        PhysicalPlan::CteRef(x) => collect_custom_ops(&x.plan, out),
         PhysicalPlan::Custom(x) => {
             out.insert(x.op_name.clone());
             collect_custom_ops(&x.input, out);
