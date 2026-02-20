@@ -91,6 +91,12 @@ struct StageExecutionSummary {
     bytes_in: u64,
     bytes_out: u64,
     partition_sizes_bytes: Vec<u64>,
+    aqe_planned_reduce_tasks: u32,
+    aqe_adaptive_reduce_tasks: u32,
+    aqe_target_bytes: u64,
+    aqe_events: Vec<String>,
+    aqe_layout_finalize_count: u32,
+    aqe_skew_split_tasks: u32,
 }
 
 #[derive(Debug, Default)]
@@ -135,6 +141,13 @@ impl RuntimeStatsCollector {
         rows_out: u64,
         bytes_out: u64,
         batches_out: u64,
+        planned_reduce_tasks: u32,
+        adaptive_reduce_tasks: u32,
+        adaptive_target_bytes: u64,
+        aqe_events: Vec<String>,
+        partition_histogram_upper_bounds: Vec<u64>,
+        layout_finalize_count: u32,
+        skew_split_tasks: u32,
     ) {
         let mut guard = self.inner.lock().expect("stats collector lock poisoned");
         if guard.query_id.is_none() {
@@ -145,6 +158,15 @@ impl RuntimeStatsCollector {
         stage.rows_out = stage.rows_out.max(rows_out);
         stage.bytes_out = stage.bytes_out.max(bytes_out);
         stage.batches_out = stage.batches_out.max(batches_out);
+        stage.aqe_planned_reduce_tasks = planned_reduce_tasks;
+        stage.aqe_adaptive_reduce_tasks = adaptive_reduce_tasks;
+        stage.aqe_target_bytes = adaptive_target_bytes;
+        stage.aqe_events = aqe_events;
+        stage.aqe_layout_finalize_count = layout_finalize_count;
+        stage.aqe_skew_split_tasks = skew_split_tasks;
+        stage
+            .partition_sizes_bytes
+            .extend(partition_histogram_upper_bounds);
     }
 
     pub(crate) fn render_report(&self) -> Option<String> {
@@ -184,6 +206,17 @@ impl RuntimeStatsCollector {
                 s.batches_in,
                 s.batches_out,
             ));
+            out.push_str(&format!(
+                "  aqe={{planned_reduce_tasks:{},adaptive_reduce_tasks:{},target_bytes:{},layout_finalize_count:{},skew_split_tasks:{}}}\n",
+                s.aqe_planned_reduce_tasks,
+                s.aqe_adaptive_reduce_tasks,
+                s.aqe_target_bytes,
+                s.aqe_layout_finalize_count,
+                s.aqe_skew_split_tasks
+            ));
+            if !s.aqe_events.is_empty() {
+                out.push_str(&format!("  aqe_events={}\n", s.aqe_events.join(" | ")));
+            }
         }
         out.push_str("operators:\n");
         for op in &guard.operators {
@@ -4361,6 +4394,16 @@ impl Runtime for DistributedRuntime {
                             sm.map_output_rows,
                             sm.map_output_bytes,
                             sm.map_output_batches,
+                            sm.planned_reduce_tasks,
+                            sm.adaptive_reduce_tasks,
+                            sm.adaptive_target_bytes,
+                            sm.aqe_events.clone(),
+                            sm.partition_bytes_histogram
+                                .iter()
+                                .map(|b| b.upper_bound_bytes)
+                                .collect(),
+                            sm.layout_finalize_count,
+                            sm.skew_split_tasks,
                         );
                     }
                     let (rows_out, batches_out, bytes_out) = batch_stats(&batches);

@@ -323,6 +323,17 @@ fn proto_query_status(status: CoreQueryStatus) -> v1::QueryStatus {
             planned_reduce_tasks: m.planned_reduce_tasks,
             adaptive_reduce_tasks: m.adaptive_reduce_tasks,
             adaptive_target_bytes: m.adaptive_target_bytes,
+            aqe_events: m.aqe_events,
+            partition_bytes_histogram: m
+                .partition_bytes_histogram
+                .into_iter()
+                .map(|b| v1::PartitionBytesHistogramBucket {
+                    upper_bound_bytes: b.upper_bound_bytes,
+                    partition_count: b.partition_count,
+                })
+                .collect(),
+            skew_split_tasks: m.skew_split_tasks,
+            layout_finalize_count: m.layout_finalize_count,
         })
         .collect::<Vec<_>>();
     stage_metrics.sort_by_key(|m| m.stage_id);

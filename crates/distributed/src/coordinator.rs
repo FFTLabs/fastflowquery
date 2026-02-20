@@ -141,6 +141,15 @@ pub struct TaskAssignment {
 }
 
 #[derive(Debug, Clone, Default)]
+/// One partition-bytes histogram bucket for AQE diagnostics.
+pub struct PartitionBytesHistogramBucket {
+    /// Inclusive upper bound (bytes) for this bucket.
+    pub upper_bound_bytes: u64,
+    /// Number of partitions falling into this bucket.
+    pub partition_count: u32,
+}
+
+#[derive(Debug, Clone, Default)]
 /// Aggregated per-stage progress and map-output metrics.
 pub struct StageMetrics {
     /// Number of queued tasks in the stage.
@@ -165,6 +174,14 @@ pub struct StageMetrics {
     pub adaptive_reduce_tasks: u32,
     /// Target bytes per reduce task used for adaptive sizing.
     pub adaptive_target_bytes: u64,
+    /// AQE/layout events explaining why task fanout changed.
+    pub aqe_events: Vec<String>,
+    /// Histogram of map-output bytes by reduce partition.
+    pub partition_bytes_histogram: Vec<PartitionBytesHistogramBucket>,
+    /// Number of skew-induced split reduce tasks in the finalized layout.
+    pub skew_split_tasks: u32,
+    /// Number of times layout was finalized for the stage.
+    pub layout_finalize_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -987,11 +1004,16 @@ impl Coordinator {
         let mut bytes = 0_u64;
         let mut batches = 0_u64;
         let mut reduce_ids = HashSet::new();
+        let mut bytes_by_partition = HashMap::<u32, u64>::new();
         for p in latest {
             rows = rows.saturating_add(p.rows);
             bytes = bytes.saturating_add(p.bytes);
             batches = batches.saturating_add(p.batches);
             reduce_ids.insert(p.reduce_partition);
+            bytes_by_partition
+                .entry(p.reduce_partition)
+                .and_modify(|b| *b = b.saturating_add(p.bytes))
+                .or_insert(p.bytes);
         }
         let planned_reduce_tasks = reduce_ids.len().max(1) as u32;
         let adaptive_reduce_tasks = adaptive_reduce_task_count(
@@ -1005,23 +1027,39 @@ impl Coordinator {
             .queries
             .get_mut(&query_id)
             .ok_or_else(|| FfqError::Planning(format!("unknown query: {query_id}")))?;
-        let stage = query
-            .stages
-            .get_mut(&stage_id)
-            .ok_or_else(|| FfqError::Planning(format!("unknown stage: {stage_id}")))?;
-        stage.metrics.map_output_rows = rows;
-        stage.metrics.map_output_bytes = bytes;
-        stage.metrics.map_output_batches = batches;
-        stage.metrics.map_output_partitions = reduce_ids.len() as u64;
-        stage.metrics.planned_reduce_tasks = planned_reduce_tasks;
-        stage.metrics.adaptive_reduce_tasks = adaptive_reduce_tasks;
-        stage.metrics.adaptive_target_bytes = self.config.adaptive_shuffle_target_bytes;
+        let histogram = build_partition_bytes_histogram(&bytes_by_partition);
+        let event = format!(
+            "map_stage_observed bytes={} partitions={} planned={} adaptive_estimate={} target_bytes={}",
+            bytes,
+            reduce_ids.len(),
+            planned_reduce_tasks,
+            adaptive_reduce_tasks,
+            self.config.adaptive_shuffle_target_bytes
+        );
+        let child_stage_ids = {
+            let stage = query
+                .stages
+                .get_mut(&stage_id)
+                .ok_or_else(|| FfqError::Planning(format!("unknown stage: {stage_id}")))?;
+            stage.metrics.map_output_rows = rows;
+            stage.metrics.map_output_bytes = bytes;
+            stage.metrics.map_output_batches = batches;
+            stage.metrics.map_output_partitions = reduce_ids.len() as u64;
+            stage.metrics.planned_reduce_tasks = planned_reduce_tasks;
+            stage.metrics.adaptive_reduce_tasks = adaptive_reduce_tasks;
+            stage.metrics.adaptive_target_bytes = self.config.adaptive_shuffle_target_bytes;
+            stage.metrics.partition_bytes_histogram = histogram.clone();
+            push_stage_aqe_event(&mut stage.metrics, event.clone());
+            stage.children.clone()
+        };
 
-        for child_stage_id in stage.children.clone() {
+        for child_stage_id in child_stage_ids {
             if let Some(child) = query.stages.get_mut(&child_stage_id) {
                 child.metrics.planned_reduce_tasks = planned_reduce_tasks;
                 child.metrics.adaptive_reduce_tasks = adaptive_reduce_tasks;
                 child.metrics.adaptive_target_bytes = self.config.adaptive_shuffle_target_bytes;
+                child.metrics.partition_bytes_histogram = histogram.clone();
+                push_stage_aqe_event(&mut child.metrics, event.clone());
             }
         }
         Ok(())
@@ -1366,6 +1404,30 @@ fn advance_stage_barriers_and_finalize_layout(
                 .filter(|t| t.stage_id == stage_id && t.state == TaskState::Queued)
                 .count() as u32;
             stage.metrics.adaptive_reduce_tasks = stage.metrics.queued_tasks;
+            stage.metrics.layout_finalize_count = stage.layout_finalize_count;
+            stage.metrics.skew_split_tasks = query
+                .tasks
+                .values()
+                .filter(|t| t.stage_id == stage_id && t.assigned_reduce_split_count > 1)
+                .count() as u32;
+            let planned = stage.metrics.planned_reduce_tasks;
+            let adaptive = stage.metrics.adaptive_reduce_tasks;
+            let skew_splits = stage.metrics.skew_split_tasks;
+            let version = stage.layout_version;
+            let reason = if adaptive > planned {
+                "split"
+            } else if adaptive < planned {
+                "coalesce"
+            } else {
+                "unchanged"
+            };
+            push_stage_aqe_event(
+                &mut stage.metrics,
+                format!(
+                    "layout_finalized version={} planned={} adaptive={} reason={} skew_splits={}",
+                    version, planned, adaptive, reason, skew_splits
+                ),
+            );
             stage.barrier_state = StageBarrierState::ReduceSchedulable;
         }
     }
@@ -1402,6 +1464,48 @@ fn latest_partition_bytes_for_stage(
         }
     }
     out
+}
+
+fn build_partition_bytes_histogram(
+    bytes_by_partition: &HashMap<u32, u64>,
+) -> Vec<PartitionBytesHistogramBucket> {
+    const BOUNDS: &[u64] = &[
+        64 * 1024,
+        256 * 1024,
+        1 * 1024 * 1024,
+        4 * 1024 * 1024,
+        16 * 1024 * 1024,
+        64 * 1024 * 1024,
+        u64::MAX,
+    ];
+    let mut counts = vec![0_u32; BOUNDS.len()];
+    for bytes in bytes_by_partition.values() {
+        let idx = BOUNDS
+            .iter()
+            .position(|b| bytes <= b)
+            .unwrap_or(BOUNDS.len() - 1);
+        counts[idx] = counts[idx].saturating_add(1);
+    }
+    BOUNDS
+        .iter()
+        .zip(counts.into_iter())
+        .filter(|(_, c)| *c > 0)
+        .map(|(upper, partition_count)| PartitionBytesHistogramBucket {
+            upper_bound_bytes: *upper,
+            partition_count,
+        })
+        .collect()
+}
+
+fn push_stage_aqe_event(metrics: &mut StageMetrics, event: String) {
+    if metrics.aqe_events.iter().any(|e| e == &event) {
+        return;
+    }
+    metrics.aqe_events.push(event);
+    if metrics.aqe_events.len() > 16 {
+        let keep_from = metrics.aqe_events.len().saturating_sub(16);
+        metrics.aqe_events.drain(0..keep_from);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2272,6 +2376,10 @@ mod tests {
         let root = status.stage_metrics.get(&0).expect("root stage");
         assert_eq!(root.planned_reduce_tasks, 4);
         assert_eq!(root.adaptive_reduce_tasks, 1);
+        assert_eq!(root.adaptive_target_bytes, 30);
+        assert!(!root.partition_bytes_histogram.is_empty());
+        assert!(!root.aqe_events.is_empty());
+        assert!(root.layout_finalize_count >= 1);
     }
 
     #[test]

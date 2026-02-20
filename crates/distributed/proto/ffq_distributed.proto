@@ -110,6 +110,15 @@ message StageMetrics {
   uint32 planned_reduce_tasks = 10;
   uint32 adaptive_reduce_tasks = 11;
   uint64 adaptive_target_bytes = 12;
+  repeated string aqe_events = 13;
+  repeated PartitionBytesHistogramBucket partition_bytes_histogram = 14;
+  uint32 skew_split_tasks = 15;
+  uint32 layout_finalize_count = 16;
+}
+
+message PartitionBytesHistogramBucket {
+  uint64 upper_bound_bytes = 1;
+  uint32 partition_count = 2;
 }
 
 message GetQueryStatusResponse {
