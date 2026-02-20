@@ -113,12 +113,14 @@ jobs:
             echo "iterations=3" >> "$GITHUB_OUTPUT"
             echo "rag_matrix=1000,16,10,1.0;5000,32,10,0.8;10000,64,10,0.2" >> "$GITHUB_OUTPUT"
             echo "window_matrix=narrow;wide;skewed;many_exprs" >> "$GITHUB_OUTPUT"
+            echo "adaptive_shuffle_matrix=tiny;large;skewed;mixed" >> "$GITHUB_OUTPUT"
           else
             echo "mode=reduced" >> "$GITHUB_OUTPUT"
             echo "warmup=0" >> "$GITHUB_OUTPUT"
             echo "iterations=2" >> "$GITHUB_OUTPUT"
             echo "rag_matrix=1000,16,5,1.0;5000,32,10,0.5" >> "$GITHUB_OUTPUT"
             echo "window_matrix=narrow;many_exprs" >> "$GITHUB_OUTPUT"
+            echo "adaptive_shuffle_matrix=tiny;skewed" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Run embedded benchmark
@@ -195,6 +197,45 @@ jobs:
             exit 1
           fi
           make bench-v2-window-compare BASELINE="${BASELINE}" CANDIDATE="${{ steps.window_candidate.outputs.json }}" THRESHOLD="${THRESHOLD}"
+
+      - name: Run adaptive shuffle benchmark matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          export FFQ_BENCH_MODE=embedded
+          export FFQ_BENCH_INCLUDE_RAG=0
+          export FFQ_BENCH_INCLUDE_WINDOW=0
+          export FFQ_BENCH_WARMUP="${{ steps.matrix.outputs.warmup }}"
+          export FFQ_BENCH_ITERATIONS="${{ steps.matrix.outputs.iterations }}"
+          export FFQ_BENCH_ADAPTIVE_SHUFFLE_MATRIX="${{ steps.matrix.outputs.adaptive_shuffle_matrix }}"
+          make bench-v2-adaptive-shuffle-embedded
+
+      - name: Resolve adaptive shuffle candidate artifact
+        id: adaptive_candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          CANDIDATE_JSON="$(ls -t tests/bench/results/*.json | head -n1)"
+          echo "json=${CANDIDATE_JSON}" >> "$GITHUB_OUTPUT"
+          echo "adaptive_candidate_json=${CANDIDATE_JSON}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Adaptive shuffle regression gate (optional)
+        if: >-
+          ${{
+            github.event_name == 'workflow_dispatch' &&
+            inputs.regression_gate &&
+            steps.matrix.outputs.mode == 'reduced'
+          }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASELINE="${{ inputs.baseline_path }}"
+          THRESHOLD="${{ inputs.threshold }}"
+          if [[ -z "${BASELINE}" ]]; then
+            echo "baseline_path is required when regression_gate=true"
+            exit 1
+          fi
+          make bench-v2-adaptive-shuffle-compare BASELINE="${BASELINE}" CANDIDATE="${{ steps.adaptive_candidate.outputs.json }}" THRESHOLD="${THRESHOLD}"
 
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4

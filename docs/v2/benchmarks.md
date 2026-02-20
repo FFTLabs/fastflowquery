@@ -482,13 +482,20 @@ Manifest contract validation:
    - Required env: `FFQ_COORDINATOR_ENDPOINT`.
 7. `make bench-v2-window-compare BASELINE=<json-or-dir> CANDIDATE=<json-or-dir> [THRESHOLD=0.10]`
    - Compares window benchmark artifacts with per-query thresholds from `tests/bench/thresholds/window_regression_thresholds.json`.
-8. `make tpch-dbgen-sf1`
+8. `make bench-v2-adaptive-shuffle-embedded`
+   - Runs adaptive-shuffle benchmark matrix in embedded mode (`tiny;large;skewed;mixed`).
+9. `make bench-v2-adaptive-shuffle-distributed`
+   - Runs adaptive-shuffle benchmark matrix in distributed mode.
+   - Required env: `FFQ_COORDINATOR_ENDPOINT`.
+10. `make bench-v2-adaptive-shuffle-compare BASELINE=<json-or-dir> CANDIDATE=<json-or-dir> [THRESHOLD=0.10]`
+   - Compares adaptive-shuffle artifacts with per-query thresholds from `tests/bench/thresholds/adaptive_shuffle_regression_thresholds.json`.
+11. `make tpch-dbgen-sf1`
    - Generates official dbgen SF1 `.tbl` dataset.
-9. `make tpch-dbgen-parquet`
+12. `make tpch-dbgen-parquet`
    - Converts dbgen `.tbl` to deterministic parquet for FFQ benchmark paths.
-10. `make bench-13.4-official-embedded`
+13. `make bench-13.4-official-embedded`
    - Runs official SF1 parquet Q1/Q3 benchmark in embedded mode.
-11. `make bench-13.4-official-distributed`
+14. `make bench-13.4-official-distributed`
    - Runs official SF1 parquet Q1/Q3 benchmark in distributed mode (`FFQ_COORDINATOR_ENDPOINT` required).
 
 Legacy alias:
@@ -521,6 +528,11 @@ Window regression thresholds:
 
 1. CI/manual window gating uses `tests/bench/thresholds/window_regression_thresholds.json`.
 2. Thresholds can be adjusted per query id without changing comparator code.
+
+Adaptive shuffle regression thresholds:
+
+1. CI/manual adaptive shuffle gating uses `tests/bench/thresholds/adaptive_shuffle_regression_thresholds.json`.
+2. Thresholds can be tuned per scenario (`tiny`, `large`, `skewed`, `mixed`) without comparator changes.
 
 Artifacts:
 

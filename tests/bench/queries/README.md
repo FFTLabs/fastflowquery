@@ -12,6 +12,10 @@ Canonical benchmark SQL files:
 8. `window/window_wide_partitions.sql`
 9. `window/window_skewed_keys.sql`
 10. `window/window_many_expressions.sql`
+11. `adaptive/adaptive_shuffle_tiny_partitions.sql`
+12. `adaptive/adaptive_shuffle_large_partitions.sql`
+13. `adaptive/adaptive_shuffle_skewed_keys.sql`
+14. `adaptive/adaptive_shuffle_mixed_workload.sql`
 
 Benchmark runners should load these files directly so query text stays centralized and versioned.
 

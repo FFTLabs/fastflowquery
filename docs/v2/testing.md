@@ -259,6 +259,32 @@ cargo install cargo-semver-checks --locked
 cargo semver-checks check-release --manifest-path crates/client/Cargo.toml --baseline-rev origin/main
 ```
 
+## 7) Benchmark Regression Gates
+
+Commands:
+
+```bash
+make bench-v2-window-embedded
+make bench-v2-adaptive-shuffle-embedded
+make bench-v2-window-compare BASELINE=<baseline.json-or-dir> CANDIDATE=<candidate.json-or-dir>
+make bench-v2-adaptive-shuffle-compare BASELINE=<baseline.json-or-dir> CANDIDATE=<candidate.json-or-dir>
+```
+
+Pass criteria:
+
+1. benchmark runs complete with all rows marked `success=true`
+2. comparator exits `0` for window matrix thresholds
+3. comparator exits `0` for adaptive-shuffle matrix thresholds
+4. CI `bench-13_3` workflow can run optional regression gates without manual patching
+
+Primary references:
+
+1. `.github/workflows/bench-13_3.yml`
+2. `scripts/run-bench-v2-window.sh`
+3. `scripts/run-bench-v2-adaptive-shuffle.sh`
+4. `tests/bench/thresholds/window_regression_thresholds.json`
+5. `tests/bench/thresholds/adaptive_shuffle_regression_thresholds.json`
+
 Pass criteria:
 
 1. feature combinations compile

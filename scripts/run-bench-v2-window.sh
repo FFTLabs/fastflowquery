@@ -7,6 +7,7 @@ cd "${ROOT_DIR}"
 export FFQ_BENCH_MODE="${FFQ_BENCH_MODE:-embedded}"
 export FFQ_BENCH_INCLUDE_WINDOW=1
 export FFQ_BENCH_INCLUDE_RAG=0
+export FFQ_BENCH_INCLUDE_ADAPTIVE_SHUFFLE=0
 export FFQ_BENCH_WINDOW_MATRIX="${FFQ_BENCH_WINDOW_MATRIX:-narrow;wide;skewed;many_exprs}"
 
 echo "Running v2 window benchmark matrix"

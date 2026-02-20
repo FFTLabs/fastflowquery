@@ -26,6 +26,9 @@ SHELL := /bin/bash
 	bench-v2-window-embedded \
 	bench-v2-window-distributed \
 	bench-v2-window-compare \
+	bench-v2-adaptive-shuffle-embedded \
+	bench-v2-adaptive-shuffle-distributed \
+	bench-v2-adaptive-shuffle-compare \
 	bench-13.4-official-embedded \
 	bench-13.4-official-distributed \
 	bench-13.4-official \
@@ -132,6 +135,17 @@ bench-v2-window-compare:
 	@test -n "$$BASELINE" || (echo "BASELINE is required (json file or dir)" && exit 1)
 	@test -n "$$CANDIDATE" || (echo "CANDIDATE is required (json file or dir)" && exit 1)
 	./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}" --threshold-file "$${THRESHOLD_FILE:-tests/bench/thresholds/window_regression_thresholds.json}"
+
+bench-v2-adaptive-shuffle-embedded:
+	FFQ_BENCH_MODE=embedded FFQ_BENCH_INCLUDE_WINDOW=0 FFQ_BENCH_INCLUDE_RAG=0 FFQ_BENCH_INCLUDE_ADAPTIVE_SHUFFLE=1 FFQ_BENCH_ADAPTIVE_SHUFFLE_MATRIX="$${FFQ_BENCH_ADAPTIVE_SHUFFLE_MATRIX:-tiny;large;skewed;mixed}" ./scripts/run-bench-v2-adaptive-shuffle.sh
+
+bench-v2-adaptive-shuffle-distributed:
+	FFQ_BENCH_MODE=distributed FFQ_BENCH_INCLUDE_WINDOW=0 FFQ_BENCH_INCLUDE_RAG=0 FFQ_BENCH_INCLUDE_ADAPTIVE_SHUFFLE=1 FFQ_BENCH_ADAPTIVE_SHUFFLE_MATRIX="$${FFQ_BENCH_ADAPTIVE_SHUFFLE_MATRIX:-tiny;large;skewed;mixed}" ./scripts/run-bench-v2-adaptive-shuffle.sh
+
+bench-v2-adaptive-shuffle-compare:
+	@test -n "$$BASELINE" || (echo "BASELINE is required (json file or dir)" && exit 1)
+	@test -n "$$CANDIDATE" || (echo "CANDIDATE is required (json file or dir)" && exit 1)
+	./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}" --threshold-file "$${THRESHOLD_FILE:-tests/bench/thresholds/adaptive_shuffle_regression_thresholds.json}"
 
 bench-13.4-official-embedded:
 	FFQ_BENCH_MODE=embedded FFQ_BENCH_TPCH_SUBDIR="$${FFQ_BENCH_TPCH_SUBDIR:-tpch_dbgen_sf1_parquet}" ./scripts/run-bench-13.4-tpch-official.sh

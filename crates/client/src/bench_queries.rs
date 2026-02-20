@@ -22,6 +22,14 @@ pub enum BenchmarkQueryId {
     WindowSkewedKeys,
     /// Window benchmark with many window expressions sharing a sort.
     WindowManyExpressions,
+    /// Adaptive-shuffle benchmark with many tiny reduce groups.
+    AdaptiveShuffleTinyPartitions,
+    /// Adaptive-shuffle benchmark with large/coalescable reduce groups.
+    AdaptiveShuffleLargePartitions,
+    /// Adaptive-shuffle benchmark with skewed partition key distribution.
+    AdaptiveShuffleSkewedKeys,
+    /// Adaptive-shuffle mixed workload benchmark (join + aggregate).
+    AdaptiveShuffleMixedWorkload,
 }
 
 impl BenchmarkQueryId {
@@ -36,6 +44,10 @@ impl BenchmarkQueryId {
             Self::WindowWidePartitions => "window_wide_partitions",
             Self::WindowSkewedKeys => "window_skewed_keys",
             Self::WindowManyExpressions => "window_many_expressions",
+            Self::AdaptiveShuffleTinyPartitions => "adaptive_shuffle_tiny_partitions",
+            Self::AdaptiveShuffleLargePartitions => "adaptive_shuffle_large_partitions",
+            Self::AdaptiveShuffleSkewedKeys => "adaptive_shuffle_skewed_keys",
+            Self::AdaptiveShuffleMixedWorkload => "adaptive_shuffle_mixed_workload",
         }
     }
 
@@ -50,12 +62,18 @@ impl BenchmarkQueryId {
             Self::WindowWidePartitions => "window/window_wide_partitions.sql",
             Self::WindowSkewedKeys => "window/window_skewed_keys.sql",
             Self::WindowManyExpressions => "window/window_many_expressions.sql",
+            Self::AdaptiveShuffleTinyPartitions => "adaptive/adaptive_shuffle_tiny_partitions.sql",
+            Self::AdaptiveShuffleLargePartitions => {
+                "adaptive/adaptive_shuffle_large_partitions.sql"
+            }
+            Self::AdaptiveShuffleSkewedKeys => "adaptive/adaptive_shuffle_skewed_keys.sql",
+            Self::AdaptiveShuffleMixedWorkload => "adaptive/adaptive_shuffle_mixed_workload.sql",
         }
     }
 }
 
 /// Ordered list of benchmark queries expected by the benchmark runner.
-pub const CANONICAL_BENCHMARK_QUERIES: [BenchmarkQueryId; 8] = [
+pub const CANONICAL_BENCHMARK_QUERIES: [BenchmarkQueryId; 12] = [
     BenchmarkQueryId::TpchQ1,
     BenchmarkQueryId::TpchQ3,
     BenchmarkQueryId::RagTopkBruteforce,
@@ -64,6 +82,10 @@ pub const CANONICAL_BENCHMARK_QUERIES: [BenchmarkQueryId; 8] = [
     BenchmarkQueryId::WindowWidePartitions,
     BenchmarkQueryId::WindowSkewedKeys,
     BenchmarkQueryId::WindowManyExpressions,
+    BenchmarkQueryId::AdaptiveShuffleTinyPartitions,
+    BenchmarkQueryId::AdaptiveShuffleLargePartitions,
+    BenchmarkQueryId::AdaptiveShuffleSkewedKeys,
+    BenchmarkQueryId::AdaptiveShuffleMixedWorkload,
 ];
 
 /// Returns the default benchmark query directory.
