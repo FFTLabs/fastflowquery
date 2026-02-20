@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use ffq_common::{FfqError, Result};
 use sqlparser::ast::{
-    BinaryOperator as SqlBinaryOp, Expr as SqlExpr, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Query,
-    SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, TableWithJoins,
-    Value, CteAsMaterialized,
+    BinaryOperator as SqlBinaryOp, CteAsMaterialized, Expr as SqlExpr, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
+    ObjectName, Query, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
+    TableWithJoins, Value,
 };
 
 use crate::logical_plan::{
@@ -365,7 +365,10 @@ fn ordered_cte_indices(
         }
     }
 
-    let cte_names = name_to_idx.keys().cloned().collect::<std::collections::HashSet<_>>();
+    let cte_names = name_to_idx
+        .keys()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
     let mut deps_by_idx: Vec<std::collections::HashSet<usize>> =
         vec![std::collections::HashSet::new(); with.cte_tables.len()];
     let mut outgoing_by_idx: Vec<Vec<usize>> = vec![Vec::new(); with.cte_tables.len()];
@@ -696,7 +699,9 @@ fn collect_cte_refs_from_select(
     for proj in &select.projection {
         match proj {
             SelectItem::UnnamedExpr(e) => collect_cte_refs_from_expr(e, cte_names, out),
-            SelectItem::ExprWithAlias { expr, .. } => collect_cte_refs_from_expr(expr, cte_names, out),
+            SelectItem::ExprWithAlias { expr, .. } => {
+                collect_cte_refs_from_expr(expr, cte_names, out)
+            }
             _ => {}
         }
     }
@@ -728,7 +733,9 @@ fn collect_cte_refs_from_expr(
 ) {
     match expr {
         SqlExpr::Subquery(q) => collect_cte_refs_from_setexpr(&q.body, cte_names, out),
-        SqlExpr::Exists { subquery, .. } => collect_cte_refs_from_setexpr(&subquery.body, cte_names, out),
+        SqlExpr::Exists { subquery, .. } => {
+            collect_cte_refs_from_setexpr(&subquery.body, cte_names, out)
+        }
         SqlExpr::InSubquery { subquery, expr, .. } => {
             collect_cte_refs_from_expr(expr, cte_names, out);
             collect_cte_refs_from_setexpr(&subquery.body, cte_names, out);
@@ -795,7 +802,10 @@ fn from_to_plan(
     Ok(left)
 }
 
-fn table_factor_to_scan(tf: &TableFactor, ctes: &HashMap<String, CteBinding>) -> Result<LogicalPlan> {
+fn table_factor_to_scan(
+    tf: &TableFactor,
+    ctes: &HashMap<String, CteBinding>,
+) -> Result<LogicalPlan> {
     match tf {
         TableFactor::Table { name, .. } => {
             let t = object_name_to_string(name);
@@ -845,52 +855,50 @@ fn where_to_plan(
             negated: *negated,
             correlation: SubqueryCorrelation::Unresolved,
         }),
-        SqlExpr::BinaryOp { left, op, right } => {
-            match (&**left, &**right) {
-                (SqlExpr::Subquery(sub), rhs_expr) => {
-                    let mapped_op = sql_binop_to_binop(op)?;
-                    let reversed = reverse_comparison_op(mapped_op).ok_or_else(|| {
+        SqlExpr::BinaryOp { left, op, right } => match (&**left, &**right) {
+            (SqlExpr::Subquery(sub), rhs_expr) => {
+                let mapped_op = sql_binop_to_binop(op)?;
+                let reversed = reverse_comparison_op(mapped_op).ok_or_else(|| {
                         FfqError::Unsupported(format!(
                             "scalar subquery only supports comparison operators (=, !=, <, <=, >, >=), got {op}"
                         ))
                     })?;
-                    Ok(LogicalPlan::ScalarSubqueryFilter {
+                Ok(LogicalPlan::ScalarSubqueryFilter {
+                    input: Box::new(input),
+                    expr: sql_expr_to_expr(rhs_expr, params)?,
+                    op: reversed,
+                    subquery: Box::new(query_to_logical_with_ctes(sub, params, ctes, opts)?),
+                    correlation: SubqueryCorrelation::Unresolved,
+                })
+            }
+            (lhs_expr, SqlExpr::Subquery(sub)) => {
+                let mapped_op = sql_binop_to_binop(op)?;
+                match mapped_op {
+                    BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq => Ok(LogicalPlan::ScalarSubqueryFilter {
                         input: Box::new(input),
-                        expr: sql_expr_to_expr(rhs_expr, params)?,
-                        op: reversed,
+                        expr: sql_expr_to_expr(lhs_expr, params)?,
+                        op: mapped_op,
                         subquery: Box::new(query_to_logical_with_ctes(sub, params, ctes, opts)?),
                         correlation: SubqueryCorrelation::Unresolved,
-                    })
-                }
-                (lhs_expr, SqlExpr::Subquery(sub)) => {
-                    let mapped_op = sql_binop_to_binop(op)?;
-                    match mapped_op {
-                        BinaryOp::Eq
-                        | BinaryOp::NotEq
-                        | BinaryOp::Lt
-                        | BinaryOp::LtEq
-                        | BinaryOp::Gt
-                        | BinaryOp::GtEq => Ok(LogicalPlan::ScalarSubqueryFilter {
-                            input: Box::new(input),
-                            expr: sql_expr_to_expr(lhs_expr, params)?,
-                            op: mapped_op,
-                            subquery: Box::new(query_to_logical_with_ctes(sub, params, ctes, opts)?),
-                            correlation: SubqueryCorrelation::Unresolved,
-                        }),
-                        _ => Err(FfqError::Unsupported(format!(
-                            "scalar subquery only supports comparison operators (=, !=, <, <=, >, >=), got {op}"
-                        ))),
-                    }
-                }
-                _ => {
-                    let pred = sql_expr_to_expr(selection, params)?;
-                    Ok(LogicalPlan::Filter {
-                        predicate: pred,
-                        input: Box::new(input),
-                    })
+                    }),
+                    _ => Err(FfqError::Unsupported(format!(
+                        "scalar subquery only supports comparison operators (=, !=, <, <=, >, >=), got {op}"
+                    ))),
                 }
             }
-        }
+            _ => {
+                let pred = sql_expr_to_expr(selection, params)?;
+                Ok(LogicalPlan::Filter {
+                    predicate: pred,
+                    input: Box::new(input),
+                })
+            }
+        },
         _ => {
             let pred = sql_expr_to_expr(selection, params)?;
             Ok(LogicalPlan::Filter {
@@ -1055,12 +1063,11 @@ fn try_parse_window_expr(
         sqlparser::ast::WindowType::WindowSpec(spec) => {
             parse_window_spec(spec, params, named_windows)?
         }
-        sqlparser::ast::WindowType::NamedWindow(name) => named_windows
-            .get(&name.value)
-            .cloned()
-            .ok_or_else(|| {
+        sqlparser::ast::WindowType::NamedWindow(name) => {
+            named_windows.get(&name.value).cloned().ok_or_else(|| {
                 FfqError::Planning(format!("unknown named window in OVER clause: '{}'", name))
-            })?,
+            })?
+        }
     };
 
     let args = function_args(func)?;
@@ -1075,7 +1082,9 @@ fn try_parse_window_expr(
         }
         "RANK" => {
             if !args.is_empty() {
-                return Err(FfqError::Unsupported("RANK() does not accept arguments".to_string()));
+                return Err(FfqError::Unsupported(
+                    "RANK() does not accept arguments".to_string(),
+                ));
             }
             WindowFunction::Rank
         }
@@ -1119,12 +1128,17 @@ fn try_parse_window_expr(
                 ));
             }
             let arg_expr = match args[0] {
-                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Expr::Literal(LiteralValue::Int64(1)),
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                    Expr::Literal(LiteralValue::Int64(1))
+                }
                 other => function_arg_to_expr(other, params)?,
             };
             WindowFunction::Count(arg_expr)
         }
-        "SUM" => WindowFunction::Sum(function_arg_to_expr(required_arg(args.first().copied(), "SUM")?, params)?),
+        "SUM" => WindowFunction::Sum(function_arg_to_expr(
+            required_arg(args.first().copied(), "SUM")?,
+            params,
+        )?),
         "AVG" => WindowFunction::Avg(function_arg_to_expr(
             required_arg(args.first().copied(), "AVG")?,
             params,
@@ -1212,7 +1226,7 @@ fn try_parse_window_expr(
         _ => {
             return Err(FfqError::Unsupported(format!(
                 "unsupported window function in v1: {fname}"
-            )))
+            )));
         }
     };
     if order_by.is_empty() {
@@ -1239,10 +1253,7 @@ fn parse_named_windows(
     let mut defs = HashMap::new();
     for def in &select.named_window {
         let name = def.0.value.clone();
-        if defs
-            .insert(name.clone(), def.1.clone())
-            .is_some()
-        {
+        if defs.insert(name.clone(), def.1.clone()).is_some() {
             return Err(FfqError::Planning(format!(
                 "duplicate named window definition: '{name}'"
             )));
@@ -1273,9 +1284,9 @@ fn resolve_named_window_spec(
             "named window reference cycle detected at '{name}'"
         )));
     }
-    let named_expr = defs.get(name).ok_or_else(|| {
-        FfqError::Planning(format!("unknown named window reference: '{name}'"))
-    })?;
+    let named_expr = defs
+        .get(name)
+        .ok_or_else(|| FfqError::Planning(format!("unknown named window reference: '{name}'")))?;
     let resolved_spec = match named_expr {
         sqlparser::ast::NamedWindowExpr::NamedWindow(parent) => {
             resolve_named_window_spec(&parent.value, defs, params, resolving, resolved)?
@@ -1344,7 +1355,11 @@ fn parse_window_spec(
         } else {
             local_order_by
         },
-        if local_frame.is_none() { base.2 } else { local_frame },
+        if local_frame.is_none() {
+            base.2
+        } else {
+            local_frame
+        },
     ))
 }
 
@@ -1397,7 +1412,11 @@ fn parse_window_spec_with_refs(
         } else {
             local_order_by
         },
-        if local_frame.is_none() { base.2 } else { local_frame },
+        if local_frame.is_none() {
+            base.2
+        } else {
+            local_frame
+        },
     ))
 }
 
@@ -1422,9 +1441,7 @@ fn parse_window_frame(
         Some(sqlparser::ast::WindowFrameExclusion::NoOthers) | None => {
             WindowFrameExclusion::NoOthers
         }
-        Some(sqlparser::ast::WindowFrameExclusion::CurrentRow) => {
-            WindowFrameExclusion::CurrentRow
-        }
+        Some(sqlparser::ast::WindowFrameExclusion::CurrentRow) => WindowFrameExclusion::CurrentRow,
         Some(sqlparser::ast::WindowFrameExclusion::Group) => WindowFrameExclusion::Group,
         Some(sqlparser::ast::WindowFrameExclusion::Ties) => WindowFrameExclusion::Ties,
     };
@@ -1449,16 +1466,12 @@ fn parse_window_frame_bound(
         sqlparser::ast::WindowFrameBound::Following(None) => {
             Ok(WindowFrameBound::UnboundedFollowing)
         }
-        sqlparser::ast::WindowFrameBound::Preceding(Some(expr)) => {
-            Ok(WindowFrameBound::Preceding(parse_positive_usize_expr(
-                expr, params, "window frame",
-            )?))
-        }
-        sqlparser::ast::WindowFrameBound::Following(Some(expr)) => {
-            Ok(WindowFrameBound::Following(parse_positive_usize_expr(
-                expr, params, "window frame",
-            )?))
-        }
+        sqlparser::ast::WindowFrameBound::Preceding(Some(expr)) => Ok(WindowFrameBound::Preceding(
+            parse_positive_usize_expr(expr, params, "window frame")?,
+        )),
+        sqlparser::ast::WindowFrameBound::Following(Some(expr)) => Ok(WindowFrameBound::Following(
+            parse_positive_usize_expr(expr, params, "window frame")?,
+        )),
     }
 }
 
@@ -1474,9 +1487,7 @@ fn parse_positive_usize_expr(
         )));
     };
     if v < 0 {
-        return Err(FfqError::Planning(format!(
-            "{ctx} bound must be >= 0"
-        )));
+        return Err(FfqError::Planning(format!("{ctx} bound must be >= 0")));
     }
     Ok(v as usize)
 }
@@ -1610,7 +1621,8 @@ fn sql_expr_to_expr(e: &SqlExpr, params: &HashMap<String, LiteralValue>) -> Resu
         } => {
             if operand.is_some() {
                 return Err(FfqError::Unsupported(
-                    "CASE <expr> WHEN ... form is not supported in v1; use CASE WHEN ...".to_string(),
+                    "CASE <expr> WHEN ... form is not supported in v1; use CASE WHEN ..."
+                        .to_string(),
                 ));
             }
             if conditions.len() != results.len() {
@@ -1885,7 +1897,10 @@ mod tests {
             LogicalPlan::Projection { exprs, .. } => {
                 assert_eq!(exprs.len(), 1);
                 match &exprs[0].0 {
-                    crate::logical_plan::Expr::CaseWhen { branches, else_expr } => {
+                    crate::logical_plan::Expr::CaseWhen {
+                        branches,
+                        else_expr,
+                    } => {
                         assert_eq!(branches.len(), 1);
                         assert!(else_expr.is_some());
                     }
@@ -1906,7 +1921,10 @@ mod tests {
         match plan {
             LogicalPlan::Projection { input, .. } => match input.as_ref() {
                 LogicalPlan::Filter { predicate, .. } => match predicate {
-                    crate::logical_plan::Expr::CaseWhen { branches, else_expr } => {
+                    crate::logical_plan::Expr::CaseWhen {
+                        branches,
+                        else_expr,
+                    } => {
                         assert_eq!(branches.len(), 1);
                         match &branches[0].0 {
                             crate::logical_plan::Expr::BinaryOp { op, .. } => {
@@ -1935,8 +1953,11 @@ mod tests {
 
     #[test]
     fn parses_cte_query() {
-        let plan = sql_to_logical("WITH c AS (SELECT a FROM t) SELECT a FROM c", &HashMap::new())
-            .expect("parse");
+        let plan = sql_to_logical(
+            "WITH c AS (SELECT a FROM t) SELECT a FROM c",
+            &HashMap::new(),
+        )
+        .expect("parse");
         match plan {
             LogicalPlan::Projection { input, .. } => match input.as_ref() {
                 LogicalPlan::Projection {
@@ -1968,11 +1989,15 @@ mod tests {
                 | LogicalPlan::Limit { input, .. }
                 | LogicalPlan::TopKByScore { input, .. }
                 | LogicalPlan::InsertInto { input, .. } => contains_tablescan(input, target),
-                LogicalPlan::InSubqueryFilter { input, subquery, .. }
-                | LogicalPlan::ExistsSubqueryFilter { input, subquery, .. }
-                | LogicalPlan::ScalarSubqueryFilter { input, subquery, .. } => {
-                    contains_tablescan(input, target) || contains_tablescan(subquery, target)
+                LogicalPlan::InSubqueryFilter {
+                    input, subquery, ..
                 }
+                | LogicalPlan::ExistsSubqueryFilter {
+                    input, subquery, ..
+                }
+                | LogicalPlan::ScalarSubqueryFilter {
+                    input, subquery, ..
+                } => contains_tablescan(input, target) || contains_tablescan(subquery, target),
                 LogicalPlan::Join { left, right, .. } => {
                     contains_tablescan(left, target) || contains_tablescan(right, target)
                 }
@@ -2000,11 +2025,15 @@ mod tests {
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::TopKByScore { input, .. }
             | LogicalPlan::InsertInto { input, .. } => count_cte_refs(input),
-            LogicalPlan::InSubqueryFilter { input, subquery, .. }
-            | LogicalPlan::ExistsSubqueryFilter { input, subquery, .. }
-            | LogicalPlan::ScalarSubqueryFilter { input, subquery, .. } => {
-                count_cte_refs(input) + count_cte_refs(subquery)
+            LogicalPlan::InSubqueryFilter {
+                input, subquery, ..
             }
+            | LogicalPlan::ExistsSubqueryFilter {
+                input, subquery, ..
+            }
+            | LogicalPlan::ScalarSubqueryFilter {
+                input, subquery, ..
+            } => count_cte_refs(input) + count_cte_refs(subquery),
             LogicalPlan::Join { left, right, .. } | LogicalPlan::UnionAll { left, right } => {
                 count_cte_refs(left) + count_cte_refs(right)
             }
@@ -2054,7 +2083,8 @@ mod tests {
         )
         .expect_err("cycle should fail");
         assert!(
-            err.to_string().contains("CTE dependency cycle detected involving"),
+            err.to_string()
+                .contains("CTE dependency cycle detected involving"),
             "unexpected error: {err}"
         );
     }
@@ -2081,8 +2111,7 @@ mod tests {
         )
         .expect_err("shadowing should fail");
         assert!(
-            err.to_string()
-                .contains("shadows an outer CTE"),
+            err.to_string().contains("shadows an outer CTE"),
             "unexpected error: {err}"
         );
     }
@@ -2109,11 +2138,15 @@ mod tests {
                 | LogicalPlan::Limit { input, .. }
                 | LogicalPlan::TopKByScore { input, .. }
                 | LogicalPlan::InsertInto { input, .. } => has_union_all(input),
-                LogicalPlan::InSubqueryFilter { input, subquery, .. }
-                | LogicalPlan::ExistsSubqueryFilter { input, subquery, .. }
-                | LogicalPlan::ScalarSubqueryFilter { input, subquery, .. } => {
-                    has_union_all(input) || has_union_all(subquery)
+                LogicalPlan::InSubqueryFilter {
+                    input, subquery, ..
                 }
+                | LogicalPlan::ExistsSubqueryFilter {
+                    input, subquery, ..
+                }
+                | LogicalPlan::ScalarSubqueryFilter {
+                    input, subquery, ..
+                } => has_union_all(input) || has_union_all(subquery),
                 LogicalPlan::Join { left, right, .. } => {
                     has_union_all(left) || has_union_all(right)
                 }
@@ -2143,8 +2176,7 @@ mod tests {
         .expect_err("self-reference without WITH RECURSIVE should fail");
 
         assert!(
-            err.to_string()
-                .contains("use WITH RECURSIVE"),
+            err.to_string().contains("use WITH RECURSIVE"),
             "unexpected error: {err}"
         );
     }
@@ -2167,16 +2199,18 @@ mod tests {
         .expect_err("depth=0 should reject recursive CTE");
 
         assert!(
-            err.to_string()
-                .contains("recursive_cte_max_depth=0"),
+            err.to_string().contains("recursive_cte_max_depth=0"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
     fn parses_in_subquery_filter() {
-        let plan = sql_to_logical("SELECT a FROM t WHERE a IN (SELECT b FROM s)", &HashMap::new())
-            .expect("parse");
+        let plan = sql_to_logical(
+            "SELECT a FROM t WHERE a IN (SELECT b FROM s)",
+            &HashMap::new(),
+        )
+        .expect("parse");
         match plan {
             LogicalPlan::Projection { input, .. } => match input.as_ref() {
                 LogicalPlan::InSubqueryFilter { .. } => {}
@@ -2188,9 +2222,11 @@ mod tests {
 
     #[test]
     fn parses_exists_subquery_filter() {
-        let plan =
-            sql_to_logical("SELECT a FROM t WHERE EXISTS (SELECT b FROM s)", &HashMap::new())
-                .expect("parse");
+        let plan = sql_to_logical(
+            "SELECT a FROM t WHERE EXISTS (SELECT b FROM s)",
+            &HashMap::new(),
+        )
+        .expect("parse");
         match plan {
             LogicalPlan::Projection { input, .. } => match input.as_ref() {
                 LogicalPlan::ExistsSubqueryFilter { negated, .. } => assert!(!negated),
@@ -2218,9 +2254,11 @@ mod tests {
 
     #[test]
     fn parses_scalar_subquery_filter() {
-        let plan =
-            sql_to_logical("SELECT a FROM t WHERE a = (SELECT max(b) FROM s)", &HashMap::new())
-                .expect("parse");
+        let plan = sql_to_logical(
+            "SELECT a FROM t WHERE a = (SELECT max(b) FROM s)",
+            &HashMap::new(),
+        )
+        .expect("parse");
         match plan {
             LogicalPlan::Projection { input, .. } => match input.as_ref() {
                 LogicalPlan::ScalarSubqueryFilter { .. } => {}
@@ -2278,7 +2316,8 @@ mod tests {
         let err = sql_to_logical("SELECT ROW_NUMBER() OVER w FROM t", &HashMap::new())
             .expect_err("unknown window should fail");
         assert!(
-            err.to_string().contains("unknown named window in OVER clause"),
+            err.to_string()
+                .contains("unknown named window in OVER clause"),
             "unexpected error: {err}"
         );
     }
@@ -2291,8 +2330,7 @@ mod tests {
         )
         .expect_err("override should fail");
         assert!(
-            err.to_string()
-                .contains("cannot override ORDER BY"),
+            err.to_string().contains("cannot override ORDER BY"),
             "unexpected error: {err}"
         );
     }
@@ -2335,8 +2373,7 @@ mod tests {
         )
         .expect_err("invalid frame should fail");
         assert!(
-            err.to_string()
-                .contains("UNBOUNDED FOLLOWING"),
+            err.to_string().contains("UNBOUNDED FOLLOWING"),
             "unexpected error: {err}"
         );
     }
@@ -2381,35 +2418,19 @@ mod tests {
                 LogicalPlan::Window { exprs, .. } => {
                     assert_eq!(exprs.len(), 4);
                     assert_eq!(
-                        exprs[0]
-                            .frame
-                            .as_ref()
-                            .expect("frame")
-                            .exclusion,
+                        exprs[0].frame.as_ref().expect("frame").exclusion,
                         WindowFrameExclusion::CurrentRow
                     );
                     assert_eq!(
-                        exprs[1]
-                            .frame
-                            .as_ref()
-                            .expect("frame")
-                            .exclusion,
+                        exprs[1].frame.as_ref().expect("frame").exclusion,
                         WindowFrameExclusion::Group
                     );
                     assert_eq!(
-                        exprs[2]
-                            .frame
-                            .as_ref()
-                            .expect("frame")
-                            .exclusion,
+                        exprs[2].frame.as_ref().expect("frame").exclusion,
                         WindowFrameExclusion::Ties
                     );
                     assert_eq!(
-                        exprs[3]
-                            .frame
-                            .as_ref()
-                            .expect("frame")
-                            .exclusion,
+                        exprs[3].frame.as_ref().expect("frame").exclusion,
                         WindowFrameExclusion::NoOthers
                     );
                 }

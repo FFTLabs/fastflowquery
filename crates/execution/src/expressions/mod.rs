@@ -111,10 +111,18 @@ pub fn compile_expr(expr: &Expr, input_schema: &SchemaRef) -> Result<Arc<dyn Phy
                 op: BoolOp::Or,
             }))
         }
-        Expr::CaseWhen { branches, else_expr } => {
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
             let compiled_branches = branches
                 .iter()
-                .map(|(cond, value)| Ok((compile_expr(cond, input_schema)?, compile_expr(value, input_schema)?)))
+                .map(|(cond, value)| {
+                    Ok((
+                        compile_expr(cond, input_schema)?,
+                        compile_expr(value, input_schema)?,
+                    ))
+                })
                 .collect::<Result<Vec<_>>>()?;
             let else_compiled = if let Some(e) = else_expr {
                 compile_expr(e, input_schema)?
@@ -324,7 +332,9 @@ impl PhysicalExpr for CaseWhenExpr {
             let cond_bool = cond_arr
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| FfqError::Execution("CASE WHEN condition must evaluate to boolean".to_string()))?;
+                .ok_or_else(|| {
+                    FfqError::Execution("CASE WHEN condition must evaluate to boolean".to_string())
+                })?;
             let then_arr = then_expr.evaluate(batch)?;
             out = case_select_arrays(cond_bool, &then_arr, &out)?;
         }
@@ -469,7 +479,11 @@ fn scalar_to_array(v: &LiteralValue, len: usize) -> Result<ArrayRef> {
     }
 }
 
-fn case_select_arrays(cond: &BooleanArray, then_arr: &ArrayRef, else_arr: &ArrayRef) -> Result<ArrayRef> {
+fn case_select_arrays(
+    cond: &BooleanArray,
+    then_arr: &ArrayRef,
+    else_arr: &ArrayRef,
+) -> Result<ArrayRef> {
     if then_arr.data_type() != else_arr.data_type() {
         return Err(FfqError::Execution(format!(
             "CASE branch type mismatch at execution: then={:?} else={:?}",

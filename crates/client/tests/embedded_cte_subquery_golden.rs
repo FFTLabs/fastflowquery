@@ -17,7 +17,11 @@ fn register_int64_table(
     values: Vec<Option<i64>>,
 ) {
     let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
-    support::write_parquet(path, schema.clone(), vec![Arc::new(Int64Array::from(values))]);
+    support::write_parquet(
+        path,
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(values))],
+    );
     engine.register_table(
         name,
         TableDef {
@@ -110,8 +114,8 @@ fn embedded_subquery_cte_edge_matrix_snapshot() {
 
     let mut snapshot = String::new();
     for (name, sql, sort_by) in cases {
-        let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect())
-            .expect("collect");
+        let batches =
+            futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
         snapshot.push_str(&format!("## {name}\n"));
         snapshot.push_str(&support::snapshot_text(&batches, &sort_by, 1e-9));
         snapshot.push('\n');

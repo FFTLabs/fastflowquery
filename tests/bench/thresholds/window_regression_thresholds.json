@@ -1,0 +1,7 @@
+{
+  "default": 0.1,
+  "window_narrow_partitions": 0.15,
+  "window_wide_partitions": 0.15,
+  "window_skewed_keys": 0.2,
+  "window_many_expressions": 0.2
+}

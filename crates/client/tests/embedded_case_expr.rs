@@ -47,7 +47,8 @@ fn make_engine_with_case_fixture() -> (Engine, std::path::PathBuf) {
 fn case_expression_works_in_projection() {
     let (engine, path) = make_engine_with_case_fixture();
     let sql = "SELECT k, CASE WHEN k > 1 THEN k + 10 ELSE 0 END AS c FROM t";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
     let mut rows = batches
         .iter()
         .flat_map(|b| {
@@ -65,8 +66,12 @@ fn case_expression_works_in_projection() {
 fn case_expression_works_in_filter() {
     let (engine, path) = make_engine_with_case_fixture();
     let sql = "SELECT k FROM t WHERE CASE WHEN k > 1 THEN true ELSE false END";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
-    let mut keys = batches.iter().flat_map(|b| int64_col(b, 0)).collect::<Vec<_>>();
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let mut keys = batches
+        .iter()
+        .flat_map(|b| int64_col(b, 0))
+        .collect::<Vec<_>>();
     keys.sort_unstable();
     assert_eq!(keys, vec![2, 3]);
     let _ = std::fs::remove_file(path);

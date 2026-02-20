@@ -124,6 +124,10 @@ Logical benchmark query ids:
 2. `tpch_q3`
 3. `rag_topk_bruteforce`
 4. `rag_topk_qdrant` (optional/feature-gated)
+5. `window_narrow_partitions`
+6. `window_wide_partitions`
+7. `window_skewed_keys`
+8. `window_many_expressions`
 
 Canonical SQL file paths:
 
@@ -131,6 +135,10 @@ Canonical SQL file paths:
 2. `tests/bench/queries/canonical/tpch_q3.sql`
 3. `tests/bench/queries/rag_topk_bruteforce.sql`
 4. `tests/bench/queries/rag_topk_qdrant.sql`
+5. `tests/bench/queries/window/window_narrow_partitions.sql`
+6. `tests/bench/queries/window/window_wide_partitions.sql`
+7. `tests/bench/queries/window/window_skewed_keys.sql`
+8. `tests/bench/queries/window/window_many_expressions.sql`
 
 The IDs are stable reporting keys. Benchmark runners must load SQL from these files rather than embedding inline SQL strings.
 
@@ -466,13 +474,21 @@ Manifest contract validation:
    - Optional qdrant env: `FFQ_BENCH_QDRANT_COLLECTION`, `FFQ_BENCH_QDRANT_ENDPOINT`.
 4. `make bench-13.3-compare BASELINE=<json-or-dir> CANDIDATE=<json-or-dir> [THRESHOLD=0.10]`
    - Compares candidate vs baseline and fails on threshold regression.
-5. `make tpch-dbgen-sf1`
+5. `make bench-v2-window-embedded`
+   - Runs the v2 window benchmark matrix in embedded mode.
+   - Optional env: `FFQ_BENCH_WINDOW_MATRIX` (`narrow;wide;skewed;many_exprs`).
+6. `make bench-v2-window-distributed`
+   - Runs the v2 window benchmark matrix in distributed mode.
+   - Required env: `FFQ_COORDINATOR_ENDPOINT`.
+7. `make bench-v2-window-compare BASELINE=<json-or-dir> CANDIDATE=<json-or-dir> [THRESHOLD=0.10]`
+   - Compares window benchmark artifacts with per-query thresholds from `tests/bench/thresholds/window_regression_thresholds.json`.
+8. `make tpch-dbgen-sf1`
    - Generates official dbgen SF1 `.tbl` dataset.
-6. `make tpch-dbgen-parquet`
+9. `make tpch-dbgen-parquet`
    - Converts dbgen `.tbl` to deterministic parquet for FFQ benchmark paths.
-7. `make bench-13.4-official-embedded`
+10. `make bench-13.4-official-embedded`
    - Runs official SF1 parquet Q1/Q3 benchmark in embedded mode.
-8. `make bench-13.4-official-distributed`
+11. `make bench-13.4-official-distributed`
    - Runs official SF1 parquet Q1/Q3 benchmark in distributed mode (`FFQ_COORDINATOR_ENDPOINT` required).
 
 Legacy alias:
@@ -485,7 +501,7 @@ Workflow: `.github/workflows/bench-13_3.yml`
 
 Triggers:
 
-1. Pull requests (`opened`, `reopened`, `synchronize`): runs reduced matrix and uploads JSON/CSV artifacts.
+1. Pull requests (`opened`, `reopened`, `synchronize`): runs reduced TPC-H/RAG matrix and reduced window matrix, then uploads JSON/CSV artifacts.
 2. Manual (`workflow_dispatch`): choose reduced/full matrix and optional regression gate.
 
 Additional CI validation in the same workflow:
@@ -500,6 +516,11 @@ Manual inputs:
 2. `regression_gate`: boolean (only applies to reduced)
 3. `baseline_path`: repo-relative baseline JSON path (required when gate is enabled)
 4. `threshold`: regression threshold ratio (default `0.10`)
+
+Window regression thresholds:
+
+1. CI/manual window gating uses `tests/bench/thresholds/window_regression_thresholds.json`.
+2. Thresholds can be adjusted per query id without changing comparator code.
 
 Artifacts:
 

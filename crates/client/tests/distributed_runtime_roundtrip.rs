@@ -699,17 +699,25 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         "distributed and embedded scan/filter/project outputs differ"
     );
 
-    let dist_cte_norm = support::snapshot_text(&dist_cte_batches, &["l_orderkey", "l_partkey"], 1e-9);
-    let emb_cte_norm = support::snapshot_text(&embedded_cte_batches, &["l_orderkey", "l_partkey"], 1e-9);
+    let dist_cte_norm =
+        support::snapshot_text(&dist_cte_batches, &["l_orderkey", "l_partkey"], 1e-9);
+    let emb_cte_norm =
+        support::snapshot_text(&embedded_cte_batches, &["l_orderkey", "l_partkey"], 1e-9);
     assert_eq!(
         dist_cte_norm, emb_cte_norm,
         "distributed and embedded CTE outputs differ"
     );
 
-    let dist_in_norm =
-        support::snapshot_text(&dist_in_subquery_batches, &["l_orderkey", "l_partkey"], 1e-9);
-    let emb_in_norm =
-        support::snapshot_text(&embedded_in_subquery_batches, &["l_orderkey", "l_partkey"], 1e-9);
+    let dist_in_norm = support::snapshot_text(
+        &dist_in_subquery_batches,
+        &["l_orderkey", "l_partkey"],
+        1e-9,
+    );
+    let emb_in_norm = support::snapshot_text(
+        &embedded_in_subquery_batches,
+        &["l_orderkey", "l_partkey"],
+        1e-9,
+    );
     assert_eq!(
         dist_in_norm, emb_in_norm,
         "distributed and embedded IN-subquery outputs differ"
@@ -744,10 +752,16 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         dist_cte_join_heavy_norm, emb_cte_join_heavy_norm,
         "distributed and embedded CTE join-heavy outputs differ"
     );
-    let dist_window_norm =
-        support::snapshot_text(&dist_window_batches, &["l_orderkey", "l_partkey", "rn"], 1e-9);
-    let emb_window_norm =
-        support::snapshot_text(&embedded_window_batches, &["l_orderkey", "l_partkey", "rn"], 1e-9);
+    let dist_window_norm = support::snapshot_text(
+        &dist_window_batches,
+        &["l_orderkey", "l_partkey", "rn"],
+        1e-9,
+    );
+    let emb_window_norm = support::snapshot_text(
+        &embedded_window_batches,
+        &["l_orderkey", "l_partkey", "rn"],
+        1e-9,
+    );
     assert_eq!(
         dist_window_norm, emb_window_norm,
         "distributed and embedded window outputs differ"

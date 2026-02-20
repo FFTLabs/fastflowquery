@@ -228,7 +228,8 @@ impl Analyzer {
                             provider,
                             &in_resolver,
                         )? {
-                            let (aplan, schema, resolver) = self.analyze_plan(rewritten, provider)?;
+                            let (aplan, schema, resolver) =
+                                self.analyze_plan(rewritten, provider)?;
                             return Ok((aplan, schema, resolver));
                         }
                         Err(err)
@@ -252,11 +253,7 @@ impl Analyzer {
                     Ok(v) => v,
                     Err(err) => {
                         if let Some((decorrelated_subquery, on)) = self
-                            .try_decorrelate_exists_subquery(
-                                raw_subquery,
-                                provider,
-                                &in_resolver,
-                            )?
+                            .try_decorrelate_exists_subquery(raw_subquery, provider, &in_resolver)?
                         {
                             let out_schema = in_schema.clone();
                             let out_resolver = Resolver::anonymous(out_schema.clone());
@@ -697,8 +694,7 @@ impl Analyzer {
         let mut join_keys = Vec::<(String, String)>::new();
         let mut inner_only = Vec::<Expr>::new();
         for pred in predicates {
-            if let Some((outer_col, inner_col)) =
-                extract_outer_inner_eq_pair(&pred, outer_resolver)
+            if let Some((outer_col, inner_col)) = extract_outer_inner_eq_pair(&pred, outer_resolver)
             {
                 join_keys.push((outer_col, inner_col));
                 continue;
@@ -723,7 +719,8 @@ impl Analyzer {
                 input: Box::new(base_input),
             }
         };
-        let (analyzed_subquery, _schema, _resolver) = self.analyze_plan(rewritten_subquery, provider)?;
+        let (analyzed_subquery, _schema, _resolver) =
+            self.analyze_plan(rewritten_subquery, provider)?;
         Ok(Some((analyzed_subquery, join_keys)))
     }
 
@@ -767,8 +764,7 @@ impl Analyzer {
         let mut corr_keys = Vec::<(String, String)>::new();
         let mut inner_only = Vec::<Expr>::new();
         for pred in predicates {
-            if let Some((outer_col, inner_col)) =
-                extract_outer_inner_eq_pair(&pred, outer_resolver)
+            if let Some((outer_col, inner_col)) = extract_outer_inner_eq_pair(&pred, outer_resolver)
             {
                 corr_keys.push((outer_col, inner_col));
                 continue;
@@ -882,11 +878,12 @@ impl Analyzer {
             .order_by
             .into_iter()
             .map(|o| {
-                self.analyze_expr(o.expr, resolver).map(|(ae, _)| WindowOrderExpr {
-                    expr: ae,
-                    asc: o.asc,
-                    nulls_first: o.nulls_first,
-                })
+                self.analyze_expr(o.expr, resolver)
+                    .map(|(ae, _)| WindowOrderExpr {
+                        expr: ae,
+                        asc: o.asc,
+                        nulls_first: o.nulls_first,
+                    })
             })
             .collect::<Result<Vec<_>>>()?;
         let func = match w.func {
@@ -932,8 +929,9 @@ impl Analyzer {
                 default,
             } => {
                 let (arg, arg_dt) = self.analyze_expr(expr, resolver)?;
-                let (arg, analyzed_default) =
-                    analyze_window_value_with_default("LAG", arg, &arg_dt, default, resolver, self)?;
+                let (arg, analyzed_default) = analyze_window_value_with_default(
+                    "LAG", arg, &arg_dt, default, resolver, self,
+                )?;
                 WindowFunction::Lag {
                     expr: arg,
                     offset,
@@ -947,12 +945,7 @@ impl Analyzer {
             } => {
                 let (arg, arg_dt) = self.analyze_expr(expr, resolver)?;
                 let (arg, analyzed_default) = analyze_window_value_with_default(
-                    "LEAD",
-                    arg,
-                    &arg_dt,
-                    default,
-                    resolver,
-                    self,
+                    "LEAD", arg, &arg_dt, default, resolver, self,
                 )?;
                 WindowFunction::Lead {
                     expr: arg,
@@ -975,8 +968,10 @@ impl Analyzer {
         };
         let frame = if let Some(frame) = w.frame {
             validate_window_frame(&frame)?;
-            if matches!(frame.units, WindowFrameUnits::Range | WindowFrameUnits::Groups)
-                && order_by.is_empty()
+            if matches!(
+                frame.units,
+                WindowFrameUnits::Range | WindowFrameUnits::Groups
+            ) && order_by.is_empty()
             {
                 return Err(FfqError::Planning(
                     "RANGE/GROUPS frame requires ORDER BY".to_string(),
@@ -1382,7 +1377,10 @@ fn predicate_has_outer_ref(expr: &Expr, outer_resolver: &Resolver) -> bool {
                 || predicate_has_outer_ref(right, outer_resolver)
         }
         Expr::Not(inner) => predicate_has_outer_ref(inner, outer_resolver),
-        Expr::CaseWhen { branches, else_expr } => {
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
             branches.iter().any(|(c, v)| {
                 predicate_has_outer_ref(c, outer_resolver)
                     || predicate_has_outer_ref(v, outer_resolver)
@@ -1403,10 +1401,7 @@ fn predicate_has_outer_ref(expr: &Expr, outer_resolver: &Resolver) -> bool {
     }
 }
 
-fn extract_outer_inner_eq_pair(
-    expr: &Expr,
-    outer_resolver: &Resolver,
-) -> Option<(String, String)> {
+fn extract_outer_inner_eq_pair(expr: &Expr, outer_resolver: &Resolver) -> Option<(String, String)> {
     let Expr::BinaryOp { left, op, right } = expr else {
         return None;
     };
@@ -1520,14 +1515,12 @@ fn strip_inner_qualifiers(expr: Expr, outer_resolver: &Resolver) -> Expr {
             expr: Box::new(strip_inner_qualifiers(*expr, outer_resolver)),
             to_type,
         },
-        Expr::IsNull(inner) => Expr::IsNull(Box::new(strip_inner_qualifiers(
-            *inner,
-            outer_resolver,
-        ))),
-        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(strip_inner_qualifiers(
-            *inner,
-            outer_resolver,
-        ))),
+        Expr::IsNull(inner) => {
+            Expr::IsNull(Box::new(strip_inner_qualifiers(*inner, outer_resolver)))
+        }
+        Expr::IsNotNull(inner) => {
+            Expr::IsNotNull(Box::new(strip_inner_qualifiers(*inner, outer_resolver)))
+        }
         Expr::And(left, right) => Expr::And(
             Box::new(strip_inner_qualifiers(*left, outer_resolver)),
             Box::new(strip_inner_qualifiers(*right, outer_resolver)),
@@ -1537,7 +1530,10 @@ fn strip_inner_qualifiers(expr: Expr, outer_resolver: &Resolver) -> Expr {
             Box::new(strip_inner_qualifiers(*right, outer_resolver)),
         ),
         Expr::Not(inner) => Expr::Not(Box::new(strip_inner_qualifiers(*inner, outer_resolver))),
-        Expr::CaseWhen { branches, else_expr } => Expr::CaseWhen {
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => Expr::CaseWhen {
             branches: branches
                 .into_iter()
                 .map(|(c, v)| {
@@ -1647,7 +1643,10 @@ fn validate_window_frame(frame: &WindowFrameSpec) -> Result<()> {
     Ok(())
 }
 
-fn window_output_type_and_nullable(func: &WindowFunction, resolver: &Resolver) -> Result<(DataType, bool)> {
+fn window_output_type_and_nullable(
+    func: &WindowFunction,
+    resolver: &Resolver,
+) -> Result<(DataType, bool)> {
     match func {
         WindowFunction::RowNumber
         | WindowFunction::Rank
@@ -1701,11 +1700,16 @@ fn expr_nullable(expr: &Expr, resolver: &Resolver) -> Result<bool> {
         Expr::Literal(v) => Ok(matches!(v, LiteralValue::Null)),
         Expr::Cast { expr, .. } => expr_nullable(expr, resolver),
         Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(false),
-        Expr::And(l, r) | Expr::Or(l, r) | Expr::BinaryOp { left: l, right: r, .. } => {
-            Ok(expr_nullable(l, resolver)? || expr_nullable(r, resolver)?)
-        }
+        Expr::And(l, r)
+        | Expr::Or(l, r)
+        | Expr::BinaryOp {
+            left: l, right: r, ..
+        } => Ok(expr_nullable(l, resolver)? || expr_nullable(r, resolver)?),
         Expr::Not(inner) => expr_nullable(inner, resolver),
-        Expr::CaseWhen { branches, else_expr } => {
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
             let mut nullable = false;
             for (cond, value) in branches {
                 nullable |= expr_nullable(cond, resolver)?;
@@ -1870,8 +1874,11 @@ mod tests {
         );
         let provider = TestSchemaProvider { schemas };
         let analyzer = Analyzer::new();
-        let plan = sql_to_logical("SELECT a FROM t WHERE EXISTS (SELECT b FROM s)", &HashMap::new())
-            .expect("parse");
+        let plan = sql_to_logical(
+            "SELECT a FROM t WHERE EXISTS (SELECT b FROM s)",
+            &HashMap::new(),
+        )
+        .expect("parse");
         let analyzed = analyzer.analyze(plan, &provider).expect("analyze");
         match analyzed {
             LogicalPlan::Projection { input, .. } => match input.as_ref() {
@@ -2244,9 +2251,11 @@ fn coerce_case_result_type(types: &[DataType]) -> Result<DataType> {
         target = Some(match target {
             None => dt.clone(),
             Some(t) if t == *dt => t,
-            Some(t) if is_numeric(&t) && is_numeric(dt) => wider_numeric(&t, dt).ok_or_else(|| {
-                FfqError::Planning("failed to determine CASE numeric widening type".to_string())
-            })?,
+            Some(t) if is_numeric(&t) && is_numeric(dt) => {
+                wider_numeric(&t, dt).ok_or_else(|| {
+                    FfqError::Planning("failed to determine CASE numeric widening type".to_string())
+                })?
+            }
             Some(DataType::Utf8) if *dt == DataType::LargeUtf8 => DataType::LargeUtf8,
             Some(DataType::LargeUtf8) if *dt == DataType::Utf8 => DataType::LargeUtf8,
             Some(DataType::Utf8) if *dt == DataType::Utf8 => DataType::Utf8,

@@ -8,6 +8,10 @@ Canonical benchmark SQL files:
 4. `rag_topk_qdrant.sql` (optional qdrant path)
 5. `rag_topk_bruteforce.template.sql` (RAG matrix variants)
 6. `rag_topk_qdrant.template.sql` (optional qdrant matrix variants)
+7. `window/window_narrow_partitions.sql`
+8. `window/window_wide_partitions.sql`
+9. `window/window_skewed_keys.sql`
+10. `window/window_many_expressions.sql`
 
 Benchmark runners should load these files directly so query text stays centralized and versioned.
 

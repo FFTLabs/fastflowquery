@@ -14,6 +14,14 @@ pub enum BenchmarkQueryId {
     RagTopkBruteforce,
     /// Optional qdrant-backed vector top-k benchmark query.
     RagTopkQdrant,
+    /// Window benchmark with narrow partitions.
+    WindowNarrowPartitions,
+    /// Window benchmark with wide partitions.
+    WindowWidePartitions,
+    /// Window benchmark with skewed partition keys.
+    WindowSkewedKeys,
+    /// Window benchmark with many window expressions sharing a sort.
+    WindowManyExpressions,
 }
 
 impl BenchmarkQueryId {
@@ -24,6 +32,10 @@ impl BenchmarkQueryId {
             Self::TpchQ3 => "tpch_q3",
             Self::RagTopkBruteforce => "rag_topk_bruteforce",
             Self::RagTopkQdrant => "rag_topk_qdrant",
+            Self::WindowNarrowPartitions => "window_narrow_partitions",
+            Self::WindowWidePartitions => "window_wide_partitions",
+            Self::WindowSkewedKeys => "window_skewed_keys",
+            Self::WindowManyExpressions => "window_many_expressions",
         }
     }
 
@@ -34,16 +46,24 @@ impl BenchmarkQueryId {
             Self::TpchQ3 => "canonical/tpch_q3.sql",
             Self::RagTopkBruteforce => "rag_topk_bruteforce.sql",
             Self::RagTopkQdrant => "rag_topk_qdrant.sql",
+            Self::WindowNarrowPartitions => "window/window_narrow_partitions.sql",
+            Self::WindowWidePartitions => "window/window_wide_partitions.sql",
+            Self::WindowSkewedKeys => "window/window_skewed_keys.sql",
+            Self::WindowManyExpressions => "window/window_many_expressions.sql",
         }
     }
 }
 
 /// Ordered list of benchmark queries expected by the benchmark runner.
-pub const CANONICAL_BENCHMARK_QUERIES: [BenchmarkQueryId; 4] = [
+pub const CANONICAL_BENCHMARK_QUERIES: [BenchmarkQueryId; 8] = [
     BenchmarkQueryId::TpchQ1,
     BenchmarkQueryId::TpchQ3,
     BenchmarkQueryId::RagTopkBruteforce,
     BenchmarkQueryId::RagTopkQdrant,
+    BenchmarkQueryId::WindowNarrowPartitions,
+    BenchmarkQueryId::WindowWidePartitions,
+    BenchmarkQueryId::WindowSkewedKeys,
+    BenchmarkQueryId::WindowManyExpressions,
 ];
 
 /// Returns the default benchmark query directory.

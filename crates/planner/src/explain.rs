@@ -128,12 +128,7 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                         offset,
                         default,
                     } => match default {
-                        Some(d) => format!(
-                            "LAG({}, {}, {})",
-                            fmt_expr(expr),
-                            offset,
-                            fmt_expr(d)
-                        ),
+                        Some(d) => format!("LAG({}, {}, {})", fmt_expr(expr), offset, fmt_expr(d)),
                         None => format!("LAG({}, {})", fmt_expr(expr), offset),
                     },
                     WindowFunction::Lead {
@@ -141,12 +136,7 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                         offset,
                         default,
                     } => match default {
-                        Some(d) => format!(
-                            "LEAD({}, {}, {})",
-                            fmt_expr(expr),
-                            offset,
-                            fmt_expr(d)
-                        ),
+                        Some(d) => format!("LEAD({}, {}, {})", fmt_expr(expr), offset, fmt_expr(d)),
                         None => format!("LEAD({}, {})", fmt_expr(expr), offset),
                     },
                     WindowFunction::FirstValue(expr) => {
@@ -301,7 +291,10 @@ fn fmt_physical(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             fmt_physical(&exec.subquery, indent + 2, out);
         }
         PhysicalPlan::ExistsSubqueryFilter(exec) => {
-            out.push_str(&format!("{pad}ExistsSubqueryFilter negated={}\n", exec.negated));
+            out.push_str(&format!(
+                "{pad}ExistsSubqueryFilter negated={}\n",
+                exec.negated
+            ));
             out.push_str(&format!("{pad}  input:\n"));
             fmt_physical(&exec.input, indent + 2, out);
             out.push_str(&format!("{pad}  subquery:\n"));
@@ -475,7 +468,13 @@ fn join_rewrite_hint(plan: &LogicalPlan) -> Option<&'static str> {
             }
         }
         crate::logical_plan::JoinType::Anti => {
-            if matches!(left.as_ref(), LogicalPlan::Join { join_type: crate::logical_plan::JoinType::Anti, .. }) {
+            if matches!(
+                left.as_ref(),
+                LogicalPlan::Join {
+                    join_type: crate::logical_plan::JoinType::Anti,
+                    ..
+                }
+            ) {
                 Some("decorrelated_not_in_subquery")
             } else {
                 Some("decorrelated_not_exists_subquery")
@@ -493,13 +492,15 @@ fn plan_has_is_not_null_filter(plan: &LogicalPlan) -> bool {
         LogicalPlan::Projection { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::TopKByScore { input, .. } => plan_has_is_not_null_filter(input),
-        LogicalPlan::InSubqueryFilter { input, subquery, .. }
-        | LogicalPlan::ExistsSubqueryFilter { input, subquery, .. } => {
-            plan_has_is_not_null_filter(input) || plan_has_is_not_null_filter(subquery)
+        LogicalPlan::InSubqueryFilter {
+            input, subquery, ..
         }
-        LogicalPlan::ScalarSubqueryFilter { input, subquery, .. } => {
-            plan_has_is_not_null_filter(input) || plan_has_is_not_null_filter(subquery)
-        }
+        | LogicalPlan::ExistsSubqueryFilter {
+            input, subquery, ..
+        } => plan_has_is_not_null_filter(input) || plan_has_is_not_null_filter(subquery),
+        LogicalPlan::ScalarSubqueryFilter {
+            input, subquery, ..
+        } => plan_has_is_not_null_filter(input) || plan_has_is_not_null_filter(subquery),
         LogicalPlan::Join { left, right, .. } | LogicalPlan::UnionAll { left, right } => {
             plan_has_is_not_null_filter(left) || plan_has_is_not_null_filter(right)
         }
@@ -613,7 +614,10 @@ mod tests {
         assert!(ex.contains("window_exprs=3 sort_reuse_groups=2"), "{ex}");
         assert!(ex.contains("windows=[rn, rnk]"), "{ex}");
         assert!(ex.contains("windows=[dr]"), "{ex}");
-        assert!(ex.contains("FRAME RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"), "{ex}");
+        assert!(
+            ex.contains("FRAME RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"),
+            "{ex}"
+        );
     }
 
     #[test]
@@ -658,8 +662,14 @@ mod tests {
         });
         let ex = explain_physical(&plan);
         assert!(ex.contains("WindowExec"), "{ex}");
-        assert!(ex.contains("distribution_strategy=shuffle hash(keys=[grp], partitions=8)"), "{ex}");
-        assert!(ex.contains("frame=RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"), "{ex}");
+        assert!(
+            ex.contains("distribution_strategy=shuffle hash(keys=[grp], partitions=8)"),
+            "{ex}"
+        );
+        assert!(
+            ex.contains("frame=RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"),
+            "{ex}"
+        );
         assert!(ex.contains("sort_reuse_groups=1"), "{ex}");
     }
 }
@@ -675,7 +685,10 @@ fn fmt_expr(e: &Expr) -> String {
         Expr::IsNotNull(x) => format!("({}) IS NOT NULL", fmt_expr(x)),
         Expr::And(a, b) => format!("({}) AND ({})", fmt_expr(a), fmt_expr(b)),
         Expr::Or(a, b) => format!("({}) OR ({})", fmt_expr(a), fmt_expr(b)),
-        Expr::CaseWhen { branches, else_expr } => {
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
             let mut parts = vec!["CASE".to_string()];
             for (cond, value) in branches {
                 parts.push(format!("WHEN {} THEN {}", fmt_expr(cond), fmt_expr(value)));
@@ -738,8 +751,7 @@ fn fmt_window_frame_or_default(w: &WindowExpr) -> String {
         "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE NO OTHERS (implicit)"
             .to_string()
     } else {
-        "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE NO OTHERS (implicit)"
-            .to_string()
+        "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE NO OTHERS (implicit)".to_string()
     }
 }
 

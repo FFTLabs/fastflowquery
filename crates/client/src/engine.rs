@@ -144,10 +144,11 @@ impl Engine {
     /// # Errors
     /// Returns an error when SQL parsing fails.
     pub fn sql(&self, query: &str) -> Result<DataFrame> {
-        let logical = self
-            .session
-            .planner
-            .plan_sql_with_params(query, &HashMap::new(), &self.session.config)?;
+        let logical = self.session.planner.plan_sql_with_params(
+            query,
+            &HashMap::new(),
+            &self.session.config,
+        )?;
         Ok(DataFrame::new(self.session.clone(), logical))
     }
 
@@ -160,10 +161,10 @@ impl Engine {
         query: &str,
         params: HashMap<String, LiteralValue>,
     ) -> Result<DataFrame> {
-        let logical = self
-            .session
-            .planner
-            .plan_sql_with_params(query, &params, &self.session.config)?;
+        let logical =
+            self.session
+                .planner
+                .plan_sql_with_params(query, &params, &self.session.config)?;
         Ok(DataFrame::new(self.session.clone(), logical))
     }
 

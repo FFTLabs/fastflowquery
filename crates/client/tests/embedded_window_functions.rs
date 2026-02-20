@@ -80,7 +80,8 @@ fn make_engine_with_window_null_fixture() -> (Engine, std::path::PathBuf) {
 fn row_number_over_partition_order_is_correct() {
     let (engine, path) = make_engine_with_window_fixture();
     let sql = "SELECT grp, ord, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY ord) AS rn FROM t";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
 
     let mut rows = Vec::new();
     for batch in &batches {
@@ -100,11 +101,7 @@ fn row_number_over_partition_order_is_correct() {
             .downcast_ref::<Int64Array>()
             .expect("rn");
         for row in 0..batch.num_rows() {
-            rows.push((
-                grp.value(row).to_string(),
-                ord.value(row),
-                rn.value(row),
-            ));
+            rows.push((grp.value(row).to_string(), ord.value(row), rn.value(row)));
         }
     }
     rows.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -126,7 +123,8 @@ fn row_number_over_partition_order_is_correct() {
 fn rank_over_partition_order_is_correct() {
     let (engine, path) = make_engine_with_window_fixture();
     let sql = "SELECT grp, ord, score, RANK() OVER (PARTITION BY grp ORDER BY score) AS rnk FROM t";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
 
     let mut rows = Vec::new();
     for batch in &batches {
@@ -146,11 +144,7 @@ fn rank_over_partition_order_is_correct() {
             .downcast_ref::<Int64Array>()
             .expect("rnk");
         for row in 0..batch.num_rows() {
-            rows.push((
-                grp.value(row).to_string(),
-                ord.value(row),
-                rnk.value(row),
-            ));
+            rows.push((grp.value(row).to_string(), ord.value(row), rnk.value(row)));
         }
     }
     rows.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -172,7 +166,8 @@ fn rank_over_partition_order_is_correct() {
 fn cumulative_sum_over_partition_order_is_correct() {
     let (engine, path) = make_engine_with_window_fixture();
     let sql = "SELECT grp, ord, SUM(v) OVER (PARTITION BY grp ORDER BY ord) AS running_sum FROM t";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
 
     let mut rows = Vec::new();
     for batch in &batches {
@@ -218,7 +213,8 @@ fn cumulative_sum_over_partition_order_is_correct() {
 fn named_window_desc_nulls_first_executes_correctly() {
     let (engine, path) = make_engine_with_window_null_fixture();
     let sql = "SELECT ord, ROW_NUMBER() OVER w AS rn FROM t WINDOW w AS (PARTITION BY grp ORDER BY ord DESC NULLS FIRST)";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
 
     let mut rows = Vec::new();
     for batch in &batches {
@@ -260,7 +256,8 @@ fn expanded_window_functions_ranking_and_value_semantics() {
                     LAST_VALUE(score) OVER (PARTITION BY grp ORDER BY ord ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lv, \
                     NTH_VALUE(score, 2) OVER (PARTITION BY grp ORDER BY ord ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS nv \
                FROM t";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
 
     #[derive(Debug, Clone, PartialEq)]
     struct Row {
@@ -280,18 +277,66 @@ fn expanded_window_functions_ranking_and_value_semantics() {
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let grp = batch.column(0).as_any().downcast_ref::<StringArray>().expect("grp");
-        let ord = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("ord");
-        let score = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("score");
-        let dr = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("dr");
-        let pr = batch.column(4).as_any().downcast_ref::<Float64Array>().expect("pr");
-        let cd = batch.column(5).as_any().downcast_ref::<Float64Array>().expect("cd");
-        let nt = batch.column(6).as_any().downcast_ref::<Int64Array>().expect("nt");
-        let lag_s = batch.column(7).as_any().downcast_ref::<Int64Array>().expect("lag_s");
-        let lead_s = batch.column(8).as_any().downcast_ref::<Int64Array>().expect("lead_s");
-        let fv = batch.column(9).as_any().downcast_ref::<Int64Array>().expect("fv");
-        let lv = batch.column(10).as_any().downcast_ref::<Int64Array>().expect("lv");
-        let nv = batch.column(11).as_any().downcast_ref::<Int64Array>().expect("nv");
+        let grp = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("grp");
+        let ord = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("ord");
+        let score = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("score");
+        let dr = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("dr");
+        let pr = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("pr");
+        let cd = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("cd");
+        let nt = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("nt");
+        let lag_s = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("lag_s");
+        let lead_s = batch
+            .column(8)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("lead_s");
+        let fv = batch
+            .column(9)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("fv");
+        let lv = batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("lv");
+        let nv = batch
+            .column(11)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("nv");
         for i in 0..batch.num_rows() {
             rows.push(Row {
                 grp: grp.value(i).to_string(),
@@ -415,7 +460,8 @@ fn window_frames_rows_range_groups_are_correct() {
                     SUM(score) OVER (PARTITION BY grp ORDER BY ord RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s_range, \
                     SUM(score) OVER (PARTITION BY grp ORDER BY score GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS s_groups \
                FROM t";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
 
     #[derive(Debug)]
     struct Row {
@@ -427,11 +473,31 @@ fn window_frames_rows_range_groups_are_correct() {
     }
     let mut rows = Vec::new();
     for batch in &batches {
-        let grp = batch.column(0).as_any().downcast_ref::<StringArray>().expect("grp");
-        let ord = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("ord");
-        let s_rows = batch.column(3).as_any().downcast_ref::<Float64Array>().expect("s_rows");
-        let s_range = batch.column(4).as_any().downcast_ref::<Float64Array>().expect("s_range");
-        let s_groups = batch.column(5).as_any().downcast_ref::<Float64Array>().expect("s_groups");
+        let grp = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("grp");
+        let ord = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("ord");
+        let s_rows = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("s_rows");
+        let s_range = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("s_range");
+        let s_groups = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("s_groups");
         for i in 0..batch.num_rows() {
             rows.push(Row {
                 grp: grp.value(i).to_string(),
@@ -470,7 +536,8 @@ fn aggregate_window_functions_count_avg_min_max_are_correct() {
                     MIN(score) OVER (PARTITION BY grp ORDER BY ord) AS min_s, \
                     MAX(score) OVER (PARTITION BY grp ORDER BY ord) AS max_s \
                FROM t";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
 
     #[derive(Debug, Clone, PartialEq)]
     struct Row {
@@ -483,12 +550,36 @@ fn aggregate_window_functions_count_avg_min_max_are_correct() {
     }
     let mut rows = Vec::new();
     for batch in &batches {
-        let grp = batch.column(0).as_any().downcast_ref::<StringArray>().expect("grp");
-        let ord = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("ord");
-        let cnt = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("cnt");
-        let avg_s = batch.column(4).as_any().downcast_ref::<Float64Array>().expect("avg_s");
-        let min_s = batch.column(5).as_any().downcast_ref::<Int64Array>().expect("min_s");
-        let max_s = batch.column(6).as_any().downcast_ref::<Int64Array>().expect("max_s");
+        let grp = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("grp");
+        let ord = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("ord");
+        let cnt = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("cnt");
+        let avg_s = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("avg_s");
+        let min_s = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("min_s");
+        let max_s = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("max_s");
         for i in 0..batch.num_rows() {
             rows.push(Row {
                 grp: grp.value(i).to_string(),
@@ -567,12 +658,21 @@ fn frame_exclusion_semantics_apply_in_sql_queries() {
                     SUM(score) OVER (PARTITION BY grp ORDER BY score ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) AS s_ties, \
                     RANK() OVER (PARTITION BY grp ORDER BY score ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE GROUP) AS rnk \
                FROM t";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let grp = batch.column(0).as_any().downcast_ref::<StringArray>().expect("grp");
-        let ord = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("ord");
+        let grp = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("grp");
+        let ord = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("ord");
         let s_cur = batch
             .column(2)
             .as_any()
@@ -588,7 +688,11 @@ fn frame_exclusion_semantics_apply_in_sql_queries() {
             .as_any()
             .downcast_ref::<Float64Array>()
             .expect("s_ties");
-        let rnk = batch.column(5).as_any().downcast_ref::<Int64Array>().expect("rnk");
+        let rnk = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("rnk");
         for i in 0..batch.num_rows() {
             rows.push((
                 grp.value(i).to_string(),
@@ -626,7 +730,8 @@ fn window_output_types_and_nullability_follow_rules() {
                     SUM(score) OVER (PARTITION BY grp ORDER BY ord) AS s, \
                     LAG(score, 1, 0.5) OVER (PARTITION BY grp ORDER BY ord) AS lg \
                FROM t";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
     let schema = batches[0].schema();
 
     assert_eq!(schema.field(0).data_type(), &DataType::Int64);
@@ -656,18 +761,43 @@ fn window_null_ordering_truth_table_is_honored() {
                     ROW_NUMBER() OVER (ORDER BY ord DESC NULLS FIRST) AS rn_df, \
                     ROW_NUMBER() OVER (ORDER BY ord DESC NULLS LAST) AS rn_dl \
                FROM t";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let ord = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("ord");
-        let rn_af = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("rn_af");
-        let rn_al = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("rn_al");
-        let rn_df = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("rn_df");
-        let rn_dl = batch.column(4).as_any().downcast_ref::<Int64Array>().expect("rn_dl");
+        let ord = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("ord");
+        let rn_af = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("rn_af");
+        let rn_al = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("rn_al");
+        let rn_df = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("rn_df");
+        let rn_dl = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("rn_dl");
         for i in 0..batch.num_rows() {
             rows.push((
-                if ord.is_null(i) { None } else { Some(ord.value(i)) },
+                if ord.is_null(i) {
+                    None
+                } else {
+                    Some(ord.value(i))
+                },
                 rn_af.value(i),
                 rn_al.value(i),
                 rn_df.value(i),
@@ -698,9 +828,21 @@ fn window_tie_ordering_is_deterministic_across_runs() {
             futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
         let mut rows = Vec::new();
         for batch in &batches {
-            let grp = batch.column(0).as_any().downcast_ref::<StringArray>().expect("grp");
-            let ord = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("ord");
-            let rn = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("rn");
+            let grp = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("grp");
+            let ord = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ord");
+            let rn = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("rn");
             for i in 0..batch.num_rows() {
                 rows.push((grp.value(i).to_string(), ord.value(i), rn.value(i)));
             }
@@ -713,11 +855,26 @@ fn window_tie_ordering_is_deterministic_across_runs() {
     let second = run_once(&engine);
     assert_eq!(first, second);
     assert_eq!(first.len(), 5);
-    let a1 = first.iter().find(|(g, o, _)| g == "A" && *o == 1).expect("A/1");
-    let a2 = first.iter().find(|(g, o, _)| g == "A" && *o == 2).expect("A/2");
-    let a3 = first.iter().find(|(g, o, _)| g == "A" && *o == 3).expect("A/3");
-    let b1 = first.iter().find(|(g, o, _)| g == "B" && *o == 1).expect("B/1");
-    let b2 = first.iter().find(|(g, o, _)| g == "B" && *o == 2).expect("B/2");
+    let a1 = first
+        .iter()
+        .find(|(g, o, _)| g == "A" && *o == 1)
+        .expect("A/1");
+    let a2 = first
+        .iter()
+        .find(|(g, o, _)| g == "A" && *o == 2)
+        .expect("A/2");
+    let a3 = first
+        .iter()
+        .find(|(g, o, _)| g == "A" && *o == 3)
+        .expect("A/3");
+    let b1 = first
+        .iter()
+        .find(|(g, o, _)| g == "B" && *o == 1)
+        .expect("B/1");
+    let b2 = first
+        .iter()
+        .find(|(g, o, _)| g == "B" && *o == 2)
+        .expect("B/2");
     assert!(a1.2 == 1 || a1.2 == 2);
     assert!(a2.2 == 1 || a2.2 == 2);
     assert_ne!(a1.2, a2.2);

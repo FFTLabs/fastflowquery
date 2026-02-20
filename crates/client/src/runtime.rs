@@ -32,9 +32,9 @@ use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result};
 use ffq_execution::{SendableRecordBatchStream, StreamAdapter, TaskContext, compile_expr};
 use ffq_planner::{
-    AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, JoinType, LiteralValue, PhysicalPlan, WindowExpr,
-    WindowFrameBound, WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits, WindowFunction,
-    WindowOrderExpr,
+    AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, JoinType, LiteralValue, PhysicalPlan,
+    WindowExpr, WindowFrameBound, WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits,
+    WindowFunction, WindowOrderExpr,
 };
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
@@ -498,7 +498,11 @@ fn execute_plan_with_cache(
                 })
             }
             PhysicalPlan::CteRef(cte_ref) => {
-                if let Some(cached) = cte_cache.lock().ok().and_then(|m| m.get(&cte_ref.name).cloned()) {
+                if let Some(cached) = cte_cache
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&cte_ref.name).cloned())
+                {
                     let (in_rows, in_batches, in_bytes) = batch_stats(&cached.batches);
                     Ok(OpEval {
                         out: cached,
@@ -1339,7 +1343,9 @@ fn run_window_exec_with_ctx(
         .map(|f| f.as_ref().clone())
         .collect();
     let mut out_columns: Vec<ArrayRef> = if input.batches.is_empty() {
-        RecordBatch::new_empty(input.schema.clone()).columns().to_vec()
+        RecordBatch::new_empty(input.schema.clone())
+            .columns()
+            .to_vec()
     } else if input.batches.len() == 1 {
         input.batches[0].columns().to_vec()
     } else {
@@ -1372,14 +1378,16 @@ fn run_window_exec_with_ctx(
             )));
         }
         out_fields.push(Field::new(&w.output_name, dt, window_output_nullable(w)));
-        out_columns.push(scalars_to_array(&output, out_fields.last().expect("field").data_type()).map_err(
-            |e| {
-                FfqError::Execution(format!(
-                    "window output column '{}' build failed: {e}",
-                    w.output_name
-                ))
-            },
-        )?);
+        out_columns.push(
+            scalars_to_array(&output, out_fields.last().expect("field").data_type()).map_err(
+                |e| {
+                    FfqError::Execution(format!(
+                        "window output column '{}' build failed: {e}",
+                        w.output_name
+                    ))
+                },
+            )?,
+        );
     }
     let out_schema = Arc::new(Schema::new(out_fields));
     let batch = RecordBatch::try_new(out_schema.clone(), out_columns)
@@ -1528,7 +1536,8 @@ fn read_window_spill_file(path: &PathBuf) -> Result<Vec<ScalarValue>> {
     let reader = BufReader::new(file);
     let mut out = Vec::new();
     for line in reader.lines() {
-        let line = line.map_err(|e| FfqError::Execution(format!("window spill read failed: {e}")))?;
+        let line =
+            line.map_err(|e| FfqError::Execution(format!("window spill read failed: {e}")))?;
         let value = serde_json::from_str::<ScalarValue>(&line)
             .map_err(|e| FfqError::Execution(format!("window spill deserialize failed: {e}")))?;
         out.push(value);
@@ -1592,8 +1601,7 @@ fn evaluate_window_expr_with_ctx(
                             &w.order_by,
                             part[part_i - 1],
                             part[part_i],
-                        )
-                            != Ordering::Equal
+                        ) != Ordering::Equal
                     {
                         rank = (part_i as i64) + 1;
                     }
@@ -1614,8 +1622,7 @@ fn evaluate_window_expr_with_ctx(
                             &w.order_by,
                             part[part_i - 1],
                             part[part_i],
-                        )
-                            != Ordering::Equal
+                        ) != Ordering::Equal
                     {
                         rank += 1;
                     }
@@ -1642,8 +1649,7 @@ fn evaluate_window_expr_with_ctx(
                             &w.order_by,
                             part[part_i - 1],
                             part[part_i],
-                        )
-                            != Ordering::Equal
+                        ) != Ordering::Equal
                     {
                         rank = (part_i as i64) + 1;
                     }
@@ -1666,8 +1672,7 @@ fn evaluate_window_expr_with_ctx(
                             &w.order_by,
                             part[tie_start],
                             part[i],
-                        )
-                            == Ordering::Equal
+                        ) == Ordering::Equal
                     {
                         i += 1;
                     }
@@ -1948,7 +1953,10 @@ fn build_partition_frame_ctx(
     } else {
         Some(
             part.iter()
-                .map(|row| scalar_to_f64(&order_keys[0][*row]).map(|v| if order_exprs[0].asc { v } else { -v }))
+                .map(|row| {
+                    scalar_to_f64(&order_keys[0][*row])
+                        .map(|v| if order_exprs[0].asc { v } else { -v })
+                })
                 .collect(),
         )
     };
@@ -2109,7 +2117,7 @@ fn resolve_range_frame(
             _ => {
                 return Err(FfqError::Planning(
                     "unsupported RANGE frame start bound".to_string(),
-                ))
+                ));
             }
         };
         let end = match frame.end_bound {
@@ -2121,7 +2129,7 @@ fn resolve_range_frame(
             _ => {
                 return Err(FfqError::Planning(
                     "unsupported RANGE frame end bound".to_string(),
-                ))
+                ));
             }
         };
         if end < start {
@@ -2182,14 +2190,18 @@ fn resolve_range_frame(
     }
 }
 
-fn partition_ranges(order_idx: &[usize], partition_keys: &[Vec<ScalarValue>]) -> Vec<(usize, usize)> {
+fn partition_ranges(
+    order_idx: &[usize],
+    partition_keys: &[Vec<ScalarValue>],
+) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < order_idx.len() {
         let start = i;
         let first = order_idx[i];
         i += 1;
-        while i < order_idx.len() && cmp_key_sets(partition_keys, first, order_idx[i]) == Ordering::Equal
+        while i < order_idx.len()
+            && cmp_key_sets(partition_keys, first, order_idx[i]) == Ordering::Equal
         {
             i += 1;
         }
@@ -2208,9 +2220,7 @@ fn window_output_type(input_schema: &SchemaRef, w: &WindowExpr) -> Result<DataTy
         WindowFunction::PercentRank
         | WindowFunction::CumeDist
         | WindowFunction::Sum(_)
-        | WindowFunction::Avg(_) => {
-            Ok(DataType::Float64)
-        }
+        | WindowFunction::Avg(_) => Ok(DataType::Float64),
         WindowFunction::Min(expr) | WindowFunction::Max(expr) => {
             let compiled = compile_expr(expr, input_schema)?;
             Ok(compiled.data_type())
@@ -2244,18 +2254,25 @@ fn infer_expr_nullable(expr: &Expr, schema: &SchemaRef) -> Result<bool> {
         Expr::ColumnRef { index, .. } => Ok(schema.field(*index).is_nullable()),
         Expr::Column(name) => {
             let idx = schema.index_of(name).map_err(|e| {
-                FfqError::Execution(format!("projection column resolution failed for '{name}': {e}"))
+                FfqError::Execution(format!(
+                    "projection column resolution failed for '{name}': {e}"
+                ))
             })?;
             Ok(schema.field(idx).is_nullable())
         }
         Expr::Literal(v) => Ok(matches!(v, LiteralValue::Null)),
         Expr::Cast { expr, .. } => infer_expr_nullable(expr, schema),
         Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(false),
-        Expr::And(l, r) | Expr::Or(l, r) | Expr::BinaryOp { left: l, right: r, .. } => {
-            Ok(infer_expr_nullable(l, schema)? || infer_expr_nullable(r, schema)?)
-        }
+        Expr::And(l, r)
+        | Expr::Or(l, r)
+        | Expr::BinaryOp {
+            left: l, right: r, ..
+        } => Ok(infer_expr_nullable(l, schema)? || infer_expr_nullable(r, schema)?),
         Expr::Not(inner) => infer_expr_nullable(inner, schema),
-        Expr::CaseWhen { branches, else_expr } => {
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
             let mut nullable = false;
             for (cond, value) in branches {
                 nullable |= infer_expr_nullable(cond, schema)?;
@@ -2422,18 +2439,16 @@ fn cmp_scalar_for_window(
     }
     let ord = match (a, b) {
         (Int64(x), Int64(y)) => x.cmp(y),
-        (Float64Bits(x), Float64Bits(y)) => cmp_f64_for_window(f64::from_bits(*x), f64::from_bits(*y)),
+        (Float64Bits(x), Float64Bits(y)) => {
+            cmp_f64_for_window(f64::from_bits(*x), f64::from_bits(*y))
+        }
         (Int64(x), Float64Bits(y)) => cmp_f64_for_window(*x as f64, f64::from_bits(*y)),
         (Float64Bits(x), Int64(y)) => cmp_f64_for_window(f64::from_bits(*x), *y as f64),
         (Utf8(x), Utf8(y)) => x.cmp(y),
         (Boolean(x), Boolean(y)) => x.cmp(y),
         _ => format!("{a:?}").cmp(&format!("{b:?}")),
     };
-    if descending {
-        ord.reverse()
-    } else {
-        ord
-    }
+    if descending { ord.reverse() } else { ord }
 }
 
 fn cmp_f64_for_window(a: f64, b: f64) -> Ordering {
@@ -2461,7 +2476,11 @@ fn build_stable_row_fallback_keys(input: &ExecOutput) -> Result<Vec<u64>> {
     Ok(out)
 }
 
-fn run_exists_subquery_filter(input: ExecOutput, subquery: ExecOutput, negated: bool) -> ExecOutput {
+fn run_exists_subquery_filter(
+    input: ExecOutput,
+    subquery: ExecOutput,
+    negated: bool,
+) -> ExecOutput {
     let sub_rows = subquery.batches.iter().map(|b| b.num_rows()).sum::<usize>();
     let exists = sub_rows > 0;
     let keep = if negated { !exists } else { exists };
@@ -2533,8 +2552,9 @@ fn run_scalar_subquery_filter(
             mask_builder.append_value(keep);
         }
         let mask = mask_builder.finish();
-        let filtered = arrow::compute::filter_record_batch(batch, &mask)
-            .map_err(|e| FfqError::Execution(format!("scalar-subquery filter batch failed: {e}")))?;
+        let filtered = arrow::compute::filter_record_batch(batch, &mask).map_err(|e| {
+            FfqError::Execution(format!("scalar-subquery filter batch failed: {e}"))
+        })?;
         out_batches.push(filtered);
     }
     Ok(ExecOutput {
@@ -2545,30 +2565,24 @@ fn run_scalar_subquery_filter(
 
 fn scalar_subquery_value(subquery: &ExecOutput) -> Result<ScalarValue> {
     if subquery.schema.fields().len() != 1 {
-        return Err(FfqError::Planning(
-            format!(
-                "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery must produce exactly one column"
-            ),
-        ));
+        return Err(FfqError::Planning(format!(
+            "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery must produce exactly one column"
+        )));
     }
     let mut seen: Option<ScalarValue> = None;
     let mut rows = 0usize;
     for batch in &subquery.batches {
         if batch.num_columns() != 1 {
-            return Err(FfqError::Planning(
-                format!(
-                    "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery must produce exactly one column"
-                ),
-            ));
+            return Err(FfqError::Planning(format!(
+                "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery must produce exactly one column"
+            )));
         }
         for row in 0..batch.num_rows() {
             rows += 1;
             if rows > 1 {
-                return Err(FfqError::Execution(
-                    format!(
-                        "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery returned more than one row"
-                    ),
-                ));
+                return Err(FfqError::Execution(format!(
+                    "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery returned more than one row"
+                )));
             }
             seen = Some(scalar_from_array(batch.column(0), row)?);
         }
@@ -4097,28 +4111,28 @@ fn decode_record_batches_ipc(payload: &[u8]) -> Result<(SchemaRef, Vec<RecordBat
 mod tests {
     use std::collections::HashMap;
     use std::fs::{self, File};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use arrow::array::Int64Array;
-    use arrow::record_batch::RecordBatch;
-    use arrow_schema::{DataType, Field, Schema};
     #[cfg(feature = "vector")]
     use arrow::array::{FixedSizeListBuilder, Float32Array, Float32Builder};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
     use ffq_execution::PhysicalOperatorFactory;
+    #[cfg(feature = "vector")]
+    use ffq_planner::LiteralValue;
+    use ffq_planner::VectorTopKExec;
     use ffq_planner::{
         CteRefExec, CustomExec, Expr, ParquetScanExec, PhysicalPlan, UnionAllExec, WindowExpr,
         WindowFrameBound, WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits, WindowFunction,
         WindowOrderExpr,
     };
-    use ffq_storage::{Catalog, TableDef, TableStats};
-    use ffq_planner::VectorTopKExec;
-    #[cfg(feature = "vector")]
-    use ffq_planner::LiteralValue;
     use ffq_storage::vector_index::{VectorIndexProvider, VectorTopKRow};
-    use futures::future::BoxFuture;
+    use ffq_storage::{Catalog, TableDef, TableStats};
     use futures::TryStreamExt;
+    use futures::future::BoxFuture;
     use parquet::arrow::ArrowWriter;
 
     #[cfg(feature = "vector")]
@@ -4318,7 +4332,10 @@ mod tests {
         };
 
         assert_eq!(run(WindowFrameExclusion::NoOthers), vec![40.0, 40.0, 40.0]);
-        assert_eq!(run(WindowFrameExclusion::CurrentRow), vec![30.0, 30.0, 20.0]);
+        assert_eq!(
+            run(WindowFrameExclusion::CurrentRow),
+            vec![30.0, 30.0, 20.0]
+        );
         assert_eq!(run(WindowFrameExclusion::Group), vec![20.0, 20.0, 20.0]);
         assert_eq!(run(WindowFrameExclusion::Ties), vec![30.0, 30.0, 40.0]);
     }
@@ -4381,7 +4398,9 @@ mod tests {
             schema.clone(),
             vec![
                 Arc::new(Int64Array::from_iter_values(1_i64..=n)),
-                Arc::new(Int64Array::from_iter_values((1_i64..=n).map(|v| (v % 17) + 1))),
+                Arc::new(Int64Array::from_iter_values(
+                    (1_i64..=n).map(|v| (v % 17) + 1),
+                )),
             ],
         )
         .expect("batch");
@@ -4519,8 +4538,8 @@ mod tests {
             Arc::clone(&registry),
         ))
         .expect("execute");
-        let batches = futures::executor::block_on(stream.try_collect::<Vec<RecordBatch>>())
-            .expect("collect");
+        let batches =
+            futures::executor::block_on(stream.try_collect::<Vec<RecordBatch>>()).expect("collect");
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 6);
         assert_eq!(

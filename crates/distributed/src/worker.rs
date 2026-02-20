@@ -2513,7 +2513,11 @@ fn resolve_rows_frame(
     Ok((start as usize, end_exclusive as usize))
 }
 
-fn resolve_range_frame(frame: &WindowFrameSpec, row_idx: usize, ctx: &FrameCtx) -> Result<(usize, usize)> {
+fn resolve_range_frame(
+    frame: &WindowFrameSpec,
+    row_idx: usize,
+    ctx: &FrameCtx,
+) -> Result<(usize, usize)> {
     let gcur = ctx.row_group[row_idx] as i64;
     let glen = ctx.peer_groups.len() as i64;
     let start_g = match frame.start_bound {
@@ -2540,7 +2544,11 @@ fn resolve_range_frame(frame: &WindowFrameSpec, row_idx: usize, ctx: &FrameCtx) 
     Ok((start, end))
 }
 
-fn resolve_groups_frame(frame: &WindowFrameSpec, row_idx: usize, ctx: &FrameCtx) -> Result<(usize, usize)> {
+fn resolve_groups_frame(
+    frame: &WindowFrameSpec,
+    row_idx: usize,
+    ctx: &FrameCtx,
+) -> Result<(usize, usize)> {
     resolve_range_frame(frame, row_idx, ctx)
 }
 
@@ -2681,7 +2689,9 @@ fn cmp_scalar_for_window(
     }
     let ord = match (a, b) {
         (Int64(x), Int64(y)) => x.cmp(y),
-        (Float64Bits(x), Float64Bits(y)) => cmp_f64_for_window(f64::from_bits(*x), f64::from_bits(*y)),
+        (Float64Bits(x), Float64Bits(y)) => {
+            cmp_f64_for_window(f64::from_bits(*x), f64::from_bits(*y))
+        }
         (Int64(x), Float64Bits(y)) => cmp_f64_for_window(*x as f64, f64::from_bits(*y)),
         (Float64Bits(x), Int64(y)) => cmp_f64_for_window(f64::from_bits(*x), *y as f64),
         (Utf8(x), Utf8(y)) => x.cmp(y),
@@ -2714,7 +2724,10 @@ fn build_stable_row_fallback_keys(input: &ExecOutput) -> Result<Vec<u64>> {
     Ok(out)
 }
 
-fn partition_ranges(order_idx: &[usize], partition_keys: &[Vec<ScalarValue>]) -> Vec<(usize, usize)> {
+fn partition_ranges(
+    order_idx: &[usize],
+    partition_keys: &[Vec<ScalarValue>],
+) -> Vec<(usize, usize)> {
     if order_idx.is_empty() {
         return Vec::new();
     }
@@ -2746,7 +2759,11 @@ fn scalar_to_f64(v: &ScalarValue) -> Option<f64> {
     }
 }
 
-fn run_exists_subquery_filter(input: ExecOutput, subquery: ExecOutput, negated: bool) -> ExecOutput {
+fn run_exists_subquery_filter(
+    input: ExecOutput,
+    subquery: ExecOutput,
+    negated: bool,
+) -> ExecOutput {
     let sub_rows = subquery.batches.iter().map(|b| b.num_rows()).sum::<usize>();
     let exists = sub_rows > 0;
     let keep = if negated { !exists } else { exists };
@@ -2827,30 +2844,24 @@ fn run_scalar_subquery_filter(
 
 fn scalar_subquery_value(subquery: &ExecOutput) -> Result<ScalarValue> {
     if subquery.schema.fields().len() != 1 {
-        return Err(FfqError::Planning(
-            format!(
-                "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery must produce exactly one column"
-            ),
-        ));
+        return Err(FfqError::Planning(format!(
+            "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery must produce exactly one column"
+        )));
     }
     let mut seen: Option<ScalarValue> = None;
     let mut rows = 0usize;
     for batch in &subquery.batches {
         if batch.num_columns() != 1 {
-            return Err(FfqError::Planning(
-                format!(
-                    "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery must produce exactly one column"
-                ),
-            ));
+            return Err(FfqError::Planning(format!(
+                "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery must produce exactly one column"
+            )));
         }
         for row in 0..batch.num_rows() {
             rows += 1;
             if rows > 1 {
-                return Err(FfqError::Execution(
-                    format!(
-                        "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery returned more than one row"
-                    ),
-                ));
+                return Err(FfqError::Execution(format!(
+                    "{E_SUBQUERY_SCALAR_ROW_VIOLATION}: scalar subquery returned more than one row"
+                )));
             }
             seen = Some(scalar_from_array(batch.column(0), row)?);
         }

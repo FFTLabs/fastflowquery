@@ -213,7 +213,12 @@ fn hash_join_broadcast_strategy_and_result() {
     let _ = std::fs::remove_dir_all(spill_dir);
 }
 
-fn make_outer_join_fixture_engine() -> (Engine, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+fn make_outer_join_fixture_engine() -> (
+    Engine,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     let left_path = support::unique_path("ffq_outer_left", "parquet");
     let right_path = support::unique_path("ffq_outer_right", "parquet");
     let spill_dir = support::unique_path("ffq_outer_spill", "dir");
@@ -280,7 +285,8 @@ fn make_outer_join_fixture_engine() -> (Engine, std::path::PathBuf, std::path::P
 fn hash_join_left_outer_correctness() {
     let (engine, left_path, right_path, spill_dir) = make_outer_join_fixture_engine();
     let query = "SELECT k, lval, k2, rval FROM l LEFT JOIN r ON k = k2";
-    let batches = futures::executor::block_on(engine.sql(query).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(query).expect("sql").collect()).expect("collect");
     let snapshot = support::snapshot_text(&batches, &["k", "k2"], 1e-9);
     support::assert_or_bless_snapshot(
         "tests/snapshots/join/hash_join_left_outer_correctness.snap",
@@ -297,7 +303,8 @@ fn hash_join_left_outer_correctness() {
 fn hash_join_right_outer_correctness() {
     let (engine, left_path, right_path, spill_dir) = make_outer_join_fixture_engine();
     let query = "SELECT k, lval, k2, rval FROM l RIGHT JOIN r ON k = k2";
-    let batches = futures::executor::block_on(engine.sql(query).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(query).expect("sql").collect()).expect("collect");
     let snapshot = support::snapshot_text(&batches, &["k2", "k"], 1e-9);
     support::assert_or_bless_snapshot(
         "tests/snapshots/join/hash_join_right_outer_correctness.snap",
@@ -314,7 +321,8 @@ fn hash_join_right_outer_correctness() {
 fn hash_join_full_outer_correctness() {
     let (engine, left_path, right_path, spill_dir) = make_outer_join_fixture_engine();
     let query = "SELECT k, lval, k2, rval FROM l FULL OUTER JOIN r ON k = k2";
-    let batches = futures::executor::block_on(engine.sql(query).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(query).expect("sql").collect()).expect("collect");
     let snapshot = support::snapshot_text(&batches, &["k", "k2"], 1e-9);
     support::assert_or_bless_snapshot(
         "tests/snapshots/join/hash_join_full_outer_correctness.snap",

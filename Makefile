@@ -23,6 +23,9 @@ SHELL := /bin/bash
 	bench-13.3-embedded \
 	bench-13.3-distributed \
 	bench-13.3-rag \
+	bench-v2-window-embedded \
+	bench-v2-window-distributed \
+	bench-v2-window-compare \
 	bench-13.4-official-embedded \
 	bench-13.4-official-distributed \
 	bench-13.4-official \
@@ -119,6 +122,17 @@ bench-13.3-distributed:
 bench-13.3-rag:
 	FFQ_BENCH_MODE=embedded FFQ_BENCH_RAG_MATRIX="$${FFQ_BENCH_RAG_MATRIX:-1000,16,10,1.0;5000,32,10,0.8;10000,64,10,0.2}" ./scripts/run-bench-13.3.sh
 
+bench-v2-window-embedded:
+	FFQ_BENCH_MODE=embedded FFQ_BENCH_INCLUDE_WINDOW=1 FFQ_BENCH_INCLUDE_RAG=0 FFQ_BENCH_WINDOW_MATRIX="$${FFQ_BENCH_WINDOW_MATRIX:-narrow;wide;skewed;many_exprs}" ./scripts/run-bench-v2-window.sh
+
+bench-v2-window-distributed:
+	FFQ_BENCH_MODE=distributed FFQ_BENCH_INCLUDE_WINDOW=1 FFQ_BENCH_INCLUDE_RAG=0 FFQ_BENCH_WINDOW_MATRIX="$${FFQ_BENCH_WINDOW_MATRIX:-narrow;wide;skewed;many_exprs}" ./scripts/run-bench-v2-window.sh
+
+bench-v2-window-compare:
+	@test -n "$$BASELINE" || (echo "BASELINE is required (json file or dir)" && exit 1)
+	@test -n "$$CANDIDATE" || (echo "CANDIDATE is required (json file or dir)" && exit 1)
+	./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}" --threshold-file "$${THRESHOLD_FILE:-tests/bench/thresholds/window_regression_thresholds.json}"
+
 bench-13.4-official-embedded:
 	FFQ_BENCH_MODE=embedded FFQ_BENCH_TPCH_SUBDIR="$${FFQ_BENCH_TPCH_SUBDIR:-tpch_dbgen_sf1_parquet}" ./scripts/run-bench-13.4-tpch-official.sh
 
@@ -130,7 +144,11 @@ bench-13.4-official: bench-13.4-official-embedded
 bench-13.3-compare:
 	@test -n "$$BASELINE" || (echo "BASELINE is required (json file or dir)" && exit 1)
 	@test -n "$$CANDIDATE" || (echo "CANDIDATE is required (json file or dir)" && exit 1)
-	./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}"
+	@if [ -n "$$THRESHOLD_FILE" ]; then \
+		./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}" --threshold-file "$$THRESHOLD_FILE"; \
+	else \
+		./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}"; \
+	fi
 
 tpch-dbgen-build:
 	./scripts/build-tpch-dbgen.sh

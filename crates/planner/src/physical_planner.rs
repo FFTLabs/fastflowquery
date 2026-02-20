@@ -2,11 +2,11 @@ use ffq_common::{FfqError, Result};
 
 use crate::logical_plan::{Expr, JoinStrategyHint, LogicalPlan};
 use crate::physical_plan::{
-    BroadcastExchange, BuildSide, ExchangeExec, FilterExec, FinalHashAggregateExec, HashJoinExec,
-    InSubqueryFilterExec, ExistsSubqueryFilterExec, LimitExec, ParquetScanExec, ParquetWriteExec,
-    ScalarSubqueryFilterExec, PartialHashAggregateExec, PartitioningSpec, PhysicalPlan, ProjectExec,
-    CteRefExec, ShuffleReadExchange, ShuffleWriteExchange, TopKByScoreExec, UnionAllExec,
-    WindowExec,
+    BroadcastExchange, BuildSide, CteRefExec, ExchangeExec, ExistsSubqueryFilterExec, FilterExec,
+    FinalHashAggregateExec, HashJoinExec, InSubqueryFilterExec, LimitExec, ParquetScanExec,
+    ParquetWriteExec, PartialHashAggregateExec, PartitioningSpec, PhysicalPlan, ProjectExec,
+    ScalarSubqueryFilterExec, ShuffleReadExchange, ShuffleWriteExchange, TopKByScoreExec,
+    UnionAllExec, WindowExec,
 };
 
 #[derive(Debug, Clone)]
@@ -82,11 +82,13 @@ pub fn create_physical_plan(
         } => {
             let child = create_physical_plan(input, cfg)?;
             let sub = create_physical_plan(subquery, cfg)?;
-            Ok(PhysicalPlan::ExistsSubqueryFilter(ExistsSubqueryFilterExec {
-                input: Box::new(child),
-                subquery: Box::new(sub),
-                negated: *negated,
-            }))
+            Ok(PhysicalPlan::ExistsSubqueryFilter(
+                ExistsSubqueryFilterExec {
+                    input: Box::new(child),
+                    subquery: Box::new(sub),
+                    negated: *negated,
+                },
+            ))
         }
         LogicalPlan::ScalarSubqueryFilter {
             input,
@@ -97,12 +99,14 @@ pub fn create_physical_plan(
         } => {
             let child = create_physical_plan(input, cfg)?;
             let sub = create_physical_plan(subquery, cfg)?;
-            Ok(PhysicalPlan::ScalarSubqueryFilter(ScalarSubqueryFilterExec {
-                input: Box::new(child),
-                expr: expr.clone(),
-                op: *op,
-                subquery: Box::new(sub),
-            }))
+            Ok(PhysicalPlan::ScalarSubqueryFilter(
+                ScalarSubqueryFilterExec {
+                    input: Box::new(child),
+                    expr: expr.clone(),
+                    op: *op,
+                    subquery: Box::new(sub),
+                },
+            ))
         }
 
         LogicalPlan::Projection { exprs, input } => {
@@ -317,7 +321,10 @@ pub fn create_physical_plan(
     }
 }
 
-fn window_phase1_partitioning(exprs: &[crate::logical_plan::WindowExpr], cfg: &PhysicalPlannerConfig) -> PartitioningSpec {
+fn window_phase1_partitioning(
+    exprs: &[crate::logical_plan::WindowExpr],
+    cfg: &PhysicalPlannerConfig,
+) -> PartitioningSpec {
     if exprs.is_empty() {
         return PartitioningSpec::Single;
     }

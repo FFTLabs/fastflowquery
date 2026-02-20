@@ -241,7 +241,10 @@ fn fold_constants_expr(e: Expr) -> Expr {
                 to_type,
             }
         }
-        Expr::CaseWhen { branches, else_expr } => Expr::CaseWhen {
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => Expr::CaseWhen {
             branches: branches
                 .into_iter()
                 .map(|(c, v)| (fold_constants_expr(c), fold_constants_expr(v)))
@@ -1900,7 +1903,10 @@ fn rewrite_expr(e: Expr, rewrite: &dyn Fn(Expr) -> Expr) -> Expr {
             expr: Box::new(rewrite_expr(*expr, rewrite)),
             to_type,
         },
-        Expr::CaseWhen { branches, else_expr } => Expr::CaseWhen {
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => Expr::CaseWhen {
             branches: branches
                 .into_iter()
                 .map(|(c, v)| (rewrite_expr(c, rewrite), rewrite_expr(v, rewrite)))
@@ -1984,13 +1990,13 @@ fn collect_cols(e: &Expr, out: &mut HashSet<String>) {
             collect_cols(a, out);
             collect_cols(b, out);
         }
-        Expr::Not(x)
-        | Expr::IsNull(x)
-        | Expr::IsNotNull(x)
-        | Expr::Cast { expr: x, .. } => {
+        Expr::Not(x) | Expr::IsNull(x) | Expr::IsNotNull(x) | Expr::Cast { expr: x, .. } => {
             collect_cols(x, out);
         }
-        Expr::CaseWhen { branches, else_expr } => {
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
             for (cond, value) in branches {
                 collect_cols(cond, out);
                 collect_cols(value, out);
@@ -2020,15 +2026,16 @@ fn expr_contains_case(e: &Expr) -> bool {
         Expr::CaseWhen { .. } => true,
         Expr::BinaryOp { left, right, .. } => expr_contains_case(left) || expr_contains_case(right),
         Expr::And(a, b) | Expr::Or(a, b) => expr_contains_case(a) || expr_contains_case(b),
-        Expr::Not(x)
-        | Expr::IsNull(x)
-        | Expr::IsNotNull(x)
-        | Expr::Cast { expr: x, .. } => expr_contains_case(x),
+        Expr::Not(x) | Expr::IsNull(x) | Expr::IsNotNull(x) | Expr::Cast { expr: x, .. } => {
+            expr_contains_case(x)
+        }
         Expr::ScalarUdf { args, .. } => args.iter().any(expr_contains_case),
         #[cfg(feature = "vector")]
         Expr::CosineSimilarity { vector, query }
         | Expr::L2Distance { vector, query }
-        | Expr::DotProduct { vector, query } => expr_contains_case(vector) || expr_contains_case(query),
+        | Expr::DotProduct { vector, query } => {
+            expr_contains_case(vector) || expr_contains_case(query)
+        }
         Expr::Column(_) | Expr::ColumnRef { .. } | Expr::Literal(_) => false,
     }
 }

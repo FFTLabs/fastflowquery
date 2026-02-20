@@ -117,8 +117,12 @@ fn make_engine_with_config(cfg: EngineConfig) -> (Engine, std::path::PathBuf, st
 fn cte_query_runs() {
     let (engine, t_path, s_path) = make_engine();
     let sql = "WITH c AS (SELECT k FROM t) SELECT k FROM c";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
-    let mut values = batches.iter().flat_map(|b| int64_values(b, 0)).collect::<Vec<_>>();
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let mut values = batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
     values.sort_unstable();
     assert_eq!(values, vec![1, 2, 3]);
     let _ = std::fs::remove_file(t_path);
@@ -129,8 +133,12 @@ fn cte_query_runs() {
 fn uncorrelated_in_subquery_runs() {
     let (engine, t_path, s_path) = make_engine();
     let sql = "SELECT k FROM t WHERE k IN (SELECT k2 FROM s)";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
-    let mut values = batches.iter().flat_map(|b| int64_values(b, 0)).collect::<Vec<_>>();
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let mut values = batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
     values.sort_unstable();
     assert_eq!(values, vec![2, 3]);
     let _ = std::fs::remove_file(t_path);
@@ -141,8 +149,12 @@ fn uncorrelated_in_subquery_runs() {
 fn uncorrelated_exists_subquery_runs() {
     let (engine, t_path, s_path) = make_engine();
     let sql = "SELECT k FROM t WHERE EXISTS (SELECT k2 FROM s WHERE k2 > 2)";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
-    let mut values = batches.iter().flat_map(|b| int64_values(b, 0)).collect::<Vec<_>>();
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let mut values = batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
     values.sort_unstable();
     assert_eq!(values, vec![1, 2, 3]);
     let _ = std::fs::remove_file(t_path);
@@ -155,7 +167,8 @@ fn uncorrelated_exists_truth_table_non_empty_subquery() {
 
     let exists_sql = "SELECT k FROM t WHERE EXISTS (SELECT k2 FROM s)";
     let exists_batches =
-        futures::executor::block_on(engine.sql(exists_sql).expect("sql").collect()).expect("collect");
+        futures::executor::block_on(engine.sql(exists_sql).expect("sql").collect())
+            .expect("collect");
     let mut exists_values = exists_batches
         .iter()
         .flat_map(|b| int64_values(b, 0))
@@ -164,15 +177,17 @@ fn uncorrelated_exists_truth_table_non_empty_subquery() {
     assert_eq!(exists_values, vec![1, 2, 3]);
 
     let not_exists_sql = "SELECT k FROM t WHERE NOT EXISTS (SELECT k2 FROM s)";
-    let not_exists_batches = futures::executor::block_on(
-        engine.sql(not_exists_sql).expect("sql").collect(),
-    )
-    .expect("collect");
+    let not_exists_batches =
+        futures::executor::block_on(engine.sql(not_exists_sql).expect("sql").collect())
+            .expect("collect");
     let not_exists_values = not_exists_batches
         .iter()
         .flat_map(|b| int64_values(b, 0))
         .collect::<Vec<_>>();
-    assert!(not_exists_values.is_empty(), "unexpected rows: {not_exists_values:?}");
+    assert!(
+        not_exists_values.is_empty(),
+        "unexpected rows: {not_exists_values:?}"
+    );
 
     let _ = std::fs::remove_file(t_path);
     let _ = std::fs::remove_file(s_path);
@@ -183,7 +198,8 @@ fn correlated_exists_rewrites_and_runs() {
     let (engine, t_path, s_path) = make_engine();
 
     let sql = "SELECT k FROM t WHERE EXISTS (SELECT k2 FROM s WHERE s.k2 = t.k)";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
     let mut values = batches
         .iter()
         .flat_map(|b| int64_values(b, 0))
@@ -193,10 +209,9 @@ fn correlated_exists_rewrites_and_runs() {
 
     let sql_with_inner_filter =
         "SELECT k FROM t WHERE EXISTS (SELECT k2 FROM s WHERE s.k2 = t.k AND s.k2 > 2)";
-    let filtered_batches = futures::executor::block_on(
-        engine.sql(sql_with_inner_filter).expect("sql").collect(),
-    )
-    .expect("collect");
+    let filtered_batches =
+        futures::executor::block_on(engine.sql(sql_with_inner_filter).expect("sql").collect())
+            .expect("collect");
     let filtered_values = filtered_batches
         .iter()
         .flat_map(|b| int64_values(b, 0))
@@ -218,7 +233,8 @@ fn correlated_not_exists_rewrites_and_runs() {
     let (engine, t_path, s_path) = make_engine();
 
     let sql = "SELECT k FROM t WHERE NOT EXISTS (SELECT k2 FROM s WHERE s.k2 = t.k)";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
     let values = batches
         .iter()
         .flat_map(|b| int64_values(b, 0))
@@ -253,21 +269,22 @@ fn uncorrelated_exists_truth_table_empty_subquery() {
     );
 
     let exists_empty_sql = "SELECT k FROM t WHERE EXISTS (SELECT k2 FROM sempty_exists)";
-    let exists_empty_batches = futures::executor::block_on(
-        engine.sql(exists_empty_sql).expect("sql").collect(),
-    )
-    .expect("collect");
+    let exists_empty_batches =
+        futures::executor::block_on(engine.sql(exists_empty_sql).expect("sql").collect())
+            .expect("collect");
     let exists_empty_values = exists_empty_batches
         .iter()
         .flat_map(|b| int64_values(b, 0))
         .collect::<Vec<_>>();
-    assert!(exists_empty_values.is_empty(), "unexpected rows: {exists_empty_values:?}");
+    assert!(
+        exists_empty_values.is_empty(),
+        "unexpected rows: {exists_empty_values:?}"
+    );
 
     let not_exists_empty_sql = "SELECT k FROM t WHERE NOT EXISTS (SELECT k2 FROM sempty_exists)";
-    let not_exists_empty_batches = futures::executor::block_on(
-        engine.sql(not_exists_empty_sql).expect("sql").collect(),
-    )
-    .expect("collect");
+    let not_exists_empty_batches =
+        futures::executor::block_on(engine.sql(not_exists_empty_sql).expect("sql").collect())
+            .expect("collect");
     let mut not_exists_empty_values = not_exists_empty_batches
         .iter()
         .flat_map(|b| int64_values(b, 0))
@@ -284,8 +301,12 @@ fn uncorrelated_exists_truth_table_empty_subquery() {
 fn scalar_subquery_comparison_runs() {
     let (engine, t_path, s_path) = make_engine();
     let sql = "SELECT k FROM t WHERE k = (SELECT max(k2) FROM s)";
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
-    let values = batches.iter().flat_map(|b| int64_values(b, 0)).collect::<Vec<_>>();
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let values = batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
     assert_eq!(values, vec![3]);
     let _ = std::fs::remove_file(t_path);
     let _ = std::fs::remove_file(s_path);
@@ -303,8 +324,7 @@ fn scalar_subquery_errors_on_multiple_rows() {
         "unexpected error: {err}"
     );
     assert!(
-        err.to_string()
-            .contains("E_SUBQUERY_SCALAR_ROW_VIOLATION"),
+        err.to_string().contains("E_SUBQUERY_SCALAR_ROW_VIOLATION"),
         "unexpected taxonomy code in error: {err}"
     );
     let _ = std::fs::remove_file(t_path);
@@ -325,8 +345,12 @@ fn recursive_cte_hierarchical_query_runs() {
     )
     SELECT node FROM r";
 
-    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
-    let mut values = batches.iter().flat_map(|b| int64_values(b, 0)).collect::<Vec<_>>();
+    let batches =
+        futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let mut values = batches
+        .iter()
+        .flat_map(|b| int64_values(b, 0))
+        .collect::<Vec<_>>();
     values.sort_unstable();
     values.dedup();
     assert_eq!(values, vec![1, 2, 3, 4, 5]);
@@ -354,8 +378,7 @@ fn recursive_cte_respects_depth_limit_config() {
         Err(e) => e,
     };
     assert!(
-        err.to_string()
-            .contains("recursive_cte_max_depth=0"),
+        err.to_string().contains("recursive_cte_max_depth=0"),
         "unexpected error: {err}"
     );
     assert!(
@@ -455,7 +478,13 @@ fn make_engine_with_correlated_in_null_fixtures() -> (Engine, Vec<std::path::Pat
         s_schema.clone(),
         vec![
             Arc::new(Int64Array::from(vec![1_i64, 1, 2, 2, 3])),
-            Arc::new(Int64Array::from(vec![Some(2_i64), None, Some(3), None, Some(7)])),
+            Arc::new(Int64Array::from(vec![
+                Some(2_i64),
+                None,
+                Some(3),
+                None,
+                Some(7),
+            ])),
         ],
     );
 
@@ -501,15 +530,17 @@ fn in_not_in_null_semantics_with_null_in_rhs() {
     assert_eq!(in_values, vec![2]);
 
     let not_in_sql = "SELECT k FROM tnull WHERE k NOT IN (SELECT k2 FROM snull)";
-    let not_in_batches = futures::executor::block_on(
-        engine.sql(not_in_sql).expect("sql").collect(),
-    )
-    .expect("collect");
+    let not_in_batches =
+        futures::executor::block_on(engine.sql(not_in_sql).expect("sql").collect())
+            .expect("collect");
     let not_in_values = not_in_batches
         .iter()
         .flat_map(|b| int64_values(b, 0))
         .collect::<Vec<_>>();
-    assert!(not_in_values.is_empty(), "unexpected rows: {not_in_values:?}");
+    assert!(
+        not_in_values.is_empty(),
+        "unexpected rows: {not_in_values:?}"
+    );
 
     for p in paths {
         let _ = std::fs::remove_file(p);
@@ -521,21 +552,22 @@ fn in_not_in_null_semantics_with_empty_rhs_and_all_null_rhs() {
     let (engine, paths) = make_engine_with_in_null_fixtures();
 
     let in_empty_sql = "SELECT k FROM tnull WHERE k IN (SELECT k2 FROM sempty)";
-    let in_empty_batches = futures::executor::block_on(
-        engine.sql(in_empty_sql).expect("sql").collect(),
-    )
-    .expect("collect");
+    let in_empty_batches =
+        futures::executor::block_on(engine.sql(in_empty_sql).expect("sql").collect())
+            .expect("collect");
     let in_empty_values = in_empty_batches
         .iter()
         .flat_map(|b| int64_values(b, 0))
         .collect::<Vec<_>>();
-    assert!(in_empty_values.is_empty(), "unexpected rows: {in_empty_values:?}");
+    assert!(
+        in_empty_values.is_empty(),
+        "unexpected rows: {in_empty_values:?}"
+    );
 
     let not_in_empty_sql = "SELECT k FROM tnull WHERE k NOT IN (SELECT k2 FROM sempty)";
-    let not_in_empty_batches = futures::executor::block_on(
-        engine.sql(not_in_empty_sql).expect("sql").collect(),
-    )
-    .expect("collect");
+    let not_in_empty_batches =
+        futures::executor::block_on(engine.sql(not_in_empty_sql).expect("sql").collect())
+            .expect("collect");
     let mut not_in_empty_values = not_in_empty_batches
         .iter()
         .flat_map(|b| int64_values(b, 0))
@@ -544,21 +576,22 @@ fn in_not_in_null_semantics_with_empty_rhs_and_all_null_rhs() {
     assert_eq!(not_in_empty_values, vec![1, 2]);
 
     let in_all_null_sql = "SELECT k FROM tnull WHERE k IN (SELECT k2 FROM sallnull)";
-    let in_all_null_batches = futures::executor::block_on(
-        engine.sql(in_all_null_sql).expect("sql").collect(),
-    )
-    .expect("collect");
+    let in_all_null_batches =
+        futures::executor::block_on(engine.sql(in_all_null_sql).expect("sql").collect())
+            .expect("collect");
     let in_all_null_values = in_all_null_batches
         .iter()
         .flat_map(|b| int64_values(b, 0))
         .collect::<Vec<_>>();
-    assert!(in_all_null_values.is_empty(), "unexpected rows: {in_all_null_values:?}");
+    assert!(
+        in_all_null_values.is_empty(),
+        "unexpected rows: {in_all_null_values:?}"
+    );
 
     let not_in_all_null_sql = "SELECT k FROM tnull WHERE k NOT IN (SELECT k2 FROM sallnull)";
-    let not_in_all_null_batches = futures::executor::block_on(
-        engine.sql(not_in_all_null_sql).expect("sql").collect(),
-    )
-    .expect("collect");
+    let not_in_all_null_batches =
+        futures::executor::block_on(engine.sql(not_in_all_null_sql).expect("sql").collect())
+            .expect("collect");
     let not_in_all_null_values = not_in_all_null_batches
         .iter()
         .flat_map(|b| int64_values(b, 0))
@@ -577,7 +610,8 @@ fn in_not_in_null_semantics_with_empty_rhs_and_all_null_rhs() {
 fn correlated_in_not_in_null_semantics() {
     let (engine, paths) = make_engine_with_correlated_in_null_fixtures();
 
-    let in_sql = "SELECT k FROM t_corr WHERE k IN (SELECT k2 FROM s_corr WHERE s_corr.g = t_corr.a)";
+    let in_sql =
+        "SELECT k FROM t_corr WHERE k IN (SELECT k2 FROM s_corr WHERE s_corr.g = t_corr.a)";
     let in_batches =
         futures::executor::block_on(engine.sql(in_sql).expect("sql").collect()).expect("collect");
     let in_values = in_batches
@@ -588,10 +622,9 @@ fn correlated_in_not_in_null_semantics() {
 
     let not_in_sql =
         "SELECT k FROM t_corr WHERE k NOT IN (SELECT k2 FROM s_corr WHERE s_corr.g = t_corr.a)";
-    let not_in_batches = futures::executor::block_on(
-        engine.sql(not_in_sql).expect("sql").collect(),
-    )
-    .expect("collect");
+    let not_in_batches =
+        futures::executor::block_on(engine.sql(not_in_sql).expect("sql").collect())
+            .expect("collect");
     let mut not_in_values = not_in_batches
         .iter()
         .flat_map(|b| int64_values(b, 0))

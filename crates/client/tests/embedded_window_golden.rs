@@ -25,7 +25,9 @@ fn build_engine() -> (Engine, Vec<std::path::PathBuf>) {
         &w_path,
         w_schema.clone(),
         vec![
-            Arc::new(StringArray::from(vec!["A", "A", "A", "A", "B", "B", "B", "B"])),
+            Arc::new(StringArray::from(vec![
+                "A", "A", "A", "A", "B", "B", "B", "B",
+            ])),
             Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 1, 2, 3, 4])),
             Arc::new(Int64Array::from(vec![
                 Some(10_i64),
@@ -139,8 +141,8 @@ fn embedded_window_correctness_edge_matrix_snapshot() {
 
     let mut snapshot = String::new();
     for (name, sql, sort_by) in cases {
-        let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect())
-            .expect("collect");
+        let batches =
+            futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
         snapshot.push_str(&format!("## {name}\n"));
         snapshot.push_str(&support::snapshot_text(&batches, &sort_by, 1e-9));
         snapshot.push('\n');

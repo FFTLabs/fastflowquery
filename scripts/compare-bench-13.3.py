@@ -102,6 +102,7 @@ def compare(
     baseline: dict,
     candidate: dict,
     threshold: float,
+    threshold_overrides: Dict[str, float],
     fail_on_missing_candidate: bool,
 ) -> Tuple[List[str], List[str]]:
     """Returns (failures, warnings)."""
@@ -138,11 +139,12 @@ def compare(
         base_elapsed = float(base.get("elapsed_ms", 0.0))
         cand_elapsed = float(cand.get("elapsed_ms", 0.0))
         increase = _pct_increase(base_elapsed, cand_elapsed)
-        if increase > threshold:
+        effective_threshold = threshold_overrides.get(key.query_id, threshold)
+        if increase > effective_threshold:
             failures.append(
                 f"[elapsed_regression] {key.render()} baseline_ms={base_elapsed:.3f} "
                 f"candidate_ms={cand_elapsed:.3f} increase_pct={increase*100:.2f} "
-                f"threshold_pct={threshold*100:.2f}"
+                f"threshold_pct={effective_threshold*100:.2f}"
             )
 
     for key in cand_rows:
@@ -178,6 +180,14 @@ def main() -> int:
         action="store_true",
         help="Warn (instead of fail) when a baseline tuple is missing in candidate",
     )
+    parser.add_argument(
+        "--threshold-file",
+        default="",
+        help=(
+            "Optional JSON file with per-query thresholds. "
+            "Format: {\"default\":0.10,\"window_many_expressions\":0.15}"
+        ),
+    )
     args = parser.parse_args()
 
     if args.threshold < 0:
@@ -188,10 +198,26 @@ def main() -> int:
     baseline = _load_artifact(baseline_path)
     candidate = _load_artifact(candidate_path)
 
+    threshold_overrides: Dict[str, float] = {}
+    if args.threshold_file:
+        with Path(args.threshold_file).open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            raise SystemExit("--threshold-file JSON must be an object")
+        for key, value in payload.items():
+            if key == "default":
+                continue
+            threshold_overrides[str(key)] = float(value)
+        if "default" in payload:
+            args.threshold = float(payload["default"])
+        if args.threshold < 0:
+            raise SystemExit("threshold-file default must be >= 0")
+
     failures, warnings = compare(
         baseline=baseline,
         candidate=candidate,
         threshold=args.threshold,
+        threshold_overrides=threshold_overrides,
         fail_on_missing_candidate=not args.warn_on_missing_candidate,
     )
 
