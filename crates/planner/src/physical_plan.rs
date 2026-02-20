@@ -241,6 +241,25 @@ pub struct HashJoinExec {
     pub strategy_hint: JoinStrategyHint,
     /// The side we build the hash table from (usually the broadcast side).
     pub build_side: BuildSide,
+    /// Adaptive alternatives considered at runtime before join child execution.
+    ///
+    /// When non-empty, runtime may swap `left/right/build_side/strategy_hint`
+    /// to one of the alternatives based on observed or estimated side sizes.
+    #[serde(default)]
+    pub alternatives: Vec<HashJoinAlternativeExec>,
+}
+
+/// Alternative execution shape for adaptive hash-join choice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HashJoinAlternativeExec {
+    /// Alternative left subtree.
+    pub left: Box<PhysicalPlan>,
+    /// Alternative right subtree.
+    pub right: Box<PhysicalPlan>,
+    /// Strategy represented by this alternative.
+    pub strategy_hint: JoinStrategyHint,
+    /// Build side for this alternative.
+    pub build_side: BuildSide,
 }
 
 /// Stage-boundary exchange operators.

@@ -60,6 +60,7 @@ const E_SUBQUERY_SCALAR_ROW_VIOLATION: &str = "E_SUBQUERY_SCALAR_ROW_VIOLATION";
 pub struct QueryContext {
     pub batch_size_rows: usize,
     pub mem_budget_bytes: usize,
+    pub broadcast_threshold_bytes: u64,
     pub spill_dir: String,
     pub(crate) stats_collector: Option<Arc<RuntimeStatsCollector>>,
 }
@@ -817,10 +818,27 @@ fn execute_plan_with_cache(
                     on,
                     join_type,
                     build_side,
+                    alternatives,
                     ..
                 } = join;
+                let (left_plan, right_plan, build_side, strategy_label) =
+                    choose_adaptive_join_alternative(
+                        &left_plan,
+                        &right_plan,
+                        build_side,
+                        &alternatives,
+                        &catalog,
+                        &ctx,
+                    );
+                info!(
+                    query_id = %trace.query_id,
+                    stage_id = trace.stage_id,
+                    task_id = trace.task_id,
+                    strategy = strategy_label,
+                    "hash join adaptive strategy selected"
+                );
                 let left = execute_plan_with_cache(
-                    *left_plan,
+                    left_plan,
                     ctx.clone(),
                     catalog.clone(),
                     Arc::clone(&physical_registry),
@@ -829,7 +847,7 @@ fn execute_plan_with_cache(
                 )
                 .await?;
                 let right = execute_plan_with_cache(
-                    *right_plan,
+                    right_plan,
                     ctx.clone(),
                     catalog,
                     Arc::clone(&physical_registry),
@@ -919,6 +937,90 @@ fn batch_stats(batches: &[RecordBatch]) -> (u64, u64, u64) {
         })
         .sum::<u64>();
     (rows, batch_count, bytes)
+}
+
+fn choose_adaptive_join_alternative(
+    left: &Box<PhysicalPlan>,
+    right: &Box<PhysicalPlan>,
+    build_side: BuildSide,
+    alternatives: &[ffq_planner::HashJoinAlternativeExec],
+    catalog: &Arc<Catalog>,
+    ctx: &QueryContext,
+) -> (PhysicalPlan, PhysicalPlan, BuildSide, &'static str) {
+    if alternatives.is_empty() {
+        return ((**left).clone(), (**right).clone(), build_side, "fixed");
+    }
+    let threshold = ctx.broadcast_threshold_bytes;
+    let mut best: Option<(u64, ffq_planner::HashJoinAlternativeExec)> = None;
+    for alt in alternatives {
+        let build_plan = match alt.build_side {
+            BuildSide::Left => &alt.left,
+            BuildSide::Right => &alt.right,
+        };
+        let est = estimate_plan_output_bytes(build_plan, catalog);
+        if est <= threshold {
+            match &best {
+                Some((cur, _)) if *cur <= est => {}
+                _ => best = Some((est, alt.clone())),
+            }
+        }
+    }
+    if let Some((_est, alt)) = best {
+        let label = match alt.strategy_hint {
+            ffq_planner::JoinStrategyHint::BroadcastLeft => "adaptive_broadcast_left",
+            ffq_planner::JoinStrategyHint::BroadcastRight => "adaptive_broadcast_right",
+            ffq_planner::JoinStrategyHint::Shuffle => "adaptive_shuffle",
+            ffq_planner::JoinStrategyHint::Auto => "adaptive_auto",
+        };
+        return (*alt.left, *alt.right, alt.build_side, label);
+    }
+    ((**left).clone(), (**right).clone(), build_side, "adaptive_fallback_shuffle")
+}
+
+fn estimate_plan_output_bytes(plan: &PhysicalPlan, catalog: &Arc<Catalog>) -> u64 {
+    match plan {
+        PhysicalPlan::ParquetScan(scan) => catalog
+            .get(&scan.table)
+            .ok()
+            .map(|t| {
+                let uri_path = std::path::Path::new(&t.uri);
+                if let Ok(meta) = std::fs::metadata(uri_path) {
+                    return meta.len();
+                }
+                t.stats.bytes.unwrap_or(u64::MAX / 8)
+            })
+            .unwrap_or(u64::MAX / 8),
+        PhysicalPlan::ParquetWrite(x) => estimate_plan_output_bytes(&x.input, catalog),
+        PhysicalPlan::Filter(x) => estimate_plan_output_bytes(&x.input, catalog) / 2,
+        PhysicalPlan::InSubqueryFilter(x) => estimate_plan_output_bytes(&x.input, catalog),
+        PhysicalPlan::ExistsSubqueryFilter(x) => estimate_plan_output_bytes(&x.input, catalog),
+        PhysicalPlan::ScalarSubqueryFilter(x) => estimate_plan_output_bytes(&x.input, catalog),
+        PhysicalPlan::Project(x) => estimate_plan_output_bytes(&x.input, catalog),
+        PhysicalPlan::Window(x) => estimate_plan_output_bytes(&x.input, catalog),
+        PhysicalPlan::CoalesceBatches(x) => estimate_plan_output_bytes(&x.input, catalog),
+        PhysicalPlan::PartialHashAggregate(x) => estimate_plan_output_bytes(&x.input, catalog),
+        PhysicalPlan::FinalHashAggregate(x) => estimate_plan_output_bytes(&x.input, catalog),
+        PhysicalPlan::HashJoin(x) => {
+            estimate_plan_output_bytes(&x.left, catalog)
+                .saturating_add(estimate_plan_output_bytes(&x.right, catalog))
+        }
+        PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(x)) => {
+            estimate_plan_output_bytes(&x.input, catalog)
+        }
+        PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(x)) => {
+            estimate_plan_output_bytes(&x.input, catalog)
+        }
+        PhysicalPlan::Exchange(ExchangeExec::Broadcast(x)) => {
+            estimate_plan_output_bytes(&x.input, catalog)
+        }
+        PhysicalPlan::Limit(x) => estimate_plan_output_bytes(&x.input, catalog) / 2,
+        PhysicalPlan::TopKByScore(x) => estimate_plan_output_bytes(&x.input, catalog) / 2,
+        PhysicalPlan::UnionAll(x) => estimate_plan_output_bytes(&x.left, catalog)
+            .saturating_add(estimate_plan_output_bytes(&x.right, catalog)),
+        PhysicalPlan::CteRef(x) => estimate_plan_output_bytes(&x.plan, catalog),
+        PhysicalPlan::VectorTopK(_) => 64 * 1024,
+        PhysicalPlan::Custom(x) => estimate_plan_output_bytes(&x.input, catalog),
+    }
 }
 
 fn operator_name(plan: &PhysicalPlan) -> &'static str {
@@ -1492,6 +1594,7 @@ fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput
     let default_ctx = QueryContext {
         batch_size_rows: 8192,
         mem_budget_bytes: usize::MAX,
+        broadcast_threshold_bytes: u64::MAX,
         spill_dir: "./ffq_spill".to_string(),
         stats_collector: None,
     };
@@ -4651,6 +4754,7 @@ mod tests {
         let ctx = QueryContext {
             batch_size_rows: 512,
             mem_budget_bytes: 256,
+            broadcast_threshold_bytes: u64::MAX,
             spill_dir: spill_dir.to_string_lossy().into_owned(),
             stats_collector: None,
         };
@@ -4744,6 +4848,7 @@ mod tests {
             QueryContext {
                 batch_size_rows: 1024,
                 mem_budget_bytes: 64 * 1024 * 1024,
+                broadcast_threshold_bytes: u64::MAX,
                 spill_dir: "./ffq_spill_test".to_string(),
                 stats_collector: None,
             },

@@ -213,6 +213,116 @@ fn hash_join_broadcast_strategy_and_result() {
     let _ = std::fs::remove_dir_all(spill_dir);
 }
 
+#[test]
+fn hash_join_adaptive_switches_from_shuffle_plan_to_broadcast() {
+    let left_path = support::unique_path("ffq_join_adaptive_left", "parquet");
+    let right_path = support::unique_path("ffq_join_adaptive_right", "parquet");
+    let spill_dir = support::unique_path("ffq_join_adaptive_spill", "dir");
+
+    let left_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("x", DataType::Int64, false),
+    ]));
+    support::write_parquet(
+        &left_path,
+        left_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+            Arc::new(Int64Array::from(vec![11_i64, 22, 33])),
+        ],
+    );
+
+    let right_schema = Arc::new(Schema::new(vec![
+        Field::new("k2", DataType::Int64, false),
+        Field::new("y", DataType::Int64, false),
+    ]));
+    support::write_parquet(
+        &right_path,
+        right_schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![2_i64, 3, 4])),
+            Arc::new(Int64Array::from(vec![200_i64, 300, 400])),
+        ],
+    );
+
+    let mut cfg = EngineConfig::default();
+    cfg.mem_budget_bytes = 1024 * 1024;
+    cfg.spill_dir = spill_dir.to_string_lossy().into_owned();
+    cfg.broadcast_threshold_bytes = 128 * 1024;
+
+    let engine = Engine::new(cfg).expect("engine");
+    engine.register_table(
+        "left_t",
+        TableDef {
+            name: "ignored".to_string(),
+            uri: left_path.to_string_lossy().into_owned(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: Some((*left_schema).clone()),
+            // Intentionally oversized stats to push optimizer into shuffle strategy.
+            stats: ffq_storage::TableStats {
+                rows: Some(5_000_000),
+                bytes: Some(10_000_000),
+            },
+            options: HashMap::new(),
+        },
+    );
+    engine.register_table(
+        "right_t",
+        TableDef {
+            name: "ignored".to_string(),
+            uri: right_path.to_string_lossy().into_owned(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: Some((*right_schema).clone()),
+            stats: ffq_storage::TableStats {
+                rows: Some(5_000_000),
+                bytes: Some(10_000_000),
+            },
+            options: HashMap::new(),
+        },
+    );
+
+    let joined = engine
+        .table("left_t")
+        .expect("left_t")
+        .join(
+            engine.table("right_t").expect("right_t"),
+            vec![("k".to_string(), "k2".to_string())],
+        )
+        .expect("join");
+
+    let explain = joined.explain().expect("explain");
+    assert!(
+        explain.contains("strategy=shuffle"),
+        "expected shuffle primary plan, got:\n{explain}"
+    );
+    assert!(
+        explain.contains("adaptive_alternatives="),
+        "expected adaptive alternatives in explain:\n{explain}"
+    );
+
+    let batches = futures::executor::block_on(joined.collect()).expect("collect");
+    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(rows, 2);
+
+    let report = engine
+        .last_query_stats_report()
+        .expect("stats report should exist");
+    assert!(
+        report.contains("op=Broadcast"),
+        "adaptive runtime should choose broadcast alternative:\n{report}"
+    );
+    assert!(
+        !report.contains("op=ShuffleWrite"),
+        "adaptive runtime should avoid shuffle subtree when broadcast selected:\n{report}"
+    );
+
+    let _ = std::fs::remove_file(left_path);
+    let _ = std::fs::remove_file(right_path);
+    let _ = std::fs::remove_dir_all(spill_dir);
+}
+
 fn make_outer_join_fixture_engine() -> (
     Engine,
     std::path::PathBuf,

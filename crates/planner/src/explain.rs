@@ -377,6 +377,19 @@ fn fmt_physical(plan: &PhysicalPlan, indent: usize, out: &mut String) {
                 fmt_join_hint(join.strategy_hint)
             ));
             out.push_str(&format!("{pad}  on={:?}\n", join.on));
+            if !join.alternatives.is_empty() {
+                out.push_str(&format!(
+                    "{pad}  adaptive_alternatives={}\n",
+                    join.alternatives.len()
+                ));
+                for (idx, alt) in join.alternatives.iter().enumerate() {
+                    out.push_str(&format!(
+                        "{pad}    alt[{idx}] strategy={} build_side={:?}\n",
+                        fmt_join_hint(alt.strategy_hint),
+                        alt.build_side
+                    ));
+                }
+            }
             out.push_str(&format!("{pad}  left:\n"));
             fmt_physical(&join.left, indent + 2, out);
             out.push_str(&format!("{pad}  right:\n"));

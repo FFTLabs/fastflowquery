@@ -451,7 +451,12 @@ impl Coordinator {
             PhysicalPlan::FinalHashAggregate(x) => self.resolve_parquet_scan_schemas(&mut x.input),
             PhysicalPlan::HashJoin(x) => {
                 self.resolve_parquet_scan_schemas(&mut x.left)?;
-                self.resolve_parquet_scan_schemas(&mut x.right)
+                self.resolve_parquet_scan_schemas(&mut x.right)?;
+                for alt in &mut x.alternatives {
+                    self.resolve_parquet_scan_schemas(&mut alt.left)?;
+                    self.resolve_parquet_scan_schemas(&mut alt.right)?;
+                }
+                Ok(())
             }
             PhysicalPlan::Exchange(x) => match x {
                 ExchangeExec::ShuffleWrite(e) => self.resolve_parquet_scan_schemas(&mut e.input),
@@ -932,6 +937,10 @@ fn collect_custom_ops(plan: &PhysicalPlan, out: &mut HashSet<String>) {
         PhysicalPlan::HashJoin(x) => {
             collect_custom_ops(&x.left, out);
             collect_custom_ops(&x.right, out);
+            for alt in &x.alternatives {
+                collect_custom_ops(&alt.left, out);
+                collect_custom_ops(&alt.right, out);
+            }
         }
         PhysicalPlan::Exchange(x) => match x {
             ExchangeExec::ShuffleWrite(e) => collect_custom_ops(&e.input, out),

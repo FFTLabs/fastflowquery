@@ -3,10 +3,10 @@ use ffq_common::{FfqError, Result};
 use crate::logical_plan::{Expr, JoinStrategyHint, LogicalPlan};
 use crate::physical_plan::{
     BroadcastExchange, BuildSide, CteRefExec, ExchangeExec, ExistsSubqueryFilterExec, FilterExec,
-    FinalHashAggregateExec, HashJoinExec, InSubqueryFilterExec, LimitExec, ParquetScanExec,
-    ParquetWriteExec, PartialHashAggregateExec, PartitioningSpec, PhysicalPlan, ProjectExec,
-    ScalarSubqueryFilterExec, ShuffleReadExchange, ShuffleWriteExchange, TopKByScoreExec,
-    UnionAllExec, WindowExec,
+    FinalHashAggregateExec, HashJoinAlternativeExec, HashJoinExec, InSubqueryFilterExec,
+    LimitExec, ParquetScanExec, ParquetWriteExec, PartialHashAggregateExec, PartitioningSpec,
+    PhysicalPlan, ProjectExec, ScalarSubqueryFilterExec, ShuffleReadExchange,
+    ShuffleWriteExchange, TopKByScoreExec, UnionAllExec, WindowExec,
 };
 
 #[derive(Debug, Clone)]
@@ -247,6 +247,7 @@ pub fn create_physical_plan(
                         join_type: *join_type,
                         strategy_hint: *strategy_hint,
                         build_side: BuildSide::Left,
+                        alternatives: Vec::new(),
                     }))
                 }
                 JoinStrategyHint::BroadcastRight => {
@@ -261,6 +262,7 @@ pub fn create_physical_plan(
                         join_type: *join_type,
                         strategy_hint: *strategy_hint,
                         build_side: BuildSide::Right,
+                        alternatives: Vec::new(),
                     }))
                 }
                 JoinStrategyHint::Shuffle | JoinStrategyHint::Auto => {
@@ -280,7 +282,7 @@ pub fn create_physical_plan(
 
                     let lw =
                         PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(ShuffleWriteExchange {
-                            input: Box::new(l),
+                            input: Box::new(l.clone()),
                             partitioning: part_l.clone(),
                         }));
                     let lr =
@@ -291,7 +293,7 @@ pub fn create_physical_plan(
 
                     let rw =
                         PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(ShuffleWriteExchange {
-                            input: Box::new(r),
+                            input: Box::new(r.clone()),
                             partitioning: part_r.clone(),
                         }));
                     let rr =
@@ -307,6 +309,33 @@ pub fn create_physical_plan(
                         join_type: *join_type,
                         strategy_hint: *strategy_hint,
                         build_side: BuildSide::Right, // arbitrary for shuffle-join, executor can decide
+                        alternatives: if matches!(
+                            *strategy_hint,
+                            JoinStrategyHint::Auto | JoinStrategyHint::Shuffle
+                        ) {
+                            vec![
+                                HashJoinAlternativeExec {
+                                    left: Box::new(PhysicalPlan::Exchange(ExchangeExec::Broadcast(
+                                        BroadcastExchange {
+                                            input: Box::new(l.clone()),
+                                        },
+                                    ))),
+                                    right: Box::new(r.clone()),
+                                    strategy_hint: JoinStrategyHint::BroadcastLeft,
+                                    build_side: BuildSide::Left,
+                                },
+                                HashJoinAlternativeExec {
+                                    left: Box::new(l),
+                                    right: Box::new(PhysicalPlan::Exchange(ExchangeExec::Broadcast(
+                                        BroadcastExchange { input: Box::new(r) },
+                                    ))),
+                                    strategy_hint: JoinStrategyHint::BroadcastRight,
+                                    build_side: BuildSide::Right,
+                                },
+                            ]
+                        } else {
+                            Vec::new()
+                        },
                     }))
                 }
             }
