@@ -438,3 +438,181 @@ impl ShuffleService for WorkerShuffleService {
         Ok(Response::new(Box::pin(stream::iter(out))))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ffq_planner::{
+        ExchangeExec, ParquetScanExec, PartitioningSpec, PhysicalPlan, ShuffleReadExchange,
+        ShuffleWriteExchange,
+    };
+    use arrow_schema::Schema;
+
+    fn shuffle_plan(partitions: usize) -> PhysicalPlan {
+        PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
+            input: Box::new(PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(
+                ShuffleWriteExchange {
+                    input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
+                        table: "t".to_string(),
+                        schema: Some(Schema::empty()),
+                        projection: None,
+                        filters: vec![],
+                    })),
+                    partitioning: PartitioningSpec::HashKeys {
+                        keys: vec!["k".to_string()],
+                        partitions,
+                    },
+                },
+            ))),
+            partitioning: PartitioningSpec::HashKeys {
+                keys: vec!["k".to_string()],
+                partitions,
+            },
+        }))
+    }
+
+    #[tokio::test]
+    async fn grpc_control_plane_matches_coordinator_adaptive_assignment_and_stats() {
+        let coordinator = Arc::new(Mutex::new(Coordinator::default()));
+        let services = CoordinatorServices::from_shared(Arc::clone(&coordinator));
+
+        let plan = serde_json::to_vec(&shuffle_plan(4)).expect("plan bytes");
+        {
+            let mut c = coordinator.lock().await;
+            c.submit_query("9001".to_string(), &plan).expect("submit");
+        }
+
+        let map_task = services
+            .get_task(Request::new(v1::GetTaskRequest {
+                worker_id: "w1".to_string(),
+                capacity: 10,
+            }))
+            .await
+            .expect("grpc get map task")
+            .into_inner()
+            .tasks
+            .into_iter()
+            .next()
+            .expect("map task exists");
+        assert!(map_task.assigned_reduce_partitions.is_empty());
+        assert_eq!(map_task.assigned_reduce_split_count, 1);
+        assert_eq!(map_task.layout_version, 1);
+
+        services
+            .register_map_output(Request::new(v1::RegisterMapOutputRequest {
+                query_id: map_task.query_id.clone(),
+                stage_id: map_task.stage_id,
+                map_task: map_task.task_id,
+                attempt: map_task.attempt,
+                layout_version: map_task.layout_version,
+                layout_fingerprint: map_task.layout_fingerprint,
+                partitions: vec![
+                    v1::MapOutputPartition {
+                        reduce_partition: 0,
+                        bytes: 8,
+                        rows: 1,
+                        batches: 1,
+                    },
+                    v1::MapOutputPartition {
+                        reduce_partition: 1,
+                        bytes: 120,
+                        rows: 1,
+                        batches: 1,
+                    },
+                    v1::MapOutputPartition {
+                        reduce_partition: 2,
+                        bytes: 8,
+                        rows: 1,
+                        batches: 1,
+                    },
+                    v1::MapOutputPartition {
+                        reduce_partition: 3,
+                        bytes: 8,
+                        rows: 1,
+                        batches: 1,
+                    },
+                ],
+            }))
+            .await
+            .expect("grpc register map output");
+        services
+            .report_task_status(Request::new(v1::ReportTaskStatusRequest {
+                query_id: map_task.query_id.clone(),
+                stage_id: map_task.stage_id,
+                task_id: map_task.task_id,
+                attempt: map_task.attempt,
+                layout_version: map_task.layout_version,
+                layout_fingerprint: map_task.layout_fingerprint,
+                state: v1::TaskState::Succeeded as i32,
+                message: "map done".to_string(),
+            }))
+            .await
+            .expect("grpc report map success");
+
+        let reduce_tasks = services
+            .get_task(Request::new(v1::GetTaskRequest {
+                worker_id: "w2".to_string(),
+                capacity: 20,
+            }))
+            .await
+            .expect("grpc get reduce tasks")
+            .into_inner()
+            .tasks;
+        assert!(!reduce_tasks.is_empty());
+        assert!(
+            reduce_tasks
+                .iter()
+                .all(|t| !t.assigned_reduce_partitions.is_empty())
+        );
+
+        let grpc_status = services
+            .get_query_status(Request::new(v1::GetQueryStatusRequest {
+                query_id: "9001".to_string(),
+            }))
+            .await
+            .expect("grpc query status")
+            .into_inner()
+            .status
+            .expect("status payload");
+        let direct_status = {
+            let c = coordinator.lock().await;
+            c.get_query_status("9001").expect("direct status")
+        };
+        let grpc_stage0 = grpc_status
+            .stage_metrics
+            .iter()
+            .find(|m| m.stage_id == 0)
+            .expect("grpc stage0");
+        let direct_stage0 = direct_status.stage_metrics.get(&0).expect("direct stage0");
+
+        assert_eq!(
+            grpc_stage0.planned_reduce_tasks,
+            direct_stage0.planned_reduce_tasks
+        );
+        assert_eq!(
+            grpc_stage0.adaptive_reduce_tasks,
+            direct_stage0.adaptive_reduce_tasks
+        );
+        assert_eq!(
+            grpc_stage0.adaptive_target_bytes,
+            direct_stage0.adaptive_target_bytes
+        );
+        assert_eq!(grpc_stage0.skew_split_tasks, direct_stage0.skew_split_tasks);
+        assert_eq!(
+            grpc_stage0.layout_finalize_count,
+            direct_stage0.layout_finalize_count
+        );
+        assert_eq!(grpc_stage0.aqe_events, direct_stage0.aqe_events);
+        let grpc_hist = grpc_stage0
+            .partition_bytes_histogram
+            .iter()
+            .map(|b| (b.upper_bound_bytes, b.partition_count))
+            .collect::<Vec<_>>();
+        let direct_hist = direct_stage0
+            .partition_bytes_histogram
+            .iter()
+            .map(|b| (b.upper_bound_bytes, b.partition_count))
+            .collect::<Vec<_>>();
+        assert_eq!(grpc_hist, direct_hist);
+    }
+}
