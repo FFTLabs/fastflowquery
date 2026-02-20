@@ -251,10 +251,10 @@ impl TaskExecutor for DefaultTaskExecutor {
             result.message = format!("sink stage rows={}", count_rows(&output.batches));
             result.output_batches = output.batches.clone();
             result.publish_results = true;
-            self.sink_outputs
-                .lock()
-                .await
-                .insert(ctx.query_id.clone(), output.batches);
+            let mut sink = self.sink_outputs.lock().await;
+            sink.entry(ctx.query_id.clone())
+                .or_default()
+                .extend(output.batches);
         } else {
             result.message = format!(
                 "map stage wrote {} partitions",
