@@ -34,6 +34,121 @@ Use this page to answer:
 | Set op | `UNION ALL` | supported | Implemented as concat operator. |
 | Set op | `UNION` (distinct), `INTERSECT`, `EXCEPT` | not supported | Use explicit rewrites for now. |
 | Ordering | General `ORDER BY` | limited | Full global sort not generally supported; vector top-k pattern remains special-case path. |
+| Window | `... OVER (...)` | supported | See detailed window contract below. |
+
+## Window SQL Contract (v2)
+
+This section is the authoritative support contract for window SQL in v2.
+
+### Supported window functions
+
+Ranking/distribution:
+
+1. `ROW_NUMBER()`
+2. `RANK()`
+3. `DENSE_RANK()`
+4. `PERCENT_RANK()`
+5. `CUME_DIST()`
+6. `NTILE(n)`
+
+Aggregate windows:
+
+1. `COUNT(expr|*)`
+2. `SUM(expr)`
+3. `AVG(expr)`
+4. `MIN(expr)`
+5. `MAX(expr)`
+
+Offset/value:
+
+1. `LAG(expr [, offset [, default]])`
+2. `LEAD(expr [, offset [, default]])`
+3. `FIRST_VALUE(expr)`
+4. `LAST_VALUE(expr)`
+5. `NTH_VALUE(expr, n)`
+
+### Supported syntax
+
+1. `PARTITION BY ...`
+2. `ORDER BY ...` with:
+   - `ASC` and `DESC`
+   - `NULLS FIRST` and `NULLS LAST`
+3. Named windows:
+   - `WINDOW w AS (...)`
+   - `... OVER w`
+4. Frame units:
+   - `ROWS`
+   - `RANGE`
+   - `GROUPS`
+5. Frame bounds:
+   - `UNBOUNDED PRECEDING`
+   - `n PRECEDING`
+   - `CURRENT ROW`
+   - `n FOLLOWING`
+   - `UNBOUNDED FOLLOWING`
+6. Frame exclusion:
+   - `EXCLUDE NO OTHERS`
+   - `EXCLUDE CURRENT ROW`
+   - `EXCLUDE GROUP`
+   - `EXCLUDE TIES`
+
+### Frame and validation semantics
+
+1. Invalid frame bounds are planning errors:
+   - start cannot be `UNBOUNDED FOLLOWING`
+   - end cannot be `UNBOUNDED PRECEDING`
+   - start bound must be `<=` end bound
+2. `RANGE` and `GROUPS` require `ORDER BY`.
+3. `RANGE` with offset currently requires exactly one numeric `ORDER BY` key with non-null value.
+4. `RANGE` without offset supports current-row and unbounded forms.
+
+### Type and nullability rules
+
+1. Return type:
+   - `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `COUNT` -> `Int64`
+   - `PERCENT_RANK`, `CUME_DIST` -> `Float64`
+   - `SUM`, `AVG` -> `Float64`
+   - `MIN`, `MAX`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE` -> input expression type
+2. `SUM`/`AVG` arguments must be numeric.
+3. `LAG`/`LEAD` default must be type-compatible with the value expression.
+4. Nullability:
+   - ranking/distribution/count outputs are non-null
+   - value/aggregate windows may be nullable per frame/expression semantics
+
+### Determinism and ordering behavior
+
+1. Null ordering follows explicit clause (`NULLS FIRST/LAST`) when present.
+2. Ties are handled deterministically; repeated runs on unchanged data produce stable results.
+3. Embedded and distributed window semantics are parity-tested for:
+   - ranking
+   - frame behavior (`ROWS`/`RANGE`/`GROUPS`)
+   - null ordering
+   - exclusion modes
+
+### Explain visibility for windows
+
+`EXPLAIN` includes:
+
+1. window expressions
+2. explicit/default frame details
+3. sort-reuse grouping information
+4. distributed strategy context where applicable
+
+### Known limits and failure modes
+
+1. Window execution currently materializes/sorts partition state; very large partitions can be memory-heavy.
+2. `RANGE` offset frames are restricted to one numeric `ORDER BY` key.
+3. Invalid shapes fail as planning/execution errors with actionable messages (for example unsupported `RANGE` frame bounds).
+
+### Performance notes
+
+1. Group compatible window expressions to maximize sort reuse.
+2. Prefer selective filters before wide window projections.
+3. Use `docs/v2/benchmarks.md` window scenarios and thresholds for regression tracking:
+   - narrow partitions
+   - wide partitions
+   - skewed keys
+   - many window expressions
 
 ## CTE Semantics
 

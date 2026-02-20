@@ -54,6 +54,30 @@ Expected:
 1. optimized plan text is printed
 2. no execution-time output rows (plan mode only)
 
+## 1b) Window Query Smoke (Embedded)
+
+Run a first window query from CLI:
+
+```bash
+cargo run -p ffq-client -- query \
+  --catalog tests/fixtures/catalog/tables.json \
+  --sql "SELECT l_returnflag, l_shipdate, ROW_NUMBER() OVER (PARTITION BY l_returnflag ORDER BY l_shipdate, l_orderkey) AS rn FROM lineitem LIMIT 10"
+```
+
+Try a frame/exclusion shape:
+
+```bash
+cargo run -p ffq-client -- query \
+  --catalog tests/fixtures/catalog/tables.json \
+  --sql "SELECT l_returnflag, l_orderkey, SUM(l_quantity) OVER (PARTITION BY l_returnflag ORDER BY l_orderkey ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) AS s FROM lineitem LIMIT 10"
+```
+
+Expected:
+
+1. both commands exit `0`
+2. output includes computed window columns (`rn`, `s`)
+3. results are stable across repeated runs on unchanged data
+
 ## 2) REPL First Session
 
 Start REPL with catalog:
@@ -230,6 +254,14 @@ FFQ_SCHEMA_WRITEBACK=true
    - cause: fixture file permissions/ownership mismatch
    - fix: regenerate fixture directory with writable permissions in workflow step before generation
 
+9. `RANGE frame with offset currently requires exactly one ORDER BY expression`:
+   - cause: `RANGE ... PRECEDING/FOLLOWING` used with multiple order keys
+   - fix: reduce to one numeric `ORDER BY` expression or switch to `ROWS`/`GROUPS` frame
+
+10. `window aggregate requires numeric argument`:
+   - cause: `SUM`/`AVG` window called on non-numeric type
+   - fix: cast to numeric type or use a compatible function
+
 ## 8) Where to Go Next
 
 1. Distributed runtime details: `docs/v2/distributed-runtime.md`
@@ -238,3 +270,4 @@ FFQ_SCHEMA_WRITEBACK=true
 4. FFI + Python deep guide: `docs/v2/ffi-python.md`
 5. Extensibility and UDF/custom operators: `docs/v2/extensibility.md`
 6. Custom operator deployment contract: `docs/v2/custom-operators-deployment.md`
+7. Full SQL support contract (including windows): `docs/v2/sql-semantics.md`
