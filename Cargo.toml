@@ -39,3 +39,6 @@ unsafe_code = "forbid"
 all = "warn"
 pedantic = "warn"
 nursery = "warn"
+
+[patch.crates-io]
+sqlparser = { path = "third_party/sqlparser" }

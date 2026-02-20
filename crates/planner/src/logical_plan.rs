@@ -243,6 +243,19 @@ pub enum WindowFrameUnits {
     Groups,
 }
 
+/// Window frame exclusion mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowFrameExclusion {
+    /// `EXCLUDE NO OTHERS` (default)
+    NoOthers,
+    /// `EXCLUDE CURRENT ROW`
+    CurrentRow,
+    /// `EXCLUDE GROUP`
+    Group,
+    /// `EXCLUDE TIES`
+    Ties,
+}
+
 /// Window frame bound.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WindowFrameBound {
@@ -267,6 +280,8 @@ pub struct WindowFrameSpec {
     pub start_bound: WindowFrameBound,
     /// Frame upper bound.
     pub end_bound: WindowFrameBound,
+    /// Frame exclusion mode.
+    pub exclusion: WindowFrameExclusion,
 }
 
 /// One window expression with partition/order specification and output name.

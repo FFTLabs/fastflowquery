@@ -33,7 +33,8 @@ use ffq_common::{FfqError, Result};
 use ffq_execution::{SendableRecordBatchStream, StreamAdapter, TaskContext, compile_expr};
 use ffq_planner::{
     AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, JoinType, PhysicalPlan, WindowExpr,
-    WindowFrameBound, WindowFrameSpec, WindowFrameUnits, WindowFunction, WindowOrderExpr,
+    WindowFrameBound, WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits, WindowFunction,
+    WindowOrderExpr,
 };
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
@@ -1469,7 +1470,7 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut cnt = 0_i64;
-                    for pos in &part[fs..fe] {
+                    for pos in filtered_frame_positions(&frame, &part_ctx, part, fs, fe, i) {
                         if !matches!(values[*pos], ScalarValue::Null) {
                             cnt += 1;
                         }
@@ -1487,7 +1488,7 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut sum = 0.0_f64;
                     let mut seen = false;
-                    for pos in &part[fs..fe] {
+                    for pos in filtered_frame_positions(&frame, &part_ctx, part, fs, fe, i) {
                         match &values[*pos] {
                             ScalarValue::Int64(v) => {
                                 sum += *v as f64;
@@ -1522,7 +1523,7 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut sum = 0.0_f64;
                     let mut count = 0_i64;
-                    for pos in &part[fs..fe] {
+                    for pos in filtered_frame_positions(&frame, &part_ctx, part, fs, fe, i) {
                         if let Some(v) = scalar_to_f64(&values[*pos]) {
                             sum += v;
                             count += 1;
@@ -1549,7 +1550,7 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut current: Option<ScalarValue> = None;
-                    for pos in &part[fs..fe] {
+                    for pos in filtered_frame_positions(&frame, &part_ctx, part, fs, fe, i) {
                         let v = values[*pos].clone();
                         if matches!(v, ScalarValue::Null) {
                             continue;
@@ -1579,7 +1580,7 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut current: Option<ScalarValue> = None;
-                    for pos in &part[fs..fe] {
+                    for pos in filtered_frame_positions(&frame, &part_ctx, part, fs, fe, i) {
                         let v = values[*pos].clone();
                         if matches!(v, ScalarValue::Null) {
                             continue;
@@ -1655,7 +1656,9 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     out[part[i]] = if fs < fe {
-                        values[part[fs]].clone()
+                        first_in_filtered_frame(&frame, &part_ctx, part, fs, fe, i)
+                            .map(|p| values[p].clone())
+                            .unwrap_or(ScalarValue::Null)
                     } else {
                         ScalarValue::Null
                     };
@@ -1670,7 +1673,9 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     out[part[i]] = if fs < fe {
-                        values[part[fe - 1]].clone()
+                        last_in_filtered_frame(&frame, &part_ctx, part, fs, fe, i)
+                            .map(|p| values[p].clone())
+                            .unwrap_or(ScalarValue::Null)
                     } else {
                         ScalarValue::Null
                     };
@@ -1684,11 +1689,11 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                 let part_ctx = build_partition_frame_ctx(part, &order_keys, &w.order_by)?;
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
-                    let width = fe.saturating_sub(fs);
-                    out[part[i]] = if *n == 0 || *n > width {
+                    let filtered = filtered_frame_positions(&frame, &part_ctx, part, fs, fe, i);
+                    out[part[i]] = if *n == 0 || *n > filtered.len() {
                         ScalarValue::Null
                     } else {
-                        values[part[fs + *n - 1]].clone()
+                        values[*filtered[*n - 1]].clone()
                     };
                 }
             }
@@ -1765,12 +1770,14 @@ fn effective_window_frame(w: &WindowExpr) -> WindowFrameSpec {
             units: WindowFrameUnits::Rows,
             start_bound: WindowFrameBound::UnboundedPreceding,
             end_bound: WindowFrameBound::UnboundedFollowing,
+            exclusion: WindowFrameExclusion::NoOthers,
         }
     } else {
         WindowFrameSpec {
             units: WindowFrameUnits::Range,
             start_bound: WindowFrameBound::UnboundedPreceding,
             end_bound: WindowFrameBound::CurrentRow,
+            exclusion: WindowFrameExclusion::NoOthers,
         }
     }
 }
@@ -1999,6 +2006,74 @@ fn scalar_to_f64(v: &ScalarValue) -> Option<f64> {
         ScalarValue::Null => None,
         _ => None,
     }
+}
+
+fn filtered_frame_positions<'a>(
+    frame: &WindowFrameSpec,
+    ctx: &'a PartitionFrameCtx,
+    part: &'a [usize],
+    fs: usize,
+    fe: usize,
+    row_idx: usize,
+) -> Vec<&'a usize> {
+    match frame.exclusion {
+        WindowFrameExclusion::NoOthers => part[fs..fe].iter().collect(),
+        WindowFrameExclusion::CurrentRow => part[fs..fe]
+            .iter()
+            .filter(|p| **p != part[row_idx])
+            .collect(),
+        WindowFrameExclusion::Group => {
+            let g = ctx.row_group[row_idx];
+            let (gs, ge) = ctx.peer_groups[g];
+            part[fs..fe]
+                .iter()
+                .filter(|p| {
+                    let abs = part.iter().position(|v| *v == **p).unwrap_or(usize::MAX);
+                    abs < gs || abs >= ge
+                })
+                .collect()
+        }
+        WindowFrameExclusion::Ties => {
+            let g = ctx.row_group[row_idx];
+            let (gs, ge) = ctx.peer_groups[g];
+            part[fs..fe]
+                .iter()
+                .filter(|p| {
+                    if **p == part[row_idx] {
+                        return true;
+                    }
+                    let abs = part.iter().position(|v| *v == **p).unwrap_or(usize::MAX);
+                    abs < gs || abs >= ge
+                })
+                .collect()
+        }
+    }
+}
+
+fn first_in_filtered_frame(
+    frame: &WindowFrameSpec,
+    ctx: &PartitionFrameCtx,
+    part: &[usize],
+    fs: usize,
+    fe: usize,
+    row_idx: usize,
+) -> Option<usize> {
+    filtered_frame_positions(frame, ctx, part, fs, fe, row_idx)
+        .first()
+        .map(|p| **p)
+}
+
+fn last_in_filtered_frame(
+    frame: &WindowFrameSpec,
+    ctx: &PartitionFrameCtx,
+    part: &[usize],
+    fs: usize,
+    fe: usize,
+    row_idx: usize,
+) -> Option<usize> {
+    filtered_frame_positions(frame, ctx, part, fs, fe, row_idx)
+        .last()
+        .map(|p| **p)
 }
 
 fn evaluate_expr_rows(input: &ExecOutput, expr: &Expr) -> Result<Vec<ScalarValue>> {
@@ -3727,8 +3802,6 @@ mod tests {
     use std::collections::HashMap;
     use std::fs::File;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    #[cfg(feature = "vector")]
-    use std::sync::Arc;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3736,22 +3809,27 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
     #[cfg(feature = "vector")]
-    use arrow::array::{FixedSizeListBuilder, Float32Array, Float32Builder, Int64Array};
+    use arrow::array::{FixedSizeListBuilder, Float32Array, Float32Builder};
     use ffq_execution::PhysicalOperatorFactory;
-    use ffq_planner::{CteRefExec, CustomExec, ParquetScanExec, PhysicalPlan, UnionAllExec};
+    use ffq_planner::{
+        CteRefExec, CustomExec, Expr, ParquetScanExec, PhysicalPlan, UnionAllExec, WindowExpr,
+        WindowFrameBound, WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits, WindowFunction,
+        WindowOrderExpr,
+    };
     use ffq_storage::{Catalog, TableDef, TableStats};
     use ffq_planner::VectorTopKExec;
     #[cfg(feature = "vector")]
-    use ffq_planner::{Expr, LiteralValue};
+    use ffq_planner::LiteralValue;
     use ffq_storage::vector_index::{VectorIndexProvider, VectorTopKRow};
     use futures::future::BoxFuture;
     use futures::TryStreamExt;
     use parquet::arrow::ArrowWriter;
 
     #[cfg(feature = "vector")]
-    use super::{ExecOutput, run_topk_by_score};
+    use super::run_topk_by_score;
     use super::{
-        EmbeddedRuntime, QueryContext, Runtime, rows_to_vector_topk_output, run_vector_topk_with_provider,
+        EmbeddedRuntime, ExecOutput, QueryContext, Runtime, rows_to_vector_topk_output,
+        run_vector_topk_with_provider, run_window_exec,
     };
     use crate::physical_registry::PhysicalOperatorRegistry;
 
@@ -3841,6 +3919,159 @@ mod tests {
         assert_eq!(b.schema().field(0).name(), "id");
         assert_eq!(b.schema().field(1).name(), "score");
         assert_eq!(b.schema().field(2).name(), "payload");
+    }
+
+    #[test]
+    fn window_exclude_current_row_changes_sum_frame_results() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ord", DataType::Int64, false),
+            Field::new("score", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+                Arc::new(Int64Array::from(vec![10_i64, 20, 30])),
+            ],
+        )
+        .expect("batch");
+        let input = ExecOutput {
+            schema: schema.clone(),
+            batches: vec![batch],
+        };
+        let w = WindowExpr {
+            func: WindowFunction::Sum(Expr::ColumnRef {
+                name: "score".to_string(),
+                index: 1,
+            }),
+            partition_by: vec![],
+            order_by: vec![WindowOrderExpr {
+                expr: Expr::ColumnRef {
+                    name: "ord".to_string(),
+                    index: 0,
+                },
+                asc: true,
+                nulls_first: false,
+            }],
+            frame: Some(WindowFrameSpec {
+                units: WindowFrameUnits::Rows,
+                start_bound: WindowFrameBound::UnboundedPreceding,
+                end_bound: WindowFrameBound::UnboundedFollowing,
+                exclusion: WindowFrameExclusion::CurrentRow,
+            }),
+            output_name: "s".to_string(),
+        };
+        let out = run_window_exec(input, &[w]).expect("window");
+        let arr = out.batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("f64");
+        let vals = (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>();
+        assert_eq!(vals, vec![50.0, 40.0, 30.0]);
+    }
+
+    #[test]
+    fn window_sum_supports_all_exclusion_modes() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ord", DataType::Int64, false),
+            Field::new("score", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+                Arc::new(Int64Array::from(vec![10_i64, 10, 20])),
+            ],
+        )
+        .expect("batch");
+        let mk_input = || ExecOutput {
+            schema: schema.clone(),
+            batches: vec![batch.clone()],
+        };
+        let run = |exclusion: WindowFrameExclusion| -> Vec<f64> {
+            let w = WindowExpr {
+                func: WindowFunction::Sum(Expr::ColumnRef {
+                    name: "score".to_string(),
+                    index: 1,
+                }),
+                partition_by: vec![],
+                order_by: vec![WindowOrderExpr {
+                    expr: Expr::ColumnRef {
+                        name: "score".to_string(),
+                        index: 1,
+                    },
+                    asc: true,
+                    nulls_first: false,
+                }],
+                frame: Some(WindowFrameSpec {
+                    units: WindowFrameUnits::Rows,
+                    start_bound: WindowFrameBound::UnboundedPreceding,
+                    end_bound: WindowFrameBound::UnboundedFollowing,
+                    exclusion,
+                }),
+                output_name: "s".to_string(),
+            };
+            let out = run_window_exec(mk_input(), &[w]).expect("window");
+            let arr = out.batches[0]
+                .column(2)
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .expect("f64");
+            (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
+        };
+
+        assert_eq!(run(WindowFrameExclusion::NoOthers), vec![40.0, 40.0, 40.0]);
+        assert_eq!(run(WindowFrameExclusion::CurrentRow), vec![30.0, 30.0, 20.0]);
+        assert_eq!(run(WindowFrameExclusion::Group), vec![20.0, 20.0, 20.0]);
+        assert_eq!(run(WindowFrameExclusion::Ties), vec![30.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn window_exclusion_does_not_change_rank_results() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ord", DataType::Int64, false),
+            Field::new("score", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3])),
+                Arc::new(Int64Array::from(vec![10_i64, 10, 20])),
+            ],
+        )
+        .expect("batch");
+        let input = ExecOutput {
+            schema: schema.clone(),
+            batches: vec![batch],
+        };
+        let w = WindowExpr {
+            func: WindowFunction::Rank,
+            partition_by: vec![],
+            order_by: vec![WindowOrderExpr {
+                expr: Expr::ColumnRef {
+                    name: "score".to_string(),
+                    index: 1,
+                },
+                asc: true,
+                nulls_first: false,
+            }],
+            frame: Some(WindowFrameSpec {
+                units: WindowFrameUnits::Rows,
+                start_bound: WindowFrameBound::UnboundedPreceding,
+                end_bound: WindowFrameBound::CurrentRow,
+                exclusion: WindowFrameExclusion::Group,
+            }),
+            output_name: "r".to_string(),
+        };
+        let out = run_window_exec(input, &[w]).expect("window");
+        let arr = out.batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("i64");
+        let vals = (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>();
+        assert_eq!(vals, vec![1, 1, 3]);
     }
 
     #[test]

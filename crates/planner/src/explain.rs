@@ -1,6 +1,6 @@
 use crate::logical_plan::{
-    Expr, JoinStrategyHint, LogicalPlan, SubqueryCorrelation, WindowFrameBound, WindowFrameSpec,
-    WindowFrameUnits, WindowFunction,
+    Expr, JoinStrategyHint, LogicalPlan, SubqueryCorrelation, WindowFrameBound,
+    WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits, WindowFunction,
 };
 
 /// Render logical plan as human-readable multiline text.
@@ -422,14 +422,20 @@ fn fmt_expr(e: &Expr) -> String {
 
 fn fmt_window_frame(f: &WindowFrameSpec) -> String {
     format!(
-        "{} BETWEEN {} AND {}",
+        "{} BETWEEN {} AND {} EXCLUDE {}",
         match f.units {
             WindowFrameUnits::Rows => "ROWS",
             WindowFrameUnits::Range => "RANGE",
             WindowFrameUnits::Groups => "GROUPS",
         },
         fmt_window_bound(&f.start_bound),
-        fmt_window_bound(&f.end_bound)
+        fmt_window_bound(&f.end_bound),
+        match f.exclusion {
+            WindowFrameExclusion::NoOthers => "NO OTHERS",
+            WindowFrameExclusion::CurrentRow => "CURRENT ROW",
+            WindowFrameExclusion::Group => "GROUP",
+            WindowFrameExclusion::Ties => "TIES",
+        }
     )
 }
 

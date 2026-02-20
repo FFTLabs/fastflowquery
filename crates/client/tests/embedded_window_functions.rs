@@ -557,3 +557,61 @@ fn aggregate_window_functions_count_avg_min_max_are_correct() {
 
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn frame_exclusion_semantics_apply_in_sql_queries() {
+    let (engine, path) = make_engine_with_window_fixture();
+    let sql = "SELECT grp, ord, \
+                    SUM(score) OVER (PARTITION BY grp ORDER BY score ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) AS s_cur, \
+                    SUM(score) OVER (PARTITION BY grp ORDER BY score ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) AS s_group, \
+                    SUM(score) OVER (PARTITION BY grp ORDER BY score ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) AS s_ties, \
+                    RANK() OVER (PARTITION BY grp ORDER BY score ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE GROUP) AS rnk \
+               FROM t";
+    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let grp = batch.column(0).as_any().downcast_ref::<StringArray>().expect("grp");
+        let ord = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("ord");
+        let s_cur = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("s_cur");
+        let s_group = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("s_group");
+        let s_ties = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("s_ties");
+        let rnk = batch.column(5).as_any().downcast_ref::<Int64Array>().expect("rnk");
+        for i in 0..batch.num_rows() {
+            rows.push((
+                grp.value(i).to_string(),
+                ord.value(i),
+                s_cur.value(i),
+                s_group.value(i),
+                s_ties.value(i),
+                rnk.value(i),
+            ));
+        }
+    }
+
+    rows.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    assert_eq!(
+        rows,
+        vec![
+            ("A".to_string(), 1, 30.0, 20.0, 30.0, 1),
+            ("A".to_string(), 2, 30.0, 20.0, 30.0, 1),
+            ("A".to_string(), 3, 20.0, 20.0, 40.0, 3),
+            ("B".to_string(), 1, 9.0, 9.0, 16.0, 1),
+            ("B".to_string(), 2, 7.0, 7.0, 16.0, 2),
+        ]
+    );
+
+    let _ = std::fs::remove_file(path);
+}

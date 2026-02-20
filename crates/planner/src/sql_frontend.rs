@@ -10,8 +10,8 @@ use sqlparser::ast::{
 
 use crate::logical_plan::{
     AggExpr, BinaryOp, Expr, JoinStrategyHint, LiteralValue, LogicalPlan, SubqueryCorrelation,
-    WindowExpr, WindowFrameBound, WindowFrameSpec, WindowFrameUnits, WindowFunction,
-    WindowOrderExpr,
+    WindowExpr, WindowFrameBound, WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits,
+    WindowFunction, WindowOrderExpr,
 };
 
 const E_RECURSIVE_CTE_OVERFLOW: &str = "E_RECURSIVE_CTE_OVERFLOW";
@@ -1418,11 +1418,22 @@ fn parse_window_frame(
             .unwrap_or(&sqlparser::ast::WindowFrameBound::CurrentRow),
         params,
     )?;
+    let exclusion = match frame.exclusion {
+        Some(sqlparser::ast::WindowFrameExclusion::NoOthers) | None => {
+            WindowFrameExclusion::NoOthers
+        }
+        Some(sqlparser::ast::WindowFrameExclusion::CurrentRow) => {
+            WindowFrameExclusion::CurrentRow
+        }
+        Some(sqlparser::ast::WindowFrameExclusion::Group) => WindowFrameExclusion::Group,
+        Some(sqlparser::ast::WindowFrameExclusion::Ties) => WindowFrameExclusion::Ties,
+    };
     validate_window_frame_bounds(&start_bound, &end_bound)?;
     Ok(WindowFrameSpec {
         units,
         start_bound,
         end_bound,
+        exclusion,
     })
 }
 
@@ -1802,7 +1813,7 @@ mod tests {
 
     use super::{CteReuseMode, SqlFrontendOptions, sql_to_logical, sql_to_logical_with_options};
     use crate::logical_plan::LiteralValue;
-    use crate::logical_plan::LogicalPlan;
+    use crate::logical_plan::{LogicalPlan, WindowFrameExclusion};
 
     #[test]
     fn parses_insert_into_select() {
@@ -2346,6 +2357,61 @@ mod tests {
                 LogicalPlan::Window { exprs, .. } => {
                     assert_eq!(exprs.len(), 3);
                     assert!(exprs.iter().all(|w| w.frame.is_some()));
+                }
+                other => panic!("expected Window, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_window_frame_exclusions() {
+        let plan = sql_to_logical(
+            "SELECT \
+                SUM(a) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) AS c, \
+                SUM(a) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) AS g, \
+                SUM(a) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) AS t, \
+                SUM(a) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE NO OTHERS) AS n \
+             FROM t",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        match plan {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Window { exprs, .. } => {
+                    assert_eq!(exprs.len(), 4);
+                    assert_eq!(
+                        exprs[0]
+                            .frame
+                            .as_ref()
+                            .expect("frame")
+                            .exclusion,
+                        WindowFrameExclusion::CurrentRow
+                    );
+                    assert_eq!(
+                        exprs[1]
+                            .frame
+                            .as_ref()
+                            .expect("frame")
+                            .exclusion,
+                        WindowFrameExclusion::Group
+                    );
+                    assert_eq!(
+                        exprs[2]
+                            .frame
+                            .as_ref()
+                            .expect("frame")
+                            .exclusion,
+                        WindowFrameExclusion::Ties
+                    );
+                    assert_eq!(
+                        exprs[3]
+                            .frame
+                            .as_ref()
+                            .expect("frame")
+                            .exclusion,
+                        WindowFrameExclusion::NoOthers
+                    );
                 }
                 other => panic!("expected Window, got {other:?}"),
             },
