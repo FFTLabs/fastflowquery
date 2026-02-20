@@ -99,6 +99,10 @@ message StageMetrics {
   uint64 map_output_rows = 6;
   uint64 map_output_bytes = 7;
   uint64 map_output_batches = 8;
+  uint64 map_output_partitions = 9;
+  uint32 planned_reduce_tasks = 10;
+  uint32 adaptive_reduce_tasks = 11;
+  uint64 adaptive_target_bytes = 12;
 }
 
 message GetQueryStatusResponse {

@@ -3,10 +3,10 @@ use ffq_common::{FfqError, Result};
 use crate::logical_plan::{Expr, JoinStrategyHint, LogicalPlan};
 use crate::physical_plan::{
     BroadcastExchange, BuildSide, CteRefExec, ExchangeExec, ExistsSubqueryFilterExec, FilterExec,
-    FinalHashAggregateExec, HashJoinAlternativeExec, HashJoinExec, InSubqueryFilterExec,
-    LimitExec, ParquetScanExec, ParquetWriteExec, PartialHashAggregateExec, PartitioningSpec,
-    PhysicalPlan, ProjectExec, ScalarSubqueryFilterExec, ShuffleReadExchange,
-    ShuffleWriteExchange, TopKByScoreExec, UnionAllExec, WindowExec,
+    FinalHashAggregateExec, HashJoinAlternativeExec, HashJoinExec, InSubqueryFilterExec, LimitExec,
+    ParquetScanExec, ParquetWriteExec, PartialHashAggregateExec, PartitioningSpec, PhysicalPlan,
+    ProjectExec, ScalarSubqueryFilterExec, ShuffleReadExchange, ShuffleWriteExchange,
+    TopKByScoreExec, UnionAllExec, WindowExec,
 };
 
 #[derive(Debug, Clone)]
@@ -315,20 +315,22 @@ pub fn create_physical_plan(
                         ) {
                             vec![
                                 HashJoinAlternativeExec {
-                                    left: Box::new(PhysicalPlan::Exchange(ExchangeExec::Broadcast(
-                                        BroadcastExchange {
+                                    left: Box::new(PhysicalPlan::Exchange(
+                                        ExchangeExec::Broadcast(BroadcastExchange {
                                             input: Box::new(l.clone()),
-                                        },
-                                    ))),
+                                        }),
+                                    )),
                                     right: Box::new(r.clone()),
                                     strategy_hint: JoinStrategyHint::BroadcastLeft,
                                     build_side: BuildSide::Left,
                                 },
                                 HashJoinAlternativeExec {
                                     left: Box::new(l),
-                                    right: Box::new(PhysicalPlan::Exchange(ExchangeExec::Broadcast(
-                                        BroadcastExchange { input: Box::new(r) },
-                                    ))),
+                                    right: Box::new(PhysicalPlan::Exchange(
+                                        ExchangeExec::Broadcast(BroadcastExchange {
+                                            input: Box::new(r),
+                                        }),
+                                    )),
                                     strategy_hint: JoinStrategyHint::BroadcastRight,
                                     build_side: BuildSide::Right,
                                 },

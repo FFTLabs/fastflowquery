@@ -310,6 +310,10 @@ fn proto_query_status(status: CoreQueryStatus) -> v1::QueryStatus {
             map_output_rows: m.map_output_rows,
             map_output_bytes: m.map_output_bytes,
             map_output_batches: m.map_output_batches,
+            map_output_partitions: m.map_output_partitions,
+            planned_reduce_tasks: m.planned_reduce_tasks,
+            adaptive_reduce_tasks: m.adaptive_reduce_tasks,
+            adaptive_target_bytes: m.adaptive_target_bytes,
         })
         .collect::<Vec<_>>();
     stage_metrics.sort_by_key(|m| m.stage_id);

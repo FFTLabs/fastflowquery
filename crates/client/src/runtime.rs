@@ -974,7 +974,12 @@ fn choose_adaptive_join_alternative(
         };
         return (*alt.left, *alt.right, alt.build_side, label);
     }
-    ((**left).clone(), (**right).clone(), build_side, "adaptive_fallback_shuffle")
+    (
+        (**left).clone(),
+        (**right).clone(),
+        build_side,
+        "adaptive_fallback_shuffle",
+    )
 }
 
 fn estimate_plan_output_bytes(plan: &PhysicalPlan, catalog: &Arc<Catalog>) -> u64 {
@@ -1000,10 +1005,8 @@ fn estimate_plan_output_bytes(plan: &PhysicalPlan, catalog: &Arc<Catalog>) -> u6
         PhysicalPlan::CoalesceBatches(x) => estimate_plan_output_bytes(&x.input, catalog),
         PhysicalPlan::PartialHashAggregate(x) => estimate_plan_output_bytes(&x.input, catalog),
         PhysicalPlan::FinalHashAggregate(x) => estimate_plan_output_bytes(&x.input, catalog),
-        PhysicalPlan::HashJoin(x) => {
-            estimate_plan_output_bytes(&x.left, catalog)
-                .saturating_add(estimate_plan_output_bytes(&x.right, catalog))
-        }
+        PhysicalPlan::HashJoin(x) => estimate_plan_output_bytes(&x.left, catalog)
+            .saturating_add(estimate_plan_output_bytes(&x.right, catalog)),
         PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(x)) => {
             estimate_plan_output_bytes(&x.input, catalog)
         }

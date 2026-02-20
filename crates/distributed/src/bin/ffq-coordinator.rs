@@ -48,6 +48,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_task_attempts = env_u32_or_default("FFQ_MAX_TASK_ATTEMPTS", 3);
     let retry_backoff_base_ms = env_u64_or_default("FFQ_RETRY_BACKOFF_BASE_MS", 250);
     let worker_liveness_timeout_ms = env_u64_or_default("FFQ_WORKER_LIVENESS_TIMEOUT_MS", 15000);
+    let adaptive_shuffle_target_bytes =
+        env_u64_or_default("FFQ_ADAPTIVE_SHUFFLE_TARGET_BYTES", 128 * 1024 * 1024);
     let catalog_path = env::var("FFQ_COORDINATOR_CATALOG_PATH").ok();
     std::fs::create_dir_all(&shuffle_root)?;
     let catalog = load_catalog(catalog_path.clone())?;
@@ -61,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_task_attempts,
             retry_backoff_base_ms,
             worker_liveness_timeout_ms,
+            adaptive_shuffle_target_bytes,
             ..CoordinatorConfig::default()
         },
         catalog,
@@ -68,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let services = CoordinatorServices::from_shared(Arc::clone(&coordinator));
 
     println!(
-        "ffq-coordinator listening on {addr} (shuffle_root={shuffle_root}, blacklist_threshold={blacklist_failure_threshold}, worker_limit={max_concurrent_tasks_per_worker}, query_limit={max_concurrent_tasks_per_query}, max_attempts={max_task_attempts}, retry_backoff_ms={retry_backoff_base_ms}, liveness_timeout_ms={worker_liveness_timeout_ms}, catalog_path={})",
+        "ffq-coordinator listening on {addr} (shuffle_root={shuffle_root}, blacklist_threshold={blacklist_failure_threshold}, worker_limit={max_concurrent_tasks_per_worker}, query_limit={max_concurrent_tasks_per_query}, max_attempts={max_task_attempts}, retry_backoff_ms={retry_backoff_base_ms}, liveness_timeout_ms={worker_liveness_timeout_ms}, adaptive_shuffle_target_bytes={adaptive_shuffle_target_bytes}, catalog_path={})",
         catalog_path.unwrap_or_else(|| "<none>".to_string())
     );
 
