@@ -2,12 +2,20 @@ use crate::logical_plan::{
     Expr, JoinStrategyHint, LogicalPlan, SubqueryCorrelation, WindowExpr, WindowFrameBound,
     WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits, WindowFunction,
 };
+use crate::physical_plan::{ExchangeExec, PartitioningSpec, PhysicalPlan};
 use std::collections::HashMap;
 
 /// Render logical plan as human-readable multiline text.
 pub fn explain_logical(plan: &LogicalPlan) -> String {
     let mut s = String::new();
     fmt_plan(plan, 0, &mut s);
+    s
+}
+
+/// Render physical plan as human-readable multiline text.
+pub fn explain_physical(plan: &PhysicalPlan) -> String {
+    let mut s = String::new();
+    fmt_physical(plan, 0, &mut s);
     s
 }
 
@@ -171,15 +179,12 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                     .collect::<Vec<_>>()
                     .join(", ");
                 out.push_str(&format!(
-                    "{pad}  {} := {} OVER (PARTITION BY [{}] ORDER BY [{}]{} )\n",
+                    "{pad}  {} := {} OVER (PARTITION BY [{}] ORDER BY [{}] FRAME {} )\n",
                     w.output_name,
                     func,
                     part,
                     ord,
-                    w.frame
-                        .as_ref()
-                        .map(|f| format!(" FRAME {}", fmt_window_frame(f)))
-                        .unwrap_or_default()
+                    fmt_window_frame_or_default(w)
                 ));
             }
             fmt_plan(input, indent + 1, out);
@@ -271,6 +276,177 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
     }
 }
 
+fn fmt_physical(plan: &PhysicalPlan, indent: usize, out: &mut String) {
+    let pad = "  ".repeat(indent);
+    match plan {
+        PhysicalPlan::ParquetScan(scan) => {
+            out.push_str(&format!("{pad}ParquetScan table={}\n", scan.table));
+            out.push_str(&format!("{pad}  projection={:?}\n", scan.projection));
+            out.push_str(&format!("{pad}  pushed_filters={}\n", scan.filters.len()));
+        }
+        PhysicalPlan::ParquetWrite(write) => {
+            out.push_str(&format!("{pad}ParquetWrite table={}\n", write.table));
+            fmt_physical(&write.input, indent + 1, out);
+        }
+        PhysicalPlan::Filter(filter) => {
+            out.push_str(&format!("{pad}Filter {}\n", fmt_expr(&filter.predicate)));
+            fmt_physical(&filter.input, indent + 1, out);
+        }
+        PhysicalPlan::InSubqueryFilter(exec) => {
+            out.push_str(&format!("{pad}InSubqueryFilter negated={}\n", exec.negated));
+            out.push_str(&format!("{pad}  expr={}\n", fmt_expr(&exec.expr)));
+            out.push_str(&format!("{pad}  input:\n"));
+            fmt_physical(&exec.input, indent + 2, out);
+            out.push_str(&format!("{pad}  subquery:\n"));
+            fmt_physical(&exec.subquery, indent + 2, out);
+        }
+        PhysicalPlan::ExistsSubqueryFilter(exec) => {
+            out.push_str(&format!("{pad}ExistsSubqueryFilter negated={}\n", exec.negated));
+            out.push_str(&format!("{pad}  input:\n"));
+            fmt_physical(&exec.input, indent + 2, out);
+            out.push_str(&format!("{pad}  subquery:\n"));
+            fmt_physical(&exec.subquery, indent + 2, out);
+        }
+        PhysicalPlan::ScalarSubqueryFilter(exec) => {
+            out.push_str(&format!(
+                "{pad}ScalarSubqueryFilter expr={} op={:?}\n",
+                fmt_expr(&exec.expr),
+                exec.op
+            ));
+            out.push_str(&format!("{pad}  input:\n"));
+            fmt_physical(&exec.input, indent + 2, out);
+            out.push_str(&format!("{pad}  subquery:\n"));
+            fmt_physical(&exec.subquery, indent + 2, out);
+        }
+        PhysicalPlan::Project(project) => {
+            out.push_str(&format!("{pad}Project exprs={}\n", project.exprs.len()));
+            for (expr, name) in &project.exprs {
+                out.push_str(&format!("{pad}  {name} := {}\n", fmt_expr(expr)));
+            }
+            fmt_physical(&project.input, indent + 1, out);
+        }
+        PhysicalPlan::Window(window) => {
+            out.push_str(&format!("{pad}WindowExec\n"));
+            let window_groups = window_sort_reuse_groups(&window.exprs);
+            out.push_str(&format!(
+                "{pad}  window_exprs={} sort_reuse_groups={}\n",
+                window.exprs.len(),
+                window_groups.len()
+            ));
+            for (gidx, group) in window_groups.iter().enumerate() {
+                out.push_str(&format!(
+                    "{pad}  group[{gidx}] partition=[{}] order=[{}] windows=[{}]\n",
+                    group.partition_display,
+                    group.order_display,
+                    group.window_names.join(", ")
+                ));
+            }
+            out.push_str(&format!(
+                "{pad}  distribution_strategy={}\n",
+                window_distribution_strategy(&window.input)
+            ));
+            for w in &window.exprs {
+                out.push_str(&format!(
+                    "{pad}  {} frame={}\n",
+                    w.output_name,
+                    fmt_window_frame_or_default(w)
+                ));
+            }
+            fmt_physical(&window.input, indent + 1, out);
+        }
+        PhysicalPlan::CoalesceBatches(exec) => {
+            out.push_str(&format!(
+                "{pad}CoalesceBatches target_batch_rows={}\n",
+                exec.target_batch_rows
+            ));
+            fmt_physical(&exec.input, indent + 1, out);
+        }
+        PhysicalPlan::PartialHashAggregate(agg) => {
+            out.push_str(&format!(
+                "{pad}PartialHashAggregate group_by={} aggs={}\n",
+                agg.group_exprs.len(),
+                agg.aggr_exprs.len()
+            ));
+            fmt_physical(&agg.input, indent + 1, out);
+        }
+        PhysicalPlan::FinalHashAggregate(agg) => {
+            out.push_str(&format!(
+                "{pad}FinalHashAggregate group_by={} aggs={}\n",
+                agg.group_exprs.len(),
+                agg.aggr_exprs.len()
+            ));
+            fmt_physical(&agg.input, indent + 1, out);
+        }
+        PhysicalPlan::HashJoin(join) => {
+            out.push_str(&format!(
+                "{pad}HashJoin type={:?} strategy={}\n",
+                join.join_type,
+                fmt_join_hint(join.strategy_hint)
+            ));
+            out.push_str(&format!("{pad}  on={:?}\n", join.on));
+            out.push_str(&format!("{pad}  left:\n"));
+            fmt_physical(&join.left, indent + 2, out);
+            out.push_str(&format!("{pad}  right:\n"));
+            fmt_physical(&join.right, indent + 2, out);
+        }
+        PhysicalPlan::Exchange(exchange) => match exchange {
+            ExchangeExec::ShuffleWrite(e) => {
+                out.push_str(&format!(
+                    "{pad}ShuffleWrite partitioning={}\n",
+                    fmt_partitioning_spec(&e.partitioning)
+                ));
+                fmt_physical(&e.input, indent + 1, out);
+            }
+            ExchangeExec::ShuffleRead(e) => {
+                out.push_str(&format!(
+                    "{pad}ShuffleRead partitioning={}\n",
+                    fmt_partitioning_spec(&e.partitioning)
+                ));
+                fmt_physical(&e.input, indent + 1, out);
+            }
+            ExchangeExec::Broadcast(e) => {
+                out.push_str(&format!("{pad}Broadcast\n"));
+                fmt_physical(&e.input, indent + 1, out);
+            }
+        },
+        PhysicalPlan::Limit(limit) => {
+            out.push_str(&format!("{pad}Limit n={}\n", limit.n));
+            fmt_physical(&limit.input, indent + 1, out);
+        }
+        PhysicalPlan::TopKByScore(topk) => {
+            out.push_str(&format!(
+                "{pad}TopKByScore k={} score={}\n",
+                topk.k,
+                fmt_expr(&topk.score_expr)
+            ));
+            fmt_physical(&topk.input, indent + 1, out);
+        }
+        PhysicalPlan::UnionAll(union) => {
+            out.push_str(&format!("{pad}UnionAll\n"));
+            out.push_str(&format!("{pad}  left:\n"));
+            fmt_physical(&union.left, indent + 2, out);
+            out.push_str(&format!("{pad}  right:\n"));
+            fmt_physical(&union.right, indent + 2, out);
+        }
+        PhysicalPlan::CteRef(cte) => {
+            out.push_str(&format!("{pad}CteRef name={}\n", cte.name));
+            fmt_physical(&cte.plan, indent + 1, out);
+        }
+        PhysicalPlan::VectorTopK(exec) => {
+            out.push_str(&format!(
+                "{pad}VectorTopK table={} k={} query_dim={}\n",
+                exec.table,
+                exec.k,
+                exec.query_vector.len()
+            ));
+        }
+        PhysicalPlan::Custom(custom) => {
+            out.push_str(&format!("{pad}Custom op_name={}\n", custom.op_name));
+            fmt_physical(&custom.input, indent + 1, out);
+        }
+    }
+}
+
 fn fmt_join_hint(h: JoinStrategyHint) -> &'static str {
     match h {
         JoinStrategyHint::Auto => "auto",
@@ -346,9 +522,13 @@ fn fmt_subquery_correlation(c: &SubqueryCorrelation) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::explain_logical;
+    use super::{explain_logical, explain_physical};
     use crate::logical_plan::{
         Expr, JoinStrategyHint, JoinType, LogicalPlan, WindowExpr, WindowFunction, WindowOrderExpr,
+    };
+    use crate::physical_plan::{
+        ExchangeExec, ParquetScanExec, PartitioningSpec, PhysicalPlan, ProjectExec,
+        ShuffleReadExchange, ShuffleWriteExchange, WindowExec,
     };
 
     fn scan(name: &str) -> LogicalPlan {
@@ -433,6 +613,54 @@ mod tests {
         assert!(ex.contains("window_exprs=3 sort_reuse_groups=2"), "{ex}");
         assert!(ex.contains("windows=[rn, rnk]"), "{ex}");
         assert!(ex.contains("windows=[dr]"), "{ex}");
+        assert!(ex.contains("FRAME RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"), "{ex}");
+    }
+
+    #[test]
+    fn explain_physical_window_prints_distribution_strategy_and_frames() {
+        let plan = PhysicalPlan::Window(WindowExec {
+            exprs: vec![WindowExpr {
+                func: WindowFunction::RowNumber,
+                partition_by: vec![Expr::Column("grp".to_string())],
+                order_by: vec![WindowOrderExpr {
+                    expr: Expr::Column("ord".to_string()),
+                    asc: true,
+                    nulls_first: false,
+                }],
+                frame: None,
+                output_name: "rn".to_string(),
+            }],
+            input: Box::new(PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(
+                ShuffleReadExchange {
+                    partitioning: PartitioningSpec::HashKeys {
+                        keys: vec!["grp".to_string()],
+                        partitions: 8,
+                    },
+                    input: Box::new(PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(
+                        ShuffleWriteExchange {
+                            partitioning: PartitioningSpec::HashKeys {
+                                keys: vec!["grp".to_string()],
+                                partitions: 8,
+                            },
+                            input: Box::new(PhysicalPlan::Project(ProjectExec {
+                                exprs: vec![(Expr::Column("grp".to_string()), "grp".to_string())],
+                                input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
+                                    table: "t".to_string(),
+                                    schema: None,
+                                    projection: None,
+                                    filters: vec![],
+                                })),
+                            })),
+                        },
+                    ))),
+                },
+            ))),
+        });
+        let ex = explain_physical(&plan);
+        assert!(ex.contains("WindowExec"), "{ex}");
+        assert!(ex.contains("distribution_strategy=shuffle hash(keys=[grp], partitions=8)"), "{ex}");
+        assert!(ex.contains("frame=RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"), "{ex}");
+        assert!(ex.contains("sort_reuse_groups=1"), "{ex}");
     }
 }
 
@@ -502,6 +730,19 @@ fn fmt_window_frame(f: &WindowFrameSpec) -> String {
     )
 }
 
+fn fmt_window_frame_or_default(w: &WindowExpr) -> String {
+    if let Some(frame) = &w.frame {
+        return fmt_window_frame(frame);
+    }
+    if w.order_by.is_empty() {
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE NO OTHERS (implicit)"
+            .to_string()
+    } else {
+        "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE NO OTHERS (implicit)"
+            .to_string()
+    }
+}
+
 fn fmt_window_bound(b: &WindowFrameBound) -> String {
     match b {
         WindowFrameBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
@@ -509,6 +750,27 @@ fn fmt_window_bound(b: &WindowFrameBound) -> String {
         WindowFrameBound::CurrentRow => "CURRENT ROW".to_string(),
         WindowFrameBound::Following(n) => format!("{n} FOLLOWING"),
         WindowFrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+    }
+}
+
+fn fmt_partitioning_spec(spec: &PartitioningSpec) -> String {
+    match spec {
+        PartitioningSpec::Single => "single".to_string(),
+        PartitioningSpec::HashKeys { keys, partitions } => {
+            format!("hash(keys=[{}], partitions={partitions})", keys.join(", "))
+        }
+    }
+}
+
+fn window_distribution_strategy(input: &PhysicalPlan) -> String {
+    match input {
+        PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(read)) => match read.input.as_ref() {
+            PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(write)) => {
+                format!("shuffle {}", fmt_partitioning_spec(&write.partitioning))
+            }
+            _ => format!("shuffle {}", fmt_partitioning_spec(&read.partitioning)),
+        },
+        _ => "local(no_exchange)".to_string(),
     }
 }
 

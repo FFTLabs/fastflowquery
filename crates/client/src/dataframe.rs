@@ -145,8 +145,12 @@ impl DataFrame {
             &provider,
             &self.session.config,
         )?;
-
-        Ok(ffq_planner::explain_logical(&opt))
+        let physical = self.session.planner.create_physical_plan(&opt)?;
+        Ok(format!(
+            "== Logical Plan ==\n{}\n== Physical Plan ==\n{}",
+            ffq_planner::explain_logical(&opt),
+            ffq_planner::explain_physical(&physical)
+        ))
     }
 
     /// df.collect() (async)
