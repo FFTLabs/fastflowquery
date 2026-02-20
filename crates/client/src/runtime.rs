@@ -1328,10 +1328,7 @@ fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput
                 output.len()
             )));
         }
-        let dt = match w.func {
-            WindowFunction::RowNumber | WindowFunction::Rank => DataType::Int64,
-            WindowFunction::Sum(_) => DataType::Float64,
-        };
+        let dt = window_output_type(&input.schema, w)?;
         out_fields.push(Field::new(&w.output_name, dt, true));
         for (idx, value) in output.into_iter().enumerate() {
             rows[idx].push(value);
@@ -1365,35 +1362,18 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
     });
 
     let mut out = vec![ScalarValue::Null; row_count];
+    let partitions = partition_ranges(&order_idx, &partition_keys);
     match &w.func {
         WindowFunction::RowNumber => {
-            let mut i = 0usize;
-            while i < order_idx.len() {
-                let start = i;
-                let first = order_idx[i];
-                i += 1;
-                while i < order_idx.len()
-                    && cmp_key_sets(&partition_keys, first, order_idx[i]) == Ordering::Equal
-                {
-                    i += 1;
-                }
-                for (offset, pos) in order_idx[start..i].iter().enumerate() {
+            for (start, end) in &partitions {
+                for (offset, pos) in order_idx[*start..*end].iter().enumerate() {
                     out[*pos] = ScalarValue::Int64((offset + 1) as i64);
                 }
             }
         }
         WindowFunction::Rank => {
-            let mut i = 0usize;
-            while i < order_idx.len() {
-                let start = i;
-                let first = order_idx[i];
-                i += 1;
-                while i < order_idx.len()
-                    && cmp_key_sets(&partition_keys, first, order_idx[i]) == Ordering::Equal
-                {
-                    i += 1;
-                }
-                let part = &order_idx[start..i];
+            for (start, end) in &partitions {
+                let part = &order_idx[*start..*end];
                 let mut rank = 1_i64;
                 let mut part_i = 0usize;
                 while part_i < part.len() {
@@ -1408,21 +1388,84 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                 }
             }
         }
+        WindowFunction::DenseRank => {
+            for (start, end) in &partitions {
+                let part = &order_idx[*start..*end];
+                let mut rank = 1_i64;
+                let mut part_i = 0usize;
+                while part_i < part.len() {
+                    if part_i > 0
+                        && cmp_order_key_sets(&order_keys, &w.order_by, part[part_i - 1], part[part_i])
+                            != Ordering::Equal
+                    {
+                        rank += 1;
+                    }
+                    out[part[part_i]] = ScalarValue::Int64(rank);
+                    part_i += 1;
+                }
+            }
+        }
+        WindowFunction::PercentRank => {
+            for (start, end) in &partitions {
+                let part = &order_idx[*start..*end];
+                let n = part.len();
+                if n <= 1 {
+                    for pos in part {
+                        out[*pos] = ScalarValue::Float64Bits(0.0_f64.to_bits());
+                    }
+                    continue;
+                }
+                let mut rank = 1_i64;
+                for part_i in 0..part.len() {
+                    if part_i > 0
+                        && cmp_order_key_sets(&order_keys, &w.order_by, part[part_i - 1], part[part_i])
+                            != Ordering::Equal
+                    {
+                        rank = (part_i as i64) + 1;
+                    }
+                    let pct = (rank as f64 - 1.0_f64) / ((n as f64) - 1.0_f64);
+                    out[part[part_i]] = ScalarValue::Float64Bits(pct.to_bits());
+                }
+            }
+        }
+        WindowFunction::CumeDist => {
+            for (start, end) in &partitions {
+                let part = &order_idx[*start..*end];
+                let n = part.len() as f64;
+                let mut i = 0usize;
+                while i < part.len() {
+                    let tie_start = i;
+                    i += 1;
+                    while i < part.len()
+                        && cmp_order_key_sets(&order_keys, &w.order_by, part[tie_start], part[i])
+                            == Ordering::Equal
+                    {
+                        i += 1;
+                    }
+                    let cume = (i as f64) / n;
+                    for pos in &part[tie_start..i] {
+                        out[*pos] = ScalarValue::Float64Bits(cume.to_bits());
+                    }
+                }
+            }
+        }
+        WindowFunction::Ntile(buckets) => {
+            for (start, end) in &partitions {
+                let part = &order_idx[*start..*end];
+                let n_rows = part.len();
+                let n_buckets = *buckets;
+                for (i, pos) in part.iter().enumerate() {
+                    let tile = ((i * n_buckets) / n_rows) + 1;
+                    out[*pos] = ScalarValue::Int64(tile as i64);
+                }
+            }
+        }
         WindowFunction::Sum(arg) => {
             let values = evaluate_expr_rows(input, arg)?;
-            let mut i = 0usize;
-            while i < order_idx.len() {
-                let start = i;
-                let first = order_idx[i];
-                i += 1;
-                while i < order_idx.len()
-                    && cmp_key_sets(&partition_keys, first, order_idx[i]) == Ordering::Equal
-                {
-                    i += 1;
-                }
+            for (start, end) in &partitions {
                 let mut running = 0.0_f64;
                 let mut seen = false;
-                for pos in &order_idx[start..i] {
+                for pos in &order_idx[*start..*end] {
                     match &values[*pos] {
                         ScalarValue::Int64(v) => {
                             running += *v as f64;
@@ -1447,8 +1490,128 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                 }
             }
         }
+        WindowFunction::Lag {
+            expr,
+            offset,
+            default,
+        } => {
+            let values = evaluate_expr_rows(input, expr)?;
+            let defaults = default
+                .as_ref()
+                .map(|d| evaluate_expr_rows(input, d))
+                .transpose()?;
+            for (start, end) in &partitions {
+                let part = &order_idx[*start..*end];
+                for (i, pos) in part.iter().enumerate() {
+                    out[*pos] = if i >= *offset {
+                        values[part[i - *offset]].clone()
+                    } else if let Some(d) = &defaults {
+                        d[*pos].clone()
+                    } else {
+                        ScalarValue::Null
+                    };
+                }
+            }
+        }
+        WindowFunction::Lead {
+            expr,
+            offset,
+            default,
+        } => {
+            let values = evaluate_expr_rows(input, expr)?;
+            let defaults = default
+                .as_ref()
+                .map(|d| evaluate_expr_rows(input, d))
+                .transpose()?;
+            for (start, end) in &partitions {
+                let part = &order_idx[*start..*end];
+                for (i, pos) in part.iter().enumerate() {
+                    out[*pos] = if i + *offset < part.len() {
+                        values[part[i + *offset]].clone()
+                    } else if let Some(d) = &defaults {
+                        d[*pos].clone()
+                    } else {
+                        ScalarValue::Null
+                    };
+                }
+            }
+        }
+        WindowFunction::FirstValue(expr) => {
+            let values = evaluate_expr_rows(input, expr)?;
+            for (start, end) in &partitions {
+                let part = &order_idx[*start..*end];
+                if let Some(first) = part.first() {
+                    let v = values[*first].clone();
+                    for pos in part {
+                        out[*pos] = v.clone();
+                    }
+                }
+            }
+        }
+        WindowFunction::LastValue(expr) => {
+            let values = evaluate_expr_rows(input, expr)?;
+            for (start, end) in &partitions {
+                let part = &order_idx[*start..*end];
+                if let Some(last) = part.last() {
+                    let v = values[*last].clone();
+                    for pos in part {
+                        out[*pos] = v.clone();
+                    }
+                }
+            }
+        }
+        WindowFunction::NthValue { expr, n } => {
+            let values = evaluate_expr_rows(input, expr)?;
+            for (start, end) in &partitions {
+                let part = &order_idx[*start..*end];
+                let v = if *n == 0 || *n > part.len() {
+                    ScalarValue::Null
+                } else {
+                    values[part[*n - 1]].clone()
+                };
+                for pos in part {
+                    out[*pos] = v.clone();
+                }
+            }
+        }
     }
     Ok(out)
+}
+
+fn partition_ranges(order_idx: &[usize], partition_keys: &[Vec<ScalarValue>]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < order_idx.len() {
+        let start = i;
+        let first = order_idx[i];
+        i += 1;
+        while i < order_idx.len() && cmp_key_sets(partition_keys, first, order_idx[i]) == Ordering::Equal
+        {
+            i += 1;
+        }
+        out.push((start, i));
+    }
+    out
+}
+
+fn window_output_type(input_schema: &SchemaRef, w: &WindowExpr) -> Result<DataType> {
+    match &w.func {
+        WindowFunction::RowNumber
+        | WindowFunction::Rank
+        | WindowFunction::DenseRank
+        | WindowFunction::Ntile(_) => Ok(DataType::Int64),
+        WindowFunction::PercentRank | WindowFunction::CumeDist | WindowFunction::Sum(_) => {
+            Ok(DataType::Float64)
+        }
+        WindowFunction::Lag { expr, .. }
+        | WindowFunction::Lead { expr, .. }
+        | WindowFunction::FirstValue(expr)
+        | WindowFunction::LastValue(expr)
+        | WindowFunction::NthValue { expr, .. } => {
+            let compiled = compile_expr(expr, input_schema)?;
+            Ok(compiled.data_type())
+        }
+    }
 }
 
 fn evaluate_expr_rows(input: &ExecOutput, expr: &Expr) -> Result<Vec<ScalarValue>> {

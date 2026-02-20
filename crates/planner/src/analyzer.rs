@@ -374,7 +374,11 @@ impl Analyzer {
                 for w in exprs {
                     let aw = self.analyze_window_expr(w, &in_resolver)?;
                     let dt = match &aw.func {
-                        WindowFunction::RowNumber | WindowFunction::Rank => DataType::Int64,
+                        WindowFunction::RowNumber
+                        | WindowFunction::Rank
+                        | WindowFunction::DenseRank
+                        | WindowFunction::Ntile(_) => DataType::Int64,
+                        WindowFunction::PercentRank | WindowFunction::CumeDist => DataType::Float64,
                         WindowFunction::Sum(expr) => {
                             let (_expr, dt) = self.analyze_expr(expr.clone(), &in_resolver)?;
                             if !is_numeric(&dt) {
@@ -383,6 +387,14 @@ impl Analyzer {
                                 ));
                             }
                             DataType::Float64
+                        }
+                        WindowFunction::Lag { expr, .. }
+                        | WindowFunction::Lead { expr, .. }
+                        | WindowFunction::FirstValue(expr)
+                        | WindowFunction::LastValue(expr)
+                        | WindowFunction::NthValue { expr, .. } => {
+                            let (_expr, dt) = self.analyze_expr(expr.clone(), &in_resolver)?;
+                            dt
                         }
                     };
                     out_fields.push(Field::new(&aw.output_name, dt, true));
@@ -902,6 +914,10 @@ impl Analyzer {
         let func = match w.func {
             WindowFunction::RowNumber => WindowFunction::RowNumber,
             WindowFunction::Rank => WindowFunction::Rank,
+            WindowFunction::DenseRank => WindowFunction::DenseRank,
+            WindowFunction::PercentRank => WindowFunction::PercentRank,
+            WindowFunction::CumeDist => WindowFunction::CumeDist,
+            WindowFunction::Ntile(n) => WindowFunction::Ntile(n),
             WindowFunction::Sum(expr) => {
                 let (arg, dt) = self.analyze_expr(expr, resolver)?;
                 if !is_numeric(&dt) {
@@ -910,6 +926,66 @@ impl Analyzer {
                     ));
                 }
                 WindowFunction::Sum(arg)
+            }
+            WindowFunction::Lag {
+                expr,
+                offset,
+                default,
+            } => {
+                let (arg, arg_dt) = self.analyze_expr(expr, resolver)?;
+                let analyzed_default = if let Some(def) = default {
+                    let (dexpr, ddt) = self.analyze_expr(def, resolver)?;
+                    if ddt != DataType::Null && ddt != arg_dt {
+                        return Err(FfqError::Planning(
+                            "LAG() default type is not compatible with value expression"
+                                .to_string(),
+                        ));
+                    }
+                    Some(dexpr)
+                } else {
+                    None
+                };
+                WindowFunction::Lag {
+                    expr: arg,
+                    offset,
+                    default: analyzed_default,
+                }
+            }
+            WindowFunction::Lead {
+                expr,
+                offset,
+                default,
+            } => {
+                let (arg, arg_dt) = self.analyze_expr(expr, resolver)?;
+                let analyzed_default = if let Some(def) = default {
+                    let (dexpr, ddt) = self.analyze_expr(def, resolver)?;
+                    if ddt != DataType::Null && ddt != arg_dt {
+                        return Err(FfqError::Planning(
+                            "LEAD() default type is not compatible with value expression"
+                                .to_string(),
+                        ));
+                    }
+                    Some(dexpr)
+                } else {
+                    None
+                };
+                WindowFunction::Lead {
+                    expr: arg,
+                    offset,
+                    default: analyzed_default,
+                }
+            }
+            WindowFunction::FirstValue(expr) => {
+                let (arg, _dt) = self.analyze_expr(expr, resolver)?;
+                WindowFunction::FirstValue(arg)
+            }
+            WindowFunction::LastValue(expr) => {
+                let (arg, _dt) = self.analyze_expr(expr, resolver)?;
+                WindowFunction::LastValue(arg)
+            }
+            WindowFunction::NthValue { expr, n } => {
+                let (arg, _dt) = self.analyze_expr(expr, resolver)?;
+                WindowFunction::NthValue { expr: arg, n }
             }
         };
         Ok(WindowExpr {

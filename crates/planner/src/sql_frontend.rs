@@ -969,6 +969,15 @@ fn first_function_arg(func: &sqlparser::ast::Function) -> Option<&FunctionArg> {
     }
 }
 
+fn function_args(func: &sqlparser::ast::Function) -> Result<Vec<&FunctionArg>> {
+    match &func.args {
+        FunctionArguments::List(list) => Ok(list.args.iter().collect()),
+        _ => Err(FfqError::Unsupported(
+            "unsupported function argument form in v1".to_string(),
+        )),
+    }
+}
+
 fn try_parse_agg(
     e: &SqlExpr,
     params: &HashMap<String, LiteralValue>,
@@ -1024,7 +1033,16 @@ fn try_parse_window_expr(
     let output_name = explicit_alias.unwrap_or_else(|| match fname.as_str() {
         "ROW_NUMBER" => "row_number()".to_string(),
         "RANK" => "rank()".to_string(),
+        "DENSE_RANK" => "dense_rank()".to_string(),
+        "PERCENT_RANK" => "percent_rank()".to_string(),
+        "CUME_DIST" => "cume_dist()".to_string(),
+        "NTILE" => "ntile()".to_string(),
         "SUM" => "sum_over()".to_string(),
+        "LAG" => "lag()".to_string(),
+        "LEAD" => "lead()".to_string(),
+        "FIRST_VALUE" => "first_value()".to_string(),
+        "LAST_VALUE" => "last_value()".to_string(),
+        "NTH_VALUE" => "nth_value()".to_string(),
         _ => format!("window_{}", fname.to_lowercase()),
     });
 
@@ -1040,9 +1058,10 @@ fn try_parse_window_expr(
             })?,
     };
 
+    let args = function_args(func)?;
     let func_kind = match fname.as_str() {
         "ROW_NUMBER" => {
-            if first_function_arg(func).is_some() {
+            if !args.is_empty() {
                 return Err(FfqError::Unsupported(
                     "ROW_NUMBER() does not accept arguments".to_string(),
                 ));
@@ -1050,15 +1069,117 @@ fn try_parse_window_expr(
             WindowFunction::RowNumber
         }
         "RANK" => {
-            if first_function_arg(func).is_some() {
+            if !args.is_empty() {
                 return Err(FfqError::Unsupported("RANK() does not accept arguments".to_string()));
             }
             WindowFunction::Rank
         }
-        "SUM" => WindowFunction::Sum(function_arg_to_expr(
-            required_arg(first_function_arg(func), "SUM")?,
-            params,
-        )?),
+        "DENSE_RANK" => {
+            if !args.is_empty() {
+                return Err(FfqError::Unsupported(
+                    "DENSE_RANK() does not accept arguments".to_string(),
+                ));
+            }
+            WindowFunction::DenseRank
+        }
+        "PERCENT_RANK" => {
+            if !args.is_empty() {
+                return Err(FfqError::Unsupported(
+                    "PERCENT_RANK() does not accept arguments".to_string(),
+                ));
+            }
+            WindowFunction::PercentRank
+        }
+        "CUME_DIST" => {
+            if !args.is_empty() {
+                return Err(FfqError::Unsupported(
+                    "CUME_DIST() does not accept arguments".to_string(),
+                ));
+            }
+            WindowFunction::CumeDist
+        }
+        "NTILE" => {
+            if args.len() != 1 {
+                return Err(FfqError::Unsupported(
+                    "NTILE() requires one positive integer argument".to_string(),
+                ));
+            }
+            let buckets = parse_positive_usize_arg(args[0], params, "NTILE")?;
+            WindowFunction::Ntile(buckets)
+        }
+        "SUM" => WindowFunction::Sum(function_arg_to_expr(required_arg(args.first().copied(), "SUM")?, params)?),
+        "LAG" => {
+            if args.is_empty() || args.len() > 3 {
+                return Err(FfqError::Unsupported(
+                    "LAG() supports 1 to 3 arguments in v1".to_string(),
+                ));
+            }
+            let expr = function_arg_to_expr(args[0], params)?;
+            let offset = if args.len() >= 2 {
+                parse_positive_usize_arg(args[1], params, "LAG")?
+            } else {
+                1
+            };
+            let default = if args.len() >= 3 {
+                Some(function_arg_to_expr(args[2], params)?)
+            } else {
+                None
+            };
+            WindowFunction::Lag {
+                expr,
+                offset,
+                default,
+            }
+        }
+        "LEAD" => {
+            if args.is_empty() || args.len() > 3 {
+                return Err(FfqError::Unsupported(
+                    "LEAD() supports 1 to 3 arguments in v1".to_string(),
+                ));
+            }
+            let expr = function_arg_to_expr(args[0], params)?;
+            let offset = if args.len() >= 2 {
+                parse_positive_usize_arg(args[1], params, "LEAD")?
+            } else {
+                1
+            };
+            let default = if args.len() >= 3 {
+                Some(function_arg_to_expr(args[2], params)?)
+            } else {
+                None
+            };
+            WindowFunction::Lead {
+                expr,
+                offset,
+                default,
+            }
+        }
+        "FIRST_VALUE" => {
+            if args.len() != 1 {
+                return Err(FfqError::Unsupported(
+                    "FIRST_VALUE() requires one argument in v1".to_string(),
+                ));
+            }
+            WindowFunction::FirstValue(function_arg_to_expr(args[0], params)?)
+        }
+        "LAST_VALUE" => {
+            if args.len() != 1 {
+                return Err(FfqError::Unsupported(
+                    "LAST_VALUE() requires one argument in v1".to_string(),
+                ));
+            }
+            WindowFunction::LastValue(function_arg_to_expr(args[0], params)?)
+        }
+        "NTH_VALUE" => {
+            if args.len() != 2 {
+                return Err(FfqError::Unsupported(
+                    "NTH_VALUE() requires two arguments in v1".to_string(),
+                ));
+            }
+            let expr = function_arg_to_expr(args[0], params)?;
+            let n = parse_positive_usize_arg(args[1], params, "NTH_VALUE")?;
+            WindowFunction::NthValue { expr, n }
+        }
         _ => {
             return Err(FfqError::Unsupported(format!(
                 "unsupported window function in v1: {fname}"
@@ -1269,6 +1390,25 @@ fn function_arg_to_expr(a: &FunctionArg, params: &HashMap<String, LiteralValue>)
             "unsupported function argument form in v1".to_string(),
         )),
     }
+}
+
+fn parse_positive_usize_arg(
+    arg: &FunctionArg,
+    params: &HashMap<String, LiteralValue>,
+    fn_name: &str,
+) -> Result<usize> {
+    let expr = function_arg_to_expr(arg, params)?;
+    let Expr::Literal(LiteralValue::Int64(v)) = expr else {
+        return Err(FfqError::Planning(format!(
+            "{fn_name}() requires a positive integer literal argument in v1"
+        )));
+    };
+    if v <= 0 {
+        return Err(FfqError::Planning(format!(
+            "{fn_name}() argument must be > 0"
+        )));
+    }
+    Ok(v as usize)
 }
 
 fn sql_expr_to_expr(e: &SqlExpr, params: &HashMap<String, LiteralValue>) -> Result<Expr> {
@@ -2004,5 +2144,31 @@ mod tests {
                 .contains("cannot override ORDER BY"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn parses_expanded_window_functions() {
+        let plan = sql_to_logical(
+            "SELECT \
+               DENSE_RANK() OVER (PARTITION BY a ORDER BY b) AS dr, \
+               PERCENT_RANK() OVER (PARTITION BY a ORDER BY b) AS pr, \
+               CUME_DIST() OVER (PARTITION BY a ORDER BY b) AS cd, \
+               NTILE(3) OVER (PARTITION BY a ORDER BY b) AS nt, \
+               LAG(b, 2, 0) OVER (PARTITION BY a ORDER BY b) AS lg, \
+               LEAD(b, 1, 0) OVER (PARTITION BY a ORDER BY b) AS ld, \
+               FIRST_VALUE(b) OVER (PARTITION BY a ORDER BY b) AS fv, \
+               LAST_VALUE(b) OVER (PARTITION BY a ORDER BY b) AS lv, \
+               NTH_VALUE(b, 2) OVER (PARTITION BY a ORDER BY b) AS nv \
+             FROM t",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        match plan {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Window { exprs, .. } => assert_eq!(exprs.len(), 9),
+                other => panic!("expected Window, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
     }
 }

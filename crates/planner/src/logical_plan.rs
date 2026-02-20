@@ -172,8 +172,45 @@ pub enum WindowFunction {
     RowNumber,
     /// `RANK() OVER (...)`
     Rank,
+    /// `DENSE_RANK() OVER (...)`
+    DenseRank,
+    /// `PERCENT_RANK() OVER (...)`
+    PercentRank,
+    /// `CUME_DIST() OVER (...)`
+    CumeDist,
+    /// `NTILE(n) OVER (...)`
+    Ntile(usize),
     /// `SUM(expr) OVER (...)`
     Sum(Expr),
+    /// `LAG(expr [, offset [, default]]) OVER (...)`
+    Lag {
+        /// Value expression.
+        expr: Expr,
+        /// Positive row offset.
+        offset: usize,
+        /// Optional fallback value when the offset row is out of range.
+        default: Option<Expr>,
+    },
+    /// `LEAD(expr [, offset [, default]]) OVER (...)`
+    Lead {
+        /// Value expression.
+        expr: Expr,
+        /// Positive row offset.
+        offset: usize,
+        /// Optional fallback value when the offset row is out of range.
+        default: Option<Expr>,
+    },
+    /// `FIRST_VALUE(expr) OVER (...)`
+    FirstValue(Expr),
+    /// `LAST_VALUE(expr) OVER (...)`
+    LastValue(Expr),
+    /// `NTH_VALUE(expr, n) OVER (...)`
+    NthValue {
+        /// Value expression.
+        expr: Expr,
+        /// 1-based row index in partition.
+        n: usize,
+    },
 }
 
 /// One ORDER BY element inside a window specification.

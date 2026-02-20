@@ -540,6 +540,21 @@ fn proj_rewrite(
                 if let crate::logical_plan::WindowFunction::Sum(arg) = &w.func {
                     child_req.extend(expr_columns(arg));
                 }
+                match &w.func {
+                    crate::logical_plan::WindowFunction::Lag { expr, default, .. }
+                    | crate::logical_plan::WindowFunction::Lead { expr, default, .. } => {
+                        child_req.extend(expr_columns(expr));
+                        if let Some(d) = default {
+                            child_req.extend(expr_columns(d));
+                        }
+                    }
+                    crate::logical_plan::WindowFunction::FirstValue(expr)
+                    | crate::logical_plan::WindowFunction::LastValue(expr)
+                    | crate::logical_plan::WindowFunction::NthValue { expr, .. } => {
+                        child_req.extend(expr_columns(expr));
+                    }
+                    _ => {}
+                }
             }
             let (new_in, _) = proj_rewrite(*input, Some(child_req.clone()), ctx)?;
             Ok((
@@ -1747,6 +1762,40 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
                     w.func = match w.func {
                         crate::logical_plan::WindowFunction::Sum(arg) => {
                             crate::logical_plan::WindowFunction::Sum(rewrite_expr(arg, rewrite))
+                        }
+                        crate::logical_plan::WindowFunction::Lag {
+                            expr,
+                            offset,
+                            default,
+                        } => crate::logical_plan::WindowFunction::Lag {
+                            expr: rewrite_expr(expr, rewrite),
+                            offset,
+                            default: default.map(|d| rewrite_expr(d, rewrite)),
+                        },
+                        crate::logical_plan::WindowFunction::Lead {
+                            expr,
+                            offset,
+                            default,
+                        } => crate::logical_plan::WindowFunction::Lead {
+                            expr: rewrite_expr(expr, rewrite),
+                            offset,
+                            default: default.map(|d| rewrite_expr(d, rewrite)),
+                        },
+                        crate::logical_plan::WindowFunction::FirstValue(expr) => {
+                            crate::logical_plan::WindowFunction::FirstValue(rewrite_expr(
+                                expr, rewrite,
+                            ))
+                        }
+                        crate::logical_plan::WindowFunction::LastValue(expr) => {
+                            crate::logical_plan::WindowFunction::LastValue(rewrite_expr(
+                                expr, rewrite,
+                            ))
+                        }
+                        crate::logical_plan::WindowFunction::NthValue { expr, n } => {
+                            crate::logical_plan::WindowFunction::NthValue {
+                                expr: rewrite_expr(expr, rewrite),
+                                n,
+                            }
                         }
                         other => other,
                     };

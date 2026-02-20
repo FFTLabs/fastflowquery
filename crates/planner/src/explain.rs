@@ -88,7 +88,46 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                 let func = match &w.func {
                     WindowFunction::RowNumber => "ROW_NUMBER()".to_string(),
                     WindowFunction::Rank => "RANK()".to_string(),
+                    WindowFunction::DenseRank => "DENSE_RANK()".to_string(),
+                    WindowFunction::PercentRank => "PERCENT_RANK()".to_string(),
+                    WindowFunction::CumeDist => "CUME_DIST()".to_string(),
+                    WindowFunction::Ntile(n) => format!("NTILE({n})"),
                     WindowFunction::Sum(expr) => format!("SUM({})", fmt_expr(expr)),
+                    WindowFunction::Lag {
+                        expr,
+                        offset,
+                        default,
+                    } => match default {
+                        Some(d) => format!(
+                            "LAG({}, {}, {})",
+                            fmt_expr(expr),
+                            offset,
+                            fmt_expr(d)
+                        ),
+                        None => format!("LAG({}, {})", fmt_expr(expr), offset),
+                    },
+                    WindowFunction::Lead {
+                        expr,
+                        offset,
+                        default,
+                    } => match default {
+                        Some(d) => format!(
+                            "LEAD({}, {}, {})",
+                            fmt_expr(expr),
+                            offset,
+                            fmt_expr(d)
+                        ),
+                        None => format!("LEAD({}, {})", fmt_expr(expr), offset),
+                    },
+                    WindowFunction::FirstValue(expr) => {
+                        format!("FIRST_VALUE({})", fmt_expr(expr))
+                    }
+                    WindowFunction::LastValue(expr) => {
+                        format!("LAST_VALUE({})", fmt_expr(expr))
+                    }
+                    WindowFunction::NthValue { expr, n } => {
+                        format!("NTH_VALUE({}, {n})", fmt_expr(expr))
+                    }
                 };
                 let part = w
                     .partition_by

@@ -245,3 +245,164 @@ fn named_window_desc_nulls_first_executes_correctly() {
     assert_eq!(rows, vec![(None, 1), (Some(3), 2), (Some(1), 3)]);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn expanded_window_functions_ranking_and_value_semantics() {
+    let (engine, path) = make_engine_with_window_fixture();
+    let sql = "SELECT grp, ord, score, \
+                    DENSE_RANK() OVER (PARTITION BY grp ORDER BY score) AS dr, \
+                    PERCENT_RANK() OVER (PARTITION BY grp ORDER BY score) AS pr, \
+                    CUME_DIST() OVER (PARTITION BY grp ORDER BY score) AS cd, \
+                    NTILE(2) OVER (PARTITION BY grp ORDER BY score) AS nt, \
+                    LAG(score) OVER (PARTITION BY grp ORDER BY ord) AS lag_s, \
+                    LEAD(score, 2, 999) OVER (PARTITION BY grp ORDER BY ord) AS lead_s, \
+                    FIRST_VALUE(score) OVER (PARTITION BY grp ORDER BY ord) AS fv, \
+                    LAST_VALUE(score) OVER (PARTITION BY grp ORDER BY ord) AS lv, \
+                    NTH_VALUE(score, 2) OVER (PARTITION BY grp ORDER BY ord) AS nv \
+               FROM t";
+    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Row {
+        grp: String,
+        ord: i64,
+        score: i64,
+        dr: i64,
+        pr: f64,
+        cd: f64,
+        nt: i64,
+        lag_s: Option<i64>,
+        lead_s: i64,
+        fv: i64,
+        lv: i64,
+        nv: i64,
+    }
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let grp = batch.column(0).as_any().downcast_ref::<StringArray>().expect("grp");
+        let ord = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("ord");
+        let score = batch.column(2).as_any().downcast_ref::<Int64Array>().expect("score");
+        let dr = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("dr");
+        let pr = batch.column(4).as_any().downcast_ref::<Float64Array>().expect("pr");
+        let cd = batch.column(5).as_any().downcast_ref::<Float64Array>().expect("cd");
+        let nt = batch.column(6).as_any().downcast_ref::<Int64Array>().expect("nt");
+        let lag_s = batch.column(7).as_any().downcast_ref::<Int64Array>().expect("lag_s");
+        let lead_s = batch.column(8).as_any().downcast_ref::<Int64Array>().expect("lead_s");
+        let fv = batch.column(9).as_any().downcast_ref::<Int64Array>().expect("fv");
+        let lv = batch.column(10).as_any().downcast_ref::<Int64Array>().expect("lv");
+        let nv = batch.column(11).as_any().downcast_ref::<Int64Array>().expect("nv");
+        for i in 0..batch.num_rows() {
+            rows.push(Row {
+                grp: grp.value(i).to_string(),
+                ord: ord.value(i),
+                score: score.value(i),
+                dr: dr.value(i),
+                pr: pr.value(i),
+                cd: cd.value(i),
+                nt: nt.value(i),
+                lag_s: if lag_s.is_null(i) {
+                    None
+                } else {
+                    Some(lag_s.value(i))
+                },
+                lead_s: lead_s.value(i),
+                fv: fv.value(i),
+                lv: lv.value(i),
+                nv: nv.value(i),
+            });
+        }
+    }
+    rows.sort_unstable_by(|a, b| a.grp.cmp(&b.grp).then(a.ord.cmp(&b.ord)));
+
+    let expected = vec![
+        Row {
+            grp: "A".to_string(),
+            ord: 1,
+            score: 10,
+            dr: 1,
+            pr: 0.0,
+            cd: 2.0 / 3.0,
+            nt: 1,
+            lag_s: None,
+            lead_s: 20,
+            fv: 10,
+            lv: 20,
+            nv: 10,
+        },
+        Row {
+            grp: "A".to_string(),
+            ord: 2,
+            score: 10,
+            dr: 1,
+            pr: 0.0,
+            cd: 2.0 / 3.0,
+            nt: 1,
+            lag_s: Some(10),
+            lead_s: 999,
+            fv: 10,
+            lv: 20,
+            nv: 10,
+        },
+        Row {
+            grp: "A".to_string(),
+            ord: 3,
+            score: 20,
+            dr: 2,
+            pr: 1.0,
+            cd: 1.0,
+            nt: 2,
+            lag_s: Some(10),
+            lead_s: 999,
+            fv: 10,
+            lv: 20,
+            nv: 10,
+        },
+        Row {
+            grp: "B".to_string(),
+            ord: 1,
+            score: 7,
+            dr: 1,
+            pr: 0.0,
+            cd: 0.5,
+            nt: 1,
+            lag_s: None,
+            lead_s: 999,
+            fv: 7,
+            lv: 9,
+            nv: 9,
+        },
+        Row {
+            grp: "B".to_string(),
+            ord: 2,
+            score: 9,
+            dr: 2,
+            pr: 1.0,
+            cd: 1.0,
+            nt: 2,
+            lag_s: Some(7),
+            lead_s: 999,
+            fv: 7,
+            lv: 9,
+            nv: 9,
+        },
+    ];
+
+    assert_eq!(rows.len(), expected.len());
+    for (actual, exp) in rows.iter().zip(expected.iter()) {
+        assert_eq!(actual.grp, exp.grp);
+        assert_eq!(actual.ord, exp.ord);
+        assert_eq!(actual.score, exp.score);
+        assert_eq!(actual.dr, exp.dr);
+        assert!((actual.pr - exp.pr).abs() < 1e-9);
+        assert!((actual.cd - exp.cd).abs() < 1e-9);
+        assert_eq!(actual.nt, exp.nt);
+        assert_eq!(actual.lag_s, exp.lag_s);
+        assert_eq!(actual.lead_s, exp.lead_s);
+        assert_eq!(actual.fv, exp.fv);
+        assert_eq!(actual.lv, exp.lv);
+        assert_eq!(actual.nv, exp.nv);
+    }
+
+    let _ = std::fs::remove_file(path);
+}
