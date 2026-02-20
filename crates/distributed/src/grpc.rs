@@ -442,11 +442,11 @@ impl ShuffleService for WorkerShuffleService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::Schema;
     use ffq_planner::{
         ExchangeExec, ParquetScanExec, PartitioningSpec, PhysicalPlan, ShuffleReadExchange,
         ShuffleWriteExchange,
     };
-    use arrow_schema::Schema;
 
     fn shuffle_plan(partitions: usize) -> PhysicalPlan {
         PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {

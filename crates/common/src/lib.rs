@@ -17,6 +17,8 @@
 //! Feature flags:
 //! - `profiling`: enables the metrics HTTP exporter helpers.
 
+/// Shared adaptive partition-planning utilities.
+pub mod adaptive;
 /// Shared engine/runtime configuration types.
 pub mod config;
 /// Shared error taxonomy.

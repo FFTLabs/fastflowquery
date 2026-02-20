@@ -28,13 +28,14 @@ use arrow::array::{
 use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use ffq_common::adaptive::{AdaptiveReducePlan, plan_adaptive_reduce_layout};
 use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result};
 use ffq_execution::{SendableRecordBatchStream, StreamAdapter, TaskContext, compile_expr};
 use ffq_planner::{
-    AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, JoinType, LiteralValue, PhysicalPlan,
-    WindowExpr, WindowFrameBound, WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits,
-    WindowFunction, WindowOrderExpr,
+    AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, JoinType, LiteralValue, PartitioningSpec,
+    PhysicalPlan, WindowExpr, WindowFrameBound, WindowFrameExclusion, WindowFrameSpec,
+    WindowFrameUnits, WindowFunction, WindowOrderExpr,
 };
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
@@ -132,7 +133,6 @@ impl RuntimeStatsCollector {
         guard.operators.push(op);
     }
 
-    #[cfg(feature = "distributed")]
     fn record_stage_summary(
         &self,
         query_id: &str,
@@ -742,7 +742,7 @@ fn execute_plan_with_cache(
                 ExchangeExec::ShuffleWrite(x) => {
                     let child = execute_plan_with_cache(
                         *x.input,
-                        ctx,
+                        ctx.clone(),
                         catalog,
                         Arc::clone(&physical_registry),
                         Arc::clone(&trace),
@@ -760,7 +760,7 @@ fn execute_plan_with_cache(
                 ExchangeExec::ShuffleRead(x) => {
                     let child = execute_plan_with_cache(
                         *x.input,
-                        ctx,
+                        ctx.clone(),
                         catalog,
                         Arc::clone(&physical_registry),
                         Arc::clone(&trace),
@@ -768,6 +768,37 @@ fn execute_plan_with_cache(
                     )
                     .await?;
                     let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                    if let Some(collector) = &ctx.stats_collector {
+                        if let Ok(summary) =
+                            embedded_adaptive_plan_for_partitioning(&child, &x.partitioning)
+                        {
+                            let (rows_out, _batches_out, bytes_out) = batch_stats(&child.batches);
+                            collector.record_stage_summary(
+                                &trace.query_id,
+                                trace.stage_id,
+                                summary.adaptive_reduce_tasks as u64,
+                                rows_out,
+                                bytes_out,
+                                child.batches.len() as u64,
+                                summary.planned_reduce_tasks,
+                                summary.adaptive_reduce_tasks,
+                                summary.target_bytes,
+                                summary.aqe_events.clone(),
+                                summary
+                                    .partition_bytes_histogram
+                                    .iter()
+                                    .flat_map(|b| {
+                                        std::iter::repeat_n(
+                                            b.upper_bound_bytes,
+                                            b.partition_count as usize,
+                                        )
+                                    })
+                                    .collect(),
+                                1,
+                                summary.skew_split_tasks,
+                            );
+                        }
+                    }
                     Ok(OpEval {
                         out: child,
                         in_rows,
@@ -3047,6 +3078,68 @@ fn resolve_key_indexes(schema: &SchemaRef, names: &[String]) -> Result<Vec<usize
         .collect()
 }
 
+fn embedded_adaptive_plan_for_partitioning(
+    input: &ExecOutput,
+    partitioning: &PartitioningSpec,
+) -> Result<AdaptiveReducePlan> {
+    let target_bytes = std::env::var("FFQ_ADAPTIVE_SHUFFLE_TARGET_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(128 * 1024 * 1024);
+    embedded_adaptive_plan_for_partitioning_with_target(input, partitioning, target_bytes)
+}
+
+fn embedded_adaptive_plan_for_partitioning_with_target(
+    input: &ExecOutput,
+    partitioning: &PartitioningSpec,
+    target_bytes: u64,
+) -> Result<AdaptiveReducePlan> {
+    let mut bytes_by_partition = HashMap::<u32, u64>::new();
+    let planned_partitions = match partitioning {
+        PartitioningSpec::Single => {
+            let total = input
+                .batches
+                .iter()
+                .map(|b| {
+                    b.columns()
+                        .iter()
+                        .map(|a| a.get_array_memory_size() as u64)
+                        .sum::<u64>()
+                })
+                .sum::<u64>();
+            bytes_by_partition.insert(0, total);
+            1_u32
+        }
+        PartitioningSpec::HashKeys { keys, partitions } => {
+            let partition_count = (*partitions).max(1) as u32;
+            let rows = rows_from_batches(input)?;
+            let key_idx = resolve_key_indexes(&input.schema, keys)?;
+            for row in &rows {
+                let key = join_key_from_row(row, &key_idx);
+                let partition = (hash_key(&key) % partition_count as u64) as u32;
+                let row_bytes = row
+                    .iter()
+                    .map(|v| scalar_estimate_bytes(v) as u64)
+                    .sum::<u64>();
+                bytes_by_partition
+                    .entry(partition)
+                    .and_modify(|b| *b = b.saturating_add(row_bytes))
+                    .or_insert(row_bytes);
+            }
+            partition_count
+        }
+    };
+    Ok(plan_adaptive_reduce_layout(
+        planned_partitions,
+        target_bytes,
+        &bytes_by_partition,
+        1,
+        0,
+        0,
+    ))
+}
+
 fn strip_qual(name: &str) -> String {
     name.rsplit('.').next().unwrap_or(name).to_string()
 }
@@ -4480,14 +4573,15 @@ mod tests {
     use arrow::array::{FixedSizeListBuilder, Float32Array, Float32Builder};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema};
+    use ffq_common::adaptive::plan_adaptive_reduce_layout;
     use ffq_execution::PhysicalOperatorFactory;
     #[cfg(feature = "vector")]
     use ffq_planner::LiteralValue;
     use ffq_planner::VectorTopKExec;
     use ffq_planner::{
-        CteRefExec, CustomExec, Expr, ParquetScanExec, PhysicalPlan, UnionAllExec, WindowExpr,
-        WindowFrameBound, WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits, WindowFunction,
-        WindowOrderExpr,
+        CteRefExec, CustomExec, Expr, ParquetScanExec, PartitioningSpec, PhysicalPlan,
+        UnionAllExec, WindowExpr, WindowFrameBound, WindowFrameExclusion, WindowFrameSpec,
+        WindowFrameUnits, WindowFunction, WindowOrderExpr,
     };
     use ffq_storage::vector_index::{VectorIndexProvider, VectorTopKRow};
     use ffq_storage::{Catalog, TableDef, TableStats};
@@ -4498,8 +4592,11 @@ mod tests {
     #[cfg(feature = "vector")]
     use super::run_topk_by_score;
     use super::{
-        EmbeddedRuntime, ExecOutput, QueryContext, Runtime, TraceIds, rows_to_vector_topk_output,
+        EmbeddedRuntime, ExecOutput, QueryContext, Runtime, TraceIds,
+        embedded_adaptive_plan_for_partitioning_with_target, hash_key, join_key_from_row,
+        resolve_key_indexes, rows_from_batches, rows_to_vector_topk_output,
         run_vector_topk_with_provider, run_window_exec, run_window_exec_with_ctx,
+        scalar_estimate_bytes,
     };
     use crate::physical_registry::PhysicalOperatorRegistry;
 
@@ -4912,6 +5009,60 @@ mod tests {
             "shared CTE subplan should execute exactly once"
         );
         let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn embedded_adaptive_partitioning_matches_shared_planner_on_same_stats() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5, 6, 7, 8])),
+                Arc::new(Int64Array::from(vec![10_i64, 20, 30, 40, 50, 60, 70, 80])),
+            ],
+        )
+        .expect("batch");
+        let input = ExecOutput {
+            schema: schema.clone(),
+            batches: vec![batch],
+        };
+        let partitioning = PartitioningSpec::HashKeys {
+            keys: vec!["k".to_string()],
+            partitions: 4,
+        };
+        let target_bytes = 32_u64;
+        let embedded = embedded_adaptive_plan_for_partitioning_with_target(
+            &input,
+            &partitioning,
+            target_bytes,
+        )
+        .expect("embedded adaptive plan");
+
+        let rows = rows_from_batches(&input).expect("rows");
+        let key_idx = resolve_key_indexes(&schema, &["k".to_string()]).expect("key idx");
+        let mut bytes_by_partition = HashMap::<u32, u64>::new();
+        for row in &rows {
+            let key = join_key_from_row(row, &key_idx);
+            let partition = (hash_key(&key) % 4) as u32;
+            let row_bytes = row
+                .iter()
+                .map(|v| scalar_estimate_bytes(v) as u64)
+                .sum::<u64>();
+            bytes_by_partition
+                .entry(partition)
+                .and_modify(|b| *b = b.saturating_add(row_bytes))
+                .or_insert(row_bytes);
+        }
+        let shared = plan_adaptive_reduce_layout(4, target_bytes, &bytes_by_partition, 1, 0, 0);
+        assert_eq!(embedded.assignments, shared.assignments);
+        assert_eq!(embedded.adaptive_reduce_tasks, shared.adaptive_reduce_tasks);
+        assert_eq!(
+            embedded.partition_bytes_histogram,
+            shared.partition_bytes_histogram
+        );
     }
 
     #[cfg(feature = "vector")]

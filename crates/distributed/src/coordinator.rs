@@ -16,6 +16,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ffq_common::adaptive::{
+    PartitionBytesHistogramBucket, ReduceTaskAssignment, plan_adaptive_reduce_layout,
+};
 use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result, SchemaInferencePolicy};
 use ffq_planner::{ExchangeExec, PartitioningSpec, PhysicalPlan};
@@ -138,15 +141,6 @@ pub struct TaskAssignment {
     pub layout_version: u32,
     /// Deterministic fingerprint of assignment layout for this stage version.
     pub layout_fingerprint: u64,
-}
-
-#[derive(Debug, Clone, Default)]
-/// One partition-bytes histogram bucket for AQE diagnostics.
-pub struct PartitionBytesHistogramBucket {
-    /// Inclusive upper bound (bytes) for this bucket.
-    pub upper_bound_bytes: u64,
-    /// Number of partitions falling into this bucket.
-    pub partition_count: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1469,32 +1463,7 @@ fn latest_partition_bytes_for_stage(
 fn build_partition_bytes_histogram(
     bytes_by_partition: &HashMap<u32, u64>,
 ) -> Vec<PartitionBytesHistogramBucket> {
-    const BOUNDS: &[u64] = &[
-        64 * 1024,
-        256 * 1024,
-        1 * 1024 * 1024,
-        4 * 1024 * 1024,
-        16 * 1024 * 1024,
-        64 * 1024 * 1024,
-        u64::MAX,
-    ];
-    let mut counts = vec![0_u32; BOUNDS.len()];
-    for bytes in bytes_by_partition.values() {
-        let idx = BOUNDS
-            .iter()
-            .position(|b| bytes <= b)
-            .unwrap_or(BOUNDS.len() - 1);
-        counts[idx] = counts[idx].saturating_add(1);
-    }
-    BOUNDS
-        .iter()
-        .zip(counts.into_iter())
-        .filter(|(_, c)| *c > 0)
-        .map(|(upper, partition_count)| PartitionBytesHistogramBucket {
-            upper_bound_bytes: *upper,
-            partition_count,
-        })
-        .collect()
+    ffq_common::adaptive::build_partition_bytes_histogram(bytes_by_partition)
 }
 
 fn push_stage_aqe_event(metrics: &mut StageMetrics, event: String) {
@@ -1508,12 +1477,7 @@ fn push_stage_aqe_event(metrics: &mut StageMetrics, event: String) {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ReduceTaskAssignmentSpec {
-    assigned_reduce_partitions: Vec<u32>,
-    assigned_reduce_split_index: u32,
-    assigned_reduce_split_count: u32,
-}
+type ReduceTaskAssignmentSpec = ReduceTaskAssignment;
 
 fn deterministic_coalesce_split_groups(
     planned_partitions: u32,
@@ -1523,177 +1487,15 @@ fn deterministic_coalesce_split_groups(
     max_reduce_tasks: u32,
     max_partitions_per_task: u32,
 ) -> Vec<ReduceTaskAssignmentSpec> {
-    if planned_partitions <= 1 {
-        return vec![ReduceTaskAssignmentSpec {
-            assigned_reduce_partitions: vec![0],
-            assigned_reduce_split_index: 0,
-            assigned_reduce_split_count: 1,
-        }];
-    }
-    if target_bytes == 0 {
-        return (0..planned_partitions)
-            .map(|p| ReduceTaskAssignmentSpec {
-                assigned_reduce_partitions: vec![p],
-                assigned_reduce_split_index: 0,
-                assigned_reduce_split_count: 1,
-            })
-            .collect();
-    }
-    let mut groups = Vec::new();
-    let mut current = Vec::new();
-    let mut current_bytes = 0_u64;
-    for p in 0..planned_partitions {
-        let bytes = *bytes_by_partition.get(&p).unwrap_or(&0);
-        if !current.is_empty() && current_bytes.saturating_add(bytes) > target_bytes {
-            groups.push(current);
-            current = Vec::new();
-            current_bytes = 0;
-        }
-        current.push(p);
-        current_bytes = current_bytes.saturating_add(bytes);
-    }
-    if !current.is_empty() {
-        groups.push(current);
-    }
-    let groups = split_groups_by_max_partitions(groups, max_partitions_per_task);
-    let groups = clamp_group_count_to_bounds(
-        groups,
+    plan_adaptive_reduce_layout(
         planned_partitions,
-        min_reduce_tasks,
-        max_reduce_tasks,
-    );
-    apply_hot_partition_splitting(
-        groups,
-        bytes_by_partition,
         target_bytes,
+        bytes_by_partition,
         min_reduce_tasks,
         max_reduce_tasks,
+        max_partitions_per_task,
     )
-}
-
-fn split_groups_by_max_partitions(
-    groups: Vec<Vec<u32>>,
-    max_partitions_per_task: u32,
-) -> Vec<Vec<u32>> {
-    if max_partitions_per_task == 0 {
-        return groups;
-    }
-    let cap = max_partitions_per_task as usize;
-    let mut out = Vec::new();
-    for g in groups {
-        if g.len() <= cap {
-            out.push(g);
-            continue;
-        }
-        let mut i = 0usize;
-        while i < g.len() {
-            let end = (i + cap).min(g.len());
-            out.push(g[i..end].to_vec());
-            i = end;
-        }
-    }
-    out
-}
-
-fn clamp_group_count_to_bounds(
-    mut groups: Vec<Vec<u32>>,
-    planned_partitions: u32,
-    min_reduce_tasks: u32,
-    max_reduce_tasks: u32,
-) -> Vec<Vec<u32>> {
-    let min_eff = min_reduce_tasks.max(1).min(planned_partitions) as usize;
-    let mut max_eff = if max_reduce_tasks == 0 {
-        planned_partitions
-    } else {
-        max_reduce_tasks
-    }
-    .max(min_eff as u32)
-    .min(planned_partitions) as usize;
-    if max_eff == 0 {
-        max_eff = 1;
-    }
-
-    // Deterministic split (left-to-right): keep splitting the first splittable group.
-    while groups.len() < min_eff {
-        let Some(idx) = groups.iter().position(|g| g.len() > 1) else {
-            break;
-        };
-        let g = groups.remove(idx);
-        let split_at = g.len() / 2;
-        groups.insert(idx, g[split_at..].to_vec());
-        groups.insert(idx, g[..split_at].to_vec());
-    }
-
-    // Deterministic merge (right-to-left): merge last two groups until within max.
-    while groups.len() > max_eff && groups.len() >= 2 {
-        let right = groups.pop().expect("has right group");
-        if let Some(prev) = groups.last_mut() {
-            prev.extend(right);
-        }
-    }
-    groups
-}
-
-fn apply_hot_partition_splitting(
-    groups: Vec<Vec<u32>>,
-    bytes_by_partition: &HashMap<u32, u64>,
-    target_bytes: u64,
-    min_reduce_tasks: u32,
-    max_reduce_tasks: u32,
-) -> Vec<ReduceTaskAssignmentSpec> {
-    let mut layouts = groups
-        .into_iter()
-        .map(|g| ReduceTaskAssignmentSpec {
-            assigned_reduce_partitions: g,
-            assigned_reduce_split_index: 0,
-            assigned_reduce_split_count: 1,
-        })
-        .collect::<Vec<_>>();
-    if target_bytes == 0 {
-        return layouts;
-    }
-    let min_eff = min_reduce_tasks.max(1);
-    let max_eff = if max_reduce_tasks == 0 {
-        u32::MAX
-    } else {
-        max_reduce_tasks.max(min_eff)
-    };
-    let mut hot = bytes_by_partition
-        .iter()
-        .map(|(p, b)| (*p, *b))
-        .collect::<Vec<_>>();
-    hot.sort_by_key(|(p, _)| *p);
-    for (partition, bytes) in hot {
-        if bytes <= target_bytes {
-            continue;
-        }
-        let Some(idx) = layouts.iter().position(|l| {
-            l.assigned_reduce_split_count == 1
-                && l.assigned_reduce_partitions.len() == 1
-                && l.assigned_reduce_partitions[0] == partition
-        }) else {
-            continue;
-        };
-        let desired = bytes.div_ceil(target_bytes).max(2) as u32;
-        let current_tasks = layouts.len() as u32;
-        let max_for_this = 1 + max_eff.saturating_sub(current_tasks);
-        let split_count = desired.min(max_for_this);
-        if split_count <= 1 {
-            continue;
-        }
-        layouts.remove(idx);
-        for split_index in (0..split_count).rev() {
-            layouts.insert(
-                idx,
-                ReduceTaskAssignmentSpec {
-                    assigned_reduce_partitions: vec![partition],
-                    assigned_reduce_split_index: split_index,
-                    assigned_reduce_split_count: split_count,
-                },
-            );
-        }
-    }
-    layouts
+    .assignments
 }
 
 fn collect_custom_ops(plan: &PhysicalPlan, out: &mut HashSet<String>) {
