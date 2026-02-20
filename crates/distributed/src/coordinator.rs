@@ -47,6 +47,12 @@ pub struct CoordinatorConfig {
     pub worker_liveness_timeout_ms: u64,
     /// Target bytes used to derive adaptive downstream shuffle reduce-task counts.
     pub adaptive_shuffle_target_bytes: u64,
+    /// Minimum reduce task count allowed for adaptive layouts (clamped to planned count).
+    pub adaptive_shuffle_min_reduce_tasks: u32,
+    /// Maximum reduce task count allowed for adaptive layouts (clamped to planned count).
+    ///
+    /// `0` means "no explicit max" (uses planned count as effective max).
+    pub adaptive_shuffle_max_reduce_tasks: u32,
     /// Optional hard cap for number of reduce partitions per reduce task group.
     ///
     /// `0` disables this split rule.
@@ -65,6 +71,8 @@ impl Default for CoordinatorConfig {
             retry_backoff_base_ms: 250,
             worker_liveness_timeout_ms: 15_000,
             adaptive_shuffle_target_bytes: 128 * 1024 * 1024,
+            adaptive_shuffle_min_reduce_tasks: 1,
+            adaptive_shuffle_max_reduce_tasks: 0,
             adaptive_shuffle_max_partitions_per_task: 0,
         }
     }
@@ -562,6 +570,8 @@ impl Coordinator {
                 query,
                 &map_outputs_snapshot,
                 self.config.adaptive_shuffle_target_bytes,
+                self.config.adaptive_shuffle_min_reduce_tasks,
+                self.config.adaptive_shuffle_max_reduce_tasks,
                 self.config.adaptive_shuffle_max_partitions_per_task,
                 now,
             );
@@ -844,6 +854,8 @@ impl Coordinator {
             bytes,
             planned_reduce_tasks,
             self.config.adaptive_shuffle_target_bytes,
+            self.config.adaptive_shuffle_min_reduce_tasks,
+            self.config.adaptive_shuffle_max_reduce_tasks,
         );
         let query = self
             .queries
@@ -1067,6 +1079,8 @@ fn maybe_apply_adaptive_partition_layout(
     query: &mut QueryRuntime,
     map_outputs: &HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>,
     target_bytes: u64,
+    min_reduce_tasks: u32,
+    max_reduce_tasks: u32,
     max_partitions_per_task: u32,
     ready_at_ms: u64,
 ) {
@@ -1101,6 +1115,8 @@ fn maybe_apply_adaptive_partition_layout(
             stage.metrics.planned_reduce_tasks,
             target_bytes,
             &bytes_by_partition,
+            min_reduce_tasks,
+            max_reduce_tasks,
             max_partitions_per_task,
         );
         if (groups.len() as u32) < stage.metrics.planned_reduce_tasks {
@@ -1190,6 +1206,8 @@ fn deterministic_coalesce_split_groups(
     planned_partitions: u32,
     target_bytes: u64,
     bytes_by_partition: &HashMap<u32, u64>,
+    min_reduce_tasks: u32,
+    max_reduce_tasks: u32,
     max_partitions_per_task: u32,
 ) -> Vec<Vec<u32>> {
     if planned_partitions <= 1 {
@@ -1214,7 +1232,13 @@ fn deterministic_coalesce_split_groups(
     if !current.is_empty() {
         groups.push(current);
     }
-    split_groups_by_max_partitions(groups, max_partitions_per_task)
+    let groups = split_groups_by_max_partitions(groups, max_partitions_per_task);
+    clamp_group_count_to_bounds(
+        groups,
+        planned_partitions,
+        min_reduce_tasks,
+        max_reduce_tasks,
+    )
 }
 
 fn split_groups_by_max_partitions(
@@ -1239,6 +1263,45 @@ fn split_groups_by_max_partitions(
         }
     }
     out
+}
+
+fn clamp_group_count_to_bounds(
+    mut groups: Vec<Vec<u32>>,
+    planned_partitions: u32,
+    min_reduce_tasks: u32,
+    max_reduce_tasks: u32,
+) -> Vec<Vec<u32>> {
+    let min_eff = min_reduce_tasks.max(1).min(planned_partitions) as usize;
+    let mut max_eff = if max_reduce_tasks == 0 {
+        planned_partitions
+    } else {
+        max_reduce_tasks
+    }
+    .max(min_eff as u32)
+    .min(planned_partitions) as usize;
+    if max_eff == 0 {
+        max_eff = 1;
+    }
+
+    // Deterministic split (left-to-right): keep splitting the first splittable group.
+    while groups.len() < min_eff {
+        let Some(idx) = groups.iter().position(|g| g.len() > 1) else {
+            break;
+        };
+        let g = groups.remove(idx);
+        let split_at = g.len() / 2;
+        groups.insert(idx, g[split_at..].to_vec());
+        groups.insert(idx, g[..split_at].to_vec());
+    }
+
+    // Deterministic merge (right-to-left): merge last two groups until within max.
+    while groups.len() > max_eff && groups.len() >= 2 {
+        let right = groups.pop().expect("has right group");
+        if let Some(prev) = groups.last_mut() {
+            prev.extend(right);
+        }
+    }
+    groups
 }
 
 fn collect_custom_ops(plan: &PhysicalPlan, out: &mut HashSet<String>) {
@@ -1400,17 +1463,31 @@ fn update_scheduler_metrics(query_id: &str, stage_id: u64, m: &StageMetrics) {
     global_metrics().set_scheduler_running_tasks(query_id, stage_id, m.running_tasks as u64);
 }
 
-fn adaptive_reduce_task_count(total_bytes: u64, planned_tasks: u32, target_bytes: u64) -> u32 {
+fn adaptive_reduce_task_count(
+    total_bytes: u64,
+    planned_tasks: u32,
+    target_bytes: u64,
+    min_reduce_tasks: u32,
+    max_reduce_tasks: u32,
+) -> u32 {
     if planned_tasks == 0 {
         return 1;
     }
+    let min_eff = min_reduce_tasks.max(1).min(planned_tasks);
+    let max_eff = if max_reduce_tasks == 0 {
+        planned_tasks
+    } else {
+        max_reduce_tasks
+    }
+    .max(min_eff)
+    .min(planned_tasks);
     if target_bytes == 0 {
-        return planned_tasks;
+        return planned_tasks.clamp(min_eff, max_eff);
     }
     let needed = ((total_bytes.saturating_add(target_bytes - 1)) / target_bytes)
         .max(1)
         .min(planned_tasks as u64);
-    needed as u32
+    (needed as u32).clamp(min_eff, max_eff)
 }
 
 fn now_ms() -> Result<u64> {
@@ -1831,8 +1908,8 @@ mod tests {
         b.insert(0_u32, 10_u64);
         b.insert(2_u32, 5_u64);
 
-        let g1 = deterministic_coalesce_split_groups(4, 25, &a, 0);
-        let g2 = deterministic_coalesce_split_groups(4, 25, &b, 0);
+        let g1 = deterministic_coalesce_split_groups(4, 25, &a, 1, 0, 0);
+        let g2 = deterministic_coalesce_split_groups(4, 25, &b, 1, 0, 0);
         assert_eq!(g1, g2);
         assert_eq!(g1, vec![vec![0, 1], vec![2, 3]]);
     }
@@ -1845,7 +1922,26 @@ mod tests {
         bytes.insert(2_u32, 5_u64);
         bytes.insert(3_u32, 5_u64);
 
-        let groups = deterministic_coalesce_split_groups(4, 1_000, &bytes, 2);
+        let groups = deterministic_coalesce_split_groups(4, 1_000, &bytes, 1, 0, 2);
         assert_eq!(groups, vec![vec![0, 1], vec![2, 3]]);
+    }
+
+    #[test]
+    fn deterministic_coalesce_split_groups_respects_min_max_reduce_task_bounds() {
+        let mut bytes = HashMap::new();
+        bytes.insert(0_u32, 10_u64);
+        bytes.insert(1_u32, 10_u64);
+        bytes.insert(2_u32, 10_u64);
+        bytes.insert(3_u32, 10_u64);
+
+        // Natural grouping with high target would be 1 group; min=2 forces deterministic split.
+        let min_groups = deterministic_coalesce_split_groups(4, 1_000, &bytes, 2, 0, 0);
+        assert_eq!(min_groups.len(), 2);
+        assert_eq!(min_groups, vec![vec![0, 1], vec![2, 3]]);
+
+        // Natural grouping with low target would be 4 groups; max=2 forces deterministic merge.
+        let max_groups = deterministic_coalesce_split_groups(4, 1, &bytes, 1, 2, 0);
+        assert_eq!(max_groups.len(), 2);
+        assert_eq!(max_groups, vec![vec![0], vec![1, 2, 3]]);
     }
 }
