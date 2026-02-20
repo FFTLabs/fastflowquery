@@ -32,7 +32,7 @@ use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result};
 use ffq_execution::{SendableRecordBatchStream, StreamAdapter, TaskContext, compile_expr};
 use ffq_planner::{
-    AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, JoinType, PhysicalPlan, WindowExpr,
+    AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, JoinType, LiteralValue, PhysicalPlan, WindowExpr,
     WindowFrameBound, WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits, WindowFunction,
     WindowOrderExpr,
 };
@@ -244,7 +244,8 @@ fn execute_plan_with_cache(
                         .iter()
                         .map(|(expr, name)| {
                             let dt = compile_expr(expr, &child.schema)?.data_type();
-                            Ok(Field::new(name, dt, true))
+                            let nullable = infer_expr_nullable(expr, &child.schema)?;
+                            Ok(Field::new(name, dt, nullable))
                         })
                         .collect::<Result<Vec<_>>>()?,
                 ));
@@ -1330,7 +1331,7 @@ fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput
             )));
         }
         let dt = window_output_type(&input.schema, w)?;
-        out_fields.push(Field::new(&w.output_name, dt, true));
+        out_fields.push(Field::new(&w.output_name, dt, window_output_nullable(w)));
         for (idx, value) in output.into_iter().enumerate() {
             rows[idx].push(value);
         }
@@ -1996,6 +1997,56 @@ fn window_output_type(input_schema: &SchemaRef, w: &WindowExpr) -> Result<DataTy
             let compiled = compile_expr(expr, input_schema)?;
             Ok(compiled.data_type())
         }
+    }
+}
+
+fn window_output_nullable(w: &WindowExpr) -> bool {
+    !matches!(
+        w.func,
+        WindowFunction::RowNumber
+            | WindowFunction::Rank
+            | WindowFunction::DenseRank
+            | WindowFunction::Ntile(_)
+            | WindowFunction::Count(_)
+            | WindowFunction::PercentRank
+            | WindowFunction::CumeDist
+    )
+}
+
+fn infer_expr_nullable(expr: &Expr, schema: &SchemaRef) -> Result<bool> {
+    match expr {
+        Expr::ColumnRef { index, .. } => Ok(schema.field(*index).is_nullable()),
+        Expr::Column(name) => {
+            let idx = schema.index_of(name).map_err(|e| {
+                FfqError::Execution(format!("projection column resolution failed for '{name}': {e}"))
+            })?;
+            Ok(schema.field(idx).is_nullable())
+        }
+        Expr::Literal(v) => Ok(matches!(v, LiteralValue::Null)),
+        Expr::Cast { expr, .. } => infer_expr_nullable(expr, schema),
+        Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(false),
+        Expr::And(l, r) | Expr::Or(l, r) | Expr::BinaryOp { left: l, right: r, .. } => {
+            Ok(infer_expr_nullable(l, schema)? || infer_expr_nullable(r, schema)?)
+        }
+        Expr::Not(inner) => infer_expr_nullable(inner, schema),
+        Expr::CaseWhen { branches, else_expr } => {
+            let mut nullable = false;
+            for (cond, value) in branches {
+                nullable |= infer_expr_nullable(cond, schema)?;
+                nullable |= infer_expr_nullable(value, schema)?;
+            }
+            nullable |= else_expr
+                .as_ref()
+                .map(|e| infer_expr_nullable(e, schema))
+                .transpose()?
+                .unwrap_or(true);
+            Ok(nullable)
+        }
+        #[cfg(feature = "vector")]
+        Expr::CosineSimilarity { .. } | Expr::L2Distance { .. } | Expr::DotProduct { .. } => {
+            Ok(false)
+        }
+        Expr::ScalarUdf { .. } => Ok(true),
     }
 }
 

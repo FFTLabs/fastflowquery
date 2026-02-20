@@ -347,7 +347,8 @@ impl Analyzer {
 
                 for (e, name) in exprs {
                     let (ae, dt) = self.analyze_expr(e, &in_resolver)?;
-                    out_fields.push(Field::new(&name, dt.clone(), true));
+                    let nullable = expr_nullable(&ae, &in_resolver)?;
+                    out_fields.push(Field::new(&name, dt.clone(), nullable));
                     out_exprs.push((ae, name));
                 }
 
@@ -373,45 +374,8 @@ impl Analyzer {
                 let mut out_exprs = Vec::with_capacity(exprs.len());
                 for w in exprs {
                     let aw = self.analyze_window_expr(w, &in_resolver)?;
-                    let dt = match &aw.func {
-                        WindowFunction::RowNumber
-                        | WindowFunction::Rank
-                        | WindowFunction::DenseRank
-                        | WindowFunction::Ntile(_)
-                        | WindowFunction::Count(_) => DataType::Int64,
-                        WindowFunction::PercentRank | WindowFunction::CumeDist => DataType::Float64,
-                        WindowFunction::Sum(expr) => {
-                            let (_expr, dt) = self.analyze_expr(expr.clone(), &in_resolver)?;
-                            if !is_numeric(&dt) {
-                                return Err(FfqError::Planning(
-                                    "SUM() OVER requires numeric argument".to_string(),
-                                ));
-                            }
-                            DataType::Float64
-                        }
-                        WindowFunction::Avg(expr) => {
-                            let (_expr, dt) = self.analyze_expr(expr.clone(), &in_resolver)?;
-                            if !is_numeric(&dt) {
-                                return Err(FfqError::Planning(
-                                    "AVG() OVER requires numeric argument".to_string(),
-                                ));
-                            }
-                            DataType::Float64
-                        }
-                        WindowFunction::Min(expr) | WindowFunction::Max(expr) => {
-                            let (_expr, dt) = self.analyze_expr(expr.clone(), &in_resolver)?;
-                            dt
-                        }
-                        WindowFunction::Lag { expr, .. }
-                        | WindowFunction::Lead { expr, .. }
-                        | WindowFunction::FirstValue(expr)
-                        | WindowFunction::LastValue(expr)
-                        | WindowFunction::NthValue { expr, .. } => {
-                            let (_expr, dt) = self.analyze_expr(expr.clone(), &in_resolver)?;
-                            dt
-                        }
-                    };
-                    out_fields.push(Field::new(&aw.output_name, dt, true));
+                    let (dt, nullable) = window_output_type_and_nullable(&aw.func, &in_resolver)?;
+                    out_fields.push(Field::new(&aw.output_name, dt, nullable));
                     out_exprs.push(aw);
                 }
                 let out_schema = Arc::new(Schema::new(out_fields));
@@ -968,18 +932,8 @@ impl Analyzer {
                 default,
             } => {
                 let (arg, arg_dt) = self.analyze_expr(expr, resolver)?;
-                let analyzed_default = if let Some(def) = default {
-                    let (dexpr, ddt) = self.analyze_expr(def, resolver)?;
-                    if ddt != DataType::Null && ddt != arg_dt {
-                        return Err(FfqError::Planning(
-                            "LAG() default type is not compatible with value expression"
-                                .to_string(),
-                        ));
-                    }
-                    Some(dexpr)
-                } else {
-                    None
-                };
+                let (arg, analyzed_default) =
+                    analyze_window_value_with_default("LAG", arg, &arg_dt, default, resolver, self)?;
                 WindowFunction::Lag {
                     expr: arg,
                     offset,
@@ -992,18 +946,14 @@ impl Analyzer {
                 default,
             } => {
                 let (arg, arg_dt) = self.analyze_expr(expr, resolver)?;
-                let analyzed_default = if let Some(def) = default {
-                    let (dexpr, ddt) = self.analyze_expr(def, resolver)?;
-                    if ddt != DataType::Null && ddt != arg_dt {
-                        return Err(FfqError::Planning(
-                            "LEAD() default type is not compatible with value expression"
-                                .to_string(),
-                        ));
-                    }
-                    Some(dexpr)
-                } else {
-                    None
-                };
+                let (arg, analyzed_default) = analyze_window_value_with_default(
+                    "LEAD",
+                    arg,
+                    &arg_dt,
+                    default,
+                    resolver,
+                    self,
+                )?;
                 WindowFunction::Lead {
                     expr: arg,
                     offset,
@@ -1697,6 +1647,131 @@ fn validate_window_frame(frame: &WindowFrameSpec) -> Result<()> {
     Ok(())
 }
 
+fn window_output_type_and_nullable(func: &WindowFunction, resolver: &Resolver) -> Result<(DataType, bool)> {
+    match func {
+        WindowFunction::RowNumber
+        | WindowFunction::Rank
+        | WindowFunction::DenseRank
+        | WindowFunction::Ntile(_)
+        | WindowFunction::Count(_) => Ok((DataType::Int64, false)),
+        WindowFunction::PercentRank | WindowFunction::CumeDist => Ok((DataType::Float64, false)),
+        WindowFunction::Sum(expr) | WindowFunction::Avg(expr) => {
+            let dt = expr_data_type(expr, resolver)?;
+            if !is_numeric(&dt) {
+                return Err(FfqError::Planning(
+                    "window aggregate requires numeric argument".to_string(),
+                ));
+            }
+            // Runtime currently normalizes SUM/AVG window outputs to Float64.
+            Ok((DataType::Float64, true))
+        }
+        WindowFunction::Min(expr) | WindowFunction::Max(expr) => {
+            Ok((expr_data_type(expr, resolver)?, true))
+        }
+        WindowFunction::Lag { expr, .. }
+        | WindowFunction::Lead { expr, .. }
+        | WindowFunction::FirstValue(expr)
+        | WindowFunction::LastValue(expr)
+        | WindowFunction::NthValue { expr, .. } => Ok((expr_data_type(expr, resolver)?, true)),
+    }
+}
+
+fn expr_data_type(expr: &Expr, resolver: &Resolver) -> Result<DataType> {
+    match expr {
+        Expr::ColumnRef { index, .. } => resolver.data_type_at(*index),
+        Expr::Column(name) => {
+            let (_idx, dt) = resolver.resolve(name)?;
+            Ok(dt)
+        }
+        Expr::Literal(v) => Ok(literal_type(v)),
+        Expr::Cast { to_type, .. } => Ok(to_type.clone()),
+        _ => Err(FfqError::Planning(
+            "window function argument must resolve to a typed expression".to_string(),
+        )),
+    }
+}
+
+fn expr_nullable(expr: &Expr, resolver: &Resolver) -> Result<bool> {
+    match expr {
+        Expr::ColumnRef { index, .. } => Ok(resolver.field_at(*index)?.is_nullable()),
+        Expr::Column(name) => {
+            let (idx, _dt) = resolver.resolve(name)?;
+            Ok(resolver.field_at(idx)?.is_nullable())
+        }
+        Expr::Literal(v) => Ok(matches!(v, LiteralValue::Null)),
+        Expr::Cast { expr, .. } => expr_nullable(expr, resolver),
+        Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(false),
+        Expr::And(l, r) | Expr::Or(l, r) | Expr::BinaryOp { left: l, right: r, .. } => {
+            Ok(expr_nullable(l, resolver)? || expr_nullable(r, resolver)?)
+        }
+        Expr::Not(inner) => expr_nullable(inner, resolver),
+        Expr::CaseWhen { branches, else_expr } => {
+            let mut nullable = false;
+            for (cond, value) in branches {
+                nullable |= expr_nullable(cond, resolver)?;
+                nullable |= expr_nullable(value, resolver)?;
+            }
+            nullable |= else_expr
+                .as_ref()
+                .map(|e| expr_nullable(e, resolver))
+                .transpose()?
+                .unwrap_or(true);
+            Ok(nullable)
+        }
+        #[cfg(feature = "vector")]
+        Expr::CosineSimilarity { .. } | Expr::L2Distance { .. } | Expr::DotProduct { .. } => {
+            Ok(false)
+        }
+        Expr::ScalarUdf { .. } => Ok(true),
+    }
+}
+
+fn analyze_window_value_with_default(
+    func_name: &str,
+    value_expr: Expr,
+    value_dt: &DataType,
+    default_expr: Option<Expr>,
+    resolver: &Resolver,
+    analyzer: &Analyzer,
+) -> Result<(Expr, Option<Expr>)> {
+    let Some(def) = default_expr else {
+        return Ok((value_expr, None));
+    };
+    let (analyzed_default, default_dt) = analyzer.analyze_expr(def, resolver)?;
+    let target_dt = if default_dt == DataType::Null {
+        value_dt.clone()
+    } else if value_dt == &default_dt {
+        value_dt.clone()
+    } else if is_numeric(value_dt) && is_numeric(&default_dt) {
+        wider_numeric(value_dt, &default_dt).ok_or_else(|| {
+            FfqError::Planning(format!(
+                "{func_name}() default type widening failed for {value_dt:?} and {default_dt:?}"
+            ))
+        })?
+    } else if matches!(
+        (value_dt, &default_dt),
+        (DataType::Utf8, DataType::LargeUtf8)
+            | (DataType::LargeUtf8, DataType::Utf8)
+            | (DataType::Utf8, DataType::Utf8)
+            | (DataType::LargeUtf8, DataType::LargeUtf8)
+    ) {
+        if *value_dt == DataType::LargeUtf8 || default_dt == DataType::LargeUtf8 {
+            DataType::LargeUtf8
+        } else {
+            DataType::Utf8
+        }
+    } else {
+        return Err(FfqError::Planning(format!(
+            "{func_name}() default type is not compatible with value expression: {value_dt:?} vs {default_dt:?}"
+        )));
+    };
+
+    Ok((
+        cast_if_needed(value_expr, value_dt, &target_dt),
+        Some(cast_if_needed(analyzed_default, &default_dt, &target_dt)),
+    ))
+}
+
 fn frame_bound_rank(bound: &WindowFrameBound) -> i32 {
     match bound {
         WindowFrameBound::UnboundedPreceding => -10_000,
@@ -1948,6 +2023,61 @@ mod tests {
             },
             other => panic!("expected Projection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn analyze_window_lag_default_allows_numeric_coercion() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT LAG(f, 1, 0) OVER (ORDER BY f) AS lagf FROM t",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let analyzed = analyzer.analyze(plan, &provider).expect("analyze");
+        match analyzed {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Window { exprs, .. } => match &exprs[0].func {
+                    crate::logical_plan::WindowFunction::Lag { expr, default, .. } => {
+                        let _ = expr;
+                        assert!(matches!(
+                            default.as_ref(),
+                            Some(crate::logical_plan::Expr::Cast { .. })
+                        ));
+                    }
+                    other => panic!("expected lag window func, got {other:?}"),
+                },
+                other => panic!("expected window plan, got {other:?}"),
+            },
+            other => panic!("expected projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_window_lead_default_rejects_incompatible_types() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT LEAD(f, 1, 'x') OVER (ORDER BY f) AS leadf FROM t",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let err = analyzer.analyze(plan, &provider).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("LEAD() default type is not compatible with value expression"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(feature = "vector")]

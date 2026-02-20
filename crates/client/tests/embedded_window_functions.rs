@@ -615,3 +615,34 @@ fn frame_exclusion_semantics_apply_in_sql_queries() {
 
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn window_output_types_and_nullability_follow_rules() {
+    let (engine, path) = make_engine_with_window_fixture();
+    let sql = "SELECT \
+                    ROW_NUMBER() OVER (PARTITION BY grp ORDER BY ord) AS rn, \
+                    COUNT(score) OVER (PARTITION BY grp ORDER BY ord) AS cnt, \
+                    PERCENT_RANK() OVER (PARTITION BY grp ORDER BY ord) AS pr, \
+                    SUM(score) OVER (PARTITION BY grp ORDER BY ord) AS s, \
+                    LAG(score, 1, 0.5) OVER (PARTITION BY grp ORDER BY ord) AS lg \
+               FROM t";
+    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+    let schema = batches[0].schema();
+
+    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+    assert!(!schema.field(0).is_nullable());
+
+    assert_eq!(schema.field(1).data_type(), &DataType::Int64);
+    assert!(!schema.field(1).is_nullable());
+
+    assert_eq!(schema.field(2).data_type(), &DataType::Float64);
+    assert!(!schema.field(2).is_nullable());
+
+    assert_eq!(schema.field(3).data_type(), &DataType::Float64);
+    assert!(schema.field(3).is_nullable());
+
+    assert_eq!(schema.field(4).data_type(), &DataType::Float64);
+    assert!(schema.field(4).is_nullable());
+
+    let _ = std::fs::remove_file(path);
+}
