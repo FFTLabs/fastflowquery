@@ -443,6 +443,7 @@ impl Coordinator {
                 self.resolve_parquet_scan_schemas(&mut x.subquery)
             }
             PhysicalPlan::Project(x) => self.resolve_parquet_scan_schemas(&mut x.input),
+            PhysicalPlan::Window(x) => self.resolve_parquet_scan_schemas(&mut x.input),
             PhysicalPlan::CoalesceBatches(x) => self.resolve_parquet_scan_schemas(&mut x.input),
             PhysicalPlan::PartialHashAggregate(x) => {
                 self.resolve_parquet_scan_schemas(&mut x.input)
@@ -924,6 +925,7 @@ fn collect_custom_ops(plan: &PhysicalPlan, out: &mut HashSet<String>) {
             collect_custom_ops(&x.subquery, out);
         }
         PhysicalPlan::Project(x) => collect_custom_ops(&x.input, out),
+        PhysicalPlan::Window(x) => collect_custom_ops(&x.input, out),
         PhysicalPlan::CoalesceBatches(x) => collect_custom_ops(&x.input, out),
         PhysicalPlan::PartialHashAggregate(x) => collect_custom_ops(&x.input, out),
         PhysicalPlan::FinalHashAggregate(x) => collect_custom_ops(&x.input, out),

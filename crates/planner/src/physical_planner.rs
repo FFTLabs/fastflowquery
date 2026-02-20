@@ -114,9 +114,18 @@ pub fn create_physical_plan(
         }
         LogicalPlan::Window { exprs, input } => {
             let child = create_physical_plan(input, cfg)?;
+            let partitioning = window_phase1_partitioning(exprs, cfg);
+            let write = PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(ShuffleWriteExchange {
+                input: Box::new(child),
+                partitioning: partitioning.clone(),
+            }));
+            let read = PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
+                input: Box::new(write),
+                partitioning,
+            }));
             Ok(PhysicalPlan::Window(WindowExec {
                 exprs: exprs.clone(),
-                input: Box::new(child),
+                input: Box::new(read),
             }))
         }
 
@@ -305,6 +314,46 @@ pub fn create_physical_plan(
                 input: Box::new(child),
             }))
         }
+    }
+}
+
+fn window_phase1_partitioning(exprs: &[crate::logical_plan::WindowExpr], cfg: &PhysicalPlannerConfig) -> PartitioningSpec {
+    if exprs.is_empty() {
+        return PartitioningSpec::Single;
+    }
+    let first = &exprs[0].partition_by;
+    // Phase-1 distributed window contract: when all window expressions share
+    // the same PARTITION BY keys and they are plain columns, hash-distribute
+    // by that key set. Otherwise, fall back to a single partition for
+    // correctness.
+    if first.is_empty() {
+        return PartitioningSpec::Single;
+    }
+    let first_sig = first
+        .iter()
+        .map(|e| format!("{e:?}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    if exprs.iter().any(|w| {
+        w.partition_by
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect::<Vec<_>>()
+            .join("|")
+            != first_sig
+    }) {
+        return PartitioningSpec::Single;
+    }
+    let mut keys = Vec::with_capacity(first.len());
+    for e in first {
+        match expr_to_key_name(e) {
+            Ok(k) => keys.push(k),
+            Err(_) => return PartitioningSpec::Single,
+        }
+    }
+    PartitioningSpec::HashKeys {
+        keys,
+        partitions: cfg.shuffle_partitions,
     }
 }
 

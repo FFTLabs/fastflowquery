@@ -121,6 +121,7 @@ fn op_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::ExistsSubqueryFilter(_) => "ExistsSubqueryFilter",
         PhysicalPlan::ScalarSubqueryFilter(_) => "ScalarSubqueryFilter",
         PhysicalPlan::Project(_) => "Project",
+        PhysicalPlan::Window(_) => "Window",
         PhysicalPlan::CoalesceBatches(_) => "CoalesceBatches",
         PhysicalPlan::PartialHashAggregate(_) => "PartialHashAggregate",
         PhysicalPlan::FinalHashAggregate(_) => "FinalHashAggregate",

@@ -413,6 +413,10 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     FROM c a
     JOIN c b
       ON a.l_orderkey = b.l_orderkey";
+    let sql_window = "SELECT l_orderkey, l_partkey,
+        ROW_NUMBER() OVER (PARTITION BY l_orderkey ORDER BY l_partkey) AS rn
+        FROM lineitem
+        WHERE l_orderkey >= 2";
 
     let dist_scan_batches = dist_engine
         .sql(sql_scan)
@@ -457,6 +461,12 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         .collect()
         .await
         .expect("dist cte join-heavy collect");
+    let dist_window_batches = dist_engine
+        .sql(sql_window)
+        .expect("dist window sql")
+        .collect()
+        .await
+        .expect("dist window collect");
 
     cfg.coordinator_endpoint = None;
 
@@ -504,6 +514,12 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         .collect()
         .await
         .expect("embedded cte join-heavy collect");
+    let embedded_window_batches = embedded_engine
+        .sql(sql_window)
+        .expect("embedded window sql")
+        .collect()
+        .await
+        .expect("embedded window collect");
 
     let dist_agg_norm = support::snapshot_text(&dist_agg_batches, &["l_orderkey"], 1e-9);
     let emb_agg_norm = support::snapshot_text(&embedded_agg_batches, &["l_orderkey"], 1e-9);
@@ -580,6 +596,14 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     assert_eq!(
         dist_cte_join_heavy_norm, emb_cte_join_heavy_norm,
         "distributed and embedded CTE join-heavy outputs differ"
+    );
+    let dist_window_norm =
+        support::snapshot_text(&dist_window_batches, &["l_orderkey", "l_partkey", "rn"], 1e-9);
+    let emb_window_norm =
+        support::snapshot_text(&embedded_window_batches, &["l_orderkey", "l_partkey", "rn"], 1e-9);
+    assert_eq!(
+        dist_window_norm, emb_window_norm,
+        "distributed and embedded window outputs differ"
     );
 
     let dist_agg = collect_group_counts(&dist_agg_batches);

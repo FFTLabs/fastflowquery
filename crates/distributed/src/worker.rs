@@ -35,7 +35,11 @@ use ffq_execution::{
     PhysicalOperatorRegistry, TaskContext as ExecTaskContext, compile_expr,
     global_physical_operator_registry,
 };
-use ffq_planner::{AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, PartitioningSpec, PhysicalPlan};
+use ffq_planner::{
+    AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, PartitioningSpec, PhysicalPlan, WindowExpr,
+    WindowFrameBound, WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits, WindowFunction,
+    WindowOrderExpr,
+};
 use ffq_shuffle::{ShuffleReader, ShuffleWriter};
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
@@ -683,6 +687,7 @@ fn operator_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::ExistsSubqueryFilter(_) => "ExistsSubqueryFilter",
         PhysicalPlan::ScalarSubqueryFilter(_) => "ScalarSubqueryFilter",
         PhysicalPlan::Project(_) => "Project",
+        PhysicalPlan::Window(_) => "Window",
         PhysicalPlan::CoalesceBatches(_) => "CoalesceBatches",
         PhysicalPlan::PartialHashAggregate(_) => "PartialHashAggregate",
         PhysicalPlan::FinalHashAggregate(_) => "FinalHashAggregate",
@@ -970,6 +975,25 @@ fn eval_plan_for_stage(
                     schema,
                     batches: out_batches,
                 },
+                in_rows,
+                in_batches,
+                in_bytes,
+            })
+        }
+        PhysicalPlan::Window(window) => {
+            let child = eval_plan_for_stage(
+                &window.input,
+                current_stage,
+                target_stage,
+                state,
+                ctx,
+                catalog,
+                Arc::clone(&physical_registry),
+            )?;
+            let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+            let out = run_window_exec(child, &window.exprs)?;
+            Ok(OpEval {
+                out,
                 in_rows,
                 in_batches,
                 in_bytes,
@@ -1906,6 +1930,820 @@ fn rows_from_batches(input: &ExecOutput) -> Result<Vec<Vec<ScalarValue>>> {
         }
     }
     Ok(out)
+}
+
+fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput> {
+    let mut rows = rows_from_batches(&input)?;
+    let row_count = rows.len();
+    let mut eval_ctx_cache: HashMap<String, WindowEvalContext> = HashMap::new();
+    let mut out_fields: Vec<Field> = input
+        .schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    for w in exprs {
+        let cache_key = window_compatibility_key(w);
+        if !eval_ctx_cache.contains_key(&cache_key) {
+            eval_ctx_cache.insert(cache_key.clone(), build_window_eval_context(&input, w)?);
+        }
+        let output = evaluate_window_expr_with_ctx(
+            &input,
+            w,
+            eval_ctx_cache
+                .get(&cache_key)
+                .expect("window eval ctx must exist"),
+        )?;
+        if output.len() != row_count {
+            return Err(FfqError::Execution(format!(
+                "window output row count mismatch: expected {row_count}, got {}",
+                output.len()
+            )));
+        }
+        let dt = window_output_type(&input.schema, w)?;
+        out_fields.push(Field::new(&w.output_name, dt, window_output_nullable(w)));
+        for (idx, value) in output.into_iter().enumerate() {
+            rows[idx].push(value);
+        }
+    }
+    let out_schema = Arc::new(Schema::new(out_fields));
+    let batch = rows_to_batch(&out_schema, &rows)?;
+    Ok(ExecOutput {
+        schema: out_schema,
+        batches: vec![batch],
+    })
+}
+
+#[derive(Debug, Clone)]
+struct WindowEvalContext {
+    order_keys: Vec<Vec<ScalarValue>>,
+    order_idx: Vec<usize>,
+    partitions: Vec<(usize, usize)>,
+}
+
+fn window_compatibility_key(w: &WindowExpr) -> String {
+    let partition_sig = w
+        .partition_by
+        .iter()
+        .map(|e| format!("{e:?}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let order_sig = w
+        .order_by
+        .iter()
+        .map(|o| format!("{:?}:{}:{}", o.expr, o.asc, o.nulls_first))
+        .collect::<Vec<_>>()
+        .join("|");
+    format!("P[{partition_sig}]O[{order_sig}]")
+}
+
+fn build_window_eval_context(input: &ExecOutput, w: &WindowExpr) -> Result<WindowEvalContext> {
+    let row_count = input.batches.iter().map(|b| b.num_rows()).sum::<usize>();
+    let partition_keys = w
+        .partition_by
+        .iter()
+        .map(|e| evaluate_expr_rows(input, e))
+        .collect::<Result<Vec<_>>>()?;
+    let order_keys = w
+        .order_by
+        .iter()
+        .map(|o| evaluate_expr_rows(input, &o.expr))
+        .collect::<Result<Vec<_>>>()?;
+    let fallback_keys = build_stable_row_fallback_keys(input)?;
+    let mut order_idx: Vec<usize> = (0..row_count).collect();
+    order_idx.sort_by(|a, b| {
+        cmp_key_sets(&partition_keys, *a, *b)
+            .then_with(|| cmp_order_key_sets(&order_keys, &w.order_by, *a, *b))
+            .then_with(|| fallback_keys[*a].cmp(&fallback_keys[*b]))
+            .then_with(|| a.cmp(b))
+    });
+    let partitions = partition_ranges(&order_idx, &partition_keys);
+    Ok(WindowEvalContext {
+        order_keys,
+        order_idx,
+        partitions,
+    })
+}
+
+fn evaluate_window_expr_with_ctx(
+    input: &ExecOutput,
+    w: &WindowExpr,
+    eval_ctx: &WindowEvalContext,
+) -> Result<Vec<ScalarValue>> {
+    let row_count = input.batches.iter().map(|b| b.num_rows()).sum::<usize>();
+    let mut out = vec![ScalarValue::Null; row_count];
+    let frame = effective_window_frame(w);
+    match &w.func {
+        WindowFunction::RowNumber => {
+            for (start, end) in &eval_ctx.partitions {
+                for (offset, pos) in eval_ctx.order_idx[*start..*end].iter().enumerate() {
+                    out[*pos] = ScalarValue::Int64((offset + 1) as i64);
+                }
+            }
+        }
+        WindowFunction::Rank => {
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let mut rank = 1_i64;
+                let mut part_i = 0usize;
+                while part_i < part.len() {
+                    if part_i > 0
+                        && cmp_order_key_sets(
+                            &eval_ctx.order_keys,
+                            &w.order_by,
+                            part[part_i - 1],
+                            part[part_i],
+                        ) != Ordering::Equal
+                    {
+                        rank = (part_i as i64) + 1;
+                    }
+                    out[part[part_i]] = ScalarValue::Int64(rank);
+                    part_i += 1;
+                }
+            }
+        }
+        WindowFunction::DenseRank => {
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let mut rank = 1_i64;
+                let mut part_i = 0usize;
+                while part_i < part.len() {
+                    if part_i > 0
+                        && cmp_order_key_sets(
+                            &eval_ctx.order_keys,
+                            &w.order_by,
+                            part[part_i - 1],
+                            part[part_i],
+                        ) != Ordering::Equal
+                    {
+                        rank += 1;
+                    }
+                    out[part[part_i]] = ScalarValue::Int64(rank);
+                    part_i += 1;
+                }
+            }
+        }
+        WindowFunction::PercentRank => {
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let n = part.len();
+                if n <= 1 {
+                    for pos in part {
+                        out[*pos] = ScalarValue::Float64Bits(0.0_f64.to_bits());
+                    }
+                    continue;
+                }
+                let mut rank = 1_i64;
+                for part_i in 0..part.len() {
+                    if part_i > 0
+                        && cmp_order_key_sets(
+                            &eval_ctx.order_keys,
+                            &w.order_by,
+                            part[part_i - 1],
+                            part[part_i],
+                        ) != Ordering::Equal
+                    {
+                        rank = (part_i as i64) + 1;
+                    }
+                    let pct = (rank - 1) as f64 / (n as f64 - 1.0);
+                    out[part[part_i]] = ScalarValue::Float64Bits(pct.to_bits());
+                }
+            }
+        }
+        WindowFunction::CumeDist => {
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let n = part.len() as f64;
+                let mut i = 0usize;
+                while i < part.len() {
+                    let tie_start = i;
+                    i += 1;
+                    while i < part.len()
+                        && cmp_order_key_sets(
+                            &eval_ctx.order_keys,
+                            &w.order_by,
+                            part[tie_start],
+                            part[i],
+                        ) == Ordering::Equal
+                    {
+                        i += 1;
+                    }
+                    let cume = i as f64 / n;
+                    for pos in &part[tie_start..i] {
+                        out[*pos] = ScalarValue::Float64Bits(cume.to_bits());
+                    }
+                }
+            }
+        }
+        WindowFunction::Ntile(buckets) => {
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let n_rows = part.len();
+                let n_buckets = *buckets;
+                for (i, pos) in part.iter().enumerate() {
+                    let tile = ((i * n_buckets) / n_rows) + 1;
+                    out[*pos] = ScalarValue::Int64(tile as i64);
+                }
+            }
+        }
+        WindowFunction::Count(arg) => {
+            let values = evaluate_expr_rows(input, arg)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let part_ctx = build_partition_frame_ctx(part, &eval_ctx.order_keys, &w.order_by)?;
+                for i in 0..part.len() {
+                    let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
+                    let mut cnt = 0_i64;
+                    for pos in &part[fs..fe] {
+                        if !matches!(values[*pos], ScalarValue::Null) {
+                            cnt += 1;
+                        }
+                    }
+                    out[part[i]] = ScalarValue::Int64(cnt);
+                }
+            }
+        }
+        WindowFunction::Sum(arg) => {
+            let values = evaluate_expr_rows(input, arg)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let part_ctx = build_partition_frame_ctx(part, &eval_ctx.order_keys, &w.order_by)?;
+                for i in 0..part.len() {
+                    let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
+                    let mut sum = 0.0_f64;
+                    let mut seen = false;
+                    for pos in &part[fs..fe] {
+                        match &values[*pos] {
+                            ScalarValue::Int64(v) => {
+                                sum += *v as f64;
+                                seen = true;
+                            }
+                            ScalarValue::Float64Bits(v) => {
+                                sum += f64::from_bits(*v);
+                                seen = true;
+                            }
+                            ScalarValue::Null => {}
+                            _ => {
+                                return Err(FfqError::Execution(
+                                    "SUM window only supports numeric types".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    out[part[i]] = if seen {
+                        ScalarValue::Float64Bits(sum.to_bits())
+                    } else {
+                        ScalarValue::Null
+                    };
+                }
+            }
+        }
+        WindowFunction::Avg(arg) => {
+            let values = evaluate_expr_rows(input, arg)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let part_ctx = build_partition_frame_ctx(part, &eval_ctx.order_keys, &w.order_by)?;
+                for i in 0..part.len() {
+                    let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
+                    let mut sum = 0.0_f64;
+                    let mut count = 0_i64;
+                    for pos in &part[fs..fe] {
+                        if let Some(v) = scalar_to_f64(&values[*pos]) {
+                            sum += v;
+                            count += 1;
+                        } else if !matches!(values[*pos], ScalarValue::Null) {
+                            return Err(FfqError::Execution(
+                                "AVG window only supports numeric types".to_string(),
+                            ));
+                        }
+                    }
+                    out[part[i]] = if count > 0 {
+                        ScalarValue::Float64Bits((sum / count as f64).to_bits())
+                    } else {
+                        ScalarValue::Null
+                    };
+                }
+            }
+        }
+        WindowFunction::Min(arg) => {
+            let values = evaluate_expr_rows(input, arg)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let part_ctx = build_partition_frame_ctx(part, &eval_ctx.order_keys, &w.order_by)?;
+                for i in 0..part.len() {
+                    let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
+                    let mut current: Option<ScalarValue> = None;
+                    for pos in &part[fs..fe] {
+                        let v = values[*pos].clone();
+                        if matches!(v, ScalarValue::Null) {
+                            continue;
+                        }
+                        match &current {
+                            None => current = Some(v),
+                            Some(existing) => {
+                                if scalar_lt(&v, existing)? {
+                                    current = Some(v);
+                                }
+                            }
+                        }
+                    }
+                    out[part[i]] = current.unwrap_or(ScalarValue::Null);
+                }
+            }
+        }
+        WindowFunction::Max(arg) => {
+            let values = evaluate_expr_rows(input, arg)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let part_ctx = build_partition_frame_ctx(part, &eval_ctx.order_keys, &w.order_by)?;
+                for i in 0..part.len() {
+                    let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
+                    let mut current: Option<ScalarValue> = None;
+                    for pos in &part[fs..fe] {
+                        let v = values[*pos].clone();
+                        if matches!(v, ScalarValue::Null) {
+                            continue;
+                        }
+                        match &current {
+                            None => current = Some(v),
+                            Some(existing) => {
+                                if scalar_gt(&v, existing)? {
+                                    current = Some(v);
+                                }
+                            }
+                        }
+                    }
+                    out[part[i]] = current.unwrap_or(ScalarValue::Null);
+                }
+            }
+        }
+        WindowFunction::Lag {
+            expr,
+            offset,
+            default,
+        } => {
+            let values = evaluate_expr_rows(input, expr)?;
+            let default_values = default
+                .as_ref()
+                .map(|d| evaluate_expr_rows(input, d))
+                .transpose()?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                for i in 0..part.len() {
+                    out[part[i]] = if i >= *offset {
+                        values[part[i - *offset]].clone()
+                    } else if let Some(default_rows) = &default_values {
+                        default_rows[part[i]].clone()
+                    } else {
+                        ScalarValue::Null
+                    };
+                }
+            }
+        }
+        WindowFunction::Lead {
+            expr,
+            offset,
+            default,
+        } => {
+            let values = evaluate_expr_rows(input, expr)?;
+            let default_values = default
+                .as_ref()
+                .map(|d| evaluate_expr_rows(input, d))
+                .transpose()?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                for i in 0..part.len() {
+                    out[part[i]] = if i + *offset < part.len() {
+                        values[part[i + *offset]].clone()
+                    } else if let Some(default_rows) = &default_values {
+                        default_rows[part[i]].clone()
+                    } else {
+                        ScalarValue::Null
+                    };
+                }
+            }
+        }
+        WindowFunction::FirstValue(expr) => {
+            let values = evaluate_expr_rows(input, expr)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let first = values[part[0]].clone();
+                for pos in part {
+                    out[*pos] = first.clone();
+                }
+            }
+        }
+        WindowFunction::LastValue(expr) => {
+            let values = evaluate_expr_rows(input, expr)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let last = values[*part.last().expect("partition non-empty")].clone();
+                for pos in part {
+                    out[*pos] = last.clone();
+                }
+            }
+        }
+        WindowFunction::NthValue { expr, n } => {
+            let values = evaluate_expr_rows(input, expr)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let nth = if *n >= 1 && *n <= part.len() {
+                    values[part[*n - 1]].clone()
+                } else {
+                    ScalarValue::Null
+                };
+                for pos in part {
+                    out[*pos] = nth.clone();
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn window_output_type(input_schema: &SchemaRef, w: &WindowExpr) -> Result<DataType> {
+    let dt = match &w.func {
+        WindowFunction::RowNumber
+        | WindowFunction::Rank
+        | WindowFunction::DenseRank
+        | WindowFunction::Ntile(_)
+        | WindowFunction::Count(_) => DataType::Int64,
+        WindowFunction::PercentRank | WindowFunction::CumeDist => DataType::Float64,
+        WindowFunction::Sum(_) | WindowFunction::Avg(_) => DataType::Float64,
+        WindowFunction::Min(expr)
+        | WindowFunction::Max(expr)
+        | WindowFunction::Lag { expr, .. }
+        | WindowFunction::Lead { expr, .. }
+        | WindowFunction::FirstValue(expr)
+        | WindowFunction::LastValue(expr)
+        | WindowFunction::NthValue { expr, .. } => compile_expr(expr, input_schema)?.data_type(),
+    };
+    Ok(dt)
+}
+
+fn window_output_nullable(w: &WindowExpr) -> bool {
+    !matches!(
+        w.func,
+        WindowFunction::RowNumber
+            | WindowFunction::Rank
+            | WindowFunction::DenseRank
+            | WindowFunction::Ntile(_)
+            | WindowFunction::Count(_)
+    )
+}
+
+fn effective_window_frame(w: &WindowExpr) -> WindowFrameSpec {
+    if let Some(frame) = &w.frame {
+        return frame.clone();
+    }
+    if w.order_by.is_empty() {
+        WindowFrameSpec {
+            units: WindowFrameUnits::Rows,
+            start_bound: WindowFrameBound::UnboundedPreceding,
+            end_bound: WindowFrameBound::UnboundedFollowing,
+            exclusion: WindowFrameExclusion::NoOthers,
+        }
+    } else {
+        WindowFrameSpec {
+            units: WindowFrameUnits::Range,
+            start_bound: WindowFrameBound::UnboundedPreceding,
+            end_bound: WindowFrameBound::CurrentRow,
+            exclusion: WindowFrameExclusion::NoOthers,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FrameCtx {
+    peer_groups: Vec<(usize, usize)>,
+    row_group: Vec<usize>,
+}
+
+fn build_partition_frame_ctx(
+    part: &[usize],
+    order_keys: &[Vec<ScalarValue>],
+    order_exprs: &[WindowOrderExpr],
+) -> Result<FrameCtx> {
+    let (peer_groups, row_group) = build_peer_groups(part, order_keys, order_exprs);
+    Ok(FrameCtx {
+        peer_groups,
+        row_group,
+    })
+}
+
+fn build_peer_groups(
+    part: &[usize],
+    order_keys: &[Vec<ScalarValue>],
+    order_exprs: &[WindowOrderExpr],
+) -> (Vec<(usize, usize)>, Vec<usize>) {
+    let mut groups = Vec::new();
+    let mut row_group = vec![0usize; part.len()];
+    let mut start = 0usize;
+    let mut i = 1usize;
+    while i <= part.len() {
+        let split = if i == part.len() {
+            true
+        } else {
+            cmp_order_key_sets(order_keys, order_exprs, part[i - 1], part[i]) != Ordering::Equal
+        };
+        if split {
+            let gidx = groups.len();
+            for rg in &mut row_group[start..i] {
+                *rg = gidx;
+            }
+            groups.push((start, i));
+            start = i;
+        }
+        i += 1;
+    }
+    (groups, row_group)
+}
+
+fn resolve_frame_range(
+    frame: &WindowFrameSpec,
+    row_idx: usize,
+    part: &[usize],
+    ctx: &FrameCtx,
+) -> Result<(usize, usize)> {
+    if part.is_empty() {
+        return Ok((0, 0));
+    }
+    let (mut start, mut end) = match frame.units {
+        WindowFrameUnits::Rows => resolve_rows_frame(frame, row_idx, part.len()),
+        WindowFrameUnits::Range => resolve_range_frame(frame, row_idx, ctx),
+        WindowFrameUnits::Groups => resolve_groups_frame(frame, row_idx, ctx),
+    }?;
+    if start > end {
+        return Ok((0, 0));
+    }
+    if start > part.len() {
+        start = part.len();
+    }
+    if end > part.len() {
+        end = part.len();
+    }
+    apply_exclusion(frame.exclusion, row_idx, start, end, ctx)
+}
+
+fn resolve_rows_frame(
+    frame: &WindowFrameSpec,
+    row_idx: usize,
+    part_len: usize,
+) -> Result<(usize, usize)> {
+    let start = match frame.start_bound {
+        WindowFrameBound::UnboundedPreceding => 0_i64,
+        WindowFrameBound::Preceding(n) => {
+            row_idx as i64 - window_bound_preceding_offset(n, "start")?
+        }
+        WindowFrameBound::CurrentRow => row_idx as i64,
+        WindowFrameBound::Following(n) => {
+            row_idx as i64 + window_bound_following_offset(n, "start")?
+        }
+        WindowFrameBound::UnboundedFollowing => part_len as i64,
+    };
+    let end_inclusive = match frame.end_bound {
+        WindowFrameBound::UnboundedPreceding => -1_i64,
+        WindowFrameBound::Preceding(n) => row_idx as i64 - window_bound_preceding_offset(n, "end")?,
+        WindowFrameBound::CurrentRow => row_idx as i64,
+        WindowFrameBound::Following(n) => row_idx as i64 + window_bound_following_offset(n, "end")?,
+        WindowFrameBound::UnboundedFollowing => part_len as i64 - 1,
+    };
+    let start = start.clamp(0, part_len as i64);
+    let end_exclusive = (end_inclusive + 1).clamp(0, part_len as i64);
+    Ok((start as usize, end_exclusive as usize))
+}
+
+fn resolve_range_frame(frame: &WindowFrameSpec, row_idx: usize, ctx: &FrameCtx) -> Result<(usize, usize)> {
+    let gcur = ctx.row_group[row_idx] as i64;
+    let glen = ctx.peer_groups.len() as i64;
+    let start_g = match frame.start_bound {
+        WindowFrameBound::UnboundedPreceding => 0_i64,
+        WindowFrameBound::Preceding(n) => gcur - window_bound_preceding_offset(n, "start")?,
+        WindowFrameBound::CurrentRow => gcur,
+        WindowFrameBound::Following(n) => gcur + window_bound_following_offset(n, "start")?,
+        WindowFrameBound::UnboundedFollowing => glen,
+    }
+    .clamp(0, glen);
+    let end_g_inclusive = match frame.end_bound {
+        WindowFrameBound::UnboundedPreceding => -1_i64,
+        WindowFrameBound::Preceding(n) => gcur - window_bound_preceding_offset(n, "end")?,
+        WindowFrameBound::CurrentRow => gcur,
+        WindowFrameBound::Following(n) => gcur + window_bound_following_offset(n, "end")?,
+        WindowFrameBound::UnboundedFollowing => glen - 1,
+    }
+    .clamp(-1, glen - 1);
+    if start_g > end_g_inclusive {
+        return Ok((0, 0));
+    }
+    let start = ctx.peer_groups[start_g as usize].0;
+    let end = ctx.peer_groups[end_g_inclusive as usize].1;
+    Ok((start, end))
+}
+
+fn resolve_groups_frame(frame: &WindowFrameSpec, row_idx: usize, ctx: &FrameCtx) -> Result<(usize, usize)> {
+    resolve_range_frame(frame, row_idx, ctx)
+}
+
+fn apply_exclusion(
+    exclusion: WindowFrameExclusion,
+    row_idx: usize,
+    start: usize,
+    end: usize,
+    ctx: &FrameCtx,
+) -> Result<(usize, usize)> {
+    if start >= end {
+        return Ok((0, 0));
+    }
+    let (s, e) = match exclusion {
+        WindowFrameExclusion::NoOthers => (start, end),
+        WindowFrameExclusion::CurrentRow => {
+            if row_idx < start || row_idx >= end {
+                (start, end)
+            } else if row_idx == start {
+                (start + 1, end)
+            } else if row_idx + 1 == end {
+                (start, end - 1)
+            } else {
+                return Ok((0, 0));
+            }
+        }
+        WindowFrameExclusion::Group => {
+            let g = ctx.row_group[row_idx];
+            let (gs, ge) = ctx.peer_groups[g];
+            if ge <= start || gs >= end {
+                (start, end)
+            } else if gs <= start && ge >= end {
+                (0, 0)
+            } else if gs <= start {
+                (ge, end)
+            } else if ge >= end {
+                (start, gs)
+            } else {
+                return Ok((0, 0));
+            }
+        }
+        WindowFrameExclusion::Ties => {
+            let g = ctx.row_group[row_idx];
+            let (gs, ge) = ctx.peer_groups[g];
+            if ge <= start || gs >= end {
+                (start, end)
+            } else if gs <= start && ge >= end {
+                (row_idx, row_idx + 1)
+            } else if gs <= start {
+                (ge, end)
+            } else if ge >= end {
+                (start, gs)
+            } else {
+                return Ok((row_idx, row_idx + 1));
+            }
+        }
+    };
+    Ok((s.min(e), e))
+}
+
+fn window_bound_preceding_offset(v: usize, where_: &str) -> Result<i64> {
+    i64::try_from(v).map_err(|_| {
+        FfqError::Execution(format!(
+            "window frame {where_} bound PRECEDING value {v} overflows i64"
+        ))
+    })
+}
+
+fn window_bound_following_offset(v: usize, where_: &str) -> Result<i64> {
+    i64::try_from(v).map_err(|_| {
+        FfqError::Execution(format!(
+            "window frame {where_} bound FOLLOWING value {v} overflows i64"
+        ))
+    })
+}
+
+fn evaluate_expr_rows(input: &ExecOutput, expr: &Expr) -> Result<Vec<ScalarValue>> {
+    let eval = compile_expr(expr, &input.schema)?;
+    let mut out = Vec::new();
+    for batch in &input.batches {
+        let arr = eval.evaluate(batch)?;
+        for row in 0..batch.num_rows() {
+            out.push(scalar_from_array(&arr, row)?);
+        }
+    }
+    Ok(out)
+}
+
+fn cmp_key_sets(keys: &[Vec<ScalarValue>], a: usize, b: usize) -> Ordering {
+    for k in keys {
+        let ord = cmp_scalar_for_window(&k[a], &k[b], false, true);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+fn cmp_order_key_sets(
+    keys: &[Vec<ScalarValue>],
+    order_exprs: &[WindowOrderExpr],
+    a: usize,
+    b: usize,
+) -> Ordering {
+    for (i, o) in order_exprs.iter().enumerate() {
+        let ord = cmp_scalar_for_window(&keys[i][a], &keys[i][b], !o.asc, o.nulls_first);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+fn cmp_scalar_for_window(
+    a: &ScalarValue,
+    b: &ScalarValue,
+    descending: bool,
+    nulls_first: bool,
+) -> Ordering {
+    use ScalarValue::*;
+    match (a, b) {
+        (Null, Null) => return Ordering::Equal,
+        (Null, _) => {
+            return if nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
+        (_, Null) => {
+            return if nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+        _ => {}
+    }
+    let ord = match (a, b) {
+        (Int64(x), Int64(y)) => x.cmp(y),
+        (Float64Bits(x), Float64Bits(y)) => cmp_f64_for_window(f64::from_bits(*x), f64::from_bits(*y)),
+        (Int64(x), Float64Bits(y)) => cmp_f64_for_window(*x as f64, f64::from_bits(*y)),
+        (Float64Bits(x), Int64(y)) => cmp_f64_for_window(f64::from_bits(*x), *y as f64),
+        (Utf8(x), Utf8(y)) => x.cmp(y),
+        (Boolean(x), Boolean(y)) => x.cmp(y),
+        _ => format!("{a:?}").cmp(&format!("{b:?}")),
+    };
+    if descending { ord.reverse() } else { ord }
+}
+
+fn cmp_f64_for_window(a: f64, b: f64) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.total_cmp(&b),
+    }
+}
+
+fn build_stable_row_fallback_keys(input: &ExecOutput) -> Result<Vec<u64>> {
+    let rows = rows_from_batches(input)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut hasher = DefaultHasher::new();
+        for value in row {
+            format!("{value:?}").hash(&mut hasher);
+            "|".hash(&mut hasher);
+        }
+        out.push(hasher.finish());
+    }
+    Ok(out)
+}
+
+fn partition_ranges(order_idx: &[usize], partition_keys: &[Vec<ScalarValue>]) -> Vec<(usize, usize)> {
+    if order_idx.is_empty() {
+        return Vec::new();
+    }
+    if partition_keys.is_empty() {
+        return vec![(0, order_idx.len())];
+    }
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for i in 1..=order_idx.len() {
+        let split = if i == order_idx.len() {
+            true
+        } else {
+            cmp_key_sets(partition_keys, order_idx[i - 1], order_idx[i]) != Ordering::Equal
+        };
+        if split {
+            out.push((start, i));
+            start = i;
+        }
+    }
+    out
+}
+
+fn scalar_to_f64(v: &ScalarValue) -> Option<f64> {
+    match v {
+        ScalarValue::Int64(x) => Some(*x as f64),
+        ScalarValue::Float64Bits(x) => Some(f64::from_bits(*x)),
+        ScalarValue::Null => None,
+        _ => None,
+    }
 }
 
 fn run_exists_subquery_filter(input: ExecOutput, subquery: ExecOutput, negated: bool) -> ExecOutput {
