@@ -47,6 +47,10 @@ pub struct CoordinatorConfig {
     pub worker_liveness_timeout_ms: u64,
     /// Target bytes used to derive adaptive downstream shuffle reduce-task counts.
     pub adaptive_shuffle_target_bytes: u64,
+    /// Optional hard cap for number of reduce partitions per reduce task group.
+    ///
+    /// `0` disables this split rule.
+    pub adaptive_shuffle_max_partitions_per_task: u32,
 }
 
 impl Default for CoordinatorConfig {
@@ -61,6 +65,7 @@ impl Default for CoordinatorConfig {
             retry_backoff_base_ms: 250,
             worker_liveness_timeout_ms: 15_000,
             adaptive_shuffle_target_bytes: 128 * 1024 * 1024,
+            adaptive_shuffle_max_partitions_per_task: 0,
         }
     }
 }
@@ -557,6 +562,7 @@ impl Coordinator {
                 query,
                 &map_outputs_snapshot,
                 self.config.adaptive_shuffle_target_bytes,
+                self.config.adaptive_shuffle_max_partitions_per_task,
                 now,
             );
             let latest_attempts = latest_attempt_map(query);
@@ -1061,6 +1067,7 @@ fn maybe_apply_adaptive_partition_layout(
     query: &mut QueryRuntime,
     map_outputs: &HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>,
     target_bytes: u64,
+    max_partitions_per_task: u32,
     ready_at_ms: u64,
 ) {
     let latest_states = latest_task_states(query);
@@ -1090,10 +1097,11 @@ fn maybe_apply_adaptive_partition_layout(
         if bytes_by_partition.is_empty() {
             continue;
         }
-        let groups = coalesced_partition_groups(
+        let groups = deterministic_coalesce_split_groups(
             stage.metrics.planned_reduce_tasks,
             target_bytes,
             &bytes_by_partition,
+            max_partitions_per_task,
         );
         if (groups.len() as u32) < stage.metrics.planned_reduce_tasks {
             stages_to_rewire.push((stage_id, groups));
@@ -1178,10 +1186,11 @@ fn latest_partition_bytes_for_stage(
     out
 }
 
-fn coalesced_partition_groups(
+fn deterministic_coalesce_split_groups(
     planned_partitions: u32,
     target_bytes: u64,
     bytes_by_partition: &HashMap<u32, u64>,
+    max_partitions_per_task: u32,
 ) -> Vec<Vec<u32>> {
     if planned_partitions <= 1 {
         return vec![vec![0]];
@@ -1205,7 +1214,31 @@ fn coalesced_partition_groups(
     if !current.is_empty() {
         groups.push(current);
     }
-    groups
+    split_groups_by_max_partitions(groups, max_partitions_per_task)
+}
+
+fn split_groups_by_max_partitions(
+    groups: Vec<Vec<u32>>,
+    max_partitions_per_task: u32,
+) -> Vec<Vec<u32>> {
+    if max_partitions_per_task == 0 {
+        return groups;
+    }
+    let cap = max_partitions_per_task as usize;
+    let mut out = Vec::new();
+    for g in groups {
+        if g.len() <= cap {
+            out.push(g);
+            continue;
+        }
+        let mut i = 0usize;
+        while i < g.len() {
+            let end = (i + cap).min(g.len());
+            out.push(g[i..end].to_vec());
+            i = end;
+        }
+    }
+    out
 }
 
 fn collect_custom_ops(plan: &PhysicalPlan, out: &mut HashSet<String>) {
@@ -1783,5 +1816,36 @@ mod tests {
         let root = status.stage_metrics.get(&0).expect("root stage");
         assert_eq!(root.planned_reduce_tasks, 4);
         assert_eq!(root.adaptive_reduce_tasks, 1);
+    }
+
+    #[test]
+    fn deterministic_coalesce_split_groups_is_stable_across_input_map_order() {
+        let mut a = HashMap::new();
+        a.insert(0_u32, 10_u64);
+        a.insert(1_u32, 15_u64);
+        a.insert(2_u32, 5_u64);
+        a.insert(3_u32, 20_u64);
+        let mut b = HashMap::new();
+        b.insert(3_u32, 20_u64);
+        b.insert(1_u32, 15_u64);
+        b.insert(0_u32, 10_u64);
+        b.insert(2_u32, 5_u64);
+
+        let g1 = deterministic_coalesce_split_groups(4, 25, &a, 0);
+        let g2 = deterministic_coalesce_split_groups(4, 25, &b, 0);
+        assert_eq!(g1, g2);
+        assert_eq!(g1, vec![vec![0, 1], vec![2, 3]]);
+    }
+
+    #[test]
+    fn deterministic_coalesce_split_groups_applies_optional_group_split_cap() {
+        let mut bytes = HashMap::new();
+        bytes.insert(0_u32, 5_u64);
+        bytes.insert(1_u32, 5_u64);
+        bytes.insert(2_u32, 5_u64);
+        bytes.insert(3_u32, 5_u64);
+
+        let groups = deterministic_coalesce_split_groups(4, 1_000, &bytes, 2);
+        assert_eq!(groups, vec![vec![0, 1], vec![2, 3]]);
     }
 }
