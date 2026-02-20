@@ -1775,6 +1775,29 @@ mod tests {
         ShuffleWriteExchange,
     };
 
+    fn hash_shuffle_plan(partitions: usize) -> PhysicalPlan {
+        PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
+            input: Box::new(PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(
+                ShuffleWriteExchange {
+                    input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
+                        table: "t".to_string(),
+                        schema: Some(Schema::empty()),
+                        projection: None,
+                        filters: vec![],
+                    })),
+                    partitioning: PartitioningSpec::HashKeys {
+                        keys: vec!["k".to_string()],
+                        partitions,
+                    },
+                },
+            ))),
+            partitioning: PartitioningSpec::HashKeys {
+                keys: vec!["k".to_string()],
+                partitions,
+            },
+        }))
+    }
+
     #[test]
     fn coordinator_schedules_and_tracks_query_state() {
         let mut c = Coordinator::new(CoordinatorConfig::default());
@@ -2315,6 +2338,205 @@ mod tests {
         .expect("reduce success");
         let final_status = c.get_query_status("303").expect("final");
         assert_eq!(final_status.state, QueryState::Succeeded);
+    }
+
+    #[test]
+    fn coordinator_adaptive_shuffle_retries_failed_map_attempt_and_completes() {
+        let mut c = Coordinator::new(CoordinatorConfig {
+            retry_backoff_base_ms: 0,
+            adaptive_shuffle_target_bytes: 30,
+            ..CoordinatorConfig::default()
+        });
+        let bytes = serde_json::to_vec(&hash_shuffle_plan(4)).expect("plan");
+        c.submit_query("305".to_string(), &bytes).expect("submit");
+
+        let map1 = c.get_task("w1", 10).expect("map1").remove(0);
+        assert_eq!(map1.attempt, 1);
+        c.report_task_status(
+            &map1.query_id,
+            map1.stage_id,
+            map1.task_id,
+            map1.attempt,
+            map1.layout_version,
+            map1.layout_fingerprint,
+            TaskState::Failed,
+            Some("w1"),
+            "synthetic map failure".to_string(),
+        )
+        .expect("map1 failed");
+
+        let map2 = c.get_task("w2", 10).expect("map2").remove(0);
+        assert_eq!(map2.stage_id, map1.stage_id);
+        assert_eq!(map2.task_id, map1.task_id);
+        assert_eq!(map2.attempt, 2);
+        c.register_map_output(
+            "305".to_string(),
+            map2.stage_id,
+            map2.task_id,
+            map2.attempt,
+            map2.layout_version,
+            map2.layout_fingerprint,
+            vec![
+                MapOutputPartitionMeta {
+                    reduce_partition: 0,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 1,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 2,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 3,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+            ],
+        )
+        .expect("register map2");
+        c.report_task_status(
+            &map2.query_id,
+            map2.stage_id,
+            map2.task_id,
+            map2.attempt,
+            map2.layout_version,
+            map2.layout_fingerprint,
+            TaskState::Succeeded,
+            Some("w2"),
+            "map2 done".to_string(),
+        )
+        .expect("map2 success");
+
+        let reduce = c.get_task("w2", 10).expect("reduce");
+        assert!(!reduce.is_empty());
+        for t in reduce {
+            c.report_task_status(
+                &t.query_id,
+                t.stage_id,
+                t.task_id,
+                t.attempt,
+                t.layout_version,
+                t.layout_fingerprint,
+                TaskState::Succeeded,
+                Some("w2"),
+                "reduce done".to_string(),
+            )
+            .expect("reduce success");
+        }
+
+        let st = c.get_query_status("305").expect("final status");
+        assert_eq!(st.state, QueryState::Succeeded);
+        assert_eq!(st.running_tasks, 0);
+        assert_eq!(st.queued_tasks, 0);
+    }
+
+    #[test]
+    fn coordinator_adaptive_shuffle_recovers_from_worker_death_during_map_and_reduce() {
+        let mut c = Coordinator::new(CoordinatorConfig {
+            worker_liveness_timeout_ms: 5,
+            retry_backoff_base_ms: 0,
+            adaptive_shuffle_target_bytes: 30,
+            ..CoordinatorConfig::default()
+        });
+        let bytes = serde_json::to_vec(&hash_shuffle_plan(4)).expect("plan");
+        c.submit_query("306".to_string(), &bytes).expect("submit");
+        c.heartbeat("w1", 0, &[]).expect("hb w1");
+
+        let map1 = c.get_task("w1", 10).expect("map1").remove(0);
+        assert_eq!(map1.attempt, 1);
+
+        thread::sleep(Duration::from_millis(10));
+        c.heartbeat("w2", 0, &[]).expect("hb w2");
+        let map2 = c.get_task("w2", 10).expect("map2").remove(0);
+        assert_eq!(map2.stage_id, map1.stage_id);
+        assert_eq!(map2.task_id, map1.task_id);
+        assert_eq!(map2.attempt, 2);
+
+        c.register_map_output(
+            "306".to_string(),
+            map2.stage_id,
+            map2.task_id,
+            map2.attempt,
+            map2.layout_version,
+            map2.layout_fingerprint,
+            vec![
+                MapOutputPartitionMeta {
+                    reduce_partition: 0,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 1,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 2,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 3,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+            ],
+        )
+        .expect("register map2");
+        c.report_task_status(
+            &map2.query_id,
+            map2.stage_id,
+            map2.task_id,
+            map2.attempt,
+            map2.layout_version,
+            map2.layout_fingerprint,
+            TaskState::Succeeded,
+            Some("w2"),
+            "map2 done".to_string(),
+        )
+        .expect("map2 success");
+
+        c.heartbeat("w2", 0, &[]).expect("hb w2 pre-reduce");
+        let reduce1 = c.get_task("w2", 10).expect("reduce1").remove(0);
+        assert_eq!(reduce1.attempt, 1);
+        thread::sleep(Duration::from_millis(10));
+
+        c.heartbeat("w3", 0, &[]).expect("hb w3");
+        let reduce2 = c.get_task("w3", 10).expect("reduce2").remove(0);
+        assert_eq!(reduce2.stage_id, reduce1.stage_id);
+        assert_eq!(reduce2.task_id, reduce1.task_id);
+        assert_eq!(reduce2.attempt, 2);
+        c.report_task_status(
+            &reduce2.query_id,
+            reduce2.stage_id,
+            reduce2.task_id,
+            reduce2.attempt,
+            reduce2.layout_version,
+            reduce2.layout_fingerprint,
+            TaskState::Succeeded,
+            Some("w3"),
+            "reduce2 done".to_string(),
+        )
+        .expect("reduce2 success");
+
+        let st = c.get_query_status("306").expect("final status");
+        assert_eq!(st.state, QueryState::Succeeded);
+        assert_eq!(st.running_tasks, 0);
+        assert_eq!(st.queued_tasks, 0);
     }
 
     #[test]
