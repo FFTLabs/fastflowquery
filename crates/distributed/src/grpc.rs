@@ -294,6 +294,7 @@ fn proto_task_assignment(task: CoreTaskAssignment) -> v1::TaskAssignment {
         task_id: task.task_id,
         attempt: task.attempt,
         plan_fragment_json: task.plan_fragment_json,
+        assigned_reduce_partitions: task.assigned_reduce_partitions,
     }
 }
 

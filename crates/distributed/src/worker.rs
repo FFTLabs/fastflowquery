@@ -102,6 +102,8 @@ pub struct TaskContext {
     pub spill_dir: PathBuf,
     /// Root directory containing shuffle data.
     pub shuffle_root: PathBuf,
+    /// Reduce partitions assigned to this task (for shuffle-read stages).
+    pub assigned_reduce_partitions: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -352,6 +354,7 @@ where
                 per_task_memory_budget_bytes: self.config.per_task_memory_budget_bytes,
                 spill_dir: self.config.spill_dir.clone(),
                 shuffle_root: self.config.shuffle_root.clone(),
+                assigned_reduce_partitions: assignment.assigned_reduce_partitions.clone(),
             };
             handles.push(tokio::spawn(async move {
                 let _permit = permit;
@@ -538,6 +541,7 @@ impl WorkerControlPlane for GrpcControlPlane {
                 task_id: t.task_id,
                 attempt: t.attempt,
                 plan_fragment_json: t.plan_fragment_json,
+                assigned_reduce_partitions: t.assigned_reduce_partitions,
             })
             .collect())
     }
@@ -1458,26 +1462,53 @@ fn read_stage_input_from_shuffle(
     let started = Instant::now();
     let reader = ShuffleReader::new(&ctx.shuffle_root);
     let mut out_batches = Vec::new();
+    let mut schema_hint: Option<SchemaRef> = None;
     let mut read_partitions = 0_u64;
     match partitioning {
         PartitioningSpec::Single => {
             if let Ok((_attempt, batches)) =
                 reader.read_partition_latest(query_numeric_id, upstream_stage_id, 0, 0)
             {
+                if schema_hint.is_none() && !batches.is_empty() {
+                    schema_hint = Some(batches[0].schema());
+                }
                 out_batches.extend(batches);
                 read_partitions += 1;
             }
         }
         PartitioningSpec::HashKeys { partitions, .. } => {
-            for reduce in 0..*partitions {
-                if let Ok((_attempt, batches)) = reader.read_partition_latest(
-                    query_numeric_id,
-                    upstream_stage_id,
-                    0,
-                    reduce as u32,
-                ) {
+            let assigned = if ctx.assigned_reduce_partitions.is_empty() {
+                (0..*partitions as u32).collect::<Vec<_>>()
+            } else {
+                ctx.assigned_reduce_partitions
+                    .iter()
+                    .copied()
+                    .filter(|p| (*p as usize) < *partitions)
+                    .collect::<Vec<_>>()
+            };
+            for reduce in assigned {
+                if let Ok((_attempt, batches)) =
+                    reader.read_partition_latest(query_numeric_id, upstream_stage_id, 0, reduce)
+                {
+                    if schema_hint.is_none() && !batches.is_empty() {
+                        schema_hint = Some(batches[0].schema());
+                    }
                     out_batches.extend(batches);
                     read_partitions += 1;
+                }
+            }
+            if out_batches.is_empty() && schema_hint.is_none() {
+                // Preserve schema for empty assigned partitions by probing
+                // any available upstream partition.
+                for reduce in 0..*partitions as u32 {
+                    if let Ok((_attempt, batches)) =
+                        reader.read_partition_latest(query_numeric_id, upstream_stage_id, 0, reduce)
+                    {
+                        if let Some(first) = batches.first() {
+                            schema_hint = Some(first.schema());
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1485,6 +1516,7 @@ fn read_stage_input_from_shuffle(
     let schema = out_batches
         .first()
         .map(|b| b.schema())
+        .or(schema_hint)
         .unwrap_or_else(|| Arc::new(Schema::empty()));
     let out = ExecOutput {
         schema,
@@ -4131,7 +4163,10 @@ mod tests {
                     strategy_hint: JoinStrategyHint::BroadcastRight,
                 }),
             },
-            &PhysicalPlannerConfig::default(),
+            &PhysicalPlannerConfig {
+                shuffle_partitions: 4,
+                ..PhysicalPlannerConfig::default()
+            },
         )
         .expect("physical plan");
         let physical_json = serde_json::to_vec(&physical).expect("physical json");

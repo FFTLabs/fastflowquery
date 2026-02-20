@@ -106,6 +106,8 @@ pub struct TaskAssignment {
     pub attempt: u32,
     /// Serialized physical-plan fragment for this task.
     pub plan_fragment_json: Vec<u8>,
+    /// Reduce partitions assigned to this task for shuffle-read stages.
+    pub assigned_reduce_partitions: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -194,6 +196,7 @@ struct TaskRuntime {
     assigned_worker: Option<String>,
     ready_at_ms: u64,
     plan_fragment_json: Vec<u8>,
+    assigned_reduce_partitions: Vec<u32>,
     required_custom_ops: Vec<String>,
     message: String,
 }
@@ -307,12 +310,21 @@ impl Coordinator {
                         t.task_id,
                         t.attempt,
                         t.plan_fragment_json.clone(),
+                        t.assigned_reduce_partitions.clone(),
                         t.required_custom_ops.clone(),
                     ));
                 }
             }
 
-            for (stage_id, task_id, attempt, fragment, required_custom_ops) in to_retry {
+            for (
+                stage_id,
+                task_id,
+                attempt,
+                fragment,
+                assigned_reduce_partitions,
+                required_custom_ops,
+            ) in to_retry
+            {
                 if attempt < self.config.max_task_attempts {
                     let next_attempt = attempt + 1;
                     let backoff_ms = self
@@ -330,6 +342,7 @@ impl Coordinator {
                             assigned_worker: None,
                             ready_at_ms: now.saturating_add(backoff_ms),
                             plan_fragment_json: fragment,
+                            assigned_reduce_partitions,
                             required_custom_ops,
                             message: "retry scheduled after worker timeout".to_string(),
                         },
@@ -574,6 +587,7 @@ impl Coordinator {
                         task_id: task.task_id,
                         attempt: task.attempt,
                         plan_fragment_json: task.plan_fragment_json.clone(),
+                        assigned_reduce_partitions: task.assigned_reduce_partitions.clone(),
                     });
                     remaining = remaining.saturating_sub(1);
                     query_budget = query_budget.saturating_sub(1);
@@ -648,6 +662,11 @@ impl Coordinator {
             .get(&key)
             .map(|t| t.plan_fragment_json.clone())
             .ok_or_else(|| FfqError::Planning("unknown task status report".to_string()))?;
+        let task_assigned_reduce_partitions = query
+            .tasks
+            .get(&key)
+            .map(|t| t.assigned_reduce_partitions.clone())
+            .ok_or_else(|| FfqError::Planning("unknown task status report".to_string()))?;
         let task_required_custom_ops = query
             .tasks
             .get(&key)
@@ -709,6 +728,7 @@ impl Coordinator {
                             assigned_worker: None,
                             ready_at_ms: now.saturating_add(backoff_ms),
                             plan_fragment_json: task_plan_fragment,
+                            assigned_reduce_partitions: task_assigned_reduce_partitions,
                             required_custom_ops: task_required_custom_ops,
                             message: format!("retry scheduled after failure: {message}"),
                         },
@@ -941,6 +961,7 @@ fn build_query_runtime(
     for node in dag.stages {
         let sid = node.id.0 as u64;
         let task_count = stage_reduce_task_counts.get(&sid).copied().unwrap_or(1);
+        let is_reduce_stage = stage_reduce_task_counts.contains_key(&sid);
         stages.insert(
             sid,
             StageRuntime {
@@ -958,6 +979,11 @@ fn build_query_runtime(
         // Stage boundaries are still respected by coordinator scheduling.
         let fragment = physical_plan_json.to_vec();
         for task_id in 0..task_count {
+            let assigned_reduce_partitions = if is_reduce_stage {
+                vec![task_id]
+            } else {
+                Vec::new()
+            };
             tasks.insert(
                 (sid, task_id as u64, 1),
                 TaskRuntime {
@@ -969,6 +995,7 @@ fn build_query_runtime(
                     assigned_worker: None,
                     ready_at_ms: submitted_at_ms,
                     plan_fragment_json: fragment.clone(),
+                    assigned_reduce_partitions,
                     required_custom_ops: required_custom_ops.clone(),
                     message: String::new(),
                 },
@@ -1418,6 +1445,7 @@ mod tests {
         let map_assignments = c.get_task("w1", 10).expect("get map task");
         assert_eq!(map_assignments.len(), 1);
         let map = &map_assignments[0];
+        assert!(map.assigned_reduce_partitions.is_empty());
         c.report_task_status(
             &map.query_id,
             map.stage_id,
@@ -1434,6 +1462,9 @@ mod tests {
         let mut task_ids = assignments.iter().map(|t| t.task_id).collect::<Vec<_>>();
         task_ids.sort_unstable();
         assert_eq!(task_ids, vec![0, 1, 2, 3]);
+        for a in &assignments {
+            assert_eq!(a.assigned_reduce_partitions, vec![a.task_id as u32]);
+        }
 
         let status = c.get_query_status("qfanout").expect("status");
         let root = status.stage_metrics.get(&0).expect("root stage metrics");
