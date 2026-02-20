@@ -4,7 +4,7 @@
 //! distributed execution paths to keep adaptive partition decisions identical
 //! for the same observed partition-byte statistics.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// One reduce-task assignment produced by adaptive planning.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +43,12 @@ pub struct AdaptiveReducePlan {
     pub aqe_events: Vec<String>,
     /// Histogram of observed bytes by reduce partition.
     pub partition_bytes_histogram: Vec<PartitionBytesHistogramBucket>,
+    /// p95 reduce-partition byte estimate computed from latest map outputs.
+    pub skew_p95_bytes: u64,
+    /// p99 reduce-partition byte estimate computed from latest map outputs.
+    pub skew_p99_bytes: u64,
+    /// Count of reduce partitions classified as heavy for skew handling.
+    pub heavy_partition_count: u32,
 }
 
 /// Compute deterministic adaptive reduce assignments from observed partition bytes.
@@ -56,6 +62,7 @@ pub fn plan_adaptive_reduce_layout(
     max_partitions_per_task: u32,
 ) -> AdaptiveReducePlan {
     let planned_reduce_tasks = planned_partitions.max(1);
+    let skew = detect_heavy_partitions(bytes_by_partition, target_bytes);
     let mut assignments = if bytes_by_partition.is_empty() {
         (0..planned_reduce_tasks)
             .map(|p| ReduceTaskAssignment {
@@ -69,6 +76,7 @@ pub fn plan_adaptive_reduce_layout(
             planned_reduce_tasks,
             target_bytes,
             bytes_by_partition,
+            &skew.heavy_partitions,
             min_reduce_tasks,
             max_reduce_tasks,
             max_partitions_per_task,
@@ -96,8 +104,14 @@ pub fn plan_adaptive_reduce_layout(
         "unchanged"
     };
     let aqe_events = vec![format!(
-        "adaptive_layout planned={} adaptive={} reason={} skew_splits={}",
-        planned_reduce_tasks, adaptive_reduce_tasks, reason, skew_split_tasks
+        "adaptive_layout planned={} adaptive={} reason={} skew_splits={} skew_p95_bytes={} skew_p99_bytes={} heavy_partitions={}",
+        planned_reduce_tasks,
+        adaptive_reduce_tasks,
+        reason,
+        skew_split_tasks,
+        skew.p95_bytes,
+        skew.p99_bytes,
+        skew.heavy_partitions.len()
     )];
     AdaptiveReducePlan {
         planned_reduce_tasks,
@@ -107,7 +121,77 @@ pub fn plan_adaptive_reduce_layout(
         skew_split_tasks,
         aqe_events,
         partition_bytes_histogram: build_partition_bytes_histogram(bytes_by_partition),
+        skew_p95_bytes: skew.p95_bytes,
+        skew_p99_bytes: skew.p99_bytes,
+        heavy_partition_count: skew.heavy_partitions.len() as u32,
     }
+}
+
+#[derive(Debug, Clone)]
+struct SkewDetection {
+    p95_bytes: u64,
+    p99_bytes: u64,
+    heavy_partitions: HashSet<u32>,
+}
+
+fn detect_heavy_partitions(
+    bytes_by_partition: &HashMap<u32, u64>,
+    target_bytes: u64,
+) -> SkewDetection {
+    if bytes_by_partition.is_empty() {
+        return SkewDetection {
+            p95_bytes: 0,
+            p99_bytes: 0,
+            heavy_partitions: HashSet::new(),
+        };
+    }
+
+    let mut sorted = bytes_by_partition.values().copied().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let p50 = percentile_nearest_rank(&sorted, 50);
+    let p95 = percentile_nearest_rank(&sorted, 95);
+    let p99 = percentile_nearest_rank(&sorted, 99);
+    let mut heavy = HashSet::new();
+    let single_partition = bytes_by_partition.len() == 1;
+    let strong_skew = p99 > p95;
+    let four_x_target = target_bytes.saturating_mul(4);
+
+    for (partition, bytes) in bytes_by_partition {
+        if target_bytes > 0 && *bytes <= target_bytes {
+            continue;
+        }
+        if single_partition {
+            heavy.insert(*partition);
+            continue;
+        }
+        if strong_skew && *bytes >= p99 {
+            heavy.insert(*partition);
+            continue;
+        }
+        if target_bytes > 0 && *bytes >= four_x_target {
+            heavy.insert(*partition);
+            continue;
+        }
+        if p50 > 0 && *bytes >= p50.saturating_mul(8) {
+            heavy.insert(*partition);
+        }
+    }
+    SkewDetection {
+        p95_bytes: p95,
+        p99_bytes: p99,
+        heavy_partitions: heavy,
+    }
+}
+
+fn percentile_nearest_rank(sorted: &[u64], percentile: u32) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let n = sorted.len();
+    let p = percentile.clamp(1, 100) as usize;
+    let rank = (n * p).div_ceil(100);
+    let idx = rank.saturating_sub(1).min(n - 1);
+    sorted[idx]
 }
 
 /// Build a stable bytes histogram for reduce partitions.
@@ -146,6 +230,7 @@ fn deterministic_coalesce_split_groups(
     planned_partitions: u32,
     target_bytes: u64,
     bytes_by_partition: &HashMap<u32, u64>,
+    heavy_partitions: &HashSet<u32>,
     min_reduce_tasks: u32,
     max_reduce_tasks: u32,
     max_partitions_per_task: u32,
@@ -194,7 +279,13 @@ fn deterministic_coalesce_split_groups(
 
     let groups = split_groups_by_max_partitions(groups, max_partitions_per_task);
     let groups = enforce_group_count_bounds(groups, min_reduce_tasks, max_reduce_tasks);
-    apply_hot_partition_splitting(groups, bytes_by_partition, target_bytes, max_reduce_tasks)
+    apply_hot_partition_splitting(
+        groups,
+        bytes_by_partition,
+        heavy_partitions,
+        target_bytes,
+        max_reduce_tasks,
+    )
 }
 
 fn split_groups_by_max_partitions(
@@ -250,6 +341,7 @@ fn enforce_group_count_bounds(
 fn apply_hot_partition_splitting(
     groups: Vec<Vec<u32>>,
     bytes_by_partition: &HashMap<u32, u64>,
+    heavy_partitions: &HashSet<u32>,
     target_bytes: u64,
     max_reduce_tasks: u32,
 ) -> Vec<ReduceTaskAssignment> {
@@ -275,7 +367,7 @@ fn apply_hot_partition_splitting(
         .collect::<Vec<_>>();
     hot.sort_by_key(|(p, _)| *p);
     for (partition, bytes) in hot {
-        if bytes <= target_bytes {
+        if bytes <= target_bytes || !heavy_partitions.contains(&partition) {
             continue;
         }
         let Some(idx) = layouts.iter().position(|l| {
@@ -326,5 +418,32 @@ mod tests {
         let pa = plan_adaptive_reduce_layout(4, 25, &a, 1, 0, 0);
         let pb = plan_adaptive_reduce_layout(4, 25, &b, 1, 0, 0);
         assert_eq!(pa.assignments, pb.assignments);
+    }
+
+    #[test]
+    fn heavy_partition_detection_prefers_tail_partitions() {
+        let mut bytes = HashMap::new();
+        bytes.insert(0_u32, 8_u64);
+        bytes.insert(1_u32, 8_u64);
+        bytes.insert(2_u32, 8_u64);
+        bytes.insert(3_u32, 200_u64);
+
+        let plan = plan_adaptive_reduce_layout(4, 32, &bytes, 1, 16, 0);
+        assert!(plan.skew_p99_bytes >= plan.skew_p95_bytes);
+        assert!(plan.heavy_partition_count >= 1);
+        assert!(plan.skew_split_tasks >= 1);
+        assert!(
+            plan.aqe_events
+                .iter()
+                .any(|e| e.contains("skew_p95_bytes=") && e.contains("skew_p99_bytes="))
+        );
+    }
+
+    #[test]
+    fn single_huge_partition_is_classified_as_heavy() {
+        let mut bytes = HashMap::new();
+        bytes.insert(0_u32, 1_000_u64);
+        let plan = plan_adaptive_reduce_layout(1, 64, &bytes, 1, 8, 0);
+        assert_eq!(plan.heavy_partition_count, 1);
     }
 }

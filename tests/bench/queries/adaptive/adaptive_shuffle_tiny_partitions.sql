@@ -3,5 +3,4 @@ SELECT
   l_orderkey AS part_key,
   SUM(l_quantity) AS sum_qty
 FROM lineitem
-GROUP BY l_orderkey
-ORDER BY part_key;
+GROUP BY l_orderkey;

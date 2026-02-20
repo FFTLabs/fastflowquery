@@ -1,18 +1,9 @@
--- Adaptive shuffle scenario: mixed join + aggregate workload.
+-- Adaptive shuffle scenario: mixed join + filter + aggregate workload.
 SELECT
-  CASE
-    WHEN o.o_custkey <= 20 THEN 0
-    WHEN o.o_custkey <= 40 THEN 1
-    ELSE 2
-  END AS bucket,
-  COUNT(*) AS row_cnt,
-  SUM(l.l_quantity) AS sum_qty
-FROM orders o
-JOIN lineitem l ON o.o_orderkey = l.l_orderkey
-GROUP BY
-  CASE
-    WHEN o.o_custkey <= 20 THEN 0
-    WHEN o.o_custkey <= 40 THEN 1
-    ELSE 2
-  END
-ORDER BY bucket;
+  o_shippriority AS bucket,
+  COUNT(1) AS row_cnt,
+  SUM(l_extendedprice) AS sum_price
+FROM lineitem
+INNER JOIN orders ON l_orderkey = o_orderkey
+WHERE o_orderdate < '1995-03-15'
+GROUP BY o_shippriority;

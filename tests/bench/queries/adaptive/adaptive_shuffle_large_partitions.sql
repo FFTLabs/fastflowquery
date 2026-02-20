@@ -10,5 +10,4 @@ GROUP BY
   CASE
     WHEN l_orderkey <= 2 THEN 0
     ELSE 1
-  END
-ORDER BY part_key;
+  END;

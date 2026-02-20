@@ -1,15 +1,9 @@
--- Adaptive shuffle scenario: heavy skew on one hot key.
+-- Adaptive shuffle scenario: skewed join (few hot keys dominate output).
 SELECT
-  CASE
-    WHEN l_orderkey <= 2 THEN 0
-    ELSE l_orderkey
-  END AS part_key,
-  COUNT(*) AS row_cnt,
+  l_orderkey AS part_key,
+  COUNT(1) AS row_cnt,
   SUM(l_quantity) AS sum_qty
 FROM lineitem
-GROUP BY
-  CASE
-    WHEN l_orderkey <= 2 THEN 0
-    ELSE l_orderkey
-  END
-ORDER BY part_key;
+INNER JOIN orders ON l_orderkey = o_orderkey
+WHERE l_orderkey <= 2
+GROUP BY l_orderkey;

@@ -1312,32 +1312,23 @@ fn advance_stage_barriers_and_finalize_layout(
         };
         let bytes_by_partition =
             latest_partition_bytes_for_stage(query_id, parent_stage_id, map_outputs);
-        let groups = if bytes_by_partition.is_empty() {
-            (0..stage.metrics.planned_reduce_tasks.max(1))
-                .map(|p| ReduceTaskAssignmentSpec {
-                    assigned_reduce_partitions: vec![p],
-                    assigned_reduce_split_index: 0,
-                    assigned_reduce_split_count: 1,
-                })
-                .collect::<Vec<_>>()
-        } else {
-            deterministic_coalesce_split_groups(
-                stage.metrics.planned_reduce_tasks,
-                target_bytes,
-                &bytes_by_partition,
-                min_reduce_tasks,
-                max_reduce_tasks,
-                max_partitions_per_task,
-            )
-        };
+        let adaptive_plan = plan_adaptive_reduce_layout(
+            stage.metrics.planned_reduce_tasks.max(1),
+            target_bytes,
+            &bytes_by_partition,
+            min_reduce_tasks,
+            max_reduce_tasks,
+            max_partitions_per_task,
+        );
+        let groups = adaptive_plan.assignments;
         let current_tasks = latest_states
             .iter()
             .filter(|((sid, _), _)| *sid == stage_id)
             .count() as u32;
-        stages_to_rewire.push((stage_id, groups, current_tasks));
+        stages_to_rewire.push((stage_id, groups, current_tasks, adaptive_plan.aqe_events));
     }
 
-    for (stage_id, groups, current_tasks) in stages_to_rewire {
+    for (stage_id, groups, current_tasks, planner_events) in stages_to_rewire {
         let Some(template) = query
             .tasks
             .values()
@@ -1392,6 +1383,9 @@ fn advance_stage_barriers_and_finalize_layout(
             stage.layout_version = layout_version;
             stage.barrier_state = StageBarrierState::LayoutFinalized;
             stage.layout_finalize_count = stage.layout_finalize_count.saturating_add(1);
+            for event in planner_events {
+                push_stage_aqe_event(&mut stage.metrics, event);
+            }
             stage.metrics.queued_tasks = query
                 .tasks
                 .values()
@@ -2705,6 +2699,15 @@ mod tests {
             })
             .count();
         assert_eq!(hot_splits, 4);
+        let st = c.get_query_status("302").expect("status");
+        let root = st.stage_metrics.get(&0).expect("root stage");
+        assert!(
+            root.aqe_events
+                .iter()
+                .any(|e| e.contains("skew_p95_bytes=") && e.contains("skew_p99_bytes=")),
+            "expected skew percentile diagnostics in AQE events: {:?}",
+            root.aqe_events
+        );
     }
 
     #[test]
