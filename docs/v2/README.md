@@ -87,6 +87,7 @@ The matrix below is the complete required v2 doc set. Ownership can be updated a
 | API | `docs/v2/ffi-python.md` | `@ffq-api` | draft |
 | API | `docs/v2/storage-catalog.md` | `@ffq-storage` | draft |
 | API | `docs/v2/client-runtime.md` | `@ffq-api` | draft |
+| API | `docs/v2/sql-semantics.md` | `@ffq-planner` | verified |
 | API | `docs/v2/writes-dml.md` | `@ffq-storage` | draft |
 | API | `docs/v2/vector-rag.md` | `@ffq-vector` | draft |
 | Ops | `docs/v2/migration-v1-to-v2.md` | `@ffq-docs` | draft |

@@ -167,6 +167,7 @@ make python-dev-install
 | `docs/v1/shuffle-stage-model.md` | `docs/v2/shuffle-stage-model.md` |
 | `docs/v1/operators-core.md` | `docs/v2/operators-core.md` |
 | `docs/v1/storage-catalog.md` | `docs/v2/storage-catalog.md` |
+| *(new in v2)* SQL semantics support matrix | `docs/v2/sql-semantics.md` |
 | `docs/v1/writes-dml.md` | `docs/v2/writes-dml.md` |
 | `docs/v1/vector-rag.md` | `docs/v2/vector-rag.md` |
 | `docs/v1/observability.md` | `docs/v2/observability.md` |
