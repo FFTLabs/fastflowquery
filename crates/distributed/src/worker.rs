@@ -1477,15 +1477,24 @@ fn read_stage_input_from_shuffle(
             }
         }
         PartitioningSpec::HashKeys { partitions, .. } => {
-            let assigned = if ctx.assigned_reduce_partitions.is_empty() {
-                (0..*partitions as u32).collect::<Vec<_>>()
-            } else {
-                ctx.assigned_reduce_partitions
-                    .iter()
-                    .copied()
-                    .filter(|p| (*p as usize) < *partitions)
-                    .collect::<Vec<_>>()
-            };
+            if ctx.assigned_reduce_partitions.is_empty() {
+                return Err(FfqError::Execution(format!(
+                    "missing assigned_reduce_partitions for shuffle-read hash stage={} task={}",
+                    ctx.stage_id, ctx.task_id
+                )));
+            }
+            let assigned = ctx
+                .assigned_reduce_partitions
+                .iter()
+                .copied()
+                .filter(|p| (*p as usize) < *partitions)
+                .collect::<Vec<_>>();
+            if assigned.is_empty() {
+                return Err(FfqError::Execution(format!(
+                    "assigned_reduce_partitions {:?} are out of range for {} partitions (stage={} task={})",
+                    ctx.assigned_reduce_partitions, partitions, ctx.stage_id, ctx.task_id
+                )));
+            }
             for reduce in assigned {
                 if let Ok((_attempt, batches)) =
                     reader.read_partition_latest(query_numeric_id, upstream_stage_id, 0, reduce)
@@ -4471,5 +4480,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(shuffle_root);
         let _ = deregister_global_physical_operator_factory("add_const_i64");
         panic!("custom query did not finish in allotted polls");
+    }
+
+    #[test]
+    fn shuffle_read_hash_requires_assigned_partitions() {
+        let shuffle_root = unique_path("ffq_shuffle_read_assign_required", "dir");
+        let _ = std::fs::create_dir_all(&shuffle_root);
+        let ctx = TaskContext {
+            query_id: "5001".to_string(),
+            stage_id: 0,
+            task_id: 0,
+            attempt: 1,
+            per_task_memory_budget_bytes: 1,
+            spill_dir: std::env::temp_dir(),
+            shuffle_root: shuffle_root.clone(),
+            assigned_reduce_partitions: Vec::new(),
+        };
+        let err = read_stage_input_from_shuffle(
+            1,
+            &ffq_planner::PartitioningSpec::HashKeys {
+                keys: vec!["k".to_string()],
+                partitions: 4,
+            },
+            5001,
+            &ctx,
+        )
+        .err()
+        .expect("missing assignment should error");
+        match err {
+            FfqError::Execution(msg) => assert!(msg.contains("missing assigned_reduce_partitions")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(shuffle_root);
+    }
+
+    #[test]
+    fn shuffle_read_hash_reads_only_assigned_partition_subset() {
+        let shuffle_root = unique_path("ffq_shuffle_read_scoped", "dir");
+        let _ = std::fs::create_dir_all(&shuffle_root);
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let input_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(
+                (1_i64..=64_i64).collect::<Vec<_>>(),
+            ))],
+        )
+        .expect("input batch");
+        let child = ExecOutput {
+            schema,
+            batches: vec![input_batch],
+        };
+
+        let map_ctx = TaskContext {
+            query_id: "5002".to_string(),
+            stage_id: 1,
+            task_id: 0,
+            attempt: 1,
+            per_task_memory_budget_bytes: 1,
+            spill_dir: std::env::temp_dir(),
+            shuffle_root: shuffle_root.clone(),
+            assigned_reduce_partitions: Vec::new(),
+        };
+        let partitioning = ffq_planner::PartitioningSpec::HashKeys {
+            keys: vec!["k".to_string()],
+            partitions: 4,
+        };
+        let metas =
+            write_stage_shuffle_outputs(&child, &partitioning, 5002, &map_ctx).expect("write map");
+        assert!(!metas.is_empty());
+        let target = metas[0].clone();
+
+        let reduce_ctx = TaskContext {
+            query_id: "5002".to_string(),
+            stage_id: 0,
+            task_id: target.reduce_partition as u64,
+            attempt: 1,
+            per_task_memory_budget_bytes: 1,
+            spill_dir: std::env::temp_dir(),
+            shuffle_root: shuffle_root.clone(),
+            assigned_reduce_partitions: vec![target.reduce_partition],
+        };
+        let out = read_stage_input_from_shuffle(1, &partitioning, 5002, &reduce_ctx)
+            .expect("read assigned partition");
+        let rows = out.batches.iter().map(|b| b.num_rows() as u64).sum::<u64>();
+        assert_eq!(rows, target.rows);
+
+        let _ = std::fs::remove_dir_all(shuffle_root);
     }
 }
