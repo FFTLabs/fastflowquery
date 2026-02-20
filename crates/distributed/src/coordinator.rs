@@ -125,6 +125,10 @@ pub struct TaskAssignment {
     pub assigned_reduce_split_index: u32,
     /// Hash-shard split count within assigned partition payloads.
     pub assigned_reduce_split_count: u32,
+    /// Stage adaptive-layout version this assignment was built from.
+    pub layout_version: u32,
+    /// Deterministic fingerprint of assignment layout for this stage version.
+    pub layout_fingerprint: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -200,6 +204,7 @@ pub struct QueryStatus {
 struct StageRuntime {
     parents: Vec<u64>,
     children: Vec<u64>,
+    layout_version: u32,
     metrics: StageMetrics,
 }
 
@@ -216,6 +221,8 @@ struct TaskRuntime {
     assigned_reduce_partitions: Vec<u32>,
     assigned_reduce_split_index: u32,
     assigned_reduce_split_count: u32,
+    layout_version: u32,
+    layout_fingerprint: u64,
     required_custom_ops: Vec<String>,
     message: String,
 }
@@ -332,6 +339,8 @@ impl Coordinator {
                         t.assigned_reduce_partitions.clone(),
                         t.assigned_reduce_split_index,
                         t.assigned_reduce_split_count,
+                        t.layout_version,
+                        t.layout_fingerprint,
                         t.required_custom_ops.clone(),
                     ));
                 }
@@ -345,6 +354,8 @@ impl Coordinator {
                 assigned_reduce_partitions,
                 assigned_reduce_split_index,
                 assigned_reduce_split_count,
+                layout_version,
+                layout_fingerprint,
                 required_custom_ops,
             ) in to_retry
             {
@@ -368,6 +379,8 @@ impl Coordinator {
                             assigned_reduce_partitions,
                             assigned_reduce_split_index,
                             assigned_reduce_split_count,
+                            layout_version,
+                            layout_fingerprint,
                             required_custom_ops,
                             message: "retry scheduled after worker timeout".to_string(),
                         },
@@ -626,6 +639,8 @@ impl Coordinator {
                         assigned_reduce_partitions: task.assigned_reduce_partitions.clone(),
                         assigned_reduce_split_index: task.assigned_reduce_split_index,
                         assigned_reduce_split_count: task.assigned_reduce_split_count,
+                        layout_version: task.layout_version,
+                        layout_fingerprint: task.layout_fingerprint,
                     });
                     remaining = remaining.saturating_sub(1);
                     query_budget = query_budget.saturating_sub(1);
@@ -652,6 +667,8 @@ impl Coordinator {
         stage_id: u64,
         task_id: u64,
         attempt: u32,
+        layout_version: u32,
+        layout_fingerprint: u64,
         state: TaskState,
         worker_id: Option<&str>,
         message: String,
@@ -678,6 +695,36 @@ impl Coordinator {
             return Ok(());
         }
         let key = (stage_id, task_id, attempt);
+        let Some(layout_identity) = query
+            .tasks
+            .get(&key)
+            .map(|t| (t.layout_version, t.layout_fingerprint))
+        else {
+            debug!(
+                query_id = %query_id,
+                stage_id,
+                task_id,
+                attempt,
+                operator = "CoordinatorReportTaskStatus",
+                "ignoring status report for unknown task attempt"
+            );
+            return Ok(());
+        };
+        if layout_identity.0 != layout_version || layout_identity.1 != layout_fingerprint {
+            debug!(
+                query_id = %query_id,
+                stage_id,
+                task_id,
+                attempt,
+                expected_layout_version = layout_identity.0,
+                reported_layout_version = layout_version,
+                expected_layout_fingerprint = layout_identity.1,
+                reported_layout_fingerprint = layout_fingerprint,
+                operator = "CoordinatorReportTaskStatus",
+                "ignoring stale status report from different adaptive layout"
+            );
+            return Ok(());
+        }
         let prev_state = query
             .tasks
             .get(&key)
@@ -779,6 +826,8 @@ impl Coordinator {
                             assigned_reduce_partitions: task_assigned_reduce_partitions,
                             assigned_reduce_split_index: task_assigned_reduce_split_index,
                             assigned_reduce_split_count: task_assigned_reduce_split_count,
+                            layout_version,
+                            layout_fingerprint,
                             required_custom_ops: task_required_custom_ops,
                             message: format!("retry scheduled after failure: {message}"),
                         },
@@ -857,10 +906,59 @@ impl Coordinator {
         stage_id: u64,
         map_task: u64,
         attempt: u32,
+        layout_version: u32,
+        layout_fingerprint: u64,
         partitions: Vec<MapOutputPartitionMeta>,
     ) -> Result<()> {
-        if !self.queries.contains_key(&query_id) {
+        let Some(query) = self.queries.get(&query_id) else {
             return Err(FfqError::Planning(format!("unknown query: {query_id}")));
+        };
+        let latest_attempt = latest_attempt_map(query)
+            .get(&(stage_id, map_task))
+            .copied()
+            .unwrap_or(attempt);
+        if attempt < latest_attempt {
+            debug!(
+                query_id = %query_id,
+                stage_id,
+                map_task,
+                attempt,
+                latest_attempt,
+                operator = "CoordinatorRegisterMapOutput",
+                "ignoring stale map-output registration from old attempt"
+            );
+            return Ok(());
+        }
+        let key = (stage_id, map_task, attempt);
+        let Some(expected_layout) = query
+            .tasks
+            .get(&key)
+            .map(|t| (t.layout_version, t.layout_fingerprint))
+        else {
+            debug!(
+                query_id = %query_id,
+                stage_id,
+                map_task,
+                attempt,
+                operator = "CoordinatorRegisterMapOutput",
+                "ignoring map-output registration for unknown task attempt"
+            );
+            return Ok(());
+        };
+        if expected_layout.0 != layout_version || expected_layout.1 != layout_fingerprint {
+            debug!(
+                query_id = %query_id,
+                stage_id,
+                map_task,
+                attempt,
+                expected_layout_version = expected_layout.0,
+                reported_layout_version = layout_version,
+                expected_layout_fingerprint = expected_layout.1,
+                reported_layout_fingerprint = layout_fingerprint,
+                operator = "CoordinatorRegisterMapOutput",
+                "ignoring stale map-output registration from different adaptive layout"
+            );
+            return Ok(());
         }
         self.map_outputs
             .insert((query_id.clone(), stage_id, map_task, attempt), partitions);
@@ -1019,6 +1117,7 @@ fn build_query_runtime(
             StageRuntime {
                 parents: node.parents.iter().map(|p| p.0 as u64).collect(),
                 children: node.children.iter().map(|c| c.0 as u64).collect(),
+                layout_version: 1,
                 metrics: StageMetrics {
                     queued_tasks: task_count,
                     planned_reduce_tasks: task_count,
@@ -1050,6 +1149,8 @@ fn build_query_runtime(
                     assigned_reduce_partitions,
                     assigned_reduce_split_index: 0,
                     assigned_reduce_split_count: 1,
+                    layout_version: 1,
+                    layout_fingerprint: 0,
                     required_custom_ops: required_custom_ops.clone(),
                     message: String::new(),
                 },
@@ -1057,7 +1158,7 @@ fn build_query_runtime(
         }
     }
 
-    Ok(QueryRuntime {
+    let mut runtime = QueryRuntime {
         state: QueryState::Queued,
         submitted_at_ms,
         started_at_ms: 0,
@@ -1065,7 +1166,9 @@ fn build_query_runtime(
         message: String::new(),
         stages,
         tasks,
-    })
+    };
+    initialize_stage_layout_identities(&mut runtime);
+    Ok(runtime)
 }
 
 fn collect_stage_reduce_task_counts(plan: &PhysicalPlan) -> HashMap<u64, u32> {
@@ -1165,6 +1268,12 @@ fn maybe_apply_adaptive_partition_layout(
         else {
             continue;
         };
+        let layout_version = query
+            .stages
+            .get(&stage_id)
+            .map(|s| s.layout_version.saturating_add(1))
+            .unwrap_or(1);
+        let layout_fingerprint = compute_layout_fingerprint_from_specs(stage_id, &groups);
         query.tasks.retain(|(sid, _, _), _| *sid != stage_id);
         for (task_id, assignment) in groups.into_iter().enumerate() {
             query.tasks.insert(
@@ -1181,12 +1290,15 @@ fn maybe_apply_adaptive_partition_layout(
                     assigned_reduce_partitions: assignment.assigned_reduce_partitions,
                     assigned_reduce_split_index: assignment.assigned_reduce_split_index,
                     assigned_reduce_split_count: assignment.assigned_reduce_split_count,
+                    layout_version,
+                    layout_fingerprint,
                     required_custom_ops: template.1.clone(),
                     message: String::new(),
                 },
             );
         }
         if let Some(stage) = query.stages.get_mut(&stage_id) {
+            stage.layout_version = layout_version;
             stage.metrics.queued_tasks = query
                 .tasks
                 .values()
@@ -1513,6 +1625,77 @@ fn latest_task_states(query: &QueryRuntime) -> HashMap<(u64, u64), TaskState> {
     out.into_iter().map(|(k, (_, s))| (k, s)).collect()
 }
 
+fn initialize_stage_layout_identities(query: &mut QueryRuntime) {
+    let stage_ids = query.stages.keys().copied().collect::<Vec<_>>();
+    for stage_id in stage_ids {
+        let layout_fingerprint = compute_layout_fingerprint_from_tasks(query, stage_id, 1);
+        if let Some(stage) = query.stages.get_mut(&stage_id) {
+            stage.layout_version = 1;
+        }
+        for task in query
+            .tasks
+            .values_mut()
+            .filter(|t| t.stage_id == stage_id && t.attempt == 1)
+        {
+            task.layout_version = 1;
+            task.layout_fingerprint = layout_fingerprint;
+        }
+    }
+}
+
+fn compute_layout_fingerprint_from_tasks(query: &QueryRuntime, stage_id: u64, attempt: u32) -> u64 {
+    let mut assignments = query
+        .tasks
+        .values()
+        .filter(|t| t.stage_id == stage_id && t.attempt == attempt)
+        .map(|t| {
+            (
+                t.task_id,
+                t.assigned_reduce_partitions.clone(),
+                t.assigned_reduce_split_index,
+                t.assigned_reduce_split_count,
+            )
+        })
+        .collect::<Vec<_>>();
+    assignments.sort_by_key(|(task_id, _, _, _)| *task_id);
+    compute_layout_fingerprint(stage_id, &assignments)
+}
+
+fn compute_layout_fingerprint_from_specs(stage_id: u64, specs: &[ReduceTaskAssignmentSpec]) -> u64 {
+    let assignments = specs
+        .iter()
+        .enumerate()
+        .map(|(task_id, s)| {
+            (
+                task_id as u64,
+                s.assigned_reduce_partitions.clone(),
+                s.assigned_reduce_split_index,
+                s.assigned_reduce_split_count,
+            )
+        })
+        .collect::<Vec<_>>();
+    compute_layout_fingerprint(stage_id, &assignments)
+}
+
+fn compute_layout_fingerprint(stage_id: u64, assignments: &[(u64, Vec<u32>, u32, u32)]) -> u64 {
+    let mut h = 1469598103934665603_u64;
+    fn mix(h: &mut u64, v: u64) {
+        *h ^= v;
+        *h = h.wrapping_mul(1099511628211_u64);
+    }
+    mix(&mut h, stage_id);
+    for (task_id, partitions, split_idx, split_count) in assignments {
+        mix(&mut h, *task_id);
+        mix(&mut h, partitions.len() as u64);
+        for p in partitions {
+            mix(&mut h, *p as u64);
+        }
+        mix(&mut h, *split_idx as u64);
+        mix(&mut h, *split_count as u64);
+    }
+    h
+}
+
 fn latest_attempt_map(query: &QueryRuntime) -> HashMap<(u64, u64), u32> {
     let mut out = HashMap::<(u64, u64), u32>::new();
     for t in query.tasks.values() {
@@ -1645,6 +1828,8 @@ mod tests {
             a.stage_id,
             a.task_id,
             a.attempt,
+            a.layout_version,
+            a.layout_fingerprint,
             TaskState::Succeeded,
             Some("w1"),
             String::new(),
@@ -1678,6 +1863,8 @@ mod tests {
             a.stage_id,
             a.task_id,
             a.attempt,
+            a.layout_version,
+            a.layout_fingerprint,
             TaskState::Failed,
             Some("wbad"),
             "boom".to_string(),
@@ -1690,6 +1877,8 @@ mod tests {
             a2.stage_id,
             a2.task_id,
             a2.attempt,
+            a2.layout_version,
+            a2.layout_fingerprint,
             TaskState::Failed,
             Some("wbad"),
             "boom".to_string(),
@@ -1760,6 +1949,8 @@ mod tests {
             t.stage_id,
             t.task_id,
             t.attempt,
+            t.layout_version,
+            t.layout_fingerprint,
             TaskState::Succeeded,
             Some("w1"),
             "ok".to_string(),
@@ -1835,6 +2026,8 @@ mod tests {
             map.stage_id,
             map.task_id,
             map.attempt,
+            map.layout_version,
+            map.layout_fingerprint,
             TaskState::Succeeded,
             Some("w1"),
             "map done".to_string(),
@@ -1887,11 +2080,14 @@ mod tests {
         }));
         let bytes = serde_json::to_vec(&plan).expect("plan");
         c.submit_query("300".to_string(), &bytes).expect("submit");
+        let map_task = c.get_task("w1", 10).expect("map").remove(0);
         c.register_map_output(
             "300".to_string(),
-            1,
-            0,
-            1,
+            map_task.stage_id,
+            map_task.task_id,
+            map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
             vec![
                 MapOutputPartitionMeta {
                     reduce_partition: 0,
@@ -1963,6 +2159,8 @@ mod tests {
             map_task.stage_id,
             map_task.task_id,
             map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
             vec![
                 MapOutputPartitionMeta {
                     reduce_partition: 0,
@@ -1996,6 +2194,8 @@ mod tests {
             map_task.stage_id,
             map_task.task_id,
             map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
             TaskState::Succeeded,
             Some("w1"),
             "map done".to_string(),
@@ -2010,6 +2210,139 @@ mod tests {
         let root = status.stage_metrics.get(&0).expect("root stage");
         assert_eq!(root.planned_reduce_tasks, 4);
         assert_eq!(root.adaptive_reduce_tasks, 1);
+    }
+
+    #[test]
+    fn coordinator_ignores_stale_reports_from_old_adaptive_layout() {
+        let mut c = Coordinator::new(CoordinatorConfig {
+            adaptive_shuffle_target_bytes: 30,
+            ..CoordinatorConfig::default()
+        });
+        let plan = PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
+            input: Box::new(PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(
+                ShuffleWriteExchange {
+                    input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
+                        table: "t".to_string(),
+                        schema: Some(Schema::empty()),
+                        projection: None,
+                        filters: vec![],
+                    })),
+                    partitioning: PartitioningSpec::HashKeys {
+                        keys: vec!["k".to_string()],
+                        partitions: 4,
+                    },
+                },
+            ))),
+            partitioning: PartitioningSpec::HashKeys {
+                keys: vec!["k".to_string()],
+                partitions: 4,
+            },
+        }));
+        let bytes = serde_json::to_vec(&plan).expect("plan");
+        c.submit_query("303".to_string(), &bytes).expect("submit");
+
+        let map_task = c.get_task("w1", 10).expect("map").remove(0);
+        c.register_map_output(
+            "303".to_string(),
+            map_task.stage_id,
+            map_task.task_id,
+            map_task.attempt,
+            map_task.layout_version.saturating_sub(1),
+            map_task.layout_fingerprint ^ 0xDEADBEEF_u64,
+            vec![MapOutputPartitionMeta {
+                reduce_partition: 0,
+                bytes: 5,
+                rows: 1,
+                batches: 1,
+            }],
+        )
+        .expect("stale map output ignored");
+        assert_eq!(c.map_output_registry_size(), 0);
+
+        c.register_map_output(
+            "303".to_string(),
+            map_task.stage_id,
+            map_task.task_id,
+            map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
+            vec![
+                MapOutputPartitionMeta {
+                    reduce_partition: 0,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 1,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 2,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+                MapOutputPartitionMeta {
+                    reduce_partition: 3,
+                    bytes: 5,
+                    rows: 1,
+                    batches: 1,
+                },
+            ],
+        )
+        .expect("register map output");
+        c.report_task_status(
+            &map_task.query_id,
+            map_task.stage_id,
+            map_task.task_id,
+            map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
+            TaskState::Succeeded,
+            Some("w1"),
+            "map done".to_string(),
+        )
+        .expect("map success");
+
+        let reduce_task = c.get_task("w1", 10).expect("reduce tasks").remove(0);
+        assert!(reduce_task.layout_version > 1);
+        c.report_task_status(
+            &reduce_task.query_id,
+            reduce_task.stage_id,
+            reduce_task.task_id,
+            reduce_task.attempt,
+            reduce_task.layout_version.saturating_sub(1),
+            reduce_task.layout_fingerprint ^ 0xABCD_u64,
+            TaskState::Succeeded,
+            Some("w1"),
+            "stale success".to_string(),
+        )
+        .expect("stale status ignored");
+        let status_after_stale = c.get_query_status("303").expect("status");
+        let root = status_after_stale
+            .stage_metrics
+            .get(&reduce_task.stage_id)
+            .expect("reduce stage metrics");
+        assert_eq!(root.succeeded_tasks, 0);
+        assert_eq!(status_after_stale.state, QueryState::Running);
+
+        c.report_task_status(
+            &reduce_task.query_id,
+            reduce_task.stage_id,
+            reduce_task.task_id,
+            reduce_task.attempt,
+            reduce_task.layout_version,
+            reduce_task.layout_fingerprint,
+            TaskState::Succeeded,
+            Some("w1"),
+            "reduce done".to_string(),
+        )
+        .expect("reduce success");
+        let final_status = c.get_query_status("303").expect("final");
+        assert_eq!(final_status.state, QueryState::Succeeded);
     }
 
     #[test]
@@ -2126,6 +2459,8 @@ mod tests {
             map_task.stage_id,
             map_task.task_id,
             map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
             vec![
                 MapOutputPartitionMeta {
                     reduce_partition: 0,
@@ -2159,6 +2494,8 @@ mod tests {
             map_task.stage_id,
             map_task.task_id,
             map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
             TaskState::Succeeded,
             Some("w1"),
             "map done".to_string(),

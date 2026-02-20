@@ -112,6 +112,8 @@ impl ControlPlane for CoordinatorServices {
                 req.stage_id,
                 req.task_id,
                 req.attempt,
+                req.layout_version,
+                req.layout_fingerprint,
                 core_task_state(req.state)?,
                 None,
                 req.message,
@@ -213,6 +215,8 @@ impl ShuffleService for CoordinatorServices {
                 req.stage_id,
                 req.map_task,
                 req.attempt,
+                req.layout_version,
+                req.layout_fingerprint,
                 partitions,
             )
             .map_err(to_status)?;
@@ -297,6 +301,8 @@ fn proto_task_assignment(task: CoreTaskAssignment) -> v1::TaskAssignment {
         assigned_reduce_partitions: task.assigned_reduce_partitions,
         assigned_reduce_split_index: task.assigned_reduce_split_index,
         assigned_reduce_split_count: task.assigned_reduce_split_count,
+        layout_version: task.layout_version,
+        layout_fingerprint: task.layout_fingerprint,
     }
 }
 

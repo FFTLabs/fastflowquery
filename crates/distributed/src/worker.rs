@@ -489,6 +489,8 @@ impl WorkerControlPlane for InProcessControlPlane {
             assignment.stage_id,
             assignment.task_id,
             assignment.attempt,
+            assignment.layout_version,
+            assignment.layout_fingerprint,
             state,
             Some(worker_id),
             message,
@@ -506,6 +508,8 @@ impl WorkerControlPlane for InProcessControlPlane {
             assignment.stage_id,
             assignment.task_id,
             assignment.attempt,
+            assignment.layout_version,
+            assignment.layout_fingerprint,
             partitions,
         )
     }
@@ -550,6 +554,8 @@ impl WorkerControlPlane for GrpcControlPlane {
                 assigned_reduce_partitions: t.assigned_reduce_partitions,
                 assigned_reduce_split_index: t.assigned_reduce_split_index,
                 assigned_reduce_split_count: t.assigned_reduce_split_count,
+                layout_version: t.layout_version,
+                layout_fingerprint: t.layout_fingerprint,
             })
             .collect())
     }
@@ -568,6 +574,8 @@ impl WorkerControlPlane for GrpcControlPlane {
                 stage_id: assignment.stage_id,
                 task_id: assignment.task_id,
                 attempt: assignment.attempt,
+                layout_version: assignment.layout_version,
+                layout_fingerprint: assignment.layout_fingerprint,
                 state: proto_task_state(state) as i32,
                 message,
             })
@@ -588,6 +596,8 @@ impl WorkerControlPlane for GrpcControlPlane {
                 stage_id: assignment.stage_id,
                 map_task: assignment.task_id,
                 attempt: assignment.attempt,
+                layout_version: assignment.layout_version,
+                layout_fingerprint: assignment.layout_fingerprint,
                 partitions: partitions
                     .into_iter()
                     .map(|p| v1::MapOutputPartition {
