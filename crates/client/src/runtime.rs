@@ -31,7 +31,10 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result};
 use ffq_execution::{SendableRecordBatchStream, StreamAdapter, TaskContext, compile_expr};
-use ffq_planner::{AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, JoinType, PhysicalPlan};
+use ffq_planner::{
+    AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, JoinType, PhysicalPlan, WindowExpr,
+    WindowFunction,
+};
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
 use ffq_storage::qdrant_provider::QdrantProvider;
@@ -260,6 +263,25 @@ fn execute_plan_with_cache(
                         schema,
                         batches: out_batches,
                     },
+                    in_rows,
+                    in_batches,
+                    in_bytes,
+                })
+            }
+            PhysicalPlan::Window(window) => {
+                let child = execute_plan_with_cache(
+                    *window.input,
+                    ctx,
+                    catalog,
+                    Arc::clone(&physical_registry),
+                    Arc::clone(&trace),
+                    Arc::clone(&cte_cache),
+                )
+                .await?;
+                let (in_rows, in_batches, in_bytes) = batch_stats(&child.batches);
+                let out = run_window_exec(child, &window.exprs)?;
+                Ok(OpEval {
+                    out,
                     in_rows,
                     in_batches,
                     in_bytes,
@@ -732,6 +754,7 @@ fn operator_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::ExistsSubqueryFilter(_) => "ExistsSubqueryFilter",
         PhysicalPlan::ScalarSubqueryFilter(_) => "ScalarSubqueryFilter",
         PhysicalPlan::Project(_) => "Project",
+        PhysicalPlan::Window(_) => "Window",
         PhysicalPlan::CoalesceBatches(_) => "CoalesceBatches",
         PhysicalPlan::PartialHashAggregate(_) => "PartialHashAggregate",
         PhysicalPlan::FinalHashAggregate(_) => "FinalHashAggregate",
@@ -1286,6 +1309,190 @@ fn rows_from_batches(input: &ExecOutput) -> Result<Vec<Vec<ScalarValue>>> {
         }
     }
     Ok(out)
+}
+
+fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput> {
+    let mut rows = rows_from_batches(&input)?;
+    let row_count = rows.len();
+    let mut out_fields: Vec<Field> = input
+        .schema
+        .fields()
+        .iter()
+        .map(|f| f.as_ref().clone())
+        .collect();
+    for w in exprs {
+        let output = evaluate_window_expr(&input, w)?;
+        if output.len() != row_count {
+            return Err(FfqError::Execution(format!(
+                "window output row count mismatch: expected {row_count}, got {}",
+                output.len()
+            )));
+        }
+        let dt = match w.func {
+            WindowFunction::RowNumber | WindowFunction::Rank => DataType::Int64,
+            WindowFunction::Sum(_) => DataType::Float64,
+        };
+        out_fields.push(Field::new(&w.output_name, dt, true));
+        for (idx, value) in output.into_iter().enumerate() {
+            rows[idx].push(value);
+        }
+    }
+    let out_schema = Arc::new(Schema::new(out_fields));
+    let batch = rows_to_batch(&out_schema, &rows)?;
+    Ok(ExecOutput {
+        schema: out_schema,
+        batches: vec![batch],
+    })
+}
+
+fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<ScalarValue>> {
+    let row_count = input.batches.iter().map(|b| b.num_rows()).sum::<usize>();
+    let partition_keys = w
+        .partition_by
+        .iter()
+        .map(|e| evaluate_expr_rows(input, e))
+        .collect::<Result<Vec<_>>>()?;
+    let order_keys = w
+        .order_by
+        .iter()
+        .map(|e| evaluate_expr_rows(input, e))
+        .collect::<Result<Vec<_>>>()?;
+    let mut order_idx: Vec<usize> = (0..row_count).collect();
+    order_idx.sort_by(|a, b| {
+        cmp_key_sets(&partition_keys, *a, *b)
+            .then_with(|| cmp_key_sets(&order_keys, *a, *b))
+            .then_with(|| a.cmp(b))
+    });
+
+    let mut out = vec![ScalarValue::Null; row_count];
+    match &w.func {
+        WindowFunction::RowNumber => {
+            let mut i = 0usize;
+            while i < order_idx.len() {
+                let start = i;
+                let first = order_idx[i];
+                i += 1;
+                while i < order_idx.len()
+                    && cmp_key_sets(&partition_keys, first, order_idx[i]) == Ordering::Equal
+                {
+                    i += 1;
+                }
+                for (offset, pos) in order_idx[start..i].iter().enumerate() {
+                    out[*pos] = ScalarValue::Int64((offset + 1) as i64);
+                }
+            }
+        }
+        WindowFunction::Rank => {
+            let mut i = 0usize;
+            while i < order_idx.len() {
+                let start = i;
+                let first = order_idx[i];
+                i += 1;
+                while i < order_idx.len()
+                    && cmp_key_sets(&partition_keys, first, order_idx[i]) == Ordering::Equal
+                {
+                    i += 1;
+                }
+                let part = &order_idx[start..i];
+                let mut rank = 1_i64;
+                let mut part_i = 0usize;
+                while part_i < part.len() {
+                    if part_i > 0
+                        && cmp_key_sets(&order_keys, part[part_i - 1], part[part_i])
+                            != Ordering::Equal
+                    {
+                        rank = (part_i as i64) + 1;
+                    }
+                    out[part[part_i]] = ScalarValue::Int64(rank);
+                    part_i += 1;
+                }
+            }
+        }
+        WindowFunction::Sum(arg) => {
+            let values = evaluate_expr_rows(input, arg)?;
+            let mut i = 0usize;
+            while i < order_idx.len() {
+                let start = i;
+                let first = order_idx[i];
+                i += 1;
+                while i < order_idx.len()
+                    && cmp_key_sets(&partition_keys, first, order_idx[i]) == Ordering::Equal
+                {
+                    i += 1;
+                }
+                let mut running = 0.0_f64;
+                let mut seen = false;
+                for pos in &order_idx[start..i] {
+                    match &values[*pos] {
+                        ScalarValue::Int64(v) => {
+                            running += *v as f64;
+                            seen = true;
+                        }
+                        ScalarValue::Float64Bits(v) => {
+                            running += f64::from_bits(*v);
+                            seen = true;
+                        }
+                        ScalarValue::Null => {}
+                        other => {
+                            return Err(FfqError::Execution(format!(
+                                "SUM() OVER encountered non-numeric value: {other:?}"
+                            )));
+                        }
+                    }
+                    out[*pos] = if seen {
+                        ScalarValue::Float64Bits(running.to_bits())
+                    } else {
+                        ScalarValue::Null
+                    };
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn evaluate_expr_rows(input: &ExecOutput, expr: &Expr) -> Result<Vec<ScalarValue>> {
+    let compiled = compile_expr(expr, &input.schema)?;
+    let mut out = Vec::with_capacity(input.batches.iter().map(|b| b.num_rows()).sum());
+    for batch in &input.batches {
+        let arr = compiled.evaluate(batch)?;
+        for row in 0..batch.num_rows() {
+            out.push(scalar_from_array(&arr, row)?);
+        }
+    }
+    Ok(out)
+}
+
+fn cmp_key_sets(keys: &[Vec<ScalarValue>], a: usize, b: usize) -> Ordering {
+    for col in keys {
+        let ord = cmp_scalar_for_window(&col[a], &col[b]);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+fn cmp_scalar_for_window(a: &ScalarValue, b: &ScalarValue) -> Ordering {
+    use ScalarValue::*;
+    match (a, b) {
+        (Null, Null) => Ordering::Equal,
+        (Null, _) => Ordering::Greater,
+        (_, Null) => Ordering::Less,
+        (Int64(x), Int64(y)) => x.cmp(y),
+        (Float64Bits(x), Float64Bits(y)) => f64::from_bits(*x)
+            .partial_cmp(&f64::from_bits(*y))
+            .unwrap_or(Ordering::Equal),
+        (Int64(x), Float64Bits(y)) => (*x as f64)
+            .partial_cmp(&f64::from_bits(*y))
+            .unwrap_or(Ordering::Equal),
+        (Float64Bits(x), Int64(y)) => f64::from_bits(*x)
+            .partial_cmp(&(*y as f64))
+            .unwrap_or(Ordering::Equal),
+        (Utf8(x), Utf8(y)) => x.cmp(y),
+        (Boolean(x), Boolean(y)) => x.cmp(y),
+        _ => format!("{a:?}").cmp(&format!("{b:?}")),
+    }
 }
 
 fn run_exists_subquery_filter(input: ExecOutput, subquery: ExecOutput, negated: bool) -> ExecOutput {

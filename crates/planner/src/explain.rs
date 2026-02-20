@@ -1,4 +1,4 @@
-use crate::logical_plan::{Expr, JoinStrategyHint, LogicalPlan, SubqueryCorrelation};
+use crate::logical_plan::{Expr, JoinStrategyHint, LogicalPlan, SubqueryCorrelation, WindowFunction};
 
 /// Render logical plan as human-readable multiline text.
 pub fn explain_logical(plan: &LogicalPlan) -> String {
@@ -79,6 +79,33 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             out.push_str(&format!("{pad}Projection\n"));
             for (e, name) in exprs {
                 out.push_str(&format!("{pad}  {name} := {}\n", fmt_expr(e)));
+            }
+            fmt_plan(input, indent + 1, out);
+        }
+        LogicalPlan::Window { exprs, input } => {
+            out.push_str(&format!("{pad}Window\n"));
+            for w in exprs {
+                let func = match &w.func {
+                    WindowFunction::RowNumber => "ROW_NUMBER()".to_string(),
+                    WindowFunction::Rank => "RANK()".to_string(),
+                    WindowFunction::Sum(expr) => format!("SUM({})", fmt_expr(expr)),
+                };
+                let part = w
+                    .partition_by
+                    .iter()
+                    .map(fmt_expr)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ord = w
+                    .order_by
+                    .iter()
+                    .map(fmt_expr)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!(
+                    "{pad}  {} := {} OVER (PARTITION BY [{}] ORDER BY [{}])\n",
+                    w.output_name, func, part, ord
+                ));
             }
             fmt_plan(input, indent + 1, out);
         }

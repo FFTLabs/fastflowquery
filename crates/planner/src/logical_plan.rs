@@ -165,6 +165,30 @@ pub enum BinaryOp {
     Divide,
 }
 
+/// Window function kinds supported by MVP window execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WindowFunction {
+    /// `ROW_NUMBER() OVER (...)`
+    RowNumber,
+    /// `RANK() OVER (...)`
+    Rank,
+    /// `SUM(expr) OVER (...)`
+    Sum(Expr),
+}
+
+/// One window expression with partition/order specification and output name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowExpr {
+    /// Function kind.
+    pub func: WindowFunction,
+    /// Partition key expressions.
+    pub partition_by: Vec<Expr>,
+    /// Order key expressions.
+    pub order_by: Vec<Expr>,
+    /// Output column name.
+    pub output_name: String,
+}
+
 /// Correlation classification for subquery filter operators.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubqueryCorrelation {
@@ -203,6 +227,15 @@ pub enum LogicalPlan {
     Projection {
         /// `(expr, output_name)` pairs.
         exprs: Vec<(Expr, String)>,
+        /// Input plan.
+        input: Box<LogicalPlan>,
+    },
+    /// Evaluate window expressions over input rows.
+    ///
+    /// Window outputs are appended as additional columns to input schema.
+    Window {
+        /// Window expressions to evaluate.
+        exprs: Vec<WindowExpr>,
         /// Input plan.
         input: Box<LogicalPlan>,
     },

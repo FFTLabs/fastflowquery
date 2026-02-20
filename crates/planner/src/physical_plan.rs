@@ -1,4 +1,4 @@
-use crate::logical_plan::{AggExpr, Expr, JoinStrategyHint, JoinType};
+use crate::logical_plan::{AggExpr, Expr, JoinStrategyHint, JoinType, WindowExpr};
 use arrow_schema::Schema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -23,6 +23,8 @@ pub enum PhysicalPlan {
     ScalarSubqueryFilter(ScalarSubqueryFilterExec),
     /// Projection.
     Project(ProjectExec),
+    /// Window function execution.
+    Window(WindowExec),
     /// Batch coalescing.
     CoalesceBatches(CoalesceBatchesExec),
 
@@ -65,6 +67,7 @@ impl PhysicalPlan {
             PhysicalPlan::ExistsSubqueryFilter(x) => vec![x.input.as_ref(), x.subquery.as_ref()],
             PhysicalPlan::ScalarSubqueryFilter(x) => vec![x.input.as_ref(), x.subquery.as_ref()],
             PhysicalPlan::Project(x) => vec![x.input.as_ref()],
+            PhysicalPlan::Window(x) => vec![x.input.as_ref()],
             PhysicalPlan::CoalesceBatches(x) => vec![x.input.as_ref()],
             PhysicalPlan::PartialHashAggregate(x) => vec![x.input.as_ref()],
             PhysicalPlan::FinalHashAggregate(x) => vec![x.input.as_ref()],
@@ -161,6 +164,15 @@ pub struct ScalarSubqueryFilterExec {
 pub struct ProjectExec {
     /// (expr, output_name)
     pub exprs: Vec<(Expr, String)>,
+    /// Input plan.
+    pub input: Box<PhysicalPlan>,
+}
+
+/// Window execution operator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowExec {
+    /// Window expressions to evaluate.
+    pub exprs: Vec<WindowExpr>,
     /// Input plan.
     pub input: Box<PhysicalPlan>,
 }

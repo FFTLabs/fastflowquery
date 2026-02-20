@@ -526,6 +526,7 @@ fn collect_table_refs(plan: &LogicalPlan, out: &mut Vec<String>) {
             collect_table_refs(right, out);
         }
         LogicalPlan::Aggregate { input, .. } => collect_table_refs(input, out),
+        LogicalPlan::Window { input, .. } => collect_table_refs(input, out),
         LogicalPlan::Limit { input, .. } => collect_table_refs(input, out),
         LogicalPlan::TopKByScore { input, .. } => collect_table_refs(input, out),
         LogicalPlan::UnionAll { left, right } => {

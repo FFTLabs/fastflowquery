@@ -10,6 +10,7 @@ use sqlparser::ast::{
 
 use crate::logical_plan::{
     AggExpr, BinaryOp, Expr, JoinStrategyHint, LiteralValue, LogicalPlan, SubqueryCorrelation,
+    WindowExpr, WindowFunction,
 };
 
 const E_RECURSIVE_CTE_OVERFLOW: &str = "E_RECURSIVE_CTE_OVERFLOW";
@@ -204,6 +205,7 @@ fn query_to_logical_with_ctes(
     let group_exprs = group_by_exprs(&select.group_by, params)?;
     let mut agg_exprs: Vec<(AggExpr, String)> = vec![];
     let mut proj_exprs: Vec<(Expr, String)> = vec![];
+    let mut window_exprs: Vec<WindowExpr> = vec![];
 
     // Parse SELECT list.
     // If we see aggregate functions or GROUP BY exists, we build Aggregate + Projection.
@@ -211,6 +213,11 @@ fn query_to_logical_with_ctes(
     for item in &select.projection {
         match item {
             SelectItem::UnnamedExpr(e) => {
+                if let Some((wexpr, out_name)) = try_parse_window_expr(e, params, None)? {
+                    window_exprs.push(wexpr);
+                    proj_exprs.push((Expr::Column(out_name.clone()), out_name));
+                    continue;
+                }
                 if let Some((agg, name)) = try_parse_agg(e, params)? {
                     saw_agg = true;
                     agg_exprs.push((agg, name.clone()));
@@ -223,6 +230,13 @@ fn query_to_logical_with_ctes(
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 let alias_name = alias.value.clone();
+                if let Some((wexpr, out_name)) =
+                    try_parse_window_expr(expr, params, Some(alias_name.clone()))?
+                {
+                    window_exprs.push(wexpr);
+                    proj_exprs.push((Expr::Column(out_name.clone()), out_name));
+                    continue;
+                }
                 if let Some((agg, _)) = try_parse_agg(expr, params)? {
                     saw_agg = true;
                     agg_exprs.push((agg, alias_name.clone()));
@@ -241,6 +255,11 @@ fn query_to_logical_with_ctes(
     }
 
     let needs_agg = saw_agg || !group_exprs.is_empty();
+    if needs_agg && !window_exprs.is_empty() {
+        return Err(FfqError::Unsupported(
+            "mixing GROUP BY aggregates and window functions is not supported in v1".to_string(),
+        ));
+    }
     let output_proj_exprs = proj_exprs.clone();
     let pre_projection_input = plan.clone();
     if needs_agg {
@@ -250,6 +269,15 @@ fn query_to_logical_with_ctes(
             input: Box::new(plan),
         };
         // After Aggregate, do a projection to shape output.
+        plan = LogicalPlan::Projection {
+            exprs: proj_exprs,
+            input: Box::new(plan),
+        };
+    } else if !window_exprs.is_empty() {
+        plan = LogicalPlan::Window {
+            exprs: window_exprs,
+            input: Box::new(plan),
+        };
         plan = LogicalPlan::Projection {
             exprs: proj_exprs,
             input: Box::new(plan),
@@ -977,6 +1005,106 @@ fn try_parse_agg(
     Ok(Some((agg, name)))
 }
 
+fn try_parse_window_expr(
+    e: &SqlExpr,
+    params: &HashMap<String, LiteralValue>,
+    explicit_alias: Option<String>,
+) -> Result<Option<(WindowExpr, String)>> {
+    let SqlExpr::Function(func) = e else {
+        return Ok(None);
+    };
+    let Some(over) = &func.over else {
+        return Ok(None);
+    };
+    let fname = object_name_to_string(&func.name).to_uppercase();
+    let output_name = explicit_alias.unwrap_or_else(|| match fname.as_str() {
+        "ROW_NUMBER" => "row_number()".to_string(),
+        "RANK" => "rank()".to_string(),
+        "SUM" => "sum_over()".to_string(),
+        _ => format!("window_{}", fname.to_lowercase()),
+    });
+
+    let (partition_by, order_by) = match over {
+        sqlparser::ast::WindowType::WindowSpec(spec) => parse_window_spec(spec, params)?,
+        _ => {
+            return Err(FfqError::Unsupported(
+                "named window references are not supported in v1".to_string(),
+            ))
+        }
+    };
+
+    let func_kind = match fname.as_str() {
+        "ROW_NUMBER" => {
+            if first_function_arg(func).is_some() {
+                return Err(FfqError::Unsupported(
+                    "ROW_NUMBER() does not accept arguments".to_string(),
+                ));
+            }
+            WindowFunction::RowNumber
+        }
+        "RANK" => {
+            if first_function_arg(func).is_some() {
+                return Err(FfqError::Unsupported("RANK() does not accept arguments".to_string()));
+            }
+            WindowFunction::Rank
+        }
+        "SUM" => WindowFunction::Sum(function_arg_to_expr(
+            required_arg(first_function_arg(func), "SUM")?,
+            params,
+        )?),
+        _ => {
+            return Err(FfqError::Unsupported(format!(
+                "unsupported window function in v1: {fname}"
+            )))
+        }
+    };
+    if order_by.is_empty() {
+        return Err(FfqError::Unsupported(
+            "window functions in v1 require ORDER BY in OVER(...)".to_string(),
+        ));
+    }
+    Ok(Some((
+        WindowExpr {
+            func: func_kind,
+            partition_by,
+            order_by,
+            output_name: output_name.clone(),
+        },
+        output_name,
+    )))
+}
+
+fn parse_window_spec(
+    spec: &sqlparser::ast::WindowSpec,
+    params: &HashMap<String, LiteralValue>,
+) -> Result<(Vec<Expr>, Vec<Expr>)> {
+    if spec.window_frame.is_some() {
+        return Err(FfqError::Unsupported(
+            "window frames are not supported in v1 window MVP".to_string(),
+        ));
+    }
+    let partition_by = spec
+        .partition_by
+        .iter()
+        .map(|e| sql_expr_to_expr(e, params))
+        .collect::<Result<Vec<_>>>()?;
+    let mut order_by = Vec::with_capacity(spec.order_by.len());
+    for ob in &spec.order_by {
+        if ob.asc == Some(false) {
+            return Err(FfqError::Unsupported(
+                "window ORDER BY DESC is not supported in v1 window MVP".to_string(),
+            ));
+        }
+        if ob.nulls_first.is_some() {
+            return Err(FfqError::Unsupported(
+                "window ORDER BY NULLS FIRST/LAST is not supported in v1 window MVP".to_string(),
+            ));
+        }
+        order_by.push(sql_expr_to_expr(&ob.expr, params)?);
+    }
+    Ok((partition_by, order_by))
+}
+
 fn required_arg<'a>(a: Option<&'a FunctionArg>, name: &str) -> Result<&'a FunctionArg> {
     a.ok_or_else(|| FfqError::Unsupported(format!("{name}() requires one argument in v1")))
 }
@@ -1395,6 +1523,7 @@ mod tests {
                 LogicalPlan::TableScan { table, .. } => table == target,
                 LogicalPlan::Projection { input, .. }
                 | LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Window { input, .. }
                 | LogicalPlan::Limit { input, .. }
                 | LogicalPlan::TopKByScore { input, .. }
                 | LogicalPlan::InsertInto { input, .. } => contains_tablescan(input, target),
@@ -1426,6 +1555,7 @@ mod tests {
             LogicalPlan::CteRef { plan, .. } => 1 + count_cte_refs(plan),
             LogicalPlan::Projection { input, .. }
             | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Window { input, .. }
             | LogicalPlan::Limit { input, .. }
             | LogicalPlan::TopKByScore { input, .. }
             | LogicalPlan::InsertInto { input, .. } => count_cte_refs(input),
@@ -1534,6 +1664,7 @@ mod tests {
                 LogicalPlan::UnionAll { .. } => true,
                 LogicalPlan::Projection { input, .. }
                 | LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Window { input, .. }
                 | LogicalPlan::Limit { input, .. }
                 | LogicalPlan::TopKByScore { input, .. }
                 | LogicalPlan::InsertInto { input, .. } => has_union_all(input),

@@ -6,6 +6,7 @@ use crate::physical_plan::{
     InSubqueryFilterExec, ExistsSubqueryFilterExec, LimitExec, ParquetScanExec, ParquetWriteExec,
     ScalarSubqueryFilterExec, PartialHashAggregateExec, PartitioningSpec, PhysicalPlan, ProjectExec,
     CteRefExec, ShuffleReadExchange, ShuffleWriteExchange, TopKByScoreExec, UnionAllExec,
+    WindowExec,
 };
 
 #[derive(Debug, Clone)]
@@ -107,6 +108,13 @@ pub fn create_physical_plan(
         LogicalPlan::Projection { exprs, input } => {
             let child = create_physical_plan(input, cfg)?;
             Ok(PhysicalPlan::Project(ProjectExec {
+                exprs: exprs.clone(),
+                input: Box::new(child),
+            }))
+        }
+        LogicalPlan::Window { exprs, input } => {
+            let child = create_physical_plan(input, cfg)?;
+            Ok(PhysicalPlan::Window(WindowExec {
                 exprs: exprs.clone(),
                 input: Box::new(child),
             }))

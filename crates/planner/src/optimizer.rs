@@ -528,6 +528,28 @@ fn proj_rewrite(
                 child_req,
             ))
         }
+        LogicalPlan::Window { exprs, input } => {
+            let mut child_req = required.unwrap_or_default();
+            for w in &exprs {
+                for p in &w.partition_by {
+                    child_req.extend(expr_columns(p));
+                }
+                for o in &w.order_by {
+                    child_req.extend(expr_columns(o));
+                }
+                if let crate::logical_plan::WindowFunction::Sum(arg) = &w.func {
+                    child_req.extend(expr_columns(arg));
+                }
+            }
+            let (new_in, _) = proj_rewrite(*input, Some(child_req.clone()), ctx)?;
+            Ok((
+                LogicalPlan::Window {
+                    exprs,
+                    input: Box::new(new_in),
+                },
+                child_req,
+            ))
+        }
 
         LogicalPlan::Join {
             left,
@@ -1004,6 +1026,10 @@ fn vector_index_rewrite(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result
             aggr_exprs,
             input: Box::new(vector_index_rewrite(*input, ctx)?),
         }),
+        LogicalPlan::Window { exprs, input } => Ok(LogicalPlan::Window {
+            exprs,
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+        }),
         LogicalPlan::Join {
             left,
             right,
@@ -1456,6 +1482,10 @@ fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy
             aggr_exprs,
             input: Box::new(f(*input)),
         },
+        LogicalPlan::Window { exprs, input } => LogicalPlan::Window {
+            exprs,
+            input: Box::new(f(*input)),
+        },
         LogicalPlan::Join {
             left,
             right,
@@ -1571,6 +1601,10 @@ fn try_map_children(
         } => LogicalPlan::Aggregate {
             group_exprs,
             aggr_exprs,
+            input: Box::new(f(*input)?),
+        },
+        LogicalPlan::Window { exprs, input } => LogicalPlan::Window {
+            exprs,
             input: Box::new(f(*input)?),
         },
         LogicalPlan::Join {
@@ -1691,6 +1725,31 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
                 .map(|e| rewrite_expr(e, rewrite))
                 .collect(),
             aggr_exprs,
+            input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+        },
+        LogicalPlan::Window { exprs, input } => LogicalPlan::Window {
+            exprs: exprs
+                .into_iter()
+                .map(|mut w| {
+                    w.partition_by = w
+                        .partition_by
+                        .into_iter()
+                        .map(|e| rewrite_expr(e, rewrite))
+                        .collect();
+                    w.order_by = w
+                        .order_by
+                        .into_iter()
+                        .map(|e| rewrite_expr(e, rewrite))
+                        .collect();
+                    w.func = match w.func {
+                        crate::logical_plan::WindowFunction::Sum(arg) => {
+                            crate::logical_plan::WindowFunction::Sum(rewrite_expr(arg, rewrite))
+                        }
+                        other => other,
+                    };
+                    w
+                })
+                .collect(),
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
         },
         LogicalPlan::Join {
@@ -1950,6 +2009,13 @@ fn plan_output_columns(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result
         LogicalPlan::TopKByScore { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::Projection { exprs, .. } => Ok(exprs.iter().map(|(_, n)| n.clone()).collect()),
         LogicalPlan::Aggregate { .. } => Ok(HashSet::new()), // v1: conservative
+        LogicalPlan::Window { exprs, input } => {
+            let mut cols = plan_output_columns(input, ctx)?;
+            for w in exprs {
+                cols.insert(w.output_name.clone());
+            }
+            Ok(cols)
+        }
         LogicalPlan::VectorTopK { .. } => Ok(["id", "score", "payload"]
             .into_iter()
             .map(std::string::ToString::to_string)
@@ -1991,6 +2057,7 @@ fn estimate_bytes(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result<Opti
         | LogicalPlan::ScalarSubqueryFilter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Window { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::TopKByScore { input, .. }
         | LogicalPlan::UnionAll { left: input, .. }

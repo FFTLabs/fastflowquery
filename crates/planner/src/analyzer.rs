@@ -4,7 +4,10 @@ use std::sync::{Arc, RwLock};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::{FfqError, Result};
 
-use crate::logical_plan::{AggExpr, BinaryOp, Expr, LiteralValue, LogicalPlan, SubqueryCorrelation};
+use crate::logical_plan::{
+    AggExpr, BinaryOp, Expr, LiteralValue, LogicalPlan, SubqueryCorrelation, WindowExpr,
+    WindowFunction,
+};
 
 const E_SUBQUERY_UNSUPPORTED_CORRELATION: &str = "E_SUBQUERY_UNSUPPORTED_CORRELATION";
 
@@ -353,6 +356,42 @@ impl Analyzer {
 
                 Ok((
                     LogicalPlan::Projection {
+                        exprs: out_exprs,
+                        input: Box::new(ain),
+                    },
+                    out_schema,
+                    out_resolver,
+                ))
+            }
+            LogicalPlan::Window { exprs, input } => {
+                let (ain, in_schema, in_resolver) = self.analyze_plan(*input, provider)?;
+                let mut out_fields: Vec<Field> = in_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.as_ref().clone())
+                    .collect();
+                let mut out_exprs = Vec::with_capacity(exprs.len());
+                for w in exprs {
+                    let aw = self.analyze_window_expr(w, &in_resolver)?;
+                    let dt = match &aw.func {
+                        WindowFunction::RowNumber | WindowFunction::Rank => DataType::Int64,
+                        WindowFunction::Sum(expr) => {
+                            let (_expr, dt) = self.analyze_expr(expr.clone(), &in_resolver)?;
+                            if !is_numeric(&dt) {
+                                return Err(FfqError::Planning(
+                                    "SUM() OVER requires numeric argument".to_string(),
+                                ));
+                            }
+                            DataType::Float64
+                        }
+                    };
+                    out_fields.push(Field::new(&aw.output_name, dt, true));
+                    out_exprs.push(aw);
+                }
+                let out_schema = Arc::new(Schema::new(out_fields));
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                Ok((
+                    LogicalPlan::Window {
                         exprs: out_exprs,
                         input: Box::new(ain),
                     },
@@ -841,6 +880,38 @@ impl Analyzer {
                 Ok((AggExpr::Avg(ae), DataType::Float64))
             }
         }
+    }
+
+    fn analyze_window_expr(&self, w: WindowExpr, resolver: &Resolver) -> Result<WindowExpr> {
+        let partition_by = w
+            .partition_by
+            .into_iter()
+            .map(|e| self.analyze_expr(e, resolver).map(|(ae, _)| ae))
+            .collect::<Result<Vec<_>>>()?;
+        let order_by = w
+            .order_by
+            .into_iter()
+            .map(|e| self.analyze_expr(e, resolver).map(|(ae, _)| ae))
+            .collect::<Result<Vec<_>>>()?;
+        let func = match w.func {
+            WindowFunction::RowNumber => WindowFunction::RowNumber,
+            WindowFunction::Rank => WindowFunction::Rank,
+            WindowFunction::Sum(expr) => {
+                let (arg, dt) = self.analyze_expr(expr, resolver)?;
+                if !is_numeric(&dt) {
+                    return Err(FfqError::Planning(
+                        "SUM() OVER requires numeric argument".to_string(),
+                    ));
+                }
+                WindowFunction::Sum(arg)
+            }
+        };
+        Ok(WindowExpr {
+            func,
+            partition_by,
+            order_by,
+            output_name: w.output_name,
+        })
     }
 
     fn analyze_expr(&self, expr: Expr, resolver: &Resolver) -> Result<(Expr, DataType)> {
