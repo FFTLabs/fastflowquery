@@ -62,6 +62,7 @@ pub struct QueryContext {
     pub batch_size_rows: usize,
     pub mem_budget_bytes: usize,
     pub broadcast_threshold_bytes: u64,
+    pub join_radix_bits: u8,
     pub spill_dir: String,
     pub(crate) stats_collector: Option<Arc<RuntimeStatsCollector>>,
 }
@@ -1536,15 +1537,44 @@ fn run_hash_join(
             trace,
         )?
     } else {
-        in_memory_hash_join(
-            build_rows,
-            probe_rows,
-            &build_key_idx,
-            &probe_key_idx,
-            build_input_side,
-            left_rows.len(),
-            right_rows.len(),
-        )
+        if ctx.join_radix_bits > 0 {
+            if let (Some(build_int_idx), Some(probe_int_idx)) = (
+                single_int64_join_key_index(build_rows, &build_key_idx),
+                single_int64_join_key_index(probe_rows, &probe_key_idx),
+            ) {
+                in_memory_radix_hash_join_i64(
+                    build_rows,
+                    probe_rows,
+                    build_int_idx,
+                    probe_int_idx,
+                    build_input_side,
+                    left_rows.len(),
+                    right_rows.len(),
+                    ctx.join_radix_bits,
+                )
+            } else {
+                in_memory_radix_hash_join(
+                    build_rows,
+                    probe_rows,
+                    &build_key_idx,
+                    &probe_key_idx,
+                    build_input_side,
+                    left_rows.len(),
+                    right_rows.len(),
+                    ctx.join_radix_bits,
+                )
+            }
+        } else {
+            in_memory_hash_join(
+                build_rows,
+                probe_rows,
+                &build_key_idx,
+                &probe_key_idx,
+                build_input_side,
+                left_rows.len(),
+                right_rows.len(),
+            )
+        }
     };
 
     if matches!(join_type, JoinType::Semi | JoinType::Anti) {
@@ -1576,6 +1606,23 @@ fn run_hash_join(
         schema: output_schema,
         batches: vec![batch],
     })
+}
+
+fn single_int64_join_key_index(rows: &[Vec<ScalarValue>], key_idx: &[usize]) -> Option<usize> {
+    if key_idx.len() != 1 {
+        return None;
+    }
+    let idx = key_idx[0];
+    if rows.iter().all(|row| {
+        matches!(
+            row.get(idx),
+            Some(ScalarValue::Int64(_) | ScalarValue::Null)
+        )
+    }) {
+        Some(idx)
+    } else {
+        None
+    }
 }
 
 fn apply_outer_join_null_extension(
@@ -1662,6 +1709,7 @@ fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput
         batch_size_rows: 8192,
         mem_budget_bytes: usize::MAX,
         broadcast_threshold_bytes: u64::MAX,
+        join_radix_bits: 8,
         spill_dir: "./ffq_spill".to_string(),
         stats_collector: None,
     };
@@ -3199,6 +3247,172 @@ fn in_memory_hash_join(
     }
 }
 
+fn in_memory_radix_hash_join(
+    build_rows: &[Vec<ScalarValue>],
+    probe_rows: &[Vec<ScalarValue>],
+    build_key_idx: &[usize],
+    probe_key_idx: &[usize],
+    build_side: JoinInputSide,
+    left_len: usize,
+    right_len: usize,
+    radix_bits: u8,
+) -> JoinMatchOutput {
+    // Keep partition fanout bounded so partition metadata stays cache-friendly.
+    let bits = radix_bits.min(12);
+    if bits == 0 {
+        return in_memory_hash_join(
+            build_rows,
+            probe_rows,
+            build_key_idx,
+            probe_key_idx,
+            build_side,
+            left_len,
+            right_len,
+        );
+    }
+
+    let partitions = 1usize << bits;
+    let mask = (partitions as u64) - 1;
+    let mut build_parts = vec![Vec::<(usize, Vec<ScalarValue>, u64)>::new(); partitions];
+    let mut probe_parts = vec![Vec::<(usize, Vec<ScalarValue>, u64)>::new(); partitions];
+
+    for (idx, row) in build_rows.iter().enumerate() {
+        let key = join_key_from_row(row, build_key_idx);
+        if join_key_has_null(&key) {
+            continue;
+        }
+        let key_hash = hash_key(&key);
+        let part = (key_hash & mask) as usize;
+        build_parts[part].push((idx, key, key_hash));
+    }
+    for (idx, row) in probe_rows.iter().enumerate() {
+        let key = join_key_from_row(row, probe_key_idx);
+        if join_key_has_null(&key) {
+            continue;
+        }
+        let key_hash = hash_key(&key);
+        let part = (key_hash & mask) as usize;
+        probe_parts[part].push((idx, key, key_hash));
+    }
+
+    let mut out = Vec::new();
+    let mut matched_left = vec![false; left_len];
+    let mut matched_right = vec![false; right_len];
+    for part in 0..partitions {
+        if build_parts[part].is_empty() || probe_parts[part].is_empty() {
+            continue;
+        }
+        let mut ht: HashMap<u64, Vec<(usize, Vec<ScalarValue>)>> = HashMap::new();
+        for (build_idx, key, key_hash) in build_parts[part].drain(..) {
+            ht.entry(key_hash).or_default().push((build_idx, key));
+        }
+        for (probe_idx, probe_key, probe_hash) in &probe_parts[part] {
+            if let Some(build_matches) = ht.get(probe_hash) {
+                for (build_idx, build_key) in build_matches {
+                    if build_key == probe_key {
+                        let build = &build_rows[*build_idx];
+                        let probe = &probe_rows[*probe_idx];
+                        out.push(combine_join_rows(build, probe, build_side));
+                        mark_join_match(
+                            &mut matched_left,
+                            &mut matched_right,
+                            build_side,
+                            *build_idx,
+                            *probe_idx,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    JoinMatchOutput {
+        rows: out,
+        matched_left,
+        matched_right,
+    }
+}
+
+fn in_memory_radix_hash_join_i64(
+    build_rows: &[Vec<ScalarValue>],
+    probe_rows: &[Vec<ScalarValue>],
+    build_key_idx: usize,
+    probe_key_idx: usize,
+    build_side: JoinInputSide,
+    left_len: usize,
+    right_len: usize,
+    radix_bits: u8,
+) -> JoinMatchOutput {
+    let bits = radix_bits.min(12);
+    if bits == 0 {
+        return in_memory_hash_join(
+            build_rows,
+            probe_rows,
+            &[build_key_idx],
+            &[probe_key_idx],
+            build_side,
+            left_len,
+            right_len,
+        );
+    }
+    let partitions = 1usize << bits;
+    let mask = (partitions as u64) - 1;
+    let mut build_parts = vec![Vec::<(usize, i64)>::new(); partitions];
+    let mut probe_parts = vec![Vec::<(usize, i64)>::new(); partitions];
+
+    for (idx, row) in build_rows.iter().enumerate() {
+        let Some(ScalarValue::Int64(key)) = row.get(build_key_idx) else {
+            continue;
+        };
+        let key_hash = hash_i64(*key);
+        let part = (key_hash & mask) as usize;
+        build_parts[part].push((idx, *key));
+    }
+    for (idx, row) in probe_rows.iter().enumerate() {
+        let Some(ScalarValue::Int64(key)) = row.get(probe_key_idx) else {
+            continue;
+        };
+        let key_hash = hash_i64(*key);
+        let part = (key_hash & mask) as usize;
+        probe_parts[part].push((idx, *key));
+    }
+
+    let mut out = Vec::new();
+    let mut matched_left = vec![false; left_len];
+    let mut matched_right = vec![false; right_len];
+    for part in 0..partitions {
+        if build_parts[part].is_empty() || probe_parts[part].is_empty() {
+            continue;
+        }
+        let mut ht: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (build_idx, key) in &build_parts[part] {
+            ht.entry(*key).or_default().push(*build_idx);
+        }
+        for (probe_idx, probe_key) in &probe_parts[part] {
+            if let Some(build_matches) = ht.get(probe_key) {
+                for build_idx in build_matches {
+                    let build = &build_rows[*build_idx];
+                    let probe = &probe_rows[*probe_idx];
+                    out.push(combine_join_rows(build, probe, build_side));
+                    mark_join_match(
+                        &mut matched_left,
+                        &mut matched_right,
+                        build_side,
+                        *build_idx,
+                        *probe_idx,
+                    );
+                }
+            }
+        }
+    }
+
+    JoinMatchOutput {
+        rows: out,
+        matched_left,
+        matched_right,
+    }
+}
+
 fn mark_join_match(
     matched_left: &mut [bool],
     matched_right: &mut [bool],
@@ -3378,6 +3592,12 @@ fn spill_join_partitions(
 fn hash_key(key: &[ScalarValue]) -> u64 {
     let mut h = DefaultHasher::new();
     key.hash(&mut h);
+    h.finish()
+}
+
+fn hash_i64(v: i64) -> u64 {
+    let mut h = DefaultHasher::new();
+    v.hash(&mut h);
     h.finish()
 }
 

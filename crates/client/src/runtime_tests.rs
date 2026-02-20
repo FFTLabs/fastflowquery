@@ -1,4 +1,3 @@
-
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::sync::Arc;
@@ -335,6 +334,7 @@ fn window_exec_spills_under_tight_memory_budget_and_cleans_temp_files() {
         batch_size_rows: 512,
         mem_budget_bytes: 256,
         broadcast_threshold_bytes: u64::MAX,
+        join_radix_bits: 8,
         spill_dir: spill_dir.to_string_lossy().into_owned(),
         stats_collector: None,
     };
@@ -428,6 +428,7 @@ fn materialized_cte_ref_executes_shared_subplan_once() {
             batch_size_rows: 1024,
             mem_budget_bytes: 64 * 1024 * 1024,
             broadcast_threshold_bytes: u64::MAX,
+            join_radix_bits: 8,
             spill_dir: "./ffq_spill_test".to_string(),
             stats_collector: None,
         },

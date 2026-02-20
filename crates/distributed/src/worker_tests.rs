@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::coordinator::CoordinatorConfig;
 use ffq_execution::{
@@ -508,6 +507,7 @@ fn shuffle_read_hash_requires_assigned_partitions() {
         task_id: 0,
         attempt: 1,
         per_task_memory_budget_bytes: 1,
+        join_radix_bits: 8,
         spill_dir: std::env::temp_dir(),
         shuffle_root: shuffle_root.clone(),
         assigned_reduce_partitions: Vec::new(),
@@ -555,6 +555,7 @@ fn shuffle_read_hash_reads_only_assigned_partition_subset() {
         task_id: 0,
         attempt: 1,
         per_task_memory_budget_bytes: 1,
+        join_radix_bits: 8,
         spill_dir: std::env::temp_dir(),
         shuffle_root: shuffle_root.clone(),
         assigned_reduce_partitions: Vec::new(),
@@ -576,6 +577,7 @@ fn shuffle_read_hash_reads_only_assigned_partition_subset() {
         task_id: target.reduce_partition as u64,
         attempt: 1,
         per_task_memory_budget_bytes: 1,
+        join_radix_bits: 8,
         spill_dir: std::env::temp_dir(),
         shuffle_root: shuffle_root.clone(),
         assigned_reduce_partitions: vec![target.reduce_partition],
@@ -617,6 +619,7 @@ fn shuffle_read_hash_split_assignment_shards_one_partition_deterministically() {
         task_id: 0,
         attempt: 1,
         per_task_memory_budget_bytes: 1,
+        join_radix_bits: 8,
         spill_dir: std::env::temp_dir(),
         shuffle_root: shuffle_root.clone(),
         assigned_reduce_partitions: Vec::new(),
@@ -638,6 +641,7 @@ fn shuffle_read_hash_split_assignment_shards_one_partition_deterministically() {
             task_id: target.reduce_partition as u64,
             attempt: 1,
             per_task_memory_budget_bytes: 1,
+            join_radix_bits: 8,
             spill_dir: std::env::temp_dir(),
             shuffle_root: shuffle_root.clone(),
             assigned_reduce_partitions: vec![target.reduce_partition],

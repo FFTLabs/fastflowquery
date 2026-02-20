@@ -206,6 +206,14 @@ fn parse_repl_opts(args: &[String]) -> Result<ReplOpts, Box<dyn std::error::Erro
                     .parse()
                     .map_err(|_| "invalid value for --broadcast-threshold-bytes")?;
             }
+            "--join-radix-bits" => {
+                i += 1;
+                config.join_radix_bits = args
+                    .get(i)
+                    .ok_or("missing value for --join-radix-bits")?
+                    .parse()
+                    .map_err(|_| "invalid value for --join-radix-bits")?;
+            }
             "--schema-inference" => {
                 i += 1;
                 let raw = args.get(i).ok_or("missing value for --schema-inference")?;
@@ -241,7 +249,7 @@ fn print_usage() {
     eprintln!("  ffq-client --plan \"<SQL>\"");
     eprintln!("  ffq-client query --sql \"<SQL>\" [--catalog PATH] [--plan]");
     eprintln!(
-        "  ffq-client repl [--catalog PATH] [--coordinator-endpoint URL] [--batch-size-rows N] [--mem-budget-bytes N] [--spill-dir PATH] [--shuffle-partitions N] [--broadcast-threshold-bytes N] [--schema-inference off|on|strict|permissive] [--schema-writeback true|false] [--schema-drift-policy fail|refresh]"
+        "  ffq-client repl [--catalog PATH] [--coordinator-endpoint URL] [--batch-size-rows N] [--mem-budget-bytes N] [--spill-dir PATH] [--shuffle-partitions N] [--broadcast-threshold-bytes N] [--join-radix-bits N] [--schema-inference off|on|strict|permissive] [--schema-writeback true|false] [--schema-drift-policy fail|refresh]"
     );
 }
 

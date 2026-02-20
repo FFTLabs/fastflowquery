@@ -59,6 +59,11 @@ fn apply_config_map(
                     ))
                 })?
             }
+            "join_radix_bits" => {
+                config.join_radix_bits = value.parse().map_err(|e| {
+                    FfqError::InvalidConfig(format!("invalid join_radix_bits '{value}': {e}"))
+                })?
+            }
             "spill_dir" => config.spill_dir = value.clone(),
             "catalog_path" => config.catalog_path = Some(value.clone()),
             "coordinator_endpoint" => config.coordinator_endpoint = Some(value.clone()),

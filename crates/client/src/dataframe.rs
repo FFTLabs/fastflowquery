@@ -358,6 +358,7 @@ impl DataFrame {
             batch_size_rows: self.session.config.batch_size_rows,
             mem_budget_bytes: self.session.config.mem_budget_bytes,
             broadcast_threshold_bytes: self.session.config.broadcast_threshold_bytes,
+            join_radix_bits: self.session.config.join_radix_bits,
             spill_dir: self.session.config.spill_dir.clone(),
             stats_collector: Some(Arc::clone(&stats_collector)),
         };

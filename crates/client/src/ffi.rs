@@ -158,6 +158,11 @@ fn apply_config_kv(config: &mut EngineConfig, kv: &str) -> std::result::Result<(
                     ))
                 })?
             }
+            "join_radix_bits" => {
+                config.join_radix_bits = value.parse().map_err(|e| {
+                    FfqError::InvalidConfig(format!("invalid join_radix_bits '{value}': {e}"))
+                })?
+            }
             "spill_dir" => config.spill_dir = value.to_string(),
             "catalog_path" => config.catalog_path = Some(value.to_string()),
             "coordinator_endpoint" => config.coordinator_endpoint = Some(value.to_string()),

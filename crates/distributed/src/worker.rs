@@ -67,6 +67,8 @@ pub struct WorkerConfig {
     pub cpu_slots: usize,
     /// Per-task soft memory budget.
     pub per_task_memory_budget_bytes: usize,
+    /// Number of radix bits for in-memory hash join partitioning.
+    pub join_radix_bits: u8,
     /// Local spill directory for memory-pressure fallback paths.
     pub spill_dir: PathBuf,
     /// Root directory containing shuffle data.
@@ -79,6 +81,7 @@ impl Default for WorkerConfig {
             worker_id: "worker-1".to_string(),
             cpu_slots: 2,
             per_task_memory_budget_bytes: 64 * 1024 * 1024,
+            join_radix_bits: 8,
             spill_dir: PathBuf::from(".ffq_spill"),
             shuffle_root: PathBuf::from("."),
         }
@@ -98,6 +101,8 @@ pub struct TaskContext {
     pub attempt: u32,
     /// Per-task soft memory budget.
     pub per_task_memory_budget_bytes: usize,
+    /// Number of radix bits for in-memory hash join partitioning.
+    pub join_radix_bits: u8,
     /// Local spill directory.
     pub spill_dir: PathBuf,
     /// Root directory containing shuffle data.
@@ -356,6 +361,7 @@ where
                 task_id: assignment.task_id,
                 attempt: assignment.attempt,
                 per_task_memory_budget_bytes: self.config.per_task_memory_budget_bytes,
+                join_radix_bits: self.config.join_radix_bits,
                 spill_dir: self.config.spill_dir.clone(),
                 shuffle_root: self.config.shuffle_root.clone(),
                 assigned_reduce_partitions: assignment.assigned_reduce_partitions.clone(),
@@ -2014,13 +2020,24 @@ fn run_hash_join(
             ctx,
         )?
     } else {
-        in_memory_hash_join(
-            build_rows,
-            probe_rows,
-            &build_key_idx,
-            &probe_key_idx,
-            build_input_side,
-        )
+        if ctx.join_radix_bits > 0 {
+            in_memory_radix_hash_join(
+                build_rows,
+                probe_rows,
+                &build_key_idx,
+                &probe_key_idx,
+                build_input_side,
+                ctx.join_radix_bits,
+            )
+        } else {
+            in_memory_hash_join(
+                build_rows,
+                probe_rows,
+                &build_key_idx,
+                &probe_key_idx,
+                build_input_side,
+            )
+        }
     };
 
     let batch = rows_to_batch(&output_schema, &joined_rows)?;
@@ -3145,6 +3162,66 @@ fn in_memory_hash_join(
             for build_idx in build_matches {
                 let build = &build_rows[*build_idx];
                 out.push(combine_join_rows(build, probe, build_side));
+            }
+        }
+    }
+    out
+}
+
+fn in_memory_radix_hash_join(
+    build_rows: &[Vec<ScalarValue>],
+    probe_rows: &[Vec<ScalarValue>],
+    build_key_idx: &[usize],
+    probe_key_idx: &[usize],
+    build_side: JoinInputSide,
+    radix_bits: u8,
+) -> Vec<Vec<ScalarValue>> {
+    let bits = radix_bits.min(12);
+    if bits == 0 {
+        return in_memory_hash_join(
+            build_rows,
+            probe_rows,
+            build_key_idx,
+            probe_key_idx,
+            build_side,
+        );
+    }
+
+    let partitions = 1usize << bits;
+    let mask = (partitions as u64) - 1;
+    let mut build_parts = vec![Vec::<(usize, Vec<ScalarValue>, u64)>::new(); partitions];
+    let mut probe_parts = vec![Vec::<(usize, Vec<ScalarValue>, u64)>::new(); partitions];
+    for (idx, row) in build_rows.iter().enumerate() {
+        let key = join_key_from_row(row, build_key_idx);
+        let key_hash = hash_key(&key);
+        let part = (key_hash & mask) as usize;
+        build_parts[part].push((idx, key, key_hash));
+    }
+    for (idx, row) in probe_rows.iter().enumerate() {
+        let key = join_key_from_row(row, probe_key_idx);
+        let key_hash = hash_key(&key);
+        let part = (key_hash & mask) as usize;
+        probe_parts[part].push((idx, key, key_hash));
+    }
+
+    let mut out = Vec::new();
+    for part in 0..partitions {
+        if build_parts[part].is_empty() || probe_parts[part].is_empty() {
+            continue;
+        }
+        let mut ht: HashMap<u64, Vec<(usize, Vec<ScalarValue>)>> = HashMap::new();
+        for (build_idx, key, key_hash) in build_parts[part].drain(..) {
+            ht.entry(key_hash).or_default().push((build_idx, key));
+        }
+        for (probe_idx, probe_key, probe_hash) in &probe_parts[part] {
+            if let Some(build_matches) = ht.get(probe_hash) {
+                for (build_idx, build_key) in build_matches {
+                    if build_key == probe_key {
+                        let build = &build_rows[*build_idx];
+                        let probe = &probe_rows[*probe_idx];
+                        out.push(combine_join_rows(build, probe, build_side));
+                    }
+                }
             }
         }
     }

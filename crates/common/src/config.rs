@@ -76,6 +76,10 @@ pub struct EngineConfig {
     pub shuffle_partitions: usize,
     /// Broadcast join threshold in bytes for optimizer join hinting.
     pub broadcast_threshold_bytes: u64,
+    /// Number of radix bits for in-memory hash join partitioning.
+    ///
+    /// `0` disables radix partitioning and uses the baseline hash-join table.
+    pub join_radix_bits: u8,
 
     /// Directory used for spill files.
     pub spill_dir: String,
@@ -111,6 +115,7 @@ impl Default for EngineConfig {
             mem_budget_bytes: 512 * 1024 * 1024, // 512MB
             shuffle_partitions: 64,
             broadcast_threshold_bytes: 64 * 1024 * 1024, // 64MB
+            join_radix_bits: 8,
             spill_dir: "./ffq_spill".to_string(),
             catalog_path: None,
             coordinator_endpoint: None,
