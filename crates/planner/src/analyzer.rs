@@ -377,7 +377,8 @@ impl Analyzer {
                         WindowFunction::RowNumber
                         | WindowFunction::Rank
                         | WindowFunction::DenseRank
-                        | WindowFunction::Ntile(_) => DataType::Int64,
+                        | WindowFunction::Ntile(_)
+                        | WindowFunction::Count(_) => DataType::Int64,
                         WindowFunction::PercentRank | WindowFunction::CumeDist => DataType::Float64,
                         WindowFunction::Sum(expr) => {
                             let (_expr, dt) = self.analyze_expr(expr.clone(), &in_resolver)?;
@@ -387,6 +388,19 @@ impl Analyzer {
                                 ));
                             }
                             DataType::Float64
+                        }
+                        WindowFunction::Avg(expr) => {
+                            let (_expr, dt) = self.analyze_expr(expr.clone(), &in_resolver)?;
+                            if !is_numeric(&dt) {
+                                return Err(FfqError::Planning(
+                                    "AVG() OVER requires numeric argument".to_string(),
+                                ));
+                            }
+                            DataType::Float64
+                        }
+                        WindowFunction::Min(expr) | WindowFunction::Max(expr) => {
+                            let (_expr, dt) = self.analyze_expr(expr.clone(), &in_resolver)?;
+                            dt
                         }
                         WindowFunction::Lag { expr, .. }
                         | WindowFunction::Lead { expr, .. }
@@ -918,6 +932,10 @@ impl Analyzer {
             WindowFunction::PercentRank => WindowFunction::PercentRank,
             WindowFunction::CumeDist => WindowFunction::CumeDist,
             WindowFunction::Ntile(n) => WindowFunction::Ntile(n),
+            WindowFunction::Count(expr) => {
+                let (arg, _dt) = self.analyze_expr(expr, resolver)?;
+                WindowFunction::Count(arg)
+            }
             WindowFunction::Sum(expr) => {
                 let (arg, dt) = self.analyze_expr(expr, resolver)?;
                 if !is_numeric(&dt) {
@@ -926,6 +944,23 @@ impl Analyzer {
                     ));
                 }
                 WindowFunction::Sum(arg)
+            }
+            WindowFunction::Avg(expr) => {
+                let (arg, dt) = self.analyze_expr(expr, resolver)?;
+                if !is_numeric(&dt) {
+                    return Err(FfqError::Planning(
+                        "AVG() OVER requires numeric argument".to_string(),
+                    ));
+                }
+                WindowFunction::Avg(arg)
+            }
+            WindowFunction::Min(expr) => {
+                let (arg, _dt) = self.analyze_expr(expr, resolver)?;
+                WindowFunction::Min(arg)
+            }
+            WindowFunction::Max(expr) => {
+                let (arg, _dt) = self.analyze_expr(expr, resolver)?;
+                WindowFunction::Max(arg)
             }
             WindowFunction::Lag {
                 expr,

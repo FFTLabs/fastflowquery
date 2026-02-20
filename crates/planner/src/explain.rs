@@ -92,7 +92,11 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
                     WindowFunction::PercentRank => "PERCENT_RANK()".to_string(),
                     WindowFunction::CumeDist => "CUME_DIST()".to_string(),
                     WindowFunction::Ntile(n) => format!("NTILE({n})"),
+                    WindowFunction::Count(expr) => format!("COUNT({})", fmt_expr(expr)),
                     WindowFunction::Sum(expr) => format!("SUM({})", fmt_expr(expr)),
+                    WindowFunction::Avg(expr) => format!("AVG({})", fmt_expr(expr)),
+                    WindowFunction::Min(expr) => format!("MIN({})", fmt_expr(expr)),
+                    WindowFunction::Max(expr) => format!("MAX({})", fmt_expr(expr)),
                     WindowFunction::Lag {
                         expr,
                         offset,

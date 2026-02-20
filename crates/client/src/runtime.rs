@@ -1460,6 +1460,18 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                 }
             }
         }
+        WindowFunction::Count(arg) => {
+            let values = evaluate_expr_rows(input, arg)?;
+            for (start, end) in &partitions {
+                let mut running = 0_i64;
+                for pos in &order_idx[*start..*end] {
+                    if !matches!(values[*pos], ScalarValue::Null) {
+                        running += 1;
+                    }
+                    out[*pos] = ScalarValue::Int64(running);
+                }
+            }
+        }
         WindowFunction::Sum(arg) => {
             let values = evaluate_expr_rows(input, arg)?;
             for (start, end) in &partitions {
@@ -1487,6 +1499,77 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                     } else {
                         ScalarValue::Null
                     };
+                }
+            }
+        }
+        WindowFunction::Avg(arg) => {
+            let values = evaluate_expr_rows(input, arg)?;
+            for (start, end) in &partitions {
+                let mut running = 0.0_f64;
+                let mut count = 0_i64;
+                for pos in &order_idx[*start..*end] {
+                    if let Some(v) = scalar_to_f64(&values[*pos]) {
+                        running += v;
+                        count += 1;
+                    } else if !matches!(values[*pos], ScalarValue::Null) {
+                        return Err(FfqError::Execution(format!(
+                            "AVG() OVER encountered non-numeric value: {:?}",
+                            values[*pos]
+                        )));
+                    }
+                    out[*pos] = if count > 0 {
+                        ScalarValue::Float64Bits((running / count as f64).to_bits())
+                    } else {
+                        ScalarValue::Null
+                    };
+                }
+            }
+        }
+        WindowFunction::Min(arg) => {
+            let values = evaluate_expr_rows(input, arg)?;
+            for (start, end) in &partitions {
+                let mut current: Option<ScalarValue> = None;
+                for pos in &order_idx[*start..*end] {
+                    let v = values[*pos].clone();
+                    if !matches!(v, ScalarValue::Null) {
+                        current = match current {
+                            None => Some(v),
+                            Some(existing) => {
+                                if cmp_scalar_for_window(&v, &existing, false, false)
+                                    == Ordering::Less
+                                {
+                                    Some(v)
+                                } else {
+                                    Some(existing)
+                                }
+                            }
+                        };
+                    }
+                    out[*pos] = current.clone().unwrap_or(ScalarValue::Null);
+                }
+            }
+        }
+        WindowFunction::Max(arg) => {
+            let values = evaluate_expr_rows(input, arg)?;
+            for (start, end) in &partitions {
+                let mut current: Option<ScalarValue> = None;
+                for pos in &order_idx[*start..*end] {
+                    let v = values[*pos].clone();
+                    if !matches!(v, ScalarValue::Null) {
+                        current = match current {
+                            None => Some(v),
+                            Some(existing) => {
+                                if cmp_scalar_for_window(&v, &existing, false, false)
+                                    == Ordering::Greater
+                                {
+                                    Some(v)
+                                } else {
+                                    Some(existing)
+                                }
+                            }
+                        };
+                    }
+                    out[*pos] = current.clone().unwrap_or(ScalarValue::Null);
                 }
             }
         }
@@ -1599,9 +1682,17 @@ fn window_output_type(input_schema: &SchemaRef, w: &WindowExpr) -> Result<DataTy
         WindowFunction::RowNumber
         | WindowFunction::Rank
         | WindowFunction::DenseRank
-        | WindowFunction::Ntile(_) => Ok(DataType::Int64),
-        WindowFunction::PercentRank | WindowFunction::CumeDist | WindowFunction::Sum(_) => {
+        | WindowFunction::Ntile(_)
+        | WindowFunction::Count(_) => Ok(DataType::Int64),
+        WindowFunction::PercentRank
+        | WindowFunction::CumeDist
+        | WindowFunction::Sum(_)
+        | WindowFunction::Avg(_) => {
             Ok(DataType::Float64)
+        }
+        WindowFunction::Min(expr) | WindowFunction::Max(expr) => {
+            let compiled = compile_expr(expr, input_schema)?;
+            Ok(compiled.data_type())
         }
         WindowFunction::Lag { expr, .. }
         | WindowFunction::Lead { expr, .. }
@@ -1611,6 +1702,15 @@ fn window_output_type(input_schema: &SchemaRef, w: &WindowExpr) -> Result<DataTy
             let compiled = compile_expr(expr, input_schema)?;
             Ok(compiled.data_type())
         }
+    }
+}
+
+fn scalar_to_f64(v: &ScalarValue) -> Option<f64> {
+    match v {
+        ScalarValue::Int64(x) => Some(*x as f64),
+        ScalarValue::Float64Bits(x) => Some(f64::from_bits(*x)),
+        ScalarValue::Null => None,
+        _ => None,
     }
 }
 

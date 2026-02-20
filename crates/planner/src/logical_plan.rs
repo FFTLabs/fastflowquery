@@ -180,8 +180,16 @@ pub enum WindowFunction {
     CumeDist,
     /// `NTILE(n) OVER (...)`
     Ntile(usize),
+    /// `COUNT(expr) OVER (...)`
+    Count(Expr),
     /// `SUM(expr) OVER (...)`
     Sum(Expr),
+    /// `AVG(expr) OVER (...)`
+    Avg(Expr),
+    /// `MIN(expr) OVER (...)`
+    Min(Expr),
+    /// `MAX(expr) OVER (...)`
+    Max(Expr),
     /// `LAG(expr [, offset [, default]]) OVER (...)`
     Lag {
         /// Value expression.

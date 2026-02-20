@@ -537,10 +537,14 @@ fn proj_rewrite(
                 for o in &w.order_by {
                     child_req.extend(expr_columns(&o.expr));
                 }
-                if let crate::logical_plan::WindowFunction::Sum(arg) = &w.func {
-                    child_req.extend(expr_columns(arg));
-                }
                 match &w.func {
+                    crate::logical_plan::WindowFunction::Count(arg)
+                    | crate::logical_plan::WindowFunction::Sum(arg)
+                    | crate::logical_plan::WindowFunction::Avg(arg)
+                    | crate::logical_plan::WindowFunction::Min(arg)
+                    | crate::logical_plan::WindowFunction::Max(arg) => {
+                        child_req.extend(expr_columns(arg));
+                    }
                     crate::logical_plan::WindowFunction::Lag { expr, default, .. }
                     | crate::logical_plan::WindowFunction::Lead { expr, default, .. } => {
                         child_req.extend(expr_columns(expr));
@@ -1760,8 +1764,20 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
                         })
                         .collect();
                     w.func = match w.func {
+                        crate::logical_plan::WindowFunction::Count(arg) => {
+                            crate::logical_plan::WindowFunction::Count(rewrite_expr(arg, rewrite))
+                        }
                         crate::logical_plan::WindowFunction::Sum(arg) => {
                             crate::logical_plan::WindowFunction::Sum(rewrite_expr(arg, rewrite))
+                        }
+                        crate::logical_plan::WindowFunction::Avg(arg) => {
+                            crate::logical_plan::WindowFunction::Avg(rewrite_expr(arg, rewrite))
+                        }
+                        crate::logical_plan::WindowFunction::Min(arg) => {
+                            crate::logical_plan::WindowFunction::Min(rewrite_expr(arg, rewrite))
+                        }
+                        crate::logical_plan::WindowFunction::Max(arg) => {
+                            crate::logical_plan::WindowFunction::Max(rewrite_expr(arg, rewrite))
                         }
                         crate::logical_plan::WindowFunction::Lag {
                             expr,

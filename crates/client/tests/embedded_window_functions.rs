@@ -406,3 +406,100 @@ fn expanded_window_functions_ranking_and_value_semantics() {
 
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn aggregate_window_functions_count_avg_min_max_are_correct() {
+    let (engine, path) = make_engine_with_window_fixture();
+    let sql = "SELECT grp, ord, score, \
+                    COUNT(score) OVER (PARTITION BY grp ORDER BY ord) AS cnt, \
+                    AVG(score) OVER (PARTITION BY grp ORDER BY ord) AS avg_s, \
+                    MIN(score) OVER (PARTITION BY grp ORDER BY ord) AS min_s, \
+                    MAX(score) OVER (PARTITION BY grp ORDER BY ord) AS max_s \
+               FROM t";
+    let batches = futures::executor::block_on(engine.sql(sql).expect("sql").collect()).expect("collect");
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Row {
+        grp: String,
+        ord: i64,
+        cnt: i64,
+        avg_s: f64,
+        min_s: i64,
+        max_s: i64,
+    }
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let grp = batch.column(0).as_any().downcast_ref::<StringArray>().expect("grp");
+        let ord = batch.column(1).as_any().downcast_ref::<Int64Array>().expect("ord");
+        let cnt = batch.column(3).as_any().downcast_ref::<Int64Array>().expect("cnt");
+        let avg_s = batch.column(4).as_any().downcast_ref::<Float64Array>().expect("avg_s");
+        let min_s = batch.column(5).as_any().downcast_ref::<Int64Array>().expect("min_s");
+        let max_s = batch.column(6).as_any().downcast_ref::<Int64Array>().expect("max_s");
+        for i in 0..batch.num_rows() {
+            rows.push(Row {
+                grp: grp.value(i).to_string(),
+                ord: ord.value(i),
+                cnt: cnt.value(i),
+                avg_s: avg_s.value(i),
+                min_s: min_s.value(i),
+                max_s: max_s.value(i),
+            });
+        }
+    }
+    rows.sort_unstable_by(|a, b| a.grp.cmp(&b.grp).then(a.ord.cmp(&b.ord)));
+
+    let expected = vec![
+        Row {
+            grp: "A".to_string(),
+            ord: 1,
+            cnt: 1,
+            avg_s: 10.0,
+            min_s: 10,
+            max_s: 10,
+        },
+        Row {
+            grp: "A".to_string(),
+            ord: 2,
+            cnt: 2,
+            avg_s: 10.0,
+            min_s: 10,
+            max_s: 10,
+        },
+        Row {
+            grp: "A".to_string(),
+            ord: 3,
+            cnt: 3,
+            avg_s: 40.0 / 3.0,
+            min_s: 10,
+            max_s: 20,
+        },
+        Row {
+            grp: "B".to_string(),
+            ord: 1,
+            cnt: 1,
+            avg_s: 7.0,
+            min_s: 7,
+            max_s: 7,
+        },
+        Row {
+            grp: "B".to_string(),
+            ord: 2,
+            cnt: 2,
+            avg_s: 8.0,
+            min_s: 7,
+            max_s: 9,
+        },
+    ];
+
+    assert_eq!(rows.len(), expected.len());
+    for (actual, exp) in rows.iter().zip(expected.iter()) {
+        assert_eq!(actual.grp, exp.grp);
+        assert_eq!(actual.ord, exp.ord);
+        assert_eq!(actual.cnt, exp.cnt);
+        assert!((actual.avg_s - exp.avg_s).abs() < 1e-9);
+        assert_eq!(actual.min_s, exp.min_s);
+        assert_eq!(actual.max_s, exp.max_s);
+    }
+
+    let _ = std::fs::remove_file(path);
+}

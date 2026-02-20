@@ -1037,7 +1037,11 @@ fn try_parse_window_expr(
         "PERCENT_RANK" => "percent_rank()".to_string(),
         "CUME_DIST" => "cume_dist()".to_string(),
         "NTILE" => "ntile()".to_string(),
+        "COUNT" => "count_over()".to_string(),
         "SUM" => "sum_over()".to_string(),
+        "AVG" => "avg_over()".to_string(),
+        "MIN" => "min_over()".to_string(),
+        "MAX" => "max_over()".to_string(),
         "LAG" => "lag()".to_string(),
         "LEAD" => "lead()".to_string(),
         "FIRST_VALUE" => "first_value()".to_string(),
@@ -1107,7 +1111,31 @@ fn try_parse_window_expr(
             let buckets = parse_positive_usize_arg(args[0], params, "NTILE")?;
             WindowFunction::Ntile(buckets)
         }
+        "COUNT" => {
+            if args.len() != 1 {
+                return Err(FfqError::Unsupported(
+                    "COUNT() OVER requires one argument in v1".to_string(),
+                ));
+            }
+            let arg_expr = match args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Expr::Literal(LiteralValue::Int64(1)),
+                other => function_arg_to_expr(other, params)?,
+            };
+            WindowFunction::Count(arg_expr)
+        }
         "SUM" => WindowFunction::Sum(function_arg_to_expr(required_arg(args.first().copied(), "SUM")?, params)?),
+        "AVG" => WindowFunction::Avg(function_arg_to_expr(
+            required_arg(args.first().copied(), "AVG")?,
+            params,
+        )?),
+        "MIN" => WindowFunction::Min(function_arg_to_expr(
+            required_arg(args.first().copied(), "MIN")?,
+            params,
+        )?),
+        "MAX" => WindowFunction::Max(function_arg_to_expr(
+            required_arg(args.first().copied(), "MAX")?,
+            params,
+        )?),
         "LAG" => {
             if args.is_empty() || args.len() > 3 {
                 return Err(FfqError::Unsupported(
@@ -2154,6 +2182,10 @@ mod tests {
                PERCENT_RANK() OVER (PARTITION BY a ORDER BY b) AS pr, \
                CUME_DIST() OVER (PARTITION BY a ORDER BY b) AS cd, \
                NTILE(3) OVER (PARTITION BY a ORDER BY b) AS nt, \
+               COUNT(b) OVER (PARTITION BY a ORDER BY b) AS ct, \
+               AVG(b) OVER (PARTITION BY a ORDER BY b) AS av, \
+               MIN(b) OVER (PARTITION BY a ORDER BY b) AS mn, \
+               MAX(b) OVER (PARTITION BY a ORDER BY b) AS mx, \
                LAG(b, 2, 0) OVER (PARTITION BY a ORDER BY b) AS lg, \
                LEAD(b, 1, 0) OVER (PARTITION BY a ORDER BY b) AS ld, \
                FIRST_VALUE(b) OVER (PARTITION BY a ORDER BY b) AS fv, \
@@ -2165,7 +2197,7 @@ mod tests {
         .expect("parse");
         match plan {
             LogicalPlan::Projection { input, .. } => match input.as_ref() {
-                LogicalPlan::Window { exprs, .. } => assert_eq!(exprs.len(), 9),
+                LogicalPlan::Window { exprs, .. } => assert_eq!(exprs.len(), 13),
                 other => panic!("expected Window, got {other:?}"),
             },
             other => panic!("expected Projection, got {other:?}"),
