@@ -1,7 +1,8 @@
 use crate::logical_plan::{
-    Expr, JoinStrategyHint, LogicalPlan, SubqueryCorrelation, WindowFrameBound,
+    Expr, JoinStrategyHint, LogicalPlan, SubqueryCorrelation, WindowExpr, WindowFrameBound,
     WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits, WindowFunction,
 };
+use std::collections::HashMap;
 
 /// Render logical plan as human-readable multiline text.
 pub fn explain_logical(plan: &LogicalPlan) -> String {
@@ -87,6 +88,20 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
         }
         LogicalPlan::Window { exprs, input } => {
             out.push_str(&format!("{pad}Window\n"));
+            let window_groups = window_sort_reuse_groups(exprs);
+            out.push_str(&format!(
+                "{pad}  window_exprs={} sort_reuse_groups={}\n",
+                exprs.len(),
+                window_groups.len()
+            ));
+            for (gidx, group) in window_groups.iter().enumerate() {
+                out.push_str(&format!(
+                    "{pad}  group[{gidx}] partition=[{}] order=[{}] windows=[{}]\n",
+                    group.partition_display,
+                    group.order_display,
+                    group.window_names.join(", ")
+                ));
+            }
             for w in exprs {
                 let func = match &w.func {
                     WindowFunction::RowNumber => "ROW_NUMBER()".to_string(),
@@ -332,7 +347,9 @@ fn fmt_subquery_correlation(c: &SubqueryCorrelation) -> String {
 #[cfg(test)]
 mod tests {
     use super::explain_logical;
-    use crate::logical_plan::{Expr, JoinStrategyHint, JoinType, LogicalPlan};
+    use crate::logical_plan::{
+        Expr, JoinStrategyHint, JoinType, LogicalPlan, WindowExpr, WindowFunction, WindowOrderExpr,
+    };
 
     fn scan(name: &str) -> LogicalPlan {
         LogicalPlan::TableScan {
@@ -370,6 +387,52 @@ mod tests {
         };
         let ex = explain_logical(&plan);
         assert!(ex.contains("rewrite=decorrelated_in_subquery"), "{ex}");
+    }
+
+    #[test]
+    fn explain_window_prints_sort_reuse_groups() {
+        let plan = LogicalPlan::Window {
+            exprs: vec![
+                WindowExpr {
+                    func: WindowFunction::RowNumber,
+                    partition_by: vec![Expr::Column("grp".to_string())],
+                    order_by: vec![WindowOrderExpr {
+                        expr: Expr::Column("score".to_string()),
+                        asc: true,
+                        nulls_first: false,
+                    }],
+                    frame: None,
+                    output_name: "rn".to_string(),
+                },
+                WindowExpr {
+                    func: WindowFunction::Rank,
+                    partition_by: vec![Expr::Column("grp".to_string())],
+                    order_by: vec![WindowOrderExpr {
+                        expr: Expr::Column("score".to_string()),
+                        asc: true,
+                        nulls_first: false,
+                    }],
+                    frame: None,
+                    output_name: "rnk".to_string(),
+                },
+                WindowExpr {
+                    func: WindowFunction::DenseRank,
+                    partition_by: vec![Expr::Column("grp".to_string())],
+                    order_by: vec![WindowOrderExpr {
+                        expr: Expr::Column("score".to_string()),
+                        asc: false,
+                        nulls_first: true,
+                    }],
+                    frame: None,
+                    output_name: "dr".to_string(),
+                },
+            ],
+            input: Box::new(scan("t")),
+        };
+        let ex = explain_logical(&plan);
+        assert!(ex.contains("window_exprs=3 sort_reuse_groups=2"), "{ex}");
+        assert!(ex.contains("windows=[rn, rnk]"), "{ex}");
+        assert!(ex.contains("windows=[dr]"), "{ex}");
     }
 }
 
@@ -447,4 +510,52 @@ fn fmt_window_bound(b: &WindowFrameBound) -> String {
         WindowFrameBound::Following(n) => format!("{n} FOLLOWING"),
         WindowFrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
     }
+}
+
+#[derive(Debug, Clone)]
+struct WindowSortReuseGroup {
+    partition_display: String,
+    order_display: String,
+    window_names: Vec<String>,
+}
+
+fn window_sort_reuse_groups(exprs: &[WindowExpr]) -> Vec<WindowSortReuseGroup> {
+    let mut groups: Vec<WindowSortReuseGroup> = Vec::new();
+    let mut by_key: HashMap<String, usize> = HashMap::new();
+    for w in exprs {
+        let partition_display = w
+            .partition_by
+            .iter()
+            .map(fmt_expr)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let order_display = w
+            .order_by
+            .iter()
+            .map(|o| {
+                format!(
+                    "{} {} NULLS {}",
+                    fmt_expr(&o.expr),
+                    if o.asc { "ASC" } else { "DESC" },
+                    if o.nulls_first { "FIRST" } else { "LAST" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let key = format!("{partition_display}|{order_display}");
+        let group_idx = if let Some(idx) = by_key.get(&key).copied() {
+            idx
+        } else {
+            let idx = groups.len();
+            groups.push(WindowSortReuseGroup {
+                partition_display: partition_display.clone(),
+                order_display: order_display.clone(),
+                window_names: Vec::new(),
+            });
+            by_key.insert(key, idx);
+            idx
+        };
+        groups[group_idx].window_names.push(w.output_name.clone());
+    }
+    groups
 }

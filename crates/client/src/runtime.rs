@@ -1316,6 +1316,7 @@ fn rows_from_batches(input: &ExecOutput) -> Result<Vec<Vec<ScalarValue>>> {
 fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput> {
     let mut rows = rows_from_batches(&input)?;
     let row_count = rows.len();
+    let mut eval_ctx_cache: HashMap<String, WindowEvalContext> = HashMap::new();
     let mut out_fields: Vec<Field> = input
         .schema
         .fields()
@@ -1323,7 +1324,17 @@ fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput
         .map(|f| f.as_ref().clone())
         .collect();
     for w in exprs {
-        let output = evaluate_window_expr(&input, w)?;
+        let cache_key = window_compatibility_key(w);
+        if !eval_ctx_cache.contains_key(&cache_key) {
+            eval_ctx_cache.insert(cache_key.clone(), build_window_eval_context(&input, w)?);
+        }
+        let output = evaluate_window_expr_with_ctx(
+            &input,
+            w,
+            eval_ctx_cache
+                .get(&cache_key)
+                .expect("window eval ctx must exist"),
+        )?;
         if output.len() != row_count {
             return Err(FfqError::Execution(format!(
                 "window output row count mismatch: expected {row_count}, got {}",
@@ -1344,7 +1355,30 @@ fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput
     })
 }
 
-fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<ScalarValue>> {
+#[derive(Debug, Clone)]
+struct WindowEvalContext {
+    order_keys: Vec<Vec<ScalarValue>>,
+    order_idx: Vec<usize>,
+    partitions: Vec<(usize, usize)>,
+}
+
+fn window_compatibility_key(w: &WindowExpr) -> String {
+    let partition_sig = w
+        .partition_by
+        .iter()
+        .map(|e| format!("{e:?}"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let order_sig = w
+        .order_by
+        .iter()
+        .map(|o| format!("{:?}:{}:{}", o.expr, o.asc, o.nulls_first))
+        .collect::<Vec<_>>()
+        .join("|");
+    format!("P[{partition_sig}]O[{order_sig}]")
+}
+
+fn build_window_eval_context(input: &ExecOutput, w: &WindowExpr) -> Result<WindowEvalContext> {
     let row_count = input.batches.iter().map(|b| b.num_rows()).sum::<usize>();
     let partition_keys = w
         .partition_by
@@ -1364,26 +1398,43 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
             .then_with(|| fallback_keys[*a].cmp(&fallback_keys[*b]))
             .then_with(|| a.cmp(b))
     });
-
-    let mut out = vec![ScalarValue::Null; row_count];
     let partitions = partition_ranges(&order_idx, &partition_keys);
+    Ok(WindowEvalContext {
+        order_keys,
+        order_idx,
+        partitions,
+    })
+}
+
+fn evaluate_window_expr_with_ctx(
+    input: &ExecOutput,
+    w: &WindowExpr,
+    eval_ctx: &WindowEvalContext,
+) -> Result<Vec<ScalarValue>> {
+    let row_count = input.batches.iter().map(|b| b.num_rows()).sum::<usize>();
+    let mut out = vec![ScalarValue::Null; row_count];
     let frame = effective_window_frame(w);
     match &w.func {
         WindowFunction::RowNumber => {
-            for (start, end) in &partitions {
-                for (offset, pos) in order_idx[*start..*end].iter().enumerate() {
+            for (start, end) in &eval_ctx.partitions {
+                for (offset, pos) in eval_ctx.order_idx[*start..*end].iter().enumerate() {
                     out[*pos] = ScalarValue::Int64((offset + 1) as i64);
                 }
             }
         }
         WindowFunction::Rank => {
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
                 let mut rank = 1_i64;
                 let mut part_i = 0usize;
                 while part_i < part.len() {
                     if part_i > 0
-                        && cmp_order_key_sets(&order_keys, &w.order_by, part[part_i - 1], part[part_i])
+                        && cmp_order_key_sets(
+                            &eval_ctx.order_keys,
+                            &w.order_by,
+                            part[part_i - 1],
+                            part[part_i],
+                        )
                             != Ordering::Equal
                     {
                         rank = (part_i as i64) + 1;
@@ -1394,13 +1445,18 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
             }
         }
         WindowFunction::DenseRank => {
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
                 let mut rank = 1_i64;
                 let mut part_i = 0usize;
                 while part_i < part.len() {
                     if part_i > 0
-                        && cmp_order_key_sets(&order_keys, &w.order_by, part[part_i - 1], part[part_i])
+                        && cmp_order_key_sets(
+                            &eval_ctx.order_keys,
+                            &w.order_by,
+                            part[part_i - 1],
+                            part[part_i],
+                        )
                             != Ordering::Equal
                     {
                         rank += 1;
@@ -1411,8 +1467,8 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
             }
         }
         WindowFunction::PercentRank => {
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
                 let n = part.len();
                 if n <= 1 {
                     for pos in part {
@@ -1423,7 +1479,12 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                 let mut rank = 1_i64;
                 for part_i in 0..part.len() {
                     if part_i > 0
-                        && cmp_order_key_sets(&order_keys, &w.order_by, part[part_i - 1], part[part_i])
+                        && cmp_order_key_sets(
+                            &eval_ctx.order_keys,
+                            &w.order_by,
+                            part[part_i - 1],
+                            part[part_i],
+                        )
                             != Ordering::Equal
                     {
                         rank = (part_i as i64) + 1;
@@ -1434,15 +1495,20 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
             }
         }
         WindowFunction::CumeDist => {
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
                 let n = part.len() as f64;
                 let mut i = 0usize;
                 while i < part.len() {
                     let tie_start = i;
                     i += 1;
                     while i < part.len()
-                        && cmp_order_key_sets(&order_keys, &w.order_by, part[tie_start], part[i])
+                        && cmp_order_key_sets(
+                            &eval_ctx.order_keys,
+                            &w.order_by,
+                            part[tie_start],
+                            part[i],
+                        )
                             == Ordering::Equal
                     {
                         i += 1;
@@ -1455,8 +1521,8 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
             }
         }
         WindowFunction::Ntile(buckets) => {
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
                 let n_rows = part.len();
                 let n_buckets = *buckets;
                 for (i, pos) in part.iter().enumerate() {
@@ -1467,9 +1533,9 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
         }
         WindowFunction::Count(arg) => {
             let values = evaluate_expr_rows(input, arg)?;
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
-                let part_ctx = build_partition_frame_ctx(part, &order_keys, &w.order_by)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let part_ctx = build_partition_frame_ctx(part, &eval_ctx.order_keys, &w.order_by)?;
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut cnt = 0_i64;
@@ -1484,9 +1550,9 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
         }
         WindowFunction::Sum(arg) => {
             let values = evaluate_expr_rows(input, arg)?;
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
-                let part_ctx = build_partition_frame_ctx(part, &order_keys, &w.order_by)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let part_ctx = build_partition_frame_ctx(part, &eval_ctx.order_keys, &w.order_by)?;
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut sum = 0.0_f64;
@@ -1519,9 +1585,9 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
         }
         WindowFunction::Avg(arg) => {
             let values = evaluate_expr_rows(input, arg)?;
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
-                let part_ctx = build_partition_frame_ctx(part, &order_keys, &w.order_by)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let part_ctx = build_partition_frame_ctx(part, &eval_ctx.order_keys, &w.order_by)?;
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut sum = 0.0_f64;
@@ -1547,9 +1613,9 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
         }
         WindowFunction::Min(arg) => {
             let values = evaluate_expr_rows(input, arg)?;
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
-                let part_ctx = build_partition_frame_ctx(part, &order_keys, &w.order_by)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let part_ctx = build_partition_frame_ctx(part, &eval_ctx.order_keys, &w.order_by)?;
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut current: Option<ScalarValue> = None;
@@ -1577,9 +1643,9 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
         }
         WindowFunction::Max(arg) => {
             let values = evaluate_expr_rows(input, arg)?;
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
-                let part_ctx = build_partition_frame_ctx(part, &order_keys, &w.order_by)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let part_ctx = build_partition_frame_ctx(part, &eval_ctx.order_keys, &w.order_by)?;
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut current: Option<ScalarValue> = None;
@@ -1615,8 +1681,8 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                 .as_ref()
                 .map(|d| evaluate_expr_rows(input, d))
                 .transpose()?;
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
                 for (i, pos) in part.iter().enumerate() {
                     out[*pos] = if i >= *offset {
                         values[part[i - *offset]].clone()
@@ -1638,8 +1704,8 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
                 .as_ref()
                 .map(|d| evaluate_expr_rows(input, d))
                 .transpose()?;
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
                 for (i, pos) in part.iter().enumerate() {
                     out[*pos] = if i + *offset < part.len() {
                         values[part[i + *offset]].clone()
@@ -1653,9 +1719,9 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
         }
         WindowFunction::FirstValue(expr) => {
             let values = evaluate_expr_rows(input, expr)?;
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
-                let part_ctx = build_partition_frame_ctx(part, &order_keys, &w.order_by)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let part_ctx = build_partition_frame_ctx(part, &eval_ctx.order_keys, &w.order_by)?;
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     out[part[i]] = if fs < fe {
@@ -1670,9 +1736,9 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
         }
         WindowFunction::LastValue(expr) => {
             let values = evaluate_expr_rows(input, expr)?;
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
-                let part_ctx = build_partition_frame_ctx(part, &order_keys, &w.order_by)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let part_ctx = build_partition_frame_ctx(part, &eval_ctx.order_keys, &w.order_by)?;
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     out[part[i]] = if fs < fe {
@@ -1687,9 +1753,9 @@ fn evaluate_window_expr(input: &ExecOutput, w: &WindowExpr) -> Result<Vec<Scalar
         }
         WindowFunction::NthValue { expr, n } => {
             let values = evaluate_expr_rows(input, expr)?;
-            for (start, end) in &partitions {
-                let part = &order_idx[*start..*end];
-                let part_ctx = build_partition_frame_ctx(part, &order_keys, &w.order_by)?;
+            for (start, end) in &eval_ctx.partitions {
+                let part = &eval_ctx.order_idx[*start..*end];
+                let part_ctx = build_partition_frame_ctx(part, &eval_ctx.order_keys, &w.order_by)?;
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let filtered = filtered_frame_positions(&frame, &part_ctx, part, fs, fe, i);
