@@ -30,7 +30,7 @@ pub trait StorageProvider: Send + Sync {
         &self,
         table: &TableDef,
         projection: Option<Vec<String>>,
-        filters: Vec<String>,
+        filters: Vec<Expr>,
     ) -> Result<StorageExecNode>;
 }
 ```
@@ -39,6 +39,64 @@ Notes:
 1. `estimate_stats` is used for planning/heuristics (`rows`, `bytes`).
 2. `scan` returns an `ExecNode` that produces Arrow `RecordBatch` stream.
 3. Current v1 parquet scan keeps `projection/filters` in node state; aggressive pushdown is limited.
+
+## File-Level Caching (EPIC 8.3)
+
+FFQ now includes a provider-level parquet file cache with two layers:
+
+1. metadata cache (schema + file statistics from parquet metadata)
+2. optional block cache (decoded full `RecordBatch` sets per parquet file)
+
+Implementation:
+
+1. `crates/storage/src/parquet_provider.rs` (`CacheSettings`, `METADATA_CACHE`, `BLOCK_CACHE`)
+2. `crates/common/src/metrics.rs` (`ffq_file_cache_events_total`)
+
+### Cache behavior
+
+1. Caches are process-local and in-memory.
+2. Cache validity checks require both:
+   - file identity match (`size_bytes`, `mtime_ns`)
+   - TTL freshness (`inserted_at + ttl`)
+3. If either check fails, entry is treated as miss and rebuilt.
+4. Cache capacity uses bounded entry counts with eviction when max entries are reached.
+
+### Configuration
+
+Environment-level controls:
+
+1. `FFQ_PARQUET_METADATA_CACHE_ENABLED` (`true|false`, default `true`)
+2. `FFQ_PARQUET_BLOCK_CACHE_ENABLED` (`true|false`, default `false`)
+3. `FFQ_FILE_CACHE_TTL_SECS` (default `300`)
+4. `FFQ_PARQUET_METADATA_CACHE_MAX_ENTRIES` (default `4096`)
+5. `FFQ_PARQUET_BLOCK_CACHE_MAX_ENTRIES` (default `64`)
+
+Per-table option overrides (for booleans/TTL):
+
+1. `cache.metadata.enabled`
+2. `cache.block.enabled`
+3. `cache.ttl_secs`
+
+Precedence:
+
+1. environment defaults are loaded first
+2. table options override env values for metadata/block enablement and TTL
+
+### Observability (hit ratio)
+
+Cache outcomes are emitted via:
+
+1. `ffq_file_cache_events_total{cache_kind="metadata|block",result="hit|miss"}`
+
+Use this to compute hit ratio:
+
+1. `hits / (hits + misses)` per `cache_kind`
+
+Operational recommendation:
+
+1. start with metadata cache enabled and block cache disabled
+2. enable block cache only for repeated scan-heavy workloads with stable files
+3. tune TTL and max entries per workload size and memory budget
 
 ## Parquet Path (Primary v1 Data Path)
 

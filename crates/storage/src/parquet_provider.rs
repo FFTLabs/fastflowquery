@@ -1,11 +1,12 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
-use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result};
 use ffq_execution::{ExecNode, SendableRecordBatchStream, StreamAdapter, TaskContext};
 use ffq_planner::{BinaryOp, Expr, LiteralValue};
@@ -38,6 +39,117 @@ pub struct FileFingerprint {
     pub size_bytes: u64,
     /// File modification timestamp (nanoseconds since Unix epoch).
     pub mtime_ns: u128,
+}
+
+#[derive(Debug, Clone)]
+struct CacheSettings {
+    metadata_enabled: bool,
+    block_enabled: bool,
+    ttl: Duration,
+    metadata_max_entries: usize,
+    block_max_entries: usize,
+}
+
+impl Default for CacheSettings {
+    fn default() -> Self {
+        Self {
+            metadata_enabled: true,
+            block_enabled: false,
+            ttl: Duration::from_secs(300),
+            metadata_max_entries: 4096,
+            block_max_entries: 64,
+        }
+    }
+}
+
+impl CacheSettings {
+    fn from_table(table: &TableDef) -> Self {
+        let mut s = Self::from_env();
+        if let Some(v) = table.options.get("cache.metadata.enabled") {
+            s.metadata_enabled = parse_bool(v, s.metadata_enabled);
+        }
+        if let Some(v) = table.options.get("cache.block.enabled") {
+            s.block_enabled = parse_bool(v, s.block_enabled);
+        }
+        if let Some(v) = table
+            .options
+            .get("cache.ttl_secs")
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            s.ttl = Duration::from_secs(v);
+        }
+        s
+    }
+
+    fn from_env() -> Self {
+        let mut s = Self::default();
+        if let Ok(v) = std::env::var("FFQ_PARQUET_METADATA_CACHE_ENABLED") {
+            s.metadata_enabled = parse_bool(&v, s.metadata_enabled);
+        }
+        if let Ok(v) = std::env::var("FFQ_PARQUET_BLOCK_CACHE_ENABLED") {
+            s.block_enabled = parse_bool(&v, s.block_enabled);
+        }
+        if let Some(v) = std::env::var("FFQ_FILE_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|x| x.parse::<u64>().ok())
+        {
+            s.ttl = Duration::from_secs(v);
+        }
+        if let Some(v) = std::env::var("FFQ_PARQUET_METADATA_CACHE_MAX_ENTRIES")
+            .ok()
+            .and_then(|x| x.parse::<usize>().ok())
+        {
+            s.metadata_max_entries = v.max(1);
+        }
+        if let Some(v) = std::env::var("FFQ_PARQUET_BLOCK_CACHE_MAX_ENTRIES")
+            .ok()
+            .and_then(|x| x.parse::<usize>().ok())
+        {
+            s.block_max_entries = v.max(1);
+        }
+        s
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FileIdentity {
+    size_bytes: u64,
+    mtime_ns: u128,
+}
+
+#[derive(Debug, Clone)]
+struct MetadataCacheEntry {
+    inserted_at: SystemTime,
+    identity: FileIdentity,
+    schema: Schema,
+    stats: ParquetFileStats,
+}
+
+#[derive(Debug, Clone)]
+struct BlockCacheEntry {
+    inserted_at: SystemTime,
+    identity: FileIdentity,
+    source_schema: SchemaRef,
+    full_batches: Vec<RecordBatch>,
+}
+
+static METADATA_CACHE: OnceLock<RwLock<HashMap<String, MetadataCacheEntry>>> = OnceLock::new();
+static BLOCK_CACHE: OnceLock<RwLock<HashMap<String, BlockCacheEntry>>> = OnceLock::new();
+
+fn metadata_cache() -> &'static RwLock<HashMap<String, MetadataCacheEntry>> {
+    METADATA_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn block_cache() -> &'static RwLock<HashMap<String, BlockCacheEntry>> {
+    BLOCK_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn parse_bool(raw: &str, default: bool) -> bool {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
 }
 
 impl ParquetProvider {
@@ -77,14 +189,10 @@ impl ParquetProvider {
         }
 
         let mut inferred: Option<arrow_schema::Schema> = None;
+        let cache_settings = CacheSettings::from_env();
         for path in paths {
-            let file = File::open(path)?;
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
-                FfqError::Execution(format!(
-                    "parquet schema inference reader build failed for '{path}': {e}"
-                ))
-            })?;
-            let schema = builder.schema().as_ref().clone();
+            let meta = get_or_load_metadata(path, &cache_settings)?;
+            let schema = meta.schema.clone();
 
             match &inferred {
                 None => inferred = Some(schema),
@@ -138,49 +246,172 @@ impl ParquetProvider {
     /// Returns an error when file metadata or parquet metadata read fails.
     pub fn collect_parquet_file_stats(paths: &[String]) -> Result<Vec<ParquetFileStats>> {
         let mut out = Vec::with_capacity(paths.len());
+        let cache_settings = CacheSettings::from_env();
         for path in paths {
-            let md = std::fs::metadata(path).map_err(|e| {
-                FfqError::InvalidConfig(format!(
-                    "failed to stat parquet path '{}' for stats collection: {e}",
-                    path
-                ))
-            })?;
-            let file = File::open(path)?;
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
-                FfqError::Execution(format!(
-                    "parquet stats reader build failed for '{}': {e}",
-                    path
-                ))
-            })?;
-            let meta = builder.metadata();
-            let row_count = meta.file_metadata().num_rows() as u64;
-
-            let mut column_ranges = HashMap::<String, ColumnRangeStats>::new();
-            for rg in meta.row_groups() {
-                for col in rg.columns() {
-                    let Some(stats) = col.statistics() else {
-                        continue;
-                    };
-                    let Some(range) = column_range_from_parquet_stats(stats) else {
-                        continue;
-                    };
-                    let name = col.column_descr().name().to_string();
-                    match column_ranges.get_mut(&name) {
-                        Some(existing) => merge_column_ranges(existing, &range),
-                        None => {
-                            column_ranges.insert(name, range);
-                        }
-                    }
-                }
-            }
-            out.push(ParquetFileStats {
-                path: path.clone(),
-                size_bytes: md.len(),
-                row_count,
-                column_ranges,
-            });
+            let meta = get_or_load_metadata(path, &cache_settings)?;
+            out.push(meta.stats.clone());
         }
         Ok(out)
+    }
+}
+
+fn file_identity(path: &str) -> Result<FileIdentity> {
+    let md = std::fs::metadata(path).map_err(|e| {
+        FfqError::InvalidConfig(format!("failed to stat parquet path '{}': {e}", path))
+    })?;
+    let modified = md.modified().map_err(|e| {
+        FfqError::InvalidConfig(format!("failed to read modified time for '{}': {e}", path))
+    })?;
+    let mtime_ns = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| FfqError::InvalidConfig(format!("invalid modified time for '{}': {e}", path)))?
+        .as_nanos();
+    Ok(FileIdentity {
+        size_bytes: md.len(),
+        mtime_ns,
+    })
+}
+
+fn get_or_load_metadata(path: &str, settings: &CacheSettings) -> Result<MetadataCacheEntry> {
+    let identity = file_identity(path)?;
+    if settings.metadata_enabled {
+        let now = SystemTime::now();
+        if let Some(hit) = metadata_cache()
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(path).cloned())
+            .filter(|entry| {
+                entry.identity.size_bytes == identity.size_bytes
+                    && entry.identity.mtime_ns == identity.mtime_ns
+                    && now
+                        .duration_since(entry.inserted_at)
+                        .map(|age| age <= settings.ttl)
+                        .unwrap_or(false)
+            })
+        {
+            global_metrics().inc_file_cache_event("metadata", true);
+            return Ok(hit);
+        }
+        global_metrics().inc_file_cache_event("metadata", false);
+    }
+    let loaded = load_metadata_entry(path, identity)?;
+    if settings.metadata_enabled {
+        if let Ok(mut cache) = metadata_cache().write() {
+            evict_cache_map(&mut cache, settings.ttl, settings.metadata_max_entries);
+            cache.insert(path.to_string(), loaded.clone());
+        }
+    }
+    Ok(loaded)
+}
+
+fn load_metadata_entry(path: &str, identity: FileIdentity) -> Result<MetadataCacheEntry> {
+    let size_bytes = identity.size_bytes;
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+        FfqError::Execution(format!(
+            "parquet metadata reader build failed for '{path}': {e}"
+        ))
+    })?;
+    let schema = builder.schema().as_ref().clone();
+    let meta = builder.metadata();
+    let row_count = meta.file_metadata().num_rows() as u64;
+    let mut column_ranges = HashMap::<String, ColumnRangeStats>::new();
+    for rg in meta.row_groups() {
+        for col in rg.columns() {
+            let Some(stats) = col.statistics() else {
+                continue;
+            };
+            let Some(range) = column_range_from_parquet_stats(stats) else {
+                continue;
+            };
+            let name = col.column_descr().name().to_string();
+            match column_ranges.get_mut(&name) {
+                Some(existing) => merge_column_ranges(existing, &range),
+                None => {
+                    column_ranges.insert(name, range);
+                }
+            }
+        }
+    }
+    Ok(MetadataCacheEntry {
+        inserted_at: SystemTime::now(),
+        identity,
+        schema,
+        stats: ParquetFileStats {
+            path: path.to_string(),
+            size_bytes,
+            row_count,
+            column_ranges,
+        },
+    })
+}
+
+fn get_or_load_block_batches(path: &str, settings: &CacheSettings) -> Result<Vec<RecordBatch>> {
+    let identity = file_identity(path)?;
+    if settings.block_enabled {
+        let now = SystemTime::now();
+        if let Some(hit) = block_cache()
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(path).cloned())
+            .filter(|entry| {
+                entry.identity.size_bytes == identity.size_bytes
+                    && entry.identity.mtime_ns == identity.mtime_ns
+                    && now
+                        .duration_since(entry.inserted_at)
+                        .map(|age| age <= settings.ttl)
+                        .unwrap_or(false)
+            })
+        {
+            let _ = &hit.source_schema;
+            global_metrics().inc_file_cache_event("block", true);
+            return Ok(hit.full_batches);
+        }
+        global_metrics().inc_file_cache_event("block", false);
+    }
+
+    let batches = load_full_batches(path)?;
+    if settings.block_enabled {
+        if let Ok(mut cache) = block_cache().write() {
+            evict_cache_map(&mut cache, settings.ttl, settings.block_max_entries);
+            cache.insert(
+                path.to_string(),
+                BlockCacheEntry {
+                    inserted_at: SystemTime::now(),
+                    identity,
+                    source_schema: batches
+                        .first()
+                        .map(|b| b.schema())
+                        .unwrap_or_else(|| Arc::new(Schema::empty())),
+                    full_batches: batches.clone(),
+                },
+            );
+        }
+    }
+    Ok(batches)
+}
+
+fn load_full_batches(path: &str) -> Result<Vec<RecordBatch>> {
+    let file = File::open(path).map_err(|e| {
+        FfqError::Execution(format!("parquet scan open failed for '{}': {e}", path))
+    })?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| FfqError::Execution(format!("parquet reader build failed: {e}")))?
+        .build()
+        .map_err(|e| FfqError::Execution(format!("parquet reader open failed: {e}")))?;
+    let mut out = Vec::new();
+    for batch in reader {
+        out.push(batch.map_err(|e| FfqError::Execution(format!("parquet decode failed: {e}")))?);
+    }
+    Ok(out)
+}
+
+fn evict_cache_map<T>(cache: &mut HashMap<String, T>, _ttl: Duration, max_entries: usize) {
+    while cache.len() >= max_entries {
+        let Some(k) = cache.keys().next().cloned() else {
+            break;
+        };
+        cache.remove(&k);
     }
 }
 
@@ -364,6 +595,7 @@ impl StorageProvider for ParquetProvider {
             )));
         }
 
+        let cache_settings = CacheSettings::from_table(table);
         let all_paths = table.data_paths()?;
         let partition_columns = table.partition_columns();
         let partition_layout = table.partition_layout();
@@ -409,6 +641,7 @@ impl StorageProvider for ParquetProvider {
             source_schema,
             projection_indices,
             filters,
+            cache_settings,
         }))
     }
 }
@@ -420,6 +653,7 @@ pub struct ParquetScanNode {
     source_schema: SchemaRef,
     projection_indices: Vec<usize>,
     filters: Vec<Expr>,
+    cache_settings: CacheSettings,
 }
 
 impl ExecNode for ParquetScanNode {
@@ -436,17 +670,8 @@ impl ExecNode for ParquetScanNode {
         let mut out = Vec::<Result<RecordBatch>>::new();
         let _ = &self.filters;
         for path in &self.paths {
-            let file = File::open(path).map_err(|e| {
-                FfqError::Execution(format!("parquet scan open failed for '{}': {e}", path))
-            })?;
-            let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-                .map_err(|e| FfqError::Execution(format!("parquet reader build failed: {e}")))?
-                .build()
-                .map_err(|e| FfqError::Execution(format!("parquet reader open failed: {e}")))?;
-
-            for batch in reader {
-                let batch = batch
-                    .map_err(|e| FfqError::Execution(format!("parquet decode failed: {e}")))?;
+            let full_batches = get_or_load_block_batches(path, &self.cache_settings)?;
+            for batch in full_batches {
                 if batch.schema().fields().len() != self.source_schema.fields().len() {
                     return Err(FfqError::Execution(format!(
                         "parquet scan schema mismatch for '{}': expected {} columns, got {}",
@@ -876,6 +1101,8 @@ mod tests {
     use arrow::array::{Float32Array, Int32Array, Int64Array};
     use arrow::record_batch::RecordBatch;
     use arrow_schema::DataType;
+    use ffq_common::metrics::global_metrics;
+    use futures::TryStreamExt;
     use parquet::arrow::ArrowWriter;
 
     use super::*;
@@ -1102,6 +1329,52 @@ mod tests {
         }];
         let pruned = prune_paths_with_file_stats(&paths, &filters, &stats);
         assert_eq!(pruned, vec!["/tmp/t/b.parquet".to_string()]);
+    }
+
+    #[test]
+    fn block_cache_records_miss_then_hit_events() {
+        let p = unique_path("block_cache", "parquet");
+        write_parquet_file(
+            &p,
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef],
+        );
+        let mut options = HashMap::new();
+        options.insert("cache.block.enabled".to_string(), "true".to_string());
+        options.insert("cache.ttl_secs".to_string(), "300".to_string());
+        let table = TableDef {
+            name: "t".to_string(),
+            uri: p.to_string_lossy().to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: None,
+            stats: TableStats::default(),
+            options,
+        };
+        let provider = ParquetProvider::new();
+        let node = provider.scan(&table, None, Vec::new()).expect("scan node");
+        let stream1 = node
+            .execute(Arc::new(TaskContext {
+                batch_size_rows: 1024,
+                mem_budget_bytes: usize::MAX,
+            }))
+            .expect("execute 1");
+        let _b1 = futures::executor::block_on(stream1.try_collect::<Vec<RecordBatch>>())
+            .expect("collect 1");
+        let stream2 = node
+            .execute(Arc::new(TaskContext {
+                batch_size_rows: 1024,
+                mem_budget_bytes: usize::MAX,
+            }))
+            .expect("execute 2");
+        let _b2 = futures::executor::block_on(stream2.try_collect::<Vec<RecordBatch>>())
+            .expect("collect 2");
+
+        let text = global_metrics().render_prometheus();
+        assert!(text.contains("ffq_file_cache_events_total"));
+        assert!(text.contains("cache_kind=\"block\",result=\"miss\""));
+        assert!(text.contains("cache_kind=\"block\",result=\"hit\""));
+        let _ = std::fs::remove_file(p);
     }
 
     fn write_parquet_file(path: &std::path::Path, schema: Arc<Schema>, cols: Vec<ArrayRef>) {

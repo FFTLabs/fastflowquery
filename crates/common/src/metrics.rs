@@ -27,6 +27,7 @@ struct MetricsInner {
     shuffle_fetch_seconds: HistogramVec,
     spill_bytes: CounterVec,
     spill_time_seconds: HistogramVec,
+    file_cache_events: CounterVec,
     scheduler_queued_tasks: GaugeVec,
     scheduler_running_tasks: GaugeVec,
     scheduler_retries: CounterVec,
@@ -160,6 +161,15 @@ impl MetricsRegistry {
             .spill_time_seconds
             .with_label_values(&labels)
             .observe(secs.max(0.0));
+    }
+
+    /// Increment file-cache event counter (`metadata`/`block`, `hit`/`miss`).
+    pub fn inc_file_cache_event(&self, kind: &str, hit: bool) {
+        let result = if hit { "hit" } else { "miss" };
+        self.inner
+            .file_cache_events
+            .with_label_values(&[kind, result])
+            .inc();
     }
 
     /// Set current scheduler queued-task gauge for one stage.
@@ -297,6 +307,12 @@ impl MetricsInner {
             "Spill write time",
             &["query_id", "stage_id", "task_id", "kind"],
         );
+        let file_cache_events = counter_vec(
+            &registry,
+            "ffq_file_cache_events_total",
+            "File cache hit/miss events",
+            &["cache_kind", "result"],
+        );
 
         let scheduler_queued_tasks = gauge_vec(
             &registry,
@@ -333,6 +349,7 @@ impl MetricsInner {
             shuffle_fetch_seconds,
             spill_bytes,
             spill_time_seconds,
+            file_cache_events,
             scheduler_queued_tasks,
             scheduler_running_tasks,
             scheduler_retries,
@@ -391,6 +408,8 @@ mod tests {
         m.record_shuffle_write("q1", 1, 2, 1024, 4, 0.01);
         m.record_shuffle_read("q1", 2, 3, 2048, 4, 0.03);
         m.record_spill("q1", 2, 3, "aggregate", 512, 0.005);
+        m.inc_file_cache_event("metadata", true);
+        m.inc_file_cache_event("block", false);
         m.set_scheduler_queued_tasks("q1", 1, 3);
         m.set_scheduler_running_tasks("q1", 1, 2);
         m.inc_scheduler_retries("q1", 1);
@@ -412,6 +431,7 @@ mod tests {
 
         assert!(text.contains("ffq_spill_bytes_total"));
         assert!(text.contains("ffq_spill_time_seconds"));
+        assert!(text.contains("ffq_file_cache_events_total"));
 
         assert!(text.contains("ffq_scheduler_queued_tasks"));
         assert!(text.contains("ffq_scheduler_running_tasks"));

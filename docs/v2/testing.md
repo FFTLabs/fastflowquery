@@ -109,6 +109,27 @@ Primary references:
 4. `crates/client/tests/embedded_parquet_sink.rs`
 5. `crates/client/tests/dataframe_write_api.rs`
 
+### 1.1) Storage IO cache validation (EPIC 8.3)
+
+Commands:
+
+```bash
+cargo test -p ffq-storage block_cache_records_miss_then_hit_events -- --nocapture
+cargo test -p ffq-storage partition_pruning_hive_matches_eq_and_range_filters -- --nocapture
+```
+
+Pass criteria:
+
+1. cache metrics include `ffq_file_cache_events_total`
+2. repeated read path records at least one `result="hit"` for enabled cache layer
+3. pruning + cache behavior does not change query correctness
+
+Primary references:
+
+1. `crates/storage/src/parquet_provider.rs`
+2. `crates/common/src/metrics.rs`
+3. `crates/storage/src/parquet_provider.rs` (tests module)
+
 ## 2) Distributed
 
 Commands:
