@@ -2048,6 +2048,7 @@ fn expr_contains_case(e: &Expr) -> bool {
 fn agg_columns(agg: &crate::logical_plan::AggExpr) -> HashSet<String> {
     match agg {
         crate::logical_plan::AggExpr::Count(e)
+        | crate::logical_plan::AggExpr::CountDistinct(e)
         | crate::logical_plan::AggExpr::Sum(e)
         | crate::logical_plan::AggExpr::Min(e)
         | crate::logical_plan::AggExpr::Max(e)

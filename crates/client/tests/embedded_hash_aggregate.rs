@@ -232,3 +232,64 @@ l_linestatus=O|sum_qty=10.500000000000\n";
 
     let _ = std::fs::remove_file(parquet_path);
 }
+
+#[test]
+fn count_distinct_grouped_is_correct_and_spill_stable() {
+    let parquet_path = support::unique_path("ffq_hash_agg_count_distinct", "parquet");
+    let spill_dir = support::unique_path("ffq_hash_agg_count_distinct_spill", "dir");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, true),
+    ]));
+    support::write_parquet(
+        &parquet_path,
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec![
+                "a", "a", "a", "a", "b", "b", "b", "b",
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(1_i64),
+                Some(1),
+                Some(2),
+                None,
+                Some(3),
+                Some(3),
+                Some(4),
+                None,
+            ])),
+        ],
+    );
+
+    let mut cfg = EngineConfig::default();
+    cfg.mem_budget_bytes = 128;
+    cfg.spill_dir = spill_dir.to_string_lossy().into_owned();
+    let engine = Engine::new(cfg).expect("engine");
+    register_src_table(&engine, &parquet_path, schema.as_ref());
+
+    let batches = futures::executor::block_on(
+        engine
+            .sql("SELECT k, COUNT(DISTINCT v) AS cd FROM t GROUP BY k")
+            .expect("sql")
+            .collect(),
+    )
+    .expect("collect");
+    let batches_again = futures::executor::block_on(
+        engine
+            .sql("SELECT k, COUNT(DISTINCT v) AS cd FROM t GROUP BY k")
+            .expect("sql")
+            .collect(),
+    )
+    .expect("collect");
+    support::assert_batches_deterministic(&batches, &batches_again, &["k"], 1e-9);
+    let snapshot = support::snapshot_text(&batches, &["k"], 1e-9);
+    let expected = "\
+schema:k:Utf8:true,cd:Int64:true\n\
+rows:\n\
+k=a|cd=2\n\
+k=b|cd=2\n";
+    assert_eq!(snapshot, expected);
+
+    let _ = std::fs::remove_file(parquet_path);
+    let _ = std::fs::remove_dir_all(spill_dir);
+}

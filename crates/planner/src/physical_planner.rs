@@ -1,6 +1,6 @@
 use ffq_common::{FfqError, Result};
 
-use crate::logical_plan::{Expr, JoinStrategyHint, LogicalPlan};
+use crate::logical_plan::{AggExpr, Expr, JoinStrategyHint, LogicalPlan};
 use crate::physical_plan::{
     BroadcastExchange, BuildSide, CteRefExec, ExchangeExec, ExistsSubqueryFilterExec, FilterExec,
     FinalHashAggregateExec, HashJoinAlternativeExec, HashJoinExec, InSubqueryFilterExec, LimitExec,
@@ -186,6 +186,9 @@ pub fn create_physical_plan(
             aggr_exprs,
             input,
         } => {
+            if has_count_distinct(aggr_exprs) {
+                return lower_count_distinct_aggregate(group_exprs, aggr_exprs, input, cfg);
+            }
             // Aggregate -> Partial -> ShuffleExchange(hash(group_keys)) -> Final
             let child = create_physical_plan(input, cfg)?;
 
@@ -352,6 +355,135 @@ pub fn create_physical_plan(
             }))
         }
     }
+}
+
+fn has_count_distinct(aggr_exprs: &[(AggExpr, String)]) -> bool {
+    aggr_exprs
+        .iter()
+        .any(|(agg, _)| matches!(agg, AggExpr::CountDistinct(_)))
+}
+
+fn lower_count_distinct_aggregate(
+    group_exprs: &[Expr],
+    aggr_exprs: &[(AggExpr, String)],
+    input: &LogicalPlan,
+    cfg: &PhysicalPlannerConfig,
+) -> Result<PhysicalPlan> {
+    if aggr_exprs
+        .iter()
+        .any(|(agg, _)| !matches!(agg, AggExpr::CountDistinct(_)))
+    {
+        return Err(FfqError::Unsupported(
+            "mixed DISTINCT/non-DISTINCT aggregates are not supported yet".to_string(),
+        ));
+    }
+
+    let mut distinct_args: Vec<Expr> = Vec::new();
+    let mut distinct_pos: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for (agg, _) in aggr_exprs {
+        let AggExpr::CountDistinct(expr) = agg else {
+            continue;
+        };
+        let key = format!("{expr:?}");
+        if let std::collections::hash_map::Entry::Vacant(v) = distinct_pos.entry(key) {
+            v.insert(distinct_args.len());
+            distinct_args.push(expr.clone());
+        }
+    }
+
+    let mut dedup_group_exprs = group_exprs.to_vec();
+    dedup_group_exprs.extend(distinct_args.clone());
+
+    let dedup_keys = dedup_group_exprs
+        .iter()
+        .map(expr_to_key_name)
+        .collect::<Result<Vec<_>>>()?;
+    let dedup_partitioning = PartitioningSpec::HashKeys {
+        keys: dedup_keys,
+        partitions: cfg.shuffle_partitions,
+    };
+
+    let child = create_physical_plan(input, cfg)?;
+    let dedup_partial = PhysicalPlan::PartialHashAggregate(PartialHashAggregateExec {
+        group_exprs: dedup_group_exprs.clone(),
+        aggr_exprs: vec![],
+        input: Box::new(child),
+    });
+    let dedup_write = PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(ShuffleWriteExchange {
+        input: Box::new(dedup_partial),
+        partitioning: dedup_partitioning.clone(),
+    }));
+    let dedup_read = PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
+        input: Box::new(dedup_write),
+        partitioning: dedup_partitioning,
+    }));
+    let dedup_final = PhysicalPlan::FinalHashAggregate(FinalHashAggregateExec {
+        group_exprs: dedup_group_exprs.clone(),
+        aggr_exprs: vec![],
+        input: Box::new(dedup_read),
+    });
+
+    let mut outer_aggs = Vec::with_capacity(aggr_exprs.len());
+    for (agg, alias) in aggr_exprs {
+        let AggExpr::CountDistinct(expr) = agg else {
+            return Err(FfqError::Unsupported(
+                "mixed DISTINCT/non-DISTINCT aggregates are not supported yet".to_string(),
+            ));
+        };
+        let key = format!("{expr:?}");
+        let dpos = *distinct_pos
+            .get(&key)
+            .ok_or_else(|| FfqError::Planning("internal DISTINCT rewrite error".to_string()))?;
+        let expr_idx = group_exprs.len() + dpos;
+        let expr_name = expr_to_key_name(&dedup_group_exprs[expr_idx])?;
+        outer_aggs.push((
+            AggExpr::Count(Expr::ColumnRef {
+                name: expr_name,
+                index: expr_idx,
+            }),
+            alias.clone(),
+        ));
+    }
+
+    let outer_group = group_exprs
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| {
+            Ok(Expr::ColumnRef {
+                name: expr_to_key_name(expr)?,
+                index: idx,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let outer_keys = outer_group
+        .iter()
+        .map(expr_to_key_name)
+        .collect::<Result<Vec<_>>>()?;
+    let outer_partitioning = PartitioningSpec::HashKeys {
+        keys: outer_keys,
+        partitions: cfg.shuffle_partitions,
+    };
+
+    let outer_partial = PhysicalPlan::PartialHashAggregate(PartialHashAggregateExec {
+        group_exprs: outer_group.clone(),
+        aggr_exprs: outer_aggs.clone(),
+        input: Box::new(dedup_final),
+    });
+    let outer_write = PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(ShuffleWriteExchange {
+        input: Box::new(outer_partial),
+        partitioning: outer_partitioning.clone(),
+    }));
+    let outer_read = PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
+        input: Box::new(outer_write),
+        partitioning: outer_partitioning,
+    }));
+    Ok(PhysicalPlan::FinalHashAggregate(FinalHashAggregateExec {
+        group_exprs: outer_group,
+        aggr_exprs: outer_aggs,
+        input: Box::new(outer_read),
+    }))
 }
 
 fn window_phase1_partitioning(

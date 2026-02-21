@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use ffq_common::{FfqError, Result};
 use sqlparser::ast::{
-    BinaryOperator as SqlBinaryOp, CteAsMaterialized, Expr as SqlExpr, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator,
-    ObjectName, Query, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableFactor,
-    TableWithJoins, Value,
+    BinaryOperator as SqlBinaryOp, CteAsMaterialized, DuplicateTreatment, Expr as SqlExpr,
+    FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, JoinConstraint,
+    JoinOperator, ObjectName, Query, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
+    TableFactor, TableWithJoins, Value,
 };
 
 use crate::logical_plan::{
@@ -998,6 +998,12 @@ fn try_parse_agg(
 
     let fname = object_name_to_string(&func.name).to_uppercase();
     let arg0 = first_function_arg(func);
+    let is_distinct = match &func.args {
+        FunctionArguments::List(list) => {
+            matches!(list.duplicate_treatment, Some(DuplicateTreatment::Distinct))
+        }
+        _ => false,
+    };
 
     let make_name = |prefix: &str| -> String {
         // v1: simple generated name; later use schema-aware naming rules
@@ -1008,12 +1014,21 @@ fn try_parse_agg(
         "COUNT" => {
             if let Some(a0) = arg0 {
                 let ex = function_arg_to_expr(a0, params)?;
-                AggExpr::Count(ex)
+                if is_distinct {
+                    AggExpr::CountDistinct(ex)
+                } else {
+                    AggExpr::Count(ex)
+                }
             } else {
                 return Err(FfqError::Unsupported(
                     "COUNT() requires an argument in v1".to_string(),
                 ));
             }
+        }
+        _ if is_distinct => {
+            return Err(FfqError::Unsupported(format!(
+                "{fname}(DISTINCT ...) is not supported in v1 (only COUNT(DISTINCT ...) is supported)"
+            )));
         }
         "SUM" => AggExpr::Sum(function_arg_to_expr(required_arg(arg0, "SUM")?, params)?),
         "MIN" => AggExpr::Min(function_arg_to_expr(required_arg(arg0, "MIN")?, params)?),
@@ -1836,6 +1851,28 @@ mod tests {
                 assert!(columns.is_empty());
             }
             other => panic!("expected InsertInto, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_count_distinct_aggregate() {
+        let plan = sql_to_logical(
+            "SELECT k, COUNT(DISTINCT v) AS cd FROM t GROUP BY k",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        match plan {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Aggregate { aggr_exprs, .. } => {
+                    assert_eq!(aggr_exprs.len(), 1);
+                    assert!(matches!(
+                        aggr_exprs[0].0,
+                        crate::logical_plan::AggExpr::CountDistinct(_)
+                    ));
+                }
+                other => panic!("expected Aggregate, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
         }
     }
 

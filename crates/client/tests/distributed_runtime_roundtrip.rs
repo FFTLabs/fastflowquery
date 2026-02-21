@@ -515,6 +515,9 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
             EXCLUDE CURRENT ROW
         ) AS s_ex
         FROM window_case";
+    let sql_count_distinct = "SELECT l_orderkey, COUNT(DISTINCT l_partkey) AS cd
+        FROM lineitem
+        GROUP BY l_orderkey";
 
     let dist_scan_batches = dist_engine
         .sql(sql_scan)
@@ -589,6 +592,12 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         .collect()
         .await
         .expect("dist window exclude collect");
+    let dist_count_distinct_batches = dist_engine
+        .sql(sql_count_distinct)
+        .expect("dist count-distinct sql")
+        .collect()
+        .await
+        .expect("dist count-distinct collect");
 
     cfg.coordinator_endpoint = None;
 
@@ -667,6 +676,12 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         .collect()
         .await
         .expect("embedded window exclude collect");
+    let embedded_count_distinct_batches = embedded_engine
+        .sql(sql_count_distinct)
+        .expect("embedded count-distinct sql")
+        .collect()
+        .await
+        .expect("embedded count-distinct collect");
 
     let dist_agg_norm = support::snapshot_text(&dist_agg_batches, &["l_orderkey"], 1e-9);
     let emb_agg_norm = support::snapshot_text(&embedded_agg_batches, &["l_orderkey"], 1e-9);
@@ -797,6 +812,14 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     assert_eq!(
         dist_window_exclude_norm, emb_window_exclude_norm,
         "distributed and embedded window exclusion outputs differ"
+    );
+    let dist_count_distinct_norm =
+        support::snapshot_text(&dist_count_distinct_batches, &["l_orderkey"], 1e-9);
+    let emb_count_distinct_norm =
+        support::snapshot_text(&embedded_count_distinct_batches, &["l_orderkey"], 1e-9);
+    assert_eq!(
+        dist_count_distinct_norm, emb_count_distinct_norm,
+        "distributed and embedded COUNT(DISTINCT) outputs differ"
     );
 
     let dist_agg = collect_group_counts(&dist_agg_batches);

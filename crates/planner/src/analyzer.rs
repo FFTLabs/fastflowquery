@@ -985,6 +985,10 @@ impl Analyzer {
                 let (ae, _dt) = self.analyze_expr(e, resolver)?;
                 Ok((AggExpr::Count(ae), DataType::Int64))
             }
+            AggExpr::CountDistinct(e) => {
+                let (ae, _dt) = self.analyze_expr(e, resolver)?;
+                Ok((AggExpr::CountDistinct(ae), DataType::Int64))
+            }
             AggExpr::Sum(e) => {
                 let (ae, dt) = self.analyze_expr(e, resolver)?;
                 if !is_numeric(&dt) {

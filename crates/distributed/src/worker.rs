@@ -3751,6 +3751,12 @@ fn build_agg_specs(
         let out_type = match mode {
             AggregateMode::Partial => match expr {
                 AggExpr::Count(_) => DataType::Int64,
+                AggExpr::CountDistinct(_) => {
+                    return Err(FfqError::Execution(
+                        "COUNT(DISTINCT ...) should be lowered before runtime aggregation"
+                            .to_string(),
+                    ));
+                }
                 AggExpr::Sum(e) | AggExpr::Min(e) | AggExpr::Max(e) => {
                     expr_data_type(e, input_schema)?
                 }
@@ -3780,6 +3786,7 @@ fn init_states(specs: &[AggSpec]) -> Vec<AggState> {
         .iter()
         .map(|s| match s.expr {
             AggExpr::Count(_) => AggState::Count(0),
+            AggExpr::CountDistinct(_) => AggState::Count(0),
             AggExpr::Sum(_) => match s.out_type {
                 DataType::Int64 => AggState::SumInt(0),
                 _ => AggState::SumFloat(0.0),
@@ -3823,6 +3830,7 @@ fn accumulate_batch(
             for spec in specs {
                 let expr = match &spec.expr {
                     AggExpr::Count(e)
+                    | AggExpr::CountDistinct(e)
                     | AggExpr::Sum(e)
                     | AggExpr::Min(e)
                     | AggExpr::Max(e)

@@ -490,6 +490,8 @@ pub enum LogicalPlan {
 pub enum AggExpr {
     /// Count non-null input rows.
     Count(Expr),
+    /// Count distinct non-null input values.
+    CountDistinct(Expr),
     /// Sum numeric input.
     Sum(Expr),
     /// Minimum input value.
