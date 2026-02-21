@@ -2078,7 +2078,7 @@ mod tests {
                 }
                 LogicalPlan::Aggregate { input, .. } => contains_tablescan(input, target),
                 LogicalPlan::CteRef { plan, .. } => contains_tablescan(plan, target),
-                LogicalPlan::VectorTopK { .. } => false,
+                LogicalPlan::VectorTopK { .. } | LogicalPlan::HybridVectorScan { .. } => false,
             }
         }
 
@@ -2110,7 +2110,9 @@ mod tests {
                 count_cte_refs(left) + count_cte_refs(right)
             }
             LogicalPlan::Aggregate { input, .. } => count_cte_refs(input),
-            LogicalPlan::TableScan { .. } | LogicalPlan::VectorTopK { .. } => 0,
+            LogicalPlan::TableScan { .. }
+            | LogicalPlan::VectorTopK { .. }
+            | LogicalPlan::HybridVectorScan { .. } => 0,
         }
     }
 
@@ -2224,7 +2226,9 @@ mod tests {
                 }
                 LogicalPlan::Aggregate { input, .. } => has_union_all(input),
                 LogicalPlan::CteRef { plan, .. } => has_union_all(plan),
-                LogicalPlan::TableScan { .. } | LogicalPlan::VectorTopK { .. } => false,
+                LogicalPlan::TableScan { .. }
+                | LogicalPlan::VectorTopK { .. }
+                | LogicalPlan::HybridVectorScan { .. } => false,
             }
         }
 

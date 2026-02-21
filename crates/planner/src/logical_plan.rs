@@ -474,6 +474,25 @@ pub enum LogicalPlan {
         /// Optional provider-specific filter payload.
         filter: Option<String>,
     },
+    /// Hybrid vector scan logical operator (v2).
+    ///
+    /// This is the canonical logical representation for index-backed vector
+    /// retrieval and carries provider/metric metadata and stable score schema
+    /// naming (`_score`).
+    HybridVectorScan {
+        /// Source table name.
+        source: String,
+        /// One or more query vectors (phase-1 uses first vector).
+        query_vectors: Vec<Vec<f32>>,
+        /// Number of rows to keep.
+        k: usize,
+        /// Optional provider-specific prefilter payload.
+        prefilter: Option<String>,
+        /// Distance/similarity metric (for example `cosine`).
+        metric: String,
+        /// Vector provider backend identifier (for example `qdrant`).
+        provider: String,
+    },
     /// Insert query result into a target table.
     InsertInto {
         /// Target table.

@@ -585,6 +585,43 @@ impl Analyzer {
                     out_resolver,
                 ))
             }
+            LogicalPlan::HybridVectorScan {
+                source,
+                query_vectors,
+                k,
+                prefilter,
+                metric,
+                provider: backend,
+            } => {
+                if k == 0 {
+                    return Err(FfqError::Planning("TOP-K value must be > 0".to_string()));
+                }
+                if query_vectors.is_empty() || query_vectors.iter().any(Vec::is_empty) {
+                    return Err(FfqError::Planning(
+                        "HybridVectorScan query vector(s) cannot be empty".to_string(),
+                    ));
+                }
+                let _ = provider.table_schema(&source)?;
+                let out_schema = Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("_score", DataType::Float32, false),
+                    Field::new("score", DataType::Float32, false),
+                    Field::new("payload", DataType::Utf8, true),
+                ]));
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                Ok((
+                    LogicalPlan::HybridVectorScan {
+                        source,
+                        query_vectors,
+                        k,
+                        prefilter,
+                        metric,
+                        provider: backend,
+                    },
+                    out_schema,
+                    out_resolver,
+                ))
+            }
             LogicalPlan::InsertInto {
                 table,
                 columns,

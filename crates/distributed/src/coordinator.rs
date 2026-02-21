@@ -679,7 +679,7 @@ impl Coordinator {
                 self.resolve_parquet_scan_schemas(&mut x.right)
             }
             PhysicalPlan::CteRef(x) => self.resolve_parquet_scan_schemas(&mut x.plan),
-            PhysicalPlan::VectorTopK(_) => Ok(()),
+            PhysicalPlan::VectorTopK(_) | PhysicalPlan::VectorKnn(_) => Ok(()),
             PhysicalPlan::Custom(x) => self.resolve_parquet_scan_schemas(&mut x.input),
         }
     }
@@ -2020,7 +2020,8 @@ fn deterministic_coalesce_split_groups(
 
 fn collect_custom_ops(plan: &PhysicalPlan, out: &mut HashSet<String>) {
     match plan {
-        PhysicalPlan::ParquetScan(_) | PhysicalPlan::VectorTopK(_) => {}
+        PhysicalPlan::ParquetScan(_) | PhysicalPlan::VectorTopK(_) | PhysicalPlan::VectorKnn(_) => {
+        }
         PhysicalPlan::ParquetWrite(x) => collect_custom_ops(&x.input, out),
         PhysicalPlan::Filter(x) => collect_custom_ops(&x.input, out),
         PhysicalPlan::InSubqueryFilter(x) => {
@@ -2112,7 +2113,7 @@ fn collect_scan_locality_hints(plan: &PhysicalPlan) -> Vec<String> {
                 visit(&x.right, out);
             }
             PhysicalPlan::CteRef(x) => visit(&x.plan, out),
-            PhysicalPlan::VectorTopK(_) => {}
+            PhysicalPlan::VectorTopK(_) | PhysicalPlan::VectorKnn(_) => {}
             PhysicalPlan::Custom(x) => visit(&x.input, out),
         }
     }

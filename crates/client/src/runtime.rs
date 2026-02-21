@@ -803,6 +803,12 @@ fn execute_plan_with_cache(
                 in_batches: 0,
                 in_bytes: 0,
             }),
+            PhysicalPlan::VectorKnn(exec) => Ok(OpEval {
+                out: execute_vector_knn(exec, catalog).await?,
+                in_rows: 0,
+                in_batches: 0,
+                in_bytes: 0,
+            }),
             PhysicalPlan::Custom(custom) => {
                 let child = execute_plan_with_cache(
                     *custom.input,
@@ -1191,7 +1197,7 @@ fn estimate_plan_output_bytes(plan: &PhysicalPlan, catalog: &Arc<Catalog>) -> u6
         PhysicalPlan::UnionAll(x) => estimate_plan_output_bytes(&x.left, catalog)
             .saturating_add(estimate_plan_output_bytes(&x.right, catalog)),
         PhysicalPlan::CteRef(x) => estimate_plan_output_bytes(&x.plan, catalog),
-        PhysicalPlan::VectorTopK(_) => 64 * 1024,
+        PhysicalPlan::VectorTopK(_) | PhysicalPlan::VectorKnn(_) => 64 * 1024,
         PhysicalPlan::Custom(x) => estimate_plan_output_bytes(&x.input, catalog),
     }
 }
@@ -1218,6 +1224,7 @@ fn operator_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::UnionAll(_) => "UnionAll",
         PhysicalPlan::CteRef(_) => "CteRef",
         PhysicalPlan::VectorTopK(_) => "VectorTopK",
+        PhysicalPlan::VectorKnn(_) => "VectorKnn",
         PhysicalPlan::Custom(_) => "Custom",
     }
 }
@@ -1525,6 +1532,51 @@ fn execute_vector_topk(
     .boxed()
 }
 
+fn execute_vector_knn(
+    exec: ffq_planner::VectorKnnExec,
+    catalog: Arc<Catalog>,
+) -> BoxFuture<'static, Result<ExecOutput>> {
+    async move {
+        let as_topk = ffq_planner::VectorTopKExec {
+            table: exec.source.clone(),
+            query_vector: exec.query_vector.clone(),
+            k: exec.k,
+            filter: exec.prefilter.clone(),
+        };
+        let table = catalog.get(&as_topk.table)?.clone();
+        if let Some(rows) = mock_vector_rows_from_table(&table, as_topk.k)? {
+            return rows_to_vector_knn_output(rows);
+        }
+        if table.format != "qdrant" {
+            return Err(FfqError::Unsupported(format!(
+                "VectorKnnExec requires table format='qdrant', got '{}'",
+                table.format
+            )));
+        }
+        #[cfg(not(feature = "qdrant"))]
+        {
+            let _ = table;
+            let _ = as_topk;
+            return Err(FfqError::Unsupported(
+                "qdrant feature is disabled; build ffq-client with --features qdrant".to_string(),
+            ));
+        }
+        #[cfg(feature = "qdrant")]
+        {
+            let provider = QdrantProvider::from_table(&table)?;
+            let rows = provider
+                .topk(
+                    as_topk.query_vector.clone(),
+                    as_topk.k,
+                    as_topk.filter.clone(),
+                )
+                .await?;
+            rows_to_vector_knn_output(rows)
+        }
+    }
+    .boxed()
+}
+
 #[cfg(any(feature = "qdrant", test))]
 async fn run_vector_topk_with_provider(
     exec: &ffq_planner::VectorTopKExec,
@@ -1600,6 +1652,45 @@ fn rows_to_vector_topk_output(
         ],
     )
     .map_err(|e| FfqError::Execution(format!("build VectorTopK record batch failed: {e}")))?;
+    Ok(ExecOutput {
+        schema,
+        batches: vec![batch],
+    })
+}
+
+fn rows_to_vector_knn_output(
+    rows: Vec<ffq_storage::vector_index::VectorTopKRow>,
+) -> Result<ExecOutput> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("_score", DataType::Float32, false),
+        Field::new("score", DataType::Float32, false),
+        Field::new("payload", DataType::Utf8, true),
+    ]));
+    let mut id_b = Int64Builder::with_capacity(rows.len());
+    let mut score_alias_b = arrow::array::Float32Builder::with_capacity(rows.len());
+    let mut score_b = arrow::array::Float32Builder::with_capacity(rows.len());
+    let mut payload_b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
+    for row in rows {
+        id_b.append_value(row.id);
+        score_alias_b.append_value(row.score);
+        score_b.append_value(row.score);
+        if let Some(p) = row.payload_json {
+            payload_b.append_value(p);
+        } else {
+            payload_b.append_null();
+        }
+    }
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(id_b.finish()),
+            Arc::new(score_alias_b.finish()),
+            Arc::new(score_b.finish()),
+            Arc::new(payload_b.finish()),
+        ],
+    )
+    .map_err(|e| FfqError::Execution(format!("build VectorKnn record batch failed: {e}")))?;
     Ok(ExecOutput {
         schema,
         batches: vec![batch],

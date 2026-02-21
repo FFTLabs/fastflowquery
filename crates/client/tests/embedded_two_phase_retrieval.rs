@@ -118,7 +118,7 @@ fn two_phase_vector_join_rerank_runs_embedded() {
         .expect("sql")
         .explain()
         .expect("explain");
-    assert!(explain.contains("VectorTopK table=docs_idx"));
+    assert!(explain.contains("HybridVectorScan source=docs_idx"));
     assert!(explain.contains("Join type=Inner"));
 
     let batches = futures::executor::block_on(

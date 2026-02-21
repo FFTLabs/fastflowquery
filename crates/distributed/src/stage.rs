@@ -134,6 +134,7 @@ fn op_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::UnionAll(_) => "UnionAll",
         PhysicalPlan::CteRef(_) => "CteRef",
         PhysicalPlan::VectorTopK(_) => "VectorTopK",
+        PhysicalPlan::VectorKnn(_) => "VectorKnn",
         PhysicalPlan::Custom(_) => "Custom",
     }
 }

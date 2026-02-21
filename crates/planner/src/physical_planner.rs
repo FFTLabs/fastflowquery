@@ -180,6 +180,27 @@ pub fn create_physical_plan(
                 filter: filter.clone(),
             },
         )),
+        LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            prefilter,
+            metric,
+            provider,
+        } => Ok(PhysicalPlan::VectorKnn(
+            crate::physical_plan::VectorKnnExec {
+                source: source.clone(),
+                query_vector: query_vectors.first().cloned().ok_or_else(|| {
+                    ffq_common::FfqError::Planning(
+                        "HybridVectorScan requires at least one query vector".to_string(),
+                    )
+                })?,
+                k: *k,
+                prefilter: prefilter.clone(),
+                metric: metric.clone(),
+                provider: provider.clone(),
+            },
+        )),
 
         LogicalPlan::Aggregate {
             group_exprs,

@@ -49,6 +49,8 @@ pub enum PhysicalPlan {
     CteRef(CteRefExec),
     /// Index-backed vector top-k.
     VectorTopK(VectorTopKExec),
+    /// Hybrid vector KNN execution.
+    VectorKnn(VectorKnnExec),
     /// Custom operator instantiated via runtime physical operator registry.
     Custom(CustomExec),
 }
@@ -82,6 +84,7 @@ impl PhysicalPlan {
             PhysicalPlan::UnionAll(x) => vec![x.left.as_ref(), x.right.as_ref()],
             PhysicalPlan::CteRef(x) => vec![x.plan.as_ref()],
             PhysicalPlan::VectorTopK(_) => vec![],
+            PhysicalPlan::VectorKnn(_) => vec![],
             PhysicalPlan::Custom(x) => vec![x.input.as_ref()],
         }
     }
@@ -364,6 +367,23 @@ pub struct VectorTopKExec {
     pub k: usize,
     /// Optional provider-specific filter payload.
     pub filter: Option<String>,
+}
+
+/// Hybrid vector KNN physical operator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorKnnExec {
+    /// Source table.
+    pub source: String,
+    /// Query vector literal.
+    pub query_vector: Vec<f32>,
+    /// Number of rows to return.
+    pub k: usize,
+    /// Optional provider-specific prefilter payload.
+    pub prefilter: Option<String>,
+    /// Distance/similarity metric identifier.
+    pub metric: String,
+    /// Vector provider backend identifier.
+    pub provider: String,
 }
 
 /// Custom physical operator descriptor.

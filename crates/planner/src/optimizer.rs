@@ -661,6 +661,24 @@ fn proj_rewrite(
             },
             HashSet::new(),
         )),
+        LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            prefilter,
+            metric,
+            provider,
+        } => Ok((
+            LogicalPlan::HybridVectorScan {
+                source,
+                query_vectors,
+                k,
+                prefilter,
+                metric,
+                provider,
+            },
+            HashSet::new(),
+        )),
 
         LogicalPlan::TableScan {
             table,
@@ -1102,6 +1120,7 @@ fn vector_index_rewrite(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result
         }),
         leaf @ LogicalPlan::TableScan { .. } => Ok(leaf),
         leaf @ LogicalPlan::VectorTopK { .. } => Ok(leaf),
+        leaf @ LogicalPlan::HybridVectorScan { .. } => Ok(leaf),
     }
 }
 
@@ -1116,15 +1135,19 @@ fn try_rewrite_projection_topk_to_vector(
     }
     match evaluate_vector_topk_rewrite(exprs, input, ctx)? {
         VectorRewriteDecision::Apply {
-            table,
+            source,
             query_vector,
             k,
-            filter,
-        } => Ok(Some(LogicalPlan::VectorTopK {
-            table,
-            query_vector,
+            prefilter,
+            metric,
+            provider,
+        } => Ok(Some(LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors: vec![query_vector],
             k,
-            filter,
+            prefilter,
+            metric,
+            provider,
         })),
         VectorRewriteDecision::Fallback { .. } => Ok(None),
     }
@@ -1192,11 +1215,13 @@ fn try_rewrite_projection_topk_to_two_phase(
             projection: None,
             filters: Vec::new(),
         }),
-        right: Box::new(LogicalPlan::VectorTopK {
-            table: index_table,
-            query_vector: query_vector.clone(),
+        right: Box::new(LogicalPlan::HybridVectorScan {
+            source: index_table,
+            query_vectors: vec![query_vector.clone()],
             k: prefetch_k,
-            filter: None,
+            prefilter: None,
+            metric: "cosine".to_string(),
+            provider: "qdrant".to_string(),
         }),
         on: vec![(id_col, "id".to_string())],
         join_type: JoinType::Inner,
@@ -1262,6 +1287,9 @@ fn two_phase_join_projection_exprs(
             (Expr::Column(format!("{docs_table}.{name}")), name)
         })
         .collect();
+    if schema.index_of("_score").is_err() {
+        out.push((Expr::Column("_score".to_string()), "_score".to_string()));
+    }
     if schema.index_of("score").is_err() {
         out.push((Expr::Column("score".to_string()), "score".to_string()));
     }
@@ -1274,10 +1302,12 @@ fn two_phase_join_projection_exprs(
 #[cfg(feature = "vector")]
 enum VectorRewriteDecision {
     Apply {
-        table: String,
+        source: String,
         query_vector: Vec<f32>,
         k: usize,
-        filter: Option<String>,
+        prefilter: Option<String>,
+        metric: String,
+        provider: String,
     },
     Fallback {
         _reason: &'static str,
@@ -1345,10 +1375,12 @@ fn evaluate_vector_topk_rewrite(
     };
 
     Ok(VectorRewriteDecision::Apply {
-        table: table.clone(),
+        source: table.clone(),
         query_vector: query_vector.clone(),
         k: *k,
-        filter,
+        prefilter: filter,
+        metric: "cosine".to_string(),
+        provider: "qdrant".to_string(),
     })
 }
 
@@ -1357,10 +1389,10 @@ fn projection_supported_for_vector_topk(exprs: &[(Expr, String)]) -> bool {
     exprs.iter().all(|(e, _)| {
         matches!(
             e,
-            Expr::Column(c) if c == "id" || c == "score" || c == "payload"
+            Expr::Column(c) if c == "id" || c == "_score" || c == "score" || c == "payload"
         ) || matches!(
             e,
-            Expr::ColumnRef { name, .. } if name == "id" || name == "score" || name == "payload"
+            Expr::ColumnRef { name, .. } if name == "id" || name == "_score" || name == "score" || name == "payload"
         )
     })
 }
@@ -1550,6 +1582,21 @@ fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy
             k,
             filter,
         },
+        LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            prefilter,
+            metric,
+            provider,
+        } => LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            prefilter,
+            metric,
+            provider,
+        },
         LogicalPlan::InsertInto {
             table,
             columns,
@@ -1670,6 +1717,21 @@ fn try_map_children(
             query_vector,
             k,
             filter,
+        },
+        LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            prefilter,
+            metric,
+            provider,
+        } => LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            prefilter,
+            metric,
+            provider,
         },
         LogicalPlan::InsertInto {
             table,
@@ -1864,6 +1926,21 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
             query_vector,
             k,
             filter,
+        },
+        LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            prefilter,
+            metric,
+            provider,
+        } => LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            prefilter,
+            metric,
+            provider,
         },
         LogicalPlan::InsertInto {
             table,
@@ -2102,6 +2179,10 @@ fn plan_output_columns(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result
             .into_iter()
             .map(std::string::ToString::to_string)
             .collect()),
+        LogicalPlan::HybridVectorScan { .. } => Ok(["id", "_score", "score", "payload"]
+            .into_iter()
+            .map(std::string::ToString::to_string)
+            .collect()),
         LogicalPlan::Join {
             left,
             right,
@@ -2146,6 +2227,7 @@ fn estimate_bytes(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result<Opti
         | LogicalPlan::CteRef { plan: input, .. }
         | LogicalPlan::InsertInto { input, .. } => estimate_bytes(input, ctx),
         LogicalPlan::VectorTopK { .. } => Ok(None),
+        LogicalPlan::HybridVectorScan { .. } => Ok(None),
         LogicalPlan::Join { .. } => Ok(None),
     }
 }
@@ -2230,17 +2312,19 @@ mod tests {
             .expect("optimize");
         match optimized {
             LogicalPlan::Projection { input, .. } => match *input {
-                LogicalPlan::VectorTopK {
-                    table,
-                    query_vector,
+                LogicalPlan::HybridVectorScan {
+                    source,
+                    query_vectors,
                     k,
                     ..
                 } => {
-                    assert_eq!(table, "docs_idx");
+                    assert_eq!(source, "docs_idx");
+                    assert_eq!(query_vectors.len(), 1);
+                    let query_vector = &query_vectors[0];
                     assert_eq!(query_vector, vec![1.0, 0.0, 0.0]);
                     assert_eq!(k, 5);
                 }
-                other => panic!("expected VectorTopK, got {other:?}"),
+                other => panic!("expected HybridVectorScan, got {other:?}"),
             },
             other => panic!("expected Projection, got {other:?}"),
         }
@@ -2348,8 +2432,8 @@ mod tests {
             .expect("optimize");
         match optimized {
             LogicalPlan::Projection { input, .. } => match *input {
-                LogicalPlan::VectorTopK { filter, .. } => {
-                    let filter = filter.expect("translated filter");
+                LogicalPlan::HybridVectorScan { prefilter, .. } => {
+                    let filter = prefilter.expect("translated filter");
                     let parsed: serde_json::Value =
                         serde_json::from_str(&filter).expect("json filter");
                     assert_eq!(
@@ -2361,7 +2445,7 @@ mod tests {
                         2
                     );
                 }
-                other => panic!("expected VectorTopK, got {other:?}"),
+                other => panic!("expected HybridVectorScan, got {other:?}"),
             },
             other => panic!("expected Projection, got {other:?}"),
         }
@@ -2578,11 +2662,11 @@ mod tests {
                                         other => panic!("expected docs TableScan, got {other:?}"),
                                     }
                                     match *right {
-                                        LogicalPlan::VectorTopK { table, k, .. } => {
-                                            assert_eq!(table, "docs_idx");
+                                        LogicalPlan::HybridVectorScan { source, k, .. } => {
+                                            assert_eq!(source, "docs_idx");
                                             assert_eq!(k, 6);
                                         }
-                                        other => panic!("expected VectorTopK, got {other:?}"),
+                                        other => panic!("expected HybridVectorScan, got {other:?}"),
                                     }
                                 }
                                 other => panic!("expected Join, got {other:?}"),

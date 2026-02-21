@@ -15,4 +15,4 @@ Projection
   id := id
   score := score
   payload := payload
-  VectorTopK table=docs_idx k=5 query_dim=3 filter=None rewrite=index_applied
+  HybridVectorScan source=docs_idx k=5 query_dim=3 metric=cosine provider=qdrant prefilter=None columns=[id,_score,payload] rewrite=index_applied
