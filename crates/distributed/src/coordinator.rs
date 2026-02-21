@@ -216,6 +216,18 @@ pub struct StageMetrics {
     pub map_publish_window_partitions: u32,
     /// Current recommended reduce fetch window.
     pub reduce_fetch_window_partitions: u32,
+    /// Milliseconds from query start until first readable map chunk was observed.
+    pub first_chunk_ms: u64,
+    /// Milliseconds from query start until first reduce-side row activity was observed.
+    pub first_reduce_row_ms: u64,
+    /// Current stream lag in milliseconds between first chunk and reduce activity/progress.
+    pub stream_lag_ms: u64,
+    /// Last observed buffered streaming bytes at reducers.
+    pub stream_buffered_bytes: u64,
+    /// Number of active (non-finalized) partition streams for this stage.
+    pub stream_active_count: u32,
+    /// Recent backpressure control-loop events for this stage.
+    pub backpressure_events: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -800,8 +812,23 @@ impl Coordinator {
                         recommended_reduce_fetch_window_partitions: reduce_fetch_window,
                     });
                     if let Some(stage) = query.stages.get_mut(&stage_id) {
+                        if stage.metrics.map_publish_window_partitions != map_publish_window
+                            || stage.metrics.reduce_fetch_window_partitions != reduce_fetch_window
+                        {
+                            push_stage_backpressure_event(
+                                &mut stage.metrics,
+                                format!(
+                                    "window_update inflight={} queue_depth={} map_publish_window={} reduce_fetch_window={}",
+                                    observed_inflight,
+                                    observed_queue_depth,
+                                    map_publish_window,
+                                    reduce_fetch_window
+                                ),
+                            );
+                        }
                         stage.metrics.backpressure_inflight_bytes = observed_inflight;
                         stage.metrics.backpressure_queue_depth = observed_queue_depth;
+                        stage.metrics.stream_buffered_bytes = observed_inflight;
                         stage.metrics.map_publish_window_partitions = map_publish_window;
                         stage.metrics.reduce_fetch_window_partitions = reduce_fetch_window;
                     }
@@ -937,10 +964,18 @@ impl Coordinator {
         if matches!(state, TaskState::Failed) {
             self.reduce_backpressure.remove(&bp_key);
         }
+        let elapsed_ms = query_elapsed_ms(query, now);
         if prev_state == state {
             if let Some(stage) = query.stages.get_mut(&stage_id) {
                 stage.metrics.backpressure_inflight_bytes = reduce_fetch_inflight_bytes;
                 stage.metrics.backpressure_queue_depth = reduce_fetch_queue_depth;
+                stage.metrics.stream_buffered_bytes = reduce_fetch_inflight_bytes;
+                if stage.metrics.first_reduce_row_ms == 0
+                    && (reduce_fetch_inflight_bytes > 0 || reduce_fetch_queue_depth > 0)
+                {
+                    stage.metrics.first_reduce_row_ms = elapsed_ms;
+                }
+                update_stage_stream_lag(&mut stage.metrics, elapsed_ms);
             }
             return Ok(());
         }
@@ -1054,6 +1089,13 @@ impl Coordinator {
         }
         stage.metrics.backpressure_inflight_bytes = reduce_fetch_inflight_bytes;
         stage.metrics.backpressure_queue_depth = reduce_fetch_queue_depth;
+        stage.metrics.stream_buffered_bytes = reduce_fetch_inflight_bytes;
+        if stage.metrics.first_reduce_row_ms == 0
+            && (reduce_fetch_inflight_bytes > 0 || reduce_fetch_queue_depth > 0)
+        {
+            stage.metrics.first_reduce_row_ms = elapsed_ms;
+        }
+        update_stage_stream_lag(&mut stage.metrics, elapsed_ms);
         update_scheduler_metrics(query_id, stage_id, &stage.metrics);
 
         if query.state != QueryState::Failed && is_query_succeeded(query) {
@@ -1122,6 +1164,7 @@ impl Coordinator {
         layout_fingerprint: u64,
         partitions: Vec<MapOutputPartitionMeta>,
     ) -> Result<()> {
+        let now = now_ms()?;
         let Some(query) = self.queries.get(&query_id) else {
             return Err(FfqError::Planning(format!("unknown query: {query_id}")));
         };
@@ -1187,7 +1230,11 @@ impl Coordinator {
         let mut batches = 0_u64;
         let mut reduce_ids = HashSet::new();
         let mut bytes_by_partition = HashMap::<u32, u64>::new();
-        for p in latest {
+        let active_stream_count = latest
+            .iter()
+            .filter(|p| p.committed_offset > 0 && !p.finalized)
+            .count() as u32;
+        for p in &latest {
             rows = rows.saturating_add(p.rows);
             bytes = bytes.saturating_add(p.bytes);
             batches = batches.saturating_add(p.batches);
@@ -1209,6 +1256,7 @@ impl Coordinator {
             .queries
             .get_mut(&query_id)
             .ok_or_else(|| FfqError::Planning(format!("unknown query: {query_id}")))?;
+        let elapsed_ms = query_elapsed_ms(query, now);
         let histogram = build_partition_bytes_histogram(&bytes_by_partition);
         let event = format!(
             "map_stage_observed bytes={} partitions={} planned={} adaptive_estimate={} target_bytes={}",
@@ -1231,6 +1279,11 @@ impl Coordinator {
             stage.metrics.adaptive_reduce_tasks = adaptive_reduce_tasks;
             stage.metrics.adaptive_target_bytes = self.config.adaptive_shuffle_target_bytes;
             stage.metrics.partition_bytes_histogram = histogram.clone();
+            stage.metrics.stream_active_count = active_stream_count;
+            if stage.metrics.first_chunk_ms == 0 && bytes > 0 {
+                stage.metrics.first_chunk_ms = elapsed_ms;
+            }
+            update_stage_stream_lag(&mut stage.metrics, elapsed_ms);
             push_stage_aqe_event(&mut stage.metrics, event.clone());
             stage.children.clone()
         };
@@ -1241,6 +1294,11 @@ impl Coordinator {
                 child.metrics.adaptive_reduce_tasks = adaptive_reduce_tasks;
                 child.metrics.adaptive_target_bytes = self.config.adaptive_shuffle_target_bytes;
                 child.metrics.partition_bytes_histogram = histogram.clone();
+                child.metrics.stream_active_count = active_stream_count;
+                if child.metrics.first_chunk_ms == 0 && bytes > 0 {
+                    child.metrics.first_chunk_ms = elapsed_ms;
+                }
+                update_stage_stream_lag(&mut child.metrics, elapsed_ms);
                 push_stage_aqe_event(&mut child.metrics, event.clone());
             }
         }
@@ -1759,6 +1817,39 @@ fn push_stage_aqe_event(metrics: &mut StageMetrics, event: String) {
         let keep_from = metrics.aqe_events.len().saturating_sub(16);
         metrics.aqe_events.drain(0..keep_from);
     }
+}
+
+fn push_stage_backpressure_event(metrics: &mut StageMetrics, event: String) {
+    if metrics.backpressure_events.iter().any(|e| e == &event) {
+        return;
+    }
+    metrics.backpressure_events.push(event);
+    if metrics.backpressure_events.len() > 16 {
+        let keep_from = metrics.backpressure_events.len().saturating_sub(16);
+        metrics.backpressure_events.drain(0..keep_from);
+    }
+}
+
+fn query_elapsed_ms(query: &QueryRuntime, now_ms: u64) -> u64 {
+    let base = if query.started_at_ms > 0 {
+        query.started_at_ms
+    } else {
+        query.submitted_at_ms
+    };
+    now_ms.saturating_sub(base)
+}
+
+fn update_stage_stream_lag(metrics: &mut StageMetrics, elapsed_ms: u64) {
+    if metrics.first_chunk_ms == 0 {
+        metrics.stream_lag_ms = 0;
+        return;
+    }
+    let progress_ms = if metrics.first_reduce_row_ms > 0 {
+        metrics.first_reduce_row_ms
+    } else {
+        elapsed_ms
+    };
+    metrics.stream_lag_ms = progress_ms.saturating_sub(metrics.first_chunk_ms);
 }
 
 type ReduceTaskAssignmentSpec = ReduceTaskAssignment;
@@ -3597,7 +3688,7 @@ mod tests {
                 batches: 1,
                 stream_epoch: 1,
                 committed_offset: 100,
-                finalized: true,
+                finalized: false,
             }],
         )
         .expect("register map");
@@ -3626,6 +3717,42 @@ mod tests {
                 .iter()
                 .all(|t| t.recommended_reduce_fetch_window_partitions <= 2)
         );
+
+        let reduce = reduce_tasks[0].clone();
+        c.report_task_status_with_pressure(
+            &reduce.query_id,
+            reduce.stage_id,
+            reduce.task_id,
+            reduce.attempt,
+            reduce.layout_version,
+            reduce.layout_fingerprint,
+            TaskState::Running,
+            Some("w2"),
+            "reduce running".to_string(),
+            24,
+            5,
+        )
+        .expect("reduce running pressure");
+
+        let st = c
+            .get_query_status(&map_task.query_id)
+            .expect("query status with streaming metrics");
+        let map_stage = st
+            .stage_metrics
+            .get(&map_task.stage_id)
+            .expect("map stage metrics");
+        assert!(map_stage.first_chunk_ms > 0);
+        assert!(map_stage.stream_active_count >= 1);
+        assert!(map_stage.backpressure_events.iter().any(|e| e.contains("window_update")));
+
+        let reduce_stage = st
+            .stage_metrics
+            .get(&reduce.stage_id)
+            .expect("reduce stage metrics");
+        assert!(reduce_stage.first_chunk_ms > 0);
+        assert!(reduce_stage.first_reduce_row_ms > 0);
+        assert_eq!(reduce_stage.stream_buffered_bytes, 24);
+        assert!(reduce_stage.stream_lag_ms <= reduce_stage.first_reduce_row_ms);
     }
 
     #[test]

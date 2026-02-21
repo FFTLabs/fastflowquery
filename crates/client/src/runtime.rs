@@ -101,6 +101,12 @@ struct StageExecutionSummary {
     aqe_events: Vec<String>,
     aqe_layout_finalize_count: u32,
     aqe_skew_split_tasks: u32,
+    streaming_first_chunk_ms: u64,
+    streaming_first_reduce_row_ms: u64,
+    streaming_lag_ms: u64,
+    streaming_buffered_bytes: u64,
+    streaming_active_streams: u32,
+    streaming_backpressure_events: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -151,6 +157,12 @@ impl RuntimeStatsCollector {
         partition_histogram_upper_bounds: Vec<u64>,
         layout_finalize_count: u32,
         skew_split_tasks: u32,
+        first_chunk_ms: u64,
+        first_reduce_row_ms: u64,
+        stream_lag_ms: u64,
+        stream_buffered_bytes: u64,
+        stream_active_count: u32,
+        backpressure_events: Vec<String>,
     ) {
         let mut guard = self.inner.lock().expect("stats collector lock poisoned");
         if guard.query_id.is_none() {
@@ -167,6 +179,12 @@ impl RuntimeStatsCollector {
         stage.aqe_events = aqe_events;
         stage.aqe_layout_finalize_count = layout_finalize_count;
         stage.aqe_skew_split_tasks = skew_split_tasks;
+        stage.streaming_first_chunk_ms = first_chunk_ms;
+        stage.streaming_first_reduce_row_ms = first_reduce_row_ms;
+        stage.streaming_lag_ms = stream_lag_ms;
+        stage.streaming_buffered_bytes = stream_buffered_bytes;
+        stage.streaming_active_streams = stream_active_count;
+        stage.streaming_backpressure_events = backpressure_events;
         stage
             .partition_sizes_bytes
             .extend(partition_histogram_upper_bounds);
@@ -219,6 +237,20 @@ impl RuntimeStatsCollector {
             ));
             if !s.aqe_events.is_empty() {
                 out.push_str(&format!("  aqe_events={}\n", s.aqe_events.join(" | ")));
+            }
+            out.push_str(&format!(
+                "  streaming={{first_chunk_ms:{},first_reduce_row_ms:{},lag_ms:{},buffered_bytes:{},active_streams:{}}}\n",
+                s.streaming_first_chunk_ms,
+                s.streaming_first_reduce_row_ms,
+                s.streaming_lag_ms,
+                s.streaming_buffered_bytes,
+                s.streaming_active_streams,
+            ));
+            if !s.streaming_backpressure_events.is_empty() {
+                out.push_str(&format!(
+                    "  backpressure_events={}\n",
+                    s.streaming_backpressure_events.join(" | ")
+                ));
             }
         }
         out.push_str("operators:\n");
@@ -799,6 +831,12 @@ fn execute_plan_with_cache(
                                     .collect(),
                                 1,
                                 summary.skew_split_tasks,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                Vec::new(),
                             );
                         }
                     }
@@ -5185,6 +5223,12 @@ impl Runtime for DistributedRuntime {
                                 .collect(),
                             sm.layout_finalize_count,
                             sm.skew_split_tasks,
+                            sm.first_chunk_ms,
+                            sm.first_reduce_row_ms,
+                            sm.stream_lag_ms,
+                            sm.stream_buffered_bytes,
+                            sm.stream_active_count,
+                            sm.backpressure_events.clone(),
                         );
                     }
                     let (rows_out, batches_out, bytes_out) = batch_stats(&batches);

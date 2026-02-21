@@ -122,6 +122,12 @@ message StageMetrics {
   uint32 backpressure_queue_depth = 18;
   uint32 map_publish_window_partitions = 19;
   uint32 reduce_fetch_window_partitions = 20;
+  uint64 first_chunk_ms = 21;
+  uint64 first_reduce_row_ms = 22;
+  uint64 stream_lag_ms = 23;
+  uint64 stream_buffered_bytes = 24;
+  uint32 stream_active_count = 25;
+  repeated string backpressure_events = 26;
 }
 
 message PartitionBytesHistogramBucket {

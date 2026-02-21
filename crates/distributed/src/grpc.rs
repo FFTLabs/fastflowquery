@@ -358,6 +358,12 @@ fn proto_query_status(status: CoreQueryStatus) -> v1::QueryStatus {
             backpressure_queue_depth: m.backpressure_queue_depth,
             map_publish_window_partitions: m.map_publish_window_partitions,
             reduce_fetch_window_partitions: m.reduce_fetch_window_partitions,
+            first_chunk_ms: m.first_chunk_ms,
+            first_reduce_row_ms: m.first_reduce_row_ms,
+            stream_lag_ms: m.stream_lag_ms,
+            stream_buffered_bytes: m.stream_buffered_bytes,
+            stream_active_count: m.stream_active_count,
+            backpressure_events: m.backpressure_events,
         })
         .collect::<Vec<_>>();
     stage_metrics.sort_by_key(|m| m.stage_id);
@@ -854,6 +860,24 @@ mod tests {
             direct_stage0.layout_finalize_count
         );
         assert_eq!(grpc_stage0.aqe_events, direct_stage0.aqe_events);
+        assert_eq!(grpc_stage0.first_chunk_ms, direct_stage0.first_chunk_ms);
+        assert_eq!(
+            grpc_stage0.first_reduce_row_ms,
+            direct_stage0.first_reduce_row_ms
+        );
+        assert_eq!(grpc_stage0.stream_lag_ms, direct_stage0.stream_lag_ms);
+        assert_eq!(
+            grpc_stage0.stream_buffered_bytes,
+            direct_stage0.stream_buffered_bytes
+        );
+        assert_eq!(
+            grpc_stage0.stream_active_count,
+            direct_stage0.stream_active_count
+        );
+        assert_eq!(
+            grpc_stage0.backpressure_events,
+            direct_stage0.backpressure_events
+        );
         let grpc_hist = grpc_stage0
             .partition_bytes_histogram
             .iter()
