@@ -12,6 +12,7 @@ qdrant = ["dep:qdrant-client"]
 [dependencies]
 ffq-common = { path = "../common" }
 ffq-execution = { path = "../execution" }
+ffq-planner = { path = "../planner" }
 arrow.workspace = true
 arrow-schema.workspace = true
 parquet.workspace = true

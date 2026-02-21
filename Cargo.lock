@@ -852,6 +852,7 @@ dependencies = [
  "arrow-schema",
  "ffq-common",
  "ffq-execution",
+ "ffq-planner",
  "futures",
  "object_store",
  "parquet",

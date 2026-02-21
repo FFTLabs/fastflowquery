@@ -1,4 +1,5 @@
 use ffq_common::{FfqError, Result};
+use ffq_planner::Expr;
 
 use crate::catalog::TableDef;
 use crate::provider::{Stats, StorageExecNode, StorageProvider};
@@ -24,7 +25,7 @@ impl StorageProvider for ObjectStoreProvider {
         &self,
         table: &TableDef,
         _projection: Option<Vec<String>>,
-        _filters: Vec<String>,
+        _filters: Vec<Expr>,
     ) -> Result<StorageExecNode> {
         Err(FfqError::Unsupported(format!(
             "object-store scan is experimental and not implemented yet for '{}'",

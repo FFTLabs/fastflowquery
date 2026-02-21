@@ -51,6 +51,38 @@ pub struct TableDef {
 }
 
 impl TableDef {
+    /// Returns configured partition columns from table options.
+    ///
+    /// Contract:
+    /// - options key: `partition.columns`
+    /// - value format: comma-separated list (for example `ds,region`)
+    #[must_use]
+    pub fn partition_columns(&self) -> Vec<String> {
+        self.options
+            .get("partition.columns")
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Returns configured partition layout convention.
+    ///
+    /// Supported values:
+    /// - `hive` (default): path segments like `col=value/`
+    #[must_use]
+    pub fn partition_layout(&self) -> String {
+        self.options
+            .get("partition.layout")
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "hive".to_string())
+    }
+
     /// Returns schema as [`SchemaRef`] or an error if missing.
     ///
     /// # Errors
@@ -425,5 +457,26 @@ mod tests {
         assert!(table.schema.is_none());
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_partition_options_contract() {
+        let mut options = std::collections::HashMap::new();
+        options.insert("partition.columns".to_string(), "ds, region".to_string());
+        options.insert("partition.layout".to_string(), "hive".to_string());
+        let table = TableDef {
+            name: "t".to_string(),
+            uri: "./x.parquet".to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: None,
+            stats: crate::TableStats::default(),
+            options,
+        };
+        assert_eq!(
+            table.partition_columns(),
+            vec!["ds".to_string(), "region".to_string()]
+        );
+        assert_eq!(table.partition_layout(), "hive");
     }
 }

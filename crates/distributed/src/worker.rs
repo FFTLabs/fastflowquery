@@ -905,11 +905,7 @@ fn eval_plan_for_stage(
                 table.schema = Some(schema.clone());
             }
             let provider = ParquetProvider::new();
-            let node = provider.scan(
-                &table,
-                scan.projection.clone(),
-                scan.filters.iter().map(|f| format!("{f:?}")).collect(),
-            )?;
+            let node = provider.scan(&table, scan.projection.clone(), scan.filters.clone())?;
             let stream = node.execute(Arc::new(ExecTaskContext {
                 batch_size_rows: ctx.batch_size_rows,
                 mem_budget_bytes: ctx.per_task_memory_budget_bytes,

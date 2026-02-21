@@ -445,11 +445,7 @@ fn execute_plan_with_cache(
             PhysicalPlan::ParquetScan(scan) => {
                 let table = catalog.get(&scan.table)?.clone();
                 let provider = ParquetProvider::new();
-                let node = provider.scan(
-                    &table,
-                    scan.projection,
-                    scan.filters.into_iter().map(|f| format!("{f:?}")).collect(),
-                )?;
+                let node = provider.scan(&table, scan.projection, scan.filters)?;
                 let stream = node.execute(Arc::new(TaskContext {
                     batch_size_rows: ctx.batch_size_rows,
                     mem_budget_bytes: ctx.mem_budget_bytes,

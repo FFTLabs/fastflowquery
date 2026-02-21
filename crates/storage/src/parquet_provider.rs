@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -6,6 +7,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::{FfqError, Result};
 use ffq_execution::{ExecNode, SendableRecordBatchStream, StreamAdapter, TaskContext};
+use ffq_planner::{BinaryOp, Expr, LiteralValue};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
 
@@ -294,7 +296,7 @@ impl StorageProvider for ParquetProvider {
         &self,
         table: &TableDef,
         projection: Option<Vec<String>>,
-        filters: Vec<String>,
+        filters: Vec<Expr>,
     ) -> Result<StorageExecNode> {
         if table.format.to_lowercase() != "parquet" {
             return Err(FfqError::Unsupported(format!(
@@ -303,7 +305,15 @@ impl StorageProvider for ParquetProvider {
             )));
         }
 
-        let paths = table.data_paths()?;
+        let all_paths = table.data_paths()?;
+        let partition_columns = table.partition_columns();
+        let partition_layout = table.partition_layout();
+        let paths =
+            if partition_columns.is_empty() || partition_layout != "hive" || filters.is_empty() {
+                all_paths
+            } else {
+                prune_partition_paths_hive(&all_paths, &partition_columns, &filters)
+            };
         let source_schema = match &table.schema {
             Some(s) => Arc::new(s.clone()),
             None => Arc::new(Self::infer_parquet_schema(&paths)?),
@@ -344,7 +354,7 @@ pub struct ParquetScanNode {
     schema: SchemaRef,
     source_schema: SchemaRef,
     projection_indices: Vec<usize>,
-    filters: Vec<String>,
+    filters: Vec<Expr>,
 }
 
 impl ExecNode for ParquetScanNode {
@@ -397,6 +407,195 @@ impl ExecNode for ParquetScanNode {
             self.schema.clone(),
             futures::stream::iter(out),
         )))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PartitionScalar {
+    Str(String),
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tri {
+    True,
+    False,
+    Unknown,
+}
+
+fn prune_partition_paths_hive(
+    paths: &[String],
+    partition_columns: &[String],
+    filters: &[Expr],
+) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| {
+            let values = parse_hive_partition_values(path, partition_columns);
+            !filters
+                .iter()
+                .any(|f| matches!(eval_partition_predicate(f, &values), Tri::False))
+        })
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+fn parse_hive_partition_values(
+    path: &str,
+    partition_columns: &[String],
+) -> HashMap<String, PartitionScalar> {
+    let mut out = HashMap::new();
+    for segment in path.split('/') {
+        let Some((k, raw_v)) = segment.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        if !partition_columns.iter().any(|c| c == key) {
+            continue;
+        }
+        let value = if raw_v.eq_ignore_ascii_case("true") {
+            PartitionScalar::Bool(true)
+        } else if raw_v.eq_ignore_ascii_case("false") {
+            PartitionScalar::Bool(false)
+        } else if let Ok(v) = raw_v.parse::<i64>() {
+            PartitionScalar::Int(v)
+        } else if let Ok(v) = raw_v.parse::<f64>() {
+            PartitionScalar::Float(v)
+        } else {
+            PartitionScalar::Str(raw_v.to_string())
+        };
+        out.insert(key.to_string(), value);
+    }
+    out
+}
+
+fn eval_partition_predicate(expr: &Expr, values: &HashMap<String, PartitionScalar>) -> Tri {
+    match expr {
+        Expr::And(l, r) => match (
+            eval_partition_predicate(l, values),
+            eval_partition_predicate(r, values),
+        ) {
+            (Tri::False, _) | (_, Tri::False) => Tri::False,
+            (Tri::True, Tri::True) => Tri::True,
+            _ => Tri::Unknown,
+        },
+        Expr::Or(l, r) => match (
+            eval_partition_predicate(l, values),
+            eval_partition_predicate(r, values),
+        ) {
+            (Tri::True, _) | (_, Tri::True) => Tri::True,
+            (Tri::False, Tri::False) => Tri::False,
+            _ => Tri::Unknown,
+        },
+        Expr::Not(inner) => match eval_partition_predicate(inner, values) {
+            Tri::True => Tri::False,
+            Tri::False => Tri::True,
+            Tri::Unknown => Tri::Unknown,
+        },
+        Expr::BinaryOp { left, op, right } => eval_partition_binary(left, *op, right, values),
+        _ => Tri::Unknown,
+    }
+}
+
+fn eval_partition_binary(
+    left: &Expr,
+    op: BinaryOp,
+    right: &Expr,
+    values: &HashMap<String, PartitionScalar>,
+) -> Tri {
+    if let (Some((col, lit)), false) = (
+        column_and_literal(left, right),
+        matches!(
+            op,
+            BinaryOp::Plus | BinaryOp::Minus | BinaryOp::Multiply | BinaryOp::Divide
+        ),
+    ) {
+        return eval_partition_comparison(col, op, lit, values);
+    }
+    if let (Some((col, lit)), false) = (
+        column_and_literal(right, left),
+        matches!(
+            op,
+            BinaryOp::Plus | BinaryOp::Minus | BinaryOp::Multiply | BinaryOp::Divide
+        ),
+    ) {
+        let swapped = match op {
+            BinaryOp::Lt => BinaryOp::Gt,
+            BinaryOp::LtEq => BinaryOp::GtEq,
+            BinaryOp::Gt => BinaryOp::Lt,
+            BinaryOp::GtEq => BinaryOp::LtEq,
+            other => other,
+        };
+        return eval_partition_comparison(col, swapped, lit, values);
+    }
+    Tri::Unknown
+}
+
+fn column_and_literal<'a>(
+    col_expr: &'a Expr,
+    lit_expr: &'a Expr,
+) -> Option<(&'a str, &'a LiteralValue)> {
+    let col = match col_expr {
+        Expr::Column(name) => name.as_str(),
+        Expr::ColumnRef { name, .. } => name.as_str(),
+        _ => return None,
+    };
+    let lit = match lit_expr {
+        Expr::Literal(v) => v,
+        _ => return None,
+    };
+    Some((col, lit))
+}
+
+fn eval_partition_comparison(
+    column: &str,
+    op: BinaryOp,
+    literal: &LiteralValue,
+    values: &HashMap<String, PartitionScalar>,
+) -> Tri {
+    let Some(partition_value) = values.get(column) else {
+        return Tri::Unknown;
+    };
+    let Some(cmp) = compare_partition_value(partition_value, literal) else {
+        return Tri::Unknown;
+    };
+    let matched = match op {
+        BinaryOp::Eq => cmp == 0,
+        BinaryOp::NotEq => cmp != 0,
+        BinaryOp::Lt => cmp < 0,
+        BinaryOp::LtEq => cmp <= 0,
+        BinaryOp::Gt => cmp > 0,
+        BinaryOp::GtEq => cmp >= 0,
+        _ => return Tri::Unknown,
+    };
+    if matched { Tri::True } else { Tri::False }
+}
+
+fn compare_partition_value(left: &PartitionScalar, right: &LiteralValue) -> Option<i8> {
+    match (left, right) {
+        (PartitionScalar::Str(a), LiteralValue::Utf8(b)) => Some(ordering_to_i8(a.cmp(b))),
+        (PartitionScalar::Int(a), LiteralValue::Int64(b)) => Some(ordering_to_i8(a.cmp(b))),
+        (PartitionScalar::Float(a), LiteralValue::Float64(b)) => {
+            a.partial_cmp(b).map(ordering_to_i8)
+        }
+        (PartitionScalar::Int(a), LiteralValue::Float64(b)) => {
+            (*a as f64).partial_cmp(b).map(ordering_to_i8)
+        }
+        (PartitionScalar::Float(a), LiteralValue::Int64(b)) => {
+            a.partial_cmp(&(*b as f64)).map(ordering_to_i8)
+        }
+        (PartitionScalar::Bool(a), LiteralValue::Boolean(b)) => Some(ordering_to_i8(a.cmp(b))),
+        _ => None,
+    }
+}
+
+fn ordering_to_i8(ord: std::cmp::Ordering) -> i8 {
+    match ord {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
     }
 }
 
@@ -523,6 +722,48 @@ mod tests {
 
         let _ = std::fs::remove_file(p1);
         let _ = std::fs::remove_file(p2);
+    }
+
+    #[test]
+    fn partition_pruning_hive_matches_eq_and_range_filters() {
+        let paths = vec![
+            "/tmp/t/ds=2025-01-01/region=us/part-0.parquet".to_string(),
+            "/tmp/t/ds=2025-01-02/region=eu/part-1.parquet".to_string(),
+            "/tmp/t/ds=2025-01-03/region=us/part-2.parquet".to_string(),
+        ];
+        let filters = vec![
+            Expr::BinaryOp {
+                left: Box::new(Expr::Column("region".to_string())),
+                op: BinaryOp::Eq,
+                right: Box::new(Expr::Literal(LiteralValue::Utf8("us".to_string()))),
+            },
+            Expr::BinaryOp {
+                left: Box::new(Expr::Column("ds".to_string())),
+                op: BinaryOp::GtEq,
+                right: Box::new(Expr::Literal(LiteralValue::Utf8("2025-01-02".to_string()))),
+            },
+        ];
+        let pruned =
+            prune_partition_paths_hive(&paths, &["ds".to_string(), "region".to_string()], &filters);
+        assert_eq!(
+            pruned,
+            vec!["/tmp/t/ds=2025-01-03/region=us/part-2.parquet".to_string()]
+        );
+    }
+
+    #[test]
+    fn partition_pruning_keeps_paths_for_unknown_predicates() {
+        let paths = vec![
+            "/tmp/t/ds=2025-01-01/part-0.parquet".to_string(),
+            "/tmp/t/ds=2025-01-02/part-1.parquet".to_string(),
+        ];
+        let filters = vec![Expr::BinaryOp {
+            left: Box::new(Expr::Column("non_partition_col".to_string())),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Literal(LiteralValue::Int64(1))),
+        }];
+        let pruned = prune_partition_paths_hive(&paths, &["ds".to_string()], &filters);
+        assert_eq!(pruned, paths);
     }
 
     fn write_parquet_file(path: &std::path::Path, schema: Arc<Schema>, cols: Vec<ArrayRef>) {
