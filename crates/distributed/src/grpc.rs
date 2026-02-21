@@ -206,6 +206,9 @@ impl ShuffleService for CoordinatorServices {
                 bytes: p.bytes,
                 rows: p.rows,
                 batches: p.batches,
+                stream_epoch: p.stream_epoch,
+                committed_offset: p.committed_offset,
+                finalized: p.finalized,
             })
             .collect();
         let mut coordinator = self.coordinator.lock().await;
@@ -390,6 +393,9 @@ impl ShuffleService for WorkerShuffleService {
                 bytes: p.bytes,
                 rows: p.rows,
                 batches: p.batches,
+                stream_epoch: p.stream_epoch,
+                committed_offset: p.committed_offset,
+                finalized: p.finalized,
             })
             .collect::<Vec<_>>();
         let key = (req.query_id, req.stage_id, req.map_task, req.attempt);
@@ -512,25 +518,37 @@ mod tests {
                         bytes: 8,
                         rows: 1,
                         batches: 1,
-                    },
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+},
                     v1::MapOutputPartition {
                         reduce_partition: 1,
                         bytes: 120,
                         rows: 1,
                         batches: 1,
-                    },
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+},
                     v1::MapOutputPartition {
                         reduce_partition: 2,
                         bytes: 8,
                         rows: 1,
                         batches: 1,
-                    },
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+},
                     v1::MapOutputPartition {
                         reduce_partition: 3,
                         bytes: 8,
                         rows: 1,
                         batches: 1,
-                    },
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+},
                 ],
             }))
             .await

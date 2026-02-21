@@ -165,6 +165,9 @@ message MapOutputPartition {
   uint64 bytes = 2;
   uint64 rows = 3;
   uint64 batches = 4;
+  uint32 stream_epoch = 5;
+  uint64 committed_offset = 6;
+  bool finalized = 7;
 }
 
 message RegisterMapOutputResponse {}

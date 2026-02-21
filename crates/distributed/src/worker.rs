@@ -646,6 +646,9 @@ impl WorkerControlPlane for GrpcControlPlane {
                         bytes: p.bytes,
                         rows: p.rows,
                         batches: p.batches,
+                        stream_epoch: p.stream_epoch,
+                        committed_offset: p.committed_offset,
+                        finalized: p.finalized,
                     })
                     .collect(),
             })
@@ -1520,6 +1523,9 @@ fn write_stage_shuffle_outputs(
             bytes: m.bytes,
             rows: m.rows,
             batches: m.batches,
+            stream_epoch: ctx.attempt,
+            committed_offset: m.bytes,
+            finalized: true,
         })
         .collect::<Vec<_>>();
     let written_bytes = out.iter().map(|m| m.bytes).sum::<u64>();
