@@ -2,7 +2,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use ffq_common::{FfqError, Result};
 use ffq_execution::stream::SendableRecordBatchStream;
-use ffq_planner::{AggExpr, Expr, JoinType, LogicalPlan, PhysicalPlan};
+use ffq_planner::{AggExpr, Expr, JoinType, LogicalPlan};
 use ffq_storage::parquet_provider::ParquetProvider;
 use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
@@ -386,7 +386,7 @@ impl DataFrame {
             (analyzed, std::sync::Arc::new((*cat_guard).clone()))
         };
 
-        let mut physical = self.session.planner.create_physical_plan(&analyzed)?;
+        let physical = self.session.planner.create_physical_plan(&analyzed)?;
         #[cfg(feature = "vector")]
         if let Some(overrides) = vector_overrides {
             apply_vector_knn_overrides(&mut physical, &overrides)?;

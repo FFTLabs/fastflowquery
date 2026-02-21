@@ -470,7 +470,14 @@ pub(crate) fn maybe_collect_parquet_file_stats_on_register(table: &mut TableDef)
         return Ok(false);
     }
     let paths = table.data_paths()?;
-    let file_stats = ParquetProvider::collect_parquet_file_stats(&paths)?;
+    let file_stats = match ParquetProvider::collect_parquet_file_stats(&paths) {
+        Ok(stats) => stats,
+        Err(e) if table.schema.is_some() && is_missing_parquet_path_error(&e) => {
+            // Allow registering parquet sink targets before INSERT creates output path(s).
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
     if file_stats.is_empty() {
         return Ok(false);
     }
@@ -484,6 +491,17 @@ pub(crate) fn maybe_collect_parquet_file_stats_on_register(table: &mut TableDef)
     table.stats.bytes = Some(total_bytes);
     annotate_parquet_file_stats_metadata(table, &file_stats)?;
     Ok(true)
+}
+
+fn is_missing_parquet_path_error(err: &ffq_common::FfqError) -> bool {
+    match err {
+        ffq_common::FfqError::InvalidConfig(msg) => {
+            msg.contains("failed to stat parquet path")
+                && msg.contains("No such file or directory")
+        }
+        ffq_common::FfqError::Io(ioe) => ioe.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
 }
 
 pub(crate) fn annotate_parquet_file_stats_metadata(

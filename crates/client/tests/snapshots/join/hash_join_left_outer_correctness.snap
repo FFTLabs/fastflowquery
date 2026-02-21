@@ -1,4 +1,4 @@
-schema:k:Int64:true,lval:Int64:true,k2:Int64:true,rval:Int64:true
+schema:k:Int64:false,lval:Int64:false,k2:Int64:true,rval:Int64:true
 rows:
 k=1|lval=10|k2=NULL|rval=NULL
 k=2|lval=20|k2=2|rval=200

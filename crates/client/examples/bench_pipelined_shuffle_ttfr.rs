@@ -1,3 +1,13 @@
+#[cfg(not(feature = "distributed"))]
+fn main() {
+    eprintln!(
+        "bench_pipelined_shuffle_ttfr requires the `distributed` feature.\nrun with: cargo run -p ffq-client --example bench_pipelined_shuffle_ttfr --features distributed"
+    );
+    std::process::exit(1);
+}
+
+#[cfg(feature = "distributed")]
+mod imp {
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -50,7 +60,7 @@ struct Artifact {
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+pub async fn run() -> Result<()> {
     let opts = parse_args(std::env::args().skip(1).collect())?;
     fs::create_dir_all(&opts.out_dir)?;
 
@@ -486,4 +496,10 @@ fn render_csv(a: &Artifact) -> String {
         a.throughput_regression_pct
     ));
     out
+}
+} // mod imp
+
+#[cfg(feature = "distributed")]
+fn main() -> ffq_common::Result<()> {
+    imp::run()
 }
