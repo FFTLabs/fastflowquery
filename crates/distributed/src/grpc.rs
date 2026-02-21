@@ -241,7 +241,9 @@ impl ShuffleService for CoordinatorServices {
                 req.stage_id,
                 req.map_task,
                 req.attempt,
+                req.layout_version,
                 req.reduce_partition,
+                req.min_stream_epoch,
                 req.start_offset,
                 req.max_bytes,
             )
@@ -255,6 +257,7 @@ impl ShuffleService for CoordinatorServices {
                 end_offset: c.end_offset,
                 watermark_offset: c.watermark_offset,
                 finalized: c.finalized,
+                stream_epoch: c.stream_epoch,
             })
         });
         Ok(Response::new(Box::pin(stream::iter(out))))
@@ -374,6 +377,7 @@ fn to_status(err: ffq_common::FfqError) -> Status {
 pub struct WorkerShuffleService {
     shuffle_root: PathBuf,
     map_outputs: Arc<Mutex<HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>>>,
+    layout_versions: Arc<Mutex<HashMap<(String, u64, u64, u32), u32>>>,
 }
 
 impl WorkerShuffleService {
@@ -382,6 +386,7 @@ impl WorkerShuffleService {
         Self {
             shuffle_root: shuffle_root.into(),
             map_outputs: Arc::new(Mutex::new(HashMap::new())),
+            layout_versions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -407,6 +412,14 @@ impl ShuffleService for WorkerShuffleService {
             })
             .collect::<Vec<_>>();
         let key = (req.query_id, req.stage_id, req.map_task, req.attempt);
+        let mut versions = self.layout_versions.lock().await;
+        if let Some(existing) = versions.get(&key)
+            && req.layout_version < *existing
+        {
+            return Ok(Response::new(v1::RegisterMapOutputResponse {}));
+        }
+        versions.insert(key.clone(), req.layout_version);
+        drop(versions);
         self.map_outputs.lock().await.insert(key, partitions);
         Ok(Response::new(v1::RegisterMapOutputResponse {}))
     }
@@ -423,6 +436,23 @@ impl ShuffleService for WorkerShuffleService {
             .query_id
             .parse::<u64>()
             .map_err(|e| Status::invalid_argument(format!("query_id must be numeric: {e}")))?;
+        let meta_key = (
+            req.query_id.clone(),
+            req.stage_id,
+            req.map_task,
+            req.attempt,
+        );
+        if req.layout_version != 0 {
+            let versions = self.layout_versions.lock().await;
+            if let Some(stored) = versions.get(&meta_key)
+                && *stored != req.layout_version
+            {
+                return Err(Status::failed_precondition(format!(
+                    "stale fetch layout version: requested={} stored={}",
+                    req.layout_version, stored
+                )));
+            }
+        }
         let reader = ShuffleReader::new(&self.shuffle_root);
         let (attempt, chunks) = if req.attempt == 0 {
             let attempt = reader
@@ -458,7 +488,7 @@ impl ShuffleService for WorkerShuffleService {
             (req.attempt, chunks)
         };
 
-        let meta_key = (req.query_id, req.stage_id, req.map_task, attempt);
+        let meta_key = (meta_key.0, meta_key.1, meta_key.2, attempt);
         let part_meta = self
             .map_outputs
             .lock()
@@ -470,9 +500,16 @@ impl ShuffleService for WorkerShuffleService {
                     .find(|p| p.reduce_partition == req.reduce_partition)
                     .cloned()
             });
-        let (watermark_offset, finalized) = part_meta
-            .map(|m| (m.committed_offset, m.finalized))
-            .unwrap_or((0, false));
+        let (watermark_offset, finalized, stream_epoch) = part_meta
+            .as_ref()
+            .map(|m| (m.committed_offset, m.finalized, m.stream_epoch))
+            .unwrap_or((0, false, 0));
+        if stream_epoch < req.min_stream_epoch {
+            return Err(Status::failed_precondition(format!(
+                "stale fetch stream epoch: requested>={} available={}",
+                req.min_stream_epoch, stream_epoch
+            )));
+        }
         let readable_end = watermark_offset;
         let start = req.start_offset.min(readable_end);
         let requested = if start >= readable_end {
@@ -490,6 +527,7 @@ impl ShuffleService for WorkerShuffleService {
                 payload: Vec::new(),
                 watermark_offset,
                 finalized,
+                stream_epoch,
             })]
         } else {
             let end_limit = start.saturating_add(requested);
@@ -510,6 +548,7 @@ impl ShuffleService for WorkerShuffleService {
                         payload,
                         watermark_offset,
                         finalized,
+                        stream_epoch,
                     }))
                 })
                 .collect::<Vec<_>>();
@@ -520,6 +559,7 @@ impl ShuffleService for WorkerShuffleService {
                     payload: Vec::new(),
                     watermark_offset,
                     finalized,
+                    stream_epoch,
                 })]
             } else {
                 filtered
@@ -784,6 +824,8 @@ mod tests {
                 reduce_partition,
                 start_offset: 8,
                 max_bytes: 10,
+                layout_version: 1,
+                min_stream_epoch: 1,
             }))
             .await
             .expect("fetch");
@@ -870,6 +912,8 @@ mod tests {
                 reduce_partition,
                 start_offset: 0,
                 max_bytes: 0,
+                layout_version: 1,
+                min_stream_epoch: 1,
             }))
             .await
             .expect("fetch partial bytes")
@@ -895,6 +939,8 @@ mod tests {
                 reduce_partition,
                 start_offset: 8,
                 max_bytes: 0,
+                layout_version: 1,
+                min_stream_epoch: 1,
             }))
             .await
             .expect("fetch eof marker")
@@ -939,6 +985,8 @@ mod tests {
                 reduce_partition,
                 start_offset: 32,
                 max_bytes: 0,
+                layout_version: 1,
+                min_stream_epoch: 1,
             }))
             .await
             .expect("fetch final eof marker")
@@ -953,6 +1001,40 @@ mod tests {
         assert_eq!(c3[0].end_offset, 32);
         assert_eq!(c3[0].watermark_offset, 32);
         assert!(c3[0].finalized);
+
+        let stale_epoch_err = svc
+            .fetch_shuffle_partition(Request::new(v1::FetchShufflePartitionRequest {
+                query_id: query_id.clone(),
+                stage_id,
+                map_task,
+                attempt,
+                reduce_partition,
+                start_offset: 0,
+                max_bytes: 1,
+                layout_version: 1,
+                min_stream_epoch: 2,
+            }))
+            .await
+            .err()
+            .expect("stale epoch fetch should fail");
+        assert_eq!(stale_epoch_err.code(), tonic::Code::FailedPrecondition);
+
+        let stale_layout_err = svc
+            .fetch_shuffle_partition(Request::new(v1::FetchShufflePartitionRequest {
+                query_id: query_id.clone(),
+                stage_id,
+                map_task,
+                attempt,
+                reduce_partition,
+                start_offset: 0,
+                max_bytes: 1,
+                layout_version: 999,
+                min_stream_epoch: 1,
+            }))
+            .await
+            .err()
+            .expect("stale layout fetch should fail");
+        assert_eq!(stale_layout_err.code(), tonic::Code::FailedPrecondition);
 
         let _ = fs::remove_dir_all(&base);
     }

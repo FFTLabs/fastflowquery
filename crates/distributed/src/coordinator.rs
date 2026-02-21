@@ -226,6 +226,8 @@ pub struct ShuffleFetchChunk {
     pub watermark_offset: u64,
     /// Whether this partition stream is finalized for the selected attempt.
     pub finalized: bool,
+    /// Stream epoch of the partition metadata used for this chunk.
+    pub stream_epoch: u32,
 }
 
 fn sanitize_map_output_partition_meta(mut p: MapOutputPartitionMeta) -> MapOutputPartitionMeta {
@@ -1231,10 +1233,28 @@ impl Coordinator {
         stage_id: u64,
         map_task: u64,
         attempt: u32,
+        layout_version: u32,
         reduce_partition: u32,
+        min_stream_epoch: u32,
         start_offset: u64,
         max_bytes: u64,
     ) -> Result<Vec<ShuffleFetchChunk>> {
+        if layout_version != 0 {
+            let query = self
+                .queries
+                .get(query_id)
+                .ok_or_else(|| FfqError::Planning(format!("unknown query: {query_id}")))?;
+            let key = (stage_id, map_task, attempt);
+            let expected = query.tasks.get(&key).ok_or_else(|| {
+                FfqError::Planning("task attempt not found for fetch request".to_string())
+            })?;
+            if expected.layout_version != layout_version {
+                return Err(FfqError::Planning(format!(
+                    "stale fetch layout version: requested={} expected={}",
+                    layout_version, expected.layout_version
+                )));
+            }
+        }
         let key = (query_id.to_string(), stage_id, map_task, attempt);
         let parts = self.map_outputs.get(&key).ok_or_else(|| {
             FfqError::Planning("map output not registered for requested attempt".to_string())
@@ -1252,6 +1272,12 @@ impl Coordinator {
                 committed_offset: 0,
                 finalized: false,
             });
+        if part_meta.stream_epoch < min_stream_epoch {
+            return Err(FfqError::Planning(format!(
+                "stale fetch stream epoch: requested>={} available={}",
+                min_stream_epoch, part_meta.stream_epoch
+            )));
+        }
 
         let query_num = query_id.parse::<u64>().map_err(|e| {
             FfqError::InvalidConfig(format!(
@@ -1268,6 +1294,7 @@ impl Coordinator {
                 end_offset: start,
                 watermark_offset: readable_end,
                 finalized: part_meta.finalized,
+                stream_epoch: part_meta.stream_epoch,
             }]);
         }
         let requested = if max_bytes == 0 {
@@ -1292,6 +1319,7 @@ impl Coordinator {
                 start_offset: c.start_offset,
                 watermark_offset: part_meta.committed_offset,
                 finalized: part_meta.finalized,
+                stream_epoch: part_meta.stream_epoch,
             })
             .collect::<Vec<_>>();
         if out.is_empty() {
@@ -1301,6 +1329,7 @@ impl Coordinator {
                 end_offset: start,
                 watermark_offset: readable_end,
                 finalized: part_meta.finalized,
+                stream_epoch: part_meta.stream_epoch,
             }]);
         }
         Ok(out)

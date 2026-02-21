@@ -180,6 +180,8 @@ message FetchShufflePartitionRequest {
   uint32 reduce_partition = 5;
   uint64 start_offset = 6;
   uint64 max_bytes = 7;
+  uint32 layout_version = 8;
+  uint32 min_stream_epoch = 9;
 }
 
 message ShufflePartitionChunk {
@@ -188,6 +190,7 @@ message ShufflePartitionChunk {
   uint64 end_offset = 3;
   uint64 watermark_offset = 4;
   bool finalized = 5;
+  uint32 stream_epoch = 6;
 }
 
 message HeartbeatRequest {
