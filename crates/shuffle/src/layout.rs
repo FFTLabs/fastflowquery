@@ -37,6 +37,19 @@ pub fn index_bin_path(query_id: u64, stage_id: u64, map_task: u64, attempt: u32)
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+/// Compression codec for on-disk shuffle partition payloads.
+pub enum ShuffleCompressionCodec {
+    /// Store payload as raw Arrow IPC stream bytes.
+    #[default]
+    None,
+    /// Store payload as LZ4 frame-compressed bytes.
+    Lz4,
+    /// Store payload as Zstd-compressed bytes.
+    Zstd,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Metadata describing one map-output partition artifact.
 pub struct ShufflePartitionMeta {
@@ -46,6 +59,15 @@ pub struct ShufflePartitionMeta {
     pub file: String,
     /// Payload size in bytes.
     pub bytes: u64,
+    /// Compressed payload bytes (excluding framing header).
+    #[serde(default)]
+    pub compressed_bytes: u64,
+    /// Uncompressed Arrow IPC payload bytes.
+    #[serde(default)]
+    pub uncompressed_bytes: u64,
+    /// Compression codec used for this partition payload.
+    #[serde(default)]
+    pub codec: ShuffleCompressionCodec,
     /// Row count in payload.
     pub rows: u64,
     /// Batch count in payload.

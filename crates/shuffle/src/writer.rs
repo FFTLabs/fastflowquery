@@ -5,17 +5,23 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::record_batch::RecordBatch;
 use ffq_common::{FfqError, Result};
+use lz4_flex::frame::FrameEncoder;
 
 use crate::layout::{
-    MapTaskIndex, ShufflePartitionMeta, index_bin_path, index_json_path, map_task_dir, shuffle_path,
+    MapTaskIndex, ShuffleCompressionCodec, ShufflePartitionMeta, index_bin_path, index_json_path,
+    map_task_dir, shuffle_path,
 };
 
 const INDEX_BIN_MAGIC: &[u8; 4] = b"FFQI";
 const INDEX_BIN_VERSION: u32 = 1;
+const SHUFFLE_PAYLOAD_MAGIC: &[u8; 4] = b"FFQS";
+const SHUFFLE_PAYLOAD_VERSION: u8 = 1;
+const SHUFFLE_PAYLOAD_HEADER_LEN: usize = 24;
 
 /// Writes shuffle partition payloads and map-task index metadata.
 pub struct ShuffleWriter {
     root_dir: PathBuf,
+    compression_codec: ShuffleCompressionCodec,
 }
 
 impl ShuffleWriter {
@@ -23,7 +29,14 @@ impl ShuffleWriter {
     pub fn new(root_dir: impl Into<PathBuf>) -> Self {
         Self {
             root_dir: root_dir.into(),
+            compression_codec: ShuffleCompressionCodec::None,
         }
+    }
+
+    /// Configure compression codec for partition payloads written by this writer.
+    pub fn with_compression_codec(mut self, codec: ShuffleCompressionCodec) -> Self {
+        self.compression_codec = codec;
+        self
     }
 
     /// Write one reduce partition payload as Arrow IPC and return its metadata.
@@ -46,19 +59,19 @@ impl ShuffleWriter {
             FfqError::InvalidConfig("shuffle partition cannot be empty".to_string())
         })?;
 
+        let ipc_payload = encode_ipc_payload(batches, schema.as_ref())?;
+        let uncompressed_bytes = ipc_payload.len() as u64;
+        let compressed_payload = compress_ipc_payload(&ipc_payload, self.compression_codec)?;
+        let compressed_bytes = compressed_payload.len() as u64;
+        let framed_payload = frame_payload(
+            self.compression_codec,
+            uncompressed_bytes,
+            compressed_bytes,
+            &compressed_payload,
+        );
+
         let mut file = File::create(&abs)?;
-        {
-            let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut file, schema.as_ref())
-                .map_err(|e| FfqError::Execution(format!("ipc writer init failed: {e}")))?;
-            for b in batches {
-                writer
-                    .write(b)
-                    .map_err(|e| FfqError::Execution(format!("ipc write failed: {e}")))?;
-            }
-            writer
-                .finish()
-                .map_err(|e| FfqError::Execution(format!("ipc finish failed: {e}")))?;
-        }
+        file.write_all(&framed_payload)?;
         file.flush()?;
 
         let bytes = fs::metadata(&abs)?.len();
@@ -69,6 +82,9 @@ impl ShuffleWriter {
             reduce_partition,
             file: rel,
             bytes,
+            compressed_bytes,
+            uncompressed_bytes,
+            codec: self.compression_codec,
             rows,
             batches: batches_count,
         })
@@ -208,6 +224,65 @@ fn to_unix_ms(ts: SystemTime) -> Result<u64> {
         .map_err(|e| FfqError::Execution(format!("clock error: {e}")))
 }
 
+fn encode_ipc_payload(batches: &[RecordBatch], schema: &arrow::datatypes::Schema) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut out, schema)
+            .map_err(|e| FfqError::Execution(format!("ipc writer init failed: {e}")))?;
+        for b in batches {
+            writer
+                .write(b)
+                .map_err(|e| FfqError::Execution(format!("ipc write failed: {e}")))?;
+        }
+        writer
+            .finish()
+            .map_err(|e| FfqError::Execution(format!("ipc finish failed: {e}")))?;
+    }
+    Ok(out)
+}
+
+fn compress_ipc_payload(payload: &[u8], codec: ShuffleCompressionCodec) -> Result<Vec<u8>> {
+    match codec {
+        ShuffleCompressionCodec::None => Ok(payload.to_vec()),
+        ShuffleCompressionCodec::Lz4 => {
+            let mut encoder = FrameEncoder::new(Vec::new());
+            encoder
+                .write_all(payload)
+                .map_err(|e| FfqError::Execution(format!("lz4 encode failed: {e}")))?;
+            encoder
+                .finish()
+                .map_err(|e| FfqError::Execution(format!("lz4 finalize failed: {e}")))
+        }
+        ShuffleCompressionCodec::Zstd => zstd::stream::encode_all(payload, 0)
+            .map_err(|e| FfqError::Execution(format!("zstd encode failed: {e}"))),
+    }
+}
+
+fn codec_to_u8(codec: ShuffleCompressionCodec) -> u8 {
+    match codec {
+        ShuffleCompressionCodec::None => 0,
+        ShuffleCompressionCodec::Lz4 => 1,
+        ShuffleCompressionCodec::Zstd => 2,
+    }
+}
+
+fn frame_payload(
+    codec: ShuffleCompressionCodec,
+    uncompressed_bytes: u64,
+    compressed_bytes: u64,
+    compressed_payload: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SHUFFLE_PAYLOAD_HEADER_LEN + compressed_payload.len());
+    out.extend_from_slice(SHUFFLE_PAYLOAD_MAGIC);
+    out.push(SHUFFLE_PAYLOAD_VERSION);
+    out.push(codec_to_u8(codec));
+    out.extend_from_slice(&[0_u8, 0_u8]);
+    out.extend_from_slice(&uncompressed_bytes.to_le_bytes());
+    out.extend_from_slice(&compressed_bytes.to_le_bytes());
+    out.extend_from_slice(compressed_payload);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -218,7 +293,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
 
-    use crate::layout::{MapTaskIndex, index_json_path};
+    use crate::layout::{MapTaskIndex, ShuffleCompressionCodec, index_json_path};
     use crate::reader::ShuffleReader;
 
     use super::ShuffleWriter;
@@ -234,7 +309,7 @@ mod tests {
     #[test]
     fn writes_index_and_reads_partition_from_streamed_chunks() {
         let root = temp_shuffle_root();
-        let writer = ShuffleWriter::new(&root);
+        let writer = ShuffleWriter::new(&root).with_compression_codec(ShuffleCompressionCodec::Lz4);
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
@@ -255,6 +330,8 @@ mod tests {
         let reader = ShuffleReader::new(&root).with_fetch_chunk_bytes(7);
         let read_meta = reader.partition_meta(100, 2, 7, 1, 3).expect("read meta");
         assert_eq!(read_meta.bytes, meta.bytes);
+        assert_eq!(read_meta.codec, ShuffleCompressionCodec::Lz4);
+        assert!(read_meta.uncompressed_bytes >= read_meta.compressed_bytes);
 
         let chunks = reader
             .fetch_partition_chunks(100, 2, 7, 1, 3)

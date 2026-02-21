@@ -829,9 +829,11 @@ version = "2.0.0"
 dependencies = [
  "arrow",
  "ffq-common",
+ "lz4_flex",
  "serde",
  "serde_json",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

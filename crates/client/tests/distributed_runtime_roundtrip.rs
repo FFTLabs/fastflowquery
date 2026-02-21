@@ -22,6 +22,7 @@ use ffq_distributed::{
 #[cfg(feature = "vector")]
 use ffq_planner::LiteralValue;
 use ffq_storage::{TableDef, TableStats};
+use ffq_shuffle::ShuffleCompressionCodec;
 use parquet::arrow::ArrowWriter;
 use tokio::sync::Mutex;
 use tonic::transport::Server;
@@ -426,6 +427,7 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
             join_radix_bits: 8,
             join_bloom_enabled: true,
             join_bloom_bits: 20,
+            shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
         },
@@ -440,6 +442,7 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
             join_radix_bits: 8,
             join_bloom_enabled: true,
             join_bloom_bits: 20,
+            shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
         },
@@ -992,6 +995,7 @@ async fn distributed_runtime_no_schema_parity_matches_embedded() {
             join_radix_bits: 8,
             join_bloom_enabled: true,
             join_bloom_bits: 20,
+            shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
         },
@@ -1006,6 +1010,7 @@ async fn distributed_runtime_no_schema_parity_matches_embedded() {
             join_radix_bits: 8,
             join_bloom_enabled: true,
             join_bloom_bits: 20,
+            shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
         },
@@ -1173,6 +1178,7 @@ async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
             join_radix_bits: 8,
             join_bloom_enabled: true,
             join_bloom_bits: 20,
+            shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
         },
@@ -1187,6 +1193,7 @@ async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
             join_radix_bits: 8,
             join_bloom_enabled: true,
             join_bloom_bits: 20,
+            shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
         },

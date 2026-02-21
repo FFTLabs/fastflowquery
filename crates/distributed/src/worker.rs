@@ -41,6 +41,7 @@ use ffq_planner::{
     WindowFunction, WindowOrderExpr,
 };
 use ffq_shuffle::{ShuffleReader, ShuffleWriter};
+use ffq_shuffle::ShuffleCompressionCodec;
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
 use ffq_storage::qdrant_provider::QdrantProvider;
@@ -73,6 +74,8 @@ pub struct WorkerConfig {
     pub join_bloom_enabled: bool,
     /// Bloom filter bit-width as log2(number_of_bits) for join prefiltering.
     pub join_bloom_bits: u8,
+    /// Shuffle partition payload compression codec.
+    pub shuffle_compression_codec: ShuffleCompressionCodec,
     /// Local spill directory for memory-pressure fallback paths.
     pub spill_dir: PathBuf,
     /// Root directory containing shuffle data.
@@ -88,6 +91,7 @@ impl Default for WorkerConfig {
             join_radix_bits: 8,
             join_bloom_enabled: true,
             join_bloom_bits: 20,
+            shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
             spill_dir: PathBuf::from(".ffq_spill"),
             shuffle_root: PathBuf::from("."),
         }
@@ -113,6 +117,8 @@ pub struct TaskContext {
     pub join_bloom_enabled: bool,
     /// Bloom filter bit-width as log2(number_of_bits) for join prefiltering.
     pub join_bloom_bits: u8,
+    /// Shuffle partition payload compression codec.
+    pub shuffle_compression_codec: ShuffleCompressionCodec,
     /// Local spill directory.
     pub spill_dir: PathBuf,
     /// Root directory containing shuffle data.
@@ -374,6 +380,7 @@ where
                 join_radix_bits: self.config.join_radix_bits,
                 join_bloom_enabled: self.config.join_bloom_enabled,
                 join_bloom_bits: self.config.join_bloom_bits,
+                shuffle_compression_codec: self.config.shuffle_compression_codec,
                 spill_dir: self.config.spill_dir.clone(),
                 shuffle_root: self.config.shuffle_root.clone(),
                 assigned_reduce_partitions: assignment.assigned_reduce_partitions.clone(),
@@ -1449,7 +1456,8 @@ fn write_stage_shuffle_outputs(
     ctx: &TaskContext,
 ) -> Result<Vec<MapOutputPartitionMeta>> {
     let started = Instant::now();
-    let writer = ShuffleWriter::new(&ctx.shuffle_root);
+    let writer = ShuffleWriter::new(&ctx.shuffle_root)
+        .with_compression_codec(ctx.shuffle_compression_codec);
     let partitioned = partition_batches(child, partitioning)?;
     let mut metas = Vec::new();
     for (reduce, batches) in partitioned {

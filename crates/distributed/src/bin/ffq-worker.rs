@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use ffq_distributed::grpc::{ShuffleServiceServer, WorkerShuffleService};
 use ffq_distributed::{DefaultTaskExecutor, GrpcControlPlane, Worker, WorkerConfig};
+use ffq_shuffle::ShuffleCompressionCodec;
 use ffq_storage::Catalog;
 use tonic::transport::Server;
 
@@ -24,6 +25,15 @@ fn env_u64_or_default(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+fn parse_shuffle_codec(raw: &str) -> ShuffleCompressionCodec {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" => ShuffleCompressionCodec::None,
+        "lz4" => ShuffleCompressionCodec::Lz4,
+        "zstd" => ShuffleCompressionCodec::Zstd,
+        _ => ShuffleCompressionCodec::Lz4,
+    }
 }
 
 fn load_catalog(path: Option<String>) -> Result<Catalog, Box<dyn std::error::Error>> {
@@ -49,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let per_task_memory_budget_bytes =
         env_usize_or_default("FFQ_WORKER_MEM_BUDGET_BYTES", 64 * 1024 * 1024);
     let poll_ms = env_u64_or_default("FFQ_WORKER_POLL_MS", 20);
+    let shuffle_codec = parse_shuffle_codec(&env_or_default("FFQ_SHUFFLE_COMPRESSION", "lz4"));
     let catalog_path = env::var("FFQ_WORKER_CATALOG_PATH").ok();
 
     std::fs::create_dir_all(&shuffle_root)?;
@@ -62,8 +73,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             worker_id: worker_id.clone(),
             cpu_slots,
             per_task_memory_budget_bytes,
+            shuffle_compression_codec: shuffle_codec,
             spill_dir: spill_dir.clone().into(),
             shuffle_root: shuffle_root.clone().into(),
+            ..WorkerConfig::default()
         },
         control_plane,
         task_executor,

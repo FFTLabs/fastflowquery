@@ -1,17 +1,20 @@
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 
 use arrow::record_batch::RecordBatch;
 use ffq_common::{FfqError, Result};
+use lz4_flex::frame::FrameDecoder;
 
 use crate::layout::{
-    MapTaskIndex, ShufflePartitionMeta, index_bin_path, index_json_path, map_task_base_dir,
-    shuffle_path,
+    MapTaskIndex, ShuffleCompressionCodec, ShufflePartitionMeta, index_bin_path, index_json_path,
+    map_task_base_dir, shuffle_path,
 };
 
 const INDEX_BIN_MAGIC: &[u8; 4] = b"FFQI";
 const INDEX_BIN_HEADER_LEN: usize = 12;
+const SHUFFLE_PAYLOAD_MAGIC: &[u8; 4] = b"FFQS";
+const SHUFFLE_PAYLOAD_HEADER_LEN: usize = 24;
 
 /// Reads shuffle partitions and index metadata from local storage.
 pub struct ShuffleReader {
@@ -129,8 +132,8 @@ impl ShuffleReader {
         reduce_partition: u32,
     ) -> Result<Vec<RecordBatch>> {
         let rel = shuffle_path(query_id, stage_id, map_task, attempt, reduce_partition);
-        let bytes = fs::read(self.root_dir.join(rel))?;
-        decode_ipc_bytes(&bytes)
+        let file = fs::File::open(self.root_dir.join(rel))?;
+        decode_partition_payload(file)
     }
 
     /// Read partition payload using the newest available attempt.
@@ -196,18 +199,130 @@ impl ShuffleReader {
         &self,
         chunks: impl IntoIterator<Item = Vec<u8>>,
     ) -> Result<Vec<RecordBatch>> {
-        let payload = chunks.into_iter().flatten().collect::<Vec<_>>();
-        decode_ipc_bytes(&payload)
+        let reader = ChunkedReader::new(chunks.into_iter().collect());
+        decode_partition_payload(reader)
     }
 }
 
 fn decode_ipc_bytes(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
-    let cur = Cursor::new(bytes.to_vec());
-    let reader = arrow::ipc::reader::StreamReader::try_new(cur, None)
+    decode_ipc_read(Cursor::new(bytes.to_vec()))
+}
+
+fn decode_ipc_read<R: Read>(reader: R) -> Result<Vec<RecordBatch>> {
+    let reader = arrow::ipc::reader::StreamReader::try_new(reader, None)
         .map_err(|e| FfqError::Execution(format!("ipc reader init failed: {e}")))?;
     reader
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| FfqError::Execution(format!("ipc read failed: {e}")))
+}
+
+fn decode_partition_payload<R: Read>(mut reader: R) -> Result<Vec<RecordBatch>> {
+    let mut magic = [0_u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != SHUFFLE_PAYLOAD_MAGIC {
+        let mut legacy = magic.to_vec();
+        reader.read_to_end(&mut legacy)?;
+        return decode_ipc_bytes(&legacy);
+    }
+
+    let mut rest_header = [0_u8; SHUFFLE_PAYLOAD_HEADER_LEN - 4];
+    reader.read_exact(&mut rest_header)?;
+    let version = rest_header[0];
+    if version != 1 {
+        return Err(FfqError::Execution(format!(
+            "unsupported shuffle payload version {version}"
+        )));
+    }
+    let codec = codec_from_u8(rest_header[1])?;
+    let _uncompressed_bytes = u64::from_le_bytes([
+        rest_header[4],
+        rest_header[5],
+        rest_header[6],
+        rest_header[7],
+        rest_header[8],
+        rest_header[9],
+        rest_header[10],
+        rest_header[11],
+    ]);
+    let compressed_bytes = u64::from_le_bytes([
+        rest_header[12],
+        rest_header[13],
+        rest_header[14],
+        rest_header[15],
+        rest_header[16],
+        rest_header[17],
+        rest_header[18],
+        rest_header[19],
+    ]);
+    let mut limited = reader.take(compressed_bytes);
+    match codec {
+        ShuffleCompressionCodec::None => decode_ipc_read(&mut limited),
+        ShuffleCompressionCodec::Lz4 => {
+            let decoder = FrameDecoder::new(&mut limited);
+            decode_ipc_read(decoder)
+        }
+        ShuffleCompressionCodec::Zstd => {
+            let decoder = zstd::stream::read::Decoder::new(&mut limited)
+                .map_err(|e| FfqError::Execution(format!("zstd decode init failed: {e}")))?;
+            decode_ipc_read(decoder)
+        }
+    }
+}
+
+fn codec_from_u8(raw: u8) -> Result<ShuffleCompressionCodec> {
+    match raw {
+        0 => Ok(ShuffleCompressionCodec::None),
+        1 => Ok(ShuffleCompressionCodec::Lz4),
+        2 => Ok(ShuffleCompressionCodec::Zstd),
+        other => Err(FfqError::Execution(format!(
+            "unsupported shuffle payload codec {other}"
+        ))),
+    }
+}
+
+struct ChunkedReader {
+    chunks: Vec<Vec<u8>>,
+    chunk_idx: usize,
+    chunk_offset: usize,
+}
+
+impl ChunkedReader {
+    fn new(chunks: Vec<Vec<u8>>) -> Self {
+        Self {
+            chunks,
+            chunk_idx: 0,
+            chunk_offset: 0,
+        }
+    }
+}
+
+impl Read for ChunkedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0;
+        while written < buf.len() && self.chunk_idx < self.chunks.len() {
+            let chunk = &self.chunks[self.chunk_idx];
+            if self.chunk_offset >= chunk.len() {
+                self.chunk_idx += 1;
+                self.chunk_offset = 0;
+                continue;
+            }
+            let remain_chunk = chunk.len() - self.chunk_offset;
+            let remain_buf = buf.len() - written;
+            let take = remain_chunk.min(remain_buf);
+            buf[written..written + take]
+                .copy_from_slice(&chunk[self.chunk_offset..self.chunk_offset + take]);
+            written += take;
+            self.chunk_offset += take;
+            if self.chunk_offset >= chunk.len() {
+                self.chunk_idx += 1;
+                self.chunk_offset = 0;
+            }
+        }
+        Ok(written)
+    }
 }
 
 fn decode_index_binary(bytes: &[u8]) -> Result<MapTaskIndex> {
