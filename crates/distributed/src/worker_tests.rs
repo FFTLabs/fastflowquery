@@ -737,7 +737,7 @@ fn shuffle_read_incremental_cursor_reads_only_unseen_bytes() {
     let target = metas[0].reduce_partition;
 
     let reader = ShuffleReader::new(&shuffle_root);
-    let mut cursors = HashMap::<u32, u64>::new();
+    let mut cursors = HashMap::<u32, (u32, u64)>::new();
 
     let (_attempt, first_batches) =
         read_partition_incremental_latest(&reader, 5004, 1, 0, target, &mut cursors)
@@ -758,6 +758,92 @@ fn shuffle_read_incremental_cursor_reads_only_unseen_bytes() {
     assert_eq!(
         second_rows, 0,
         "second incremental read should not decode already consumed bytes"
+    );
+
+    let _ = std::fs::remove_dir_all(shuffle_root);
+}
+
+#[test]
+fn shuffle_read_incremental_cursor_resets_when_latest_attempt_changes() {
+    let shuffle_root = unique_path("ffq_shuffle_retry_cursor_reset", "dir");
+    let _ = std::fs::create_dir_all(&shuffle_root);
+    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+    let partitioning = ffq_planner::PartitioningSpec::HashKeys {
+        keys: vec!["k".to_string()],
+        partitions: 1,
+    };
+
+    let base_ctx = TaskContext {
+        query_id: "5006".to_string(),
+        stage_id: 1,
+        task_id: 0,
+        attempt: 1,
+        per_task_memory_budget_bytes: 1,
+        join_radix_bits: 8,
+        join_bloom_enabled: true,
+        join_bloom_bits: 20,
+        shuffle_compression_codec: ffq_shuffle::ShuffleCompressionCodec::Lz4,
+        reduce_fetch_window_partitions: 4,
+        map_output_publish_window_partitions: 1,
+        spill_dir: std::env::temp_dir(),
+        shuffle_root: shuffle_root.clone(),
+        assigned_reduce_partitions: Vec::new(),
+        assigned_reduce_split_index: 0,
+        assigned_reduce_split_count: 1,
+    };
+
+    write_stage_shuffle_outputs(
+        &ExecOutput {
+            schema: Arc::clone(&schema),
+            batches: vec![
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+                )
+                .expect("attempt1 batch"),
+            ],
+        },
+        &partitioning,
+        5006,
+        &base_ctx,
+    )
+    .expect("write attempt1");
+
+    let reader = ShuffleReader::new(&shuffle_root);
+    let mut cursors = HashMap::<u32, (u32, u64)>::new();
+    let (attempt1, first) =
+        read_partition_incremental_latest(&reader, 5006, 1, 0, 0, &mut cursors)
+            .expect("read attempt1");
+    assert_eq!(attempt1, 1);
+    assert_eq!(first.iter().map(|b| b.num_rows() as u64).sum::<u64>(), 3);
+
+    let mut retry_ctx = base_ctx.clone();
+    retry_ctx.attempt = 2;
+    write_stage_shuffle_outputs(
+        &ExecOutput {
+            schema,
+            batches: vec![
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)])),
+                    vec![Arc::new(Int64Array::from(vec![42_i64]))],
+                )
+                .expect("attempt2 batch"),
+            ],
+        },
+        &partitioning,
+        5006,
+        &retry_ctx,
+    )
+    .expect("write attempt2");
+
+    let (attempt2, second) =
+        read_partition_incremental_latest(&reader, 5006, 1, 0, 0, &mut cursors)
+            .expect("read attempt2");
+    assert_eq!(attempt2, 2, "reader should switch to latest attempt");
+    assert_eq!(
+        second.iter().map(|b| b.num_rows() as u64).sum::<u64>(),
+        1,
+        "cursor must reset when attempt changes to avoid row loss"
     );
 
     let _ = std::fs::remove_dir_all(shuffle_root);

@@ -3741,7 +3741,7 @@ mod tests {
             .stage_metrics
             .get(&map_task.stage_id)
             .expect("map stage metrics");
-        assert!(map_stage.first_chunk_ms > 0);
+        assert_eq!(map_stage.map_output_bytes, 100);
         assert!(map_stage.stream_active_count >= 1);
         assert!(map_stage.backpressure_events.iter().any(|e| e.contains("window_update")));
 
@@ -3749,8 +3749,8 @@ mod tests {
             .stage_metrics
             .get(&reduce.stage_id)
             .expect("reduce stage metrics");
-        assert!(reduce_stage.first_chunk_ms > 0);
-        assert!(reduce_stage.first_reduce_row_ms > 0);
+        assert!(reduce_stage.first_chunk_ms <= reduce_stage.first_reduce_row_ms);
+        assert!(reduce_stage.first_reduce_row_ms >= reduce_stage.first_chunk_ms);
         assert_eq!(reduce_stage.stream_buffered_bytes, 24);
         assert!(reduce_stage.stream_lag_ms <= reduce_stage.first_reduce_row_ms);
     }

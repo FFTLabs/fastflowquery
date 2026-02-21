@@ -1304,4 +1304,224 @@ mod tests {
 
         let _ = fs::remove_dir_all(&base);
     }
+
+    #[tokio::test]
+    async fn worker_shuffle_fetch_out_of_order_range_requests_reconstruct_without_loss() {
+        let base = std::env::temp_dir().join(format!(
+            "ffq-grpc-out-of-order-range-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).expect("create temp root");
+        let svc = WorkerShuffleService::new(&base);
+
+        let query_id = "9030".to_string();
+        let stage_id = 1_u64;
+        let map_task = 0_u64;
+        let attempt = 1_u32;
+        let reduce_partition = 0_u32;
+        let payload = (0_u8..64).collect::<Vec<_>>();
+        let rel = shuffle_path(
+            query_id.parse().expect("numeric query"),
+            stage_id,
+            map_task,
+            attempt,
+            reduce_partition,
+        );
+        let full = base.join(rel);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).expect("mkdirs");
+        }
+        fs::write(&full, &payload).expect("write payload");
+
+        svc.register_map_output(Request::new(v1::RegisterMapOutputRequest {
+            query_id: query_id.clone(),
+            stage_id,
+            map_task,
+            attempt,
+            layout_version: 1,
+            layout_fingerprint: 1,
+            partitions: vec![v1::MapOutputPartition {
+                reduce_partition,
+                bytes: payload.len() as u64,
+                rows: 4,
+                batches: 2,
+                stream_epoch: 1,
+                committed_offset: payload.len() as u64,
+                finalized: true,
+            }],
+        }))
+        .await
+        .expect("register");
+
+        let mut high = svc
+            .fetch_shuffle_partition(Request::new(v1::FetchShufflePartitionRequest {
+                query_id: query_id.clone(),
+                stage_id,
+                map_task,
+                attempt,
+                reduce_partition,
+                start_offset: 32,
+                max_bytes: 32,
+                layout_version: 1,
+                min_stream_epoch: 1,
+            }))
+            .await
+            .expect("fetch high range")
+            .into_inner();
+        let mut high_chunks = Vec::new();
+        while let Some(next) = high.next().await {
+            high_chunks.push(next.expect("chunk"));
+        }
+
+        let mut low = svc
+            .fetch_shuffle_partition(Request::new(v1::FetchShufflePartitionRequest {
+                query_id: query_id.clone(),
+                stage_id,
+                map_task,
+                attempt,
+                reduce_partition,
+                start_offset: 0,
+                max_bytes: 32,
+                layout_version: 1,
+                min_stream_epoch: 1,
+            }))
+            .await
+            .expect("fetch low range")
+            .into_inner();
+        let mut low_chunks = Vec::new();
+        while let Some(next) = low.next().await {
+            low_chunks.push(next.expect("chunk"));
+        }
+
+        let mut all = Vec::new();
+        all.extend(high_chunks.into_iter());
+        all.extend(low_chunks.into_iter());
+        all.sort_by_key(|c| c.start_offset);
+        let reconstructed = all
+            .into_iter()
+            .flat_map(|c| c.payload.into_iter())
+            .collect::<Vec<_>>();
+        assert_eq!(reconstructed, payload);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn worker_shuffle_service_restart_requires_reregistration_then_reads_deterministically() {
+        let base = std::env::temp_dir().join(format!(
+            "ffq-grpc-restart-reregister-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).expect("create temp root");
+
+        let query_id = "9031".to_string();
+        let stage_id = 1_u64;
+        let map_task = 0_u64;
+        let attempt = 1_u32;
+        let reduce_partition = 0_u32;
+        let payload = (0_u8..24).collect::<Vec<_>>();
+        let rel = shuffle_path(
+            query_id.parse().expect("numeric query"),
+            stage_id,
+            map_task,
+            attempt,
+            reduce_partition,
+        );
+        let full = base.join(rel);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).expect("mkdirs");
+        }
+        fs::write(&full, &payload).expect("write payload");
+
+        let svc1 = WorkerShuffleService::new(&base);
+        svc1.register_map_output(Request::new(v1::RegisterMapOutputRequest {
+            query_id: query_id.clone(),
+            stage_id,
+            map_task,
+            attempt,
+            layout_version: 1,
+            layout_fingerprint: 1,
+            partitions: vec![v1::MapOutputPartition {
+                reduce_partition,
+                bytes: payload.len() as u64,
+                rows: 3,
+                batches: 1,
+                stream_epoch: 1,
+                committed_offset: payload.len() as u64,
+                finalized: true,
+            }],
+        }))
+        .await
+        .expect("register on first service");
+
+        let svc2 = WorkerShuffleService::new(&base);
+        let err = svc2
+            .fetch_shuffle_partition(Request::new(v1::FetchShufflePartitionRequest {
+                query_id: query_id.clone(),
+                stage_id,
+                map_task,
+                attempt,
+                reduce_partition,
+                start_offset: 0,
+                max_bytes: 0,
+                layout_version: 1,
+                min_stream_epoch: 1,
+            }))
+            .await
+            .err()
+            .expect("restart without re-register should fail");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+        svc2.register_map_output(Request::new(v1::RegisterMapOutputRequest {
+            query_id: query_id.clone(),
+            stage_id,
+            map_task,
+            attempt,
+            layout_version: 1,
+            layout_fingerprint: 1,
+            partitions: vec![v1::MapOutputPartition {
+                reduce_partition,
+                bytes: payload.len() as u64,
+                rows: 3,
+                batches: 1,
+                stream_epoch: 1,
+                committed_offset: payload.len() as u64,
+                finalized: true,
+            }],
+        }))
+        .await
+        .expect("re-register on restarted service");
+        let mut s = svc2
+            .fetch_shuffle_partition(Request::new(v1::FetchShufflePartitionRequest {
+                query_id: query_id.clone(),
+                stage_id,
+                map_task,
+                attempt,
+                reduce_partition,
+                start_offset: 0,
+                max_bytes: 0,
+                layout_version: 1,
+                min_stream_epoch: 1,
+            }))
+            .await
+            .expect("fetch after reregister")
+            .into_inner();
+        let mut chunks = Vec::new();
+        while let Some(next) = s.next().await {
+            chunks.push(next.expect("chunk"));
+        }
+        let stitched = chunks
+            .into_iter()
+            .flat_map(|c| c.payload.into_iter())
+            .collect::<Vec<_>>();
+        assert_eq!(stitched, payload);
+
+        let _ = fs::remove_dir_all(&base);
+    }
 }

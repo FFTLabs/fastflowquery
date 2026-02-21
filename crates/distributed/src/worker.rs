@@ -1625,7 +1625,7 @@ fn read_stage_input_from_shuffle(
     let reader = ShuffleReader::new(&ctx.shuffle_root);
     let mut out_batches = Vec::new();
     let mut schema_hint: Option<SchemaRef> = None;
-    let mut partition_read_cursors = HashMap::<u32, u64>::new();
+    let mut partition_read_cursors = HashMap::<u32, (u32, u64)>::new();
     let mut read_partitions = 0_u64;
     match partitioning {
         PartitioningSpec::Single => {
@@ -1736,7 +1736,7 @@ fn read_partition_incremental_latest(
     upstream_stage_id: u64,
     map_task: u64,
     reduce_partition: u32,
-    read_cursors: &mut HashMap<u32, u64>,
+    read_cursors: &mut HashMap<u32, (u32, u64)>,
 ) -> Result<(u32, Vec<RecordBatch>)> {
     let attempt = reader
         .latest_attempt(query_numeric_id, upstream_stage_id, map_task)?
@@ -1750,7 +1750,10 @@ fn read_partition_incremental_latest(
     else {
         return Ok((attempt, Vec::new()));
     };
-    let cursor = *read_cursors.get(&reduce_partition).unwrap_or(&0);
+    let cursor = match read_cursors.get(&reduce_partition) {
+        Some((cursor_attempt, cursor_offset)) if *cursor_attempt == attempt => *cursor_offset,
+        _ => 0,
+    };
     let watermark = meta.bytes;
     if cursor >= watermark {
         return Ok((attempt, Vec::new()));
@@ -1817,7 +1820,7 @@ fn read_partition_incremental_latest(
             next_cursor = frame_end;
         }
     }
-    read_cursors.insert(reduce_partition, next_cursor);
+    read_cursors.insert(reduce_partition, (attempt, next_cursor));
     Ok((attempt, out_batches))
 }
 
