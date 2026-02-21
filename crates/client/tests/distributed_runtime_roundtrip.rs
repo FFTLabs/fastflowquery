@@ -219,6 +219,17 @@ fn collect_scan_rows(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
     out
 }
 
+#[cfg(feature = "approx")]
+fn collect_single_int64(batches: &[RecordBatch], col: usize) -> i64 {
+    let batch = batches.first().expect("at least one batch");
+    let arr = batch
+        .column(col)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("int64");
+    arr.value(0)
+}
+
 #[cfg(feature = "vector")]
 fn write_docs_vector(path: &std::path::Path, schema: Arc<Schema>) {
     let mut emb = FixedSizeListBuilder::new(Float32Builder::new(), 3);
@@ -412,6 +423,9 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
             worker_id: "w1".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
+            join_radix_bits: 8,
+            join_bloom_enabled: true,
+            join_bloom_bits: 20,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
         },
@@ -423,6 +437,9 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
             worker_id: "w2".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
+            join_radix_bits: 8,
+            join_bloom_enabled: true,
+            join_bloom_bits: 20,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
         },
@@ -518,6 +535,9 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     let sql_count_distinct = "SELECT l_orderkey, COUNT(DISTINCT l_partkey) AS cd
         FROM lineitem
         GROUP BY l_orderkey";
+    #[cfg(feature = "approx")]
+    let sql_approx_count_distinct = "SELECT APPROX_COUNT_DISTINCT(l_partkey) AS acd
+        FROM lineitem";
 
     let dist_scan_batches = dist_engine
         .sql(sql_scan)
@@ -598,6 +618,13 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         .collect()
         .await
         .expect("dist count-distinct collect");
+    #[cfg(feature = "approx")]
+    let dist_approx_count_distinct_batches = dist_engine
+        .sql(sql_approx_count_distinct)
+        .expect("dist approx-count-distinct sql")
+        .collect()
+        .await
+        .expect("dist approx-count-distinct collect");
 
     cfg.coordinator_endpoint = None;
 
@@ -682,6 +709,13 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         .collect()
         .await
         .expect("embedded count-distinct collect");
+    #[cfg(feature = "approx")]
+    let embedded_approx_count_distinct_batches = embedded_engine
+        .sql(sql_approx_count_distinct)
+        .expect("embedded approx-count-distinct sql")
+        .collect()
+        .await
+        .expect("embedded approx-count-distinct collect");
 
     let dist_agg_norm = support::snapshot_text(&dist_agg_batches, &["l_orderkey"], 1e-9);
     let emb_agg_norm = support::snapshot_text(&embedded_agg_batches, &["l_orderkey"], 1e-9);
@@ -821,6 +855,17 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         dist_count_distinct_norm, emb_count_distinct_norm,
         "distributed and embedded COUNT(DISTINCT) outputs differ"
     );
+    #[cfg(feature = "approx")]
+    {
+        let dist_approx = collect_single_int64(&dist_approx_count_distinct_batches, 0) as f64;
+        let emb_approx = collect_single_int64(&embedded_approx_count_distinct_batches, 0) as f64;
+        let denom = emb_approx.max(1.0);
+        let rel_err = ((dist_approx - emb_approx) / denom).abs();
+        assert!(
+            rel_err <= 0.10,
+            "distributed and embedded APPROX_COUNT_DISTINCT diverged too much: dist={dist_approx}, emb={emb_approx}, rel_err={rel_err}"
+        );
+    }
 
     let dist_agg = collect_group_counts(&dist_agg_batches);
     let emb_agg = collect_group_counts(&embedded_agg_batches);
@@ -944,6 +989,9 @@ async fn distributed_runtime_no_schema_parity_matches_embedded() {
             worker_id: "w1".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
+            join_radix_bits: 8,
+            join_bloom_enabled: true,
+            join_bloom_bits: 20,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
         },
@@ -955,6 +1003,9 @@ async fn distributed_runtime_no_schema_parity_matches_embedded() {
             worker_id: "w2".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
+            join_radix_bits: 8,
+            join_bloom_enabled: true,
+            join_bloom_bits: 20,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
         },
@@ -1119,6 +1170,9 @@ async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
             worker_id: "w1".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
+            join_radix_bits: 8,
+            join_bloom_enabled: true,
+            join_bloom_bits: 20,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
         },
@@ -1130,6 +1184,9 @@ async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
             worker_id: "w2".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
+            join_radix_bits: 8,
+            join_bloom_enabled: true,
+            join_bloom_bits: 20,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
         },
