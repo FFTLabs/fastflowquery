@@ -228,6 +228,16 @@ pub struct ShuffleFetchChunk {
     pub finalized: bool,
 }
 
+fn sanitize_map_output_partition_meta(mut p: MapOutputPartitionMeta) -> MapOutputPartitionMeta {
+    if p.committed_offset > p.bytes {
+        p.committed_offset = p.bytes;
+    }
+    if p.finalized {
+        p.committed_offset = p.bytes;
+    }
+    p
+}
+
 #[derive(Debug, Clone)]
 /// Public query status snapshot returned by control-plane APIs.
 pub struct QueryStatus {
@@ -1063,6 +1073,10 @@ impl Coordinator {
             return Ok(());
         }
         let registry_key = (query_id.clone(), stage_id, map_task, attempt);
+        let partitions = partitions
+            .into_iter()
+            .map(sanitize_map_output_partition_meta)
+            .collect::<Vec<_>>();
         self.map_outputs
             .entry(registry_key)
             .and_modify(|existing| merge_map_output_partitions(existing, &partitions))
@@ -1245,16 +1259,32 @@ impl Coordinator {
             ))
         })?;
         let reader = ShuffleReader::new(&self.config.shuffle_root);
+        let readable_end = part_meta.committed_offset;
+        let start = start_offset.min(readable_end);
+        if start >= readable_end {
+            return Ok(vec![ShuffleFetchChunk {
+                payload: Vec::new(),
+                start_offset: start,
+                end_offset: start,
+                watermark_offset: readable_end,
+                finalized: part_meta.finalized,
+            }]);
+        }
+        let requested = if max_bytes == 0 {
+            readable_end.saturating_sub(start)
+        } else {
+            max_bytes.min(readable_end.saturating_sub(start))
+        };
         let chunks = reader.fetch_partition_chunks_range(
             query_num,
             stage_id,
             map_task,
             attempt,
             reduce_partition,
-            start_offset,
-            max_bytes,
+            start,
+            requested,
         )?;
-        Ok(chunks
+        let out = chunks
             .into_iter()
             .map(|c: FetchedPartitionChunk| ShuffleFetchChunk {
                 end_offset: c.start_offset + c.payload.len() as u64,
@@ -1263,7 +1293,17 @@ impl Coordinator {
                 watermark_offset: part_meta.committed_offset,
                 finalized: part_meta.finalized,
             })
-            .collect())
+            .collect::<Vec<_>>();
+        if out.is_empty() {
+            return Ok(vec![ShuffleFetchChunk {
+                payload: Vec::new(),
+                start_offset: start,
+                end_offset: start,
+                watermark_offset: readable_end,
+                finalized: part_meta.finalized,
+            }]);
+        }
+        Ok(out)
     }
 }
 

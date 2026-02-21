@@ -473,16 +473,58 @@ impl ShuffleService for WorkerShuffleService {
         let (watermark_offset, finalized) = part_meta
             .map(|m| (m.committed_offset, m.finalized))
             .unwrap_or((0, false));
+        let readable_end = watermark_offset;
+        let start = req.start_offset.min(readable_end);
+        let requested = if start >= readable_end {
+            0
+        } else if req.max_bytes == 0 {
+            readable_end.saturating_sub(start)
+        } else {
+            req.max_bytes.min(readable_end.saturating_sub(start))
+        };
 
-        let out = chunks.into_iter().map(move |c| {
-            Ok(v1::ShufflePartitionChunk {
-                start_offset: c.start_offset,
-                end_offset: c.start_offset + c.payload.len() as u64,
-                payload: c.payload,
+        let out = if requested == 0 {
+            vec![Ok(v1::ShufflePartitionChunk {
+                start_offset: start,
+                end_offset: start,
+                payload: Vec::new(),
                 watermark_offset,
                 finalized,
-            })
-        });
+            })]
+        } else {
+            let end_limit = start.saturating_add(requested);
+            let filtered = chunks
+                .into_iter()
+                .filter_map(|c| {
+                    let chunk_start = c.start_offset.max(start);
+                    let chunk_end = (c.start_offset + c.payload.len() as u64).min(end_limit);
+                    if chunk_end <= chunk_start {
+                        return None;
+                    }
+                    let trim_start = (chunk_start - c.start_offset) as usize;
+                    let trim_end = (chunk_end - c.start_offset) as usize;
+                    let payload = c.payload[trim_start..trim_end].to_vec();
+                    Some(Ok(v1::ShufflePartitionChunk {
+                        start_offset: chunk_start,
+                        end_offset: chunk_end,
+                        payload,
+                        watermark_offset,
+                        finalized,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            if filtered.is_empty() {
+                vec![Ok(v1::ShufflePartitionChunk {
+                    start_offset: start,
+                    end_offset: start,
+                    payload: Vec::new(),
+                    watermark_offset,
+                    finalized,
+                })]
+            } else {
+                filtered
+            }
+        };
         Ok(Response::new(Box::pin(stream::iter(out))))
     }
 }
@@ -764,6 +806,153 @@ mod tests {
         );
         assert!(chunks.iter().all(|c| c.watermark_offset == 24));
         assert!(chunks.iter().all(|c| !c.finalized));
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn worker_shuffle_fetch_respects_committed_watermark_and_emits_eof_marker() {
+        let base = std::env::temp_dir().join(format!(
+            "ffq-grpc-fetch-watermark-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).expect("create temp root");
+        let svc = WorkerShuffleService::new(&base);
+
+        let query_id = "9011".to_string();
+        let stage_id = 1_u64;
+        let map_task = 0_u64;
+        let attempt = 1_u32;
+        let reduce_partition = 4_u32;
+        let payload = (0_u8..32).collect::<Vec<_>>();
+        let rel = shuffle_path(
+            query_id.parse().expect("numeric query"),
+            stage_id,
+            map_task,
+            attempt,
+            reduce_partition,
+        );
+        let full = base.join(rel);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).expect("mkdirs");
+        }
+        fs::write(&full, &payload).expect("write payload");
+
+        svc.register_map_output(Request::new(v1::RegisterMapOutputRequest {
+            query_id: query_id.clone(),
+            stage_id,
+            map_task,
+            attempt,
+            layout_version: 1,
+            layout_fingerprint: 9,
+            partitions: vec![v1::MapOutputPartition {
+                reduce_partition,
+                bytes: payload.len() as u64,
+                rows: 2,
+                batches: 1,
+                stream_epoch: 1,
+                committed_offset: 8,
+                finalized: false,
+            }],
+        }))
+        .await
+        .expect("register partial");
+
+        let mut s1 = svc
+            .fetch_shuffle_partition(Request::new(v1::FetchShufflePartitionRequest {
+                query_id: query_id.clone(),
+                stage_id,
+                map_task,
+                attempt,
+                reduce_partition,
+                start_offset: 0,
+                max_bytes: 0,
+            }))
+            .await
+            .expect("fetch partial bytes")
+            .into_inner();
+        let mut c1 = Vec::new();
+        while let Some(next) = s1.next().await {
+            c1.push(next.expect("chunk"));
+        }
+        let stitched = c1
+            .iter()
+            .flat_map(|c| c.payload.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(stitched, payload[0..8].to_vec());
+        assert!(c1.iter().all(|c| c.watermark_offset == 8));
+        assert!(c1.iter().all(|c| !c.finalized));
+
+        let mut s2 = svc
+            .fetch_shuffle_partition(Request::new(v1::FetchShufflePartitionRequest {
+                query_id: query_id.clone(),
+                stage_id,
+                map_task,
+                attempt,
+                reduce_partition,
+                start_offset: 8,
+                max_bytes: 0,
+            }))
+            .await
+            .expect("fetch eof marker")
+            .into_inner();
+        let mut c2 = Vec::new();
+        while let Some(next) = s2.next().await {
+            c2.push(next.expect("chunk"));
+        }
+        assert_eq!(c2.len(), 1);
+        assert!(c2[0].payload.is_empty());
+        assert_eq!(c2[0].start_offset, 8);
+        assert_eq!(c2[0].end_offset, 8);
+        assert_eq!(c2[0].watermark_offset, 8);
+        assert!(!c2[0].finalized);
+
+        svc.register_map_output(Request::new(v1::RegisterMapOutputRequest {
+            query_id: query_id.clone(),
+            stage_id,
+            map_task,
+            attempt,
+            layout_version: 1,
+            layout_fingerprint: 9,
+            partitions: vec![v1::MapOutputPartition {
+                reduce_partition,
+                bytes: payload.len() as u64,
+                rows: 2,
+                batches: 1,
+                stream_epoch: 1,
+                committed_offset: payload.len() as u64,
+                finalized: true,
+            }],
+        }))
+        .await
+        .expect("register finalize");
+
+        let mut s3 = svc
+            .fetch_shuffle_partition(Request::new(v1::FetchShufflePartitionRequest {
+                query_id: query_id.clone(),
+                stage_id,
+                map_task,
+                attempt,
+                reduce_partition,
+                start_offset: 32,
+                max_bytes: 0,
+            }))
+            .await
+            .expect("fetch final eof marker")
+            .into_inner();
+        let mut c3 = Vec::new();
+        while let Some(next) = s3.next().await {
+            c3.push(next.expect("chunk"));
+        }
+        assert_eq!(c3.len(), 1);
+        assert!(c3[0].payload.is_empty());
+        assert_eq!(c3[0].start_offset, 32);
+        assert_eq!(c3[0].end_offset, 32);
+        assert_eq!(c3[0].watermark_offset, 32);
+        assert!(c3[0].finalized);
 
         let _ = fs::remove_dir_all(&base);
     }

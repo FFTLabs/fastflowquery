@@ -419,8 +419,30 @@ where
                             let publish_window =
                                 task_ctx.map_output_publish_window_partitions.max(1) as usize;
                             for chunk in exec_result.map_output_partitions.chunks(publish_window) {
+                                let commit_markers = chunk
+                                    .iter()
+                                    .cloned()
+                                    .map(|mut p| {
+                                        p.finalized = false;
+                                        p
+                                    })
+                                    .collect::<Vec<_>>();
                                 control_plane
-                                    .register_map_output(&assignment, chunk.to_vec())
+                                    .register_map_output(&assignment, commit_markers)
+                                    .await?;
+                                tokio::task::yield_now().await;
+                            }
+                            for chunk in exec_result.map_output_partitions.chunks(publish_window) {
+                                let finalize_markers = chunk
+                                    .iter()
+                                    .cloned()
+                                    .map(|mut p| {
+                                        p.finalized = true;
+                                        p
+                                    })
+                                    .collect::<Vec<_>>();
+                                control_plane
+                                    .register_map_output(&assignment, finalize_markers)
                                     .await?;
                                 tokio::task::yield_now().await;
                             }
@@ -1667,7 +1689,8 @@ fn read_partition_incremental_latest(
     let attempt = reader
         .latest_attempt(query_numeric_id, upstream_stage_id, map_task)?
         .ok_or_else(|| FfqError::Execution("no shuffle attempts found for map task".to_string()))?;
-    let index = reader.read_map_task_index(query_numeric_id, upstream_stage_id, map_task, attempt)?;
+    let index =
+        reader.read_map_task_index(query_numeric_id, upstream_stage_id, map_task, attempt)?;
     let Some(meta) = index
         .partitions
         .into_iter()
