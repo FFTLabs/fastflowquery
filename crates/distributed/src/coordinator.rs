@@ -81,6 +81,16 @@ pub struct CoordinatorConfig {
     pub backpressure_max_map_publish_window_partitions: u32,
     /// Max reduce-fetch window used when system is unconstrained.
     pub backpressure_max_reduce_fetch_window_partitions: u32,
+    /// Enables speculative execution for detected stragglers.
+    pub speculative_execution_enabled: bool,
+    /// Minimum completed task samples required before p95 straggler baseline is used.
+    pub speculative_min_completed_samples: u32,
+    /// Runtime multiplier over p95 to classify a task as a straggler.
+    pub speculative_p95_multiplier: f64,
+    /// Minimum runtime threshold (ms) before straggler detection can trigger.
+    pub speculative_min_runtime_ms: u64,
+    /// Enables locality-aware task preference when worker locality tags are available.
+    pub locality_preference_enabled: bool,
 }
 
 impl Default for CoordinatorConfig {
@@ -105,6 +115,11 @@ impl Default for CoordinatorConfig {
             backpressure_target_queue_depth: 32,
             backpressure_max_map_publish_window_partitions: 8,
             backpressure_max_reduce_fetch_window_partitions: 8,
+            speculative_execution_enabled: true,
+            speculative_min_completed_samples: 5,
+            speculative_p95_multiplier: 1.5,
+            speculative_min_runtime_ms: 250,
+            locality_preference_enabled: true,
         }
     }
 }
@@ -228,6 +243,12 @@ pub struct StageMetrics {
     pub stream_active_count: u32,
     /// Recent backpressure control-loop events for this stage.
     pub backpressure_events: Vec<String>,
+    /// Number of speculative attempts launched for this stage.
+    pub speculative_attempts_launched: u32,
+    /// Number of speculative races won by an older attempt.
+    pub speculative_older_attempt_wins: u32,
+    /// Number of speculative races won by a newer attempt.
+    pub speculative_newer_attempt_wins: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +334,7 @@ struct StageRuntime {
     barrier_state: StageBarrierState,
     layout_finalize_count: u32,
     metrics: StageMetrics,
+    completed_runtime_ms_samples: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -331,6 +353,9 @@ struct TaskRuntime {
     layout_version: u32,
     layout_fingerprint: u64,
     required_custom_ops: Vec<String>,
+    locality_hints: Vec<String>,
+    running_since_ms: Option<u64>,
+    is_speculative: bool,
     message: String,
 }
 
@@ -338,6 +363,7 @@ struct TaskRuntime {
 struct WorkerHeartbeat {
     last_seen_ms: u64,
     custom_operator_capabilities: HashSet<String>,
+    locality_tags: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -389,6 +415,7 @@ impl Coordinator {
             .or_insert_with(|| WorkerHeartbeat {
                 last_seen_ms: now,
                 custom_operator_capabilities: HashSet::new(),
+                locality_tags: HashSet::new(),
             });
     }
 
@@ -456,6 +483,7 @@ impl Coordinator {
                         t.layout_version,
                         t.layout_fingerprint,
                         t.required_custom_ops.clone(),
+                        t.locality_hints.clone(),
                     ));
                 }
             }
@@ -471,6 +499,7 @@ impl Coordinator {
                 layout_version,
                 layout_fingerprint,
                 required_custom_ops,
+                locality_hints,
             ) in to_retry
             {
                 if attempt < self.config.max_task_attempts {
@@ -496,6 +525,9 @@ impl Coordinator {
                             layout_version,
                             layout_fingerprint,
                             required_custom_ops,
+                            locality_hints,
+                            running_since_ms: None,
+                            is_speculative: false,
                             message: "retry scheduled after worker timeout".to_string(),
                         },
                     );
@@ -677,9 +709,9 @@ impl Coordinator {
         let mut remaining = capacity.min(worker_budget);
         let mut out = Vec::new();
         self.touch_worker(worker_id, now);
-        let worker_caps = self
-            .worker_heartbeats
-            .get(worker_id)
+        let worker_hb = self.worker_heartbeats.get(worker_id).cloned();
+        let worker_caps = worker_hb
+            .as_ref()
             .map(|hb| hb.custom_operator_capabilities.clone());
         if remaining == 0 {
             return Ok(out);
@@ -724,8 +756,19 @@ impl Coordinator {
                 self.config.adaptive_shuffle_max_partitions_per_task,
                 now,
             );
-            let latest_attempts = latest_attempt_map(query);
             let latest_states = latest_task_states(query);
+            if self.config.speculative_execution_enabled {
+                enqueue_speculative_attempts(
+                    query_id,
+                    query,
+                    now,
+                    self.config.speculative_min_completed_samples,
+                    self.config.speculative_p95_multiplier,
+                    self.config.speculative_min_runtime_ms,
+                    self.config.max_task_attempts,
+                );
+            }
+            let latest_attempts = latest_attempt_map(query);
             for stage_id in runnable_stages_with_pipeline(
                 query_id,
                 query,
@@ -759,6 +802,15 @@ impl Coordinator {
                 {
                     continue;
                 }
+                let running_logical_tasks_on_worker = query
+                    .tasks
+                    .values()
+                    .filter(|t| {
+                        t.state == TaskState::Running
+                            && t.assigned_worker.as_deref() == Some(worker_id)
+                    })
+                    .map(|t| (t.stage_id, t.task_id))
+                    .collect::<HashSet<_>>();
                 for task in query.tasks.values_mut().filter(|t| {
                     t.stage_id == stage_id && t.state == TaskState::Queued && t.ready_at_ms <= now
                 }) {
@@ -771,7 +823,25 @@ impl Coordinator {
                     {
                         continue;
                     }
+                    if task.is_speculative
+                        && running_logical_tasks_on_worker.contains(&(task.stage_id, task.task_id))
+                    {
+                        continue;
+                    }
                     if !worker_supports_task(worker_caps.as_ref(), &task.required_custom_ops) {
+                        continue;
+                    }
+                    if self.config.locality_preference_enabled
+                        && !task.locality_hints.is_empty()
+                        && !worker_matches_locality(worker_hb.as_ref(), &task.locality_hints)
+                        && has_any_live_worker_for_locality(
+                            &self.worker_heartbeats,
+                            &self.blacklisted_workers,
+                            now,
+                            self.config.worker_liveness_timeout_ms,
+                            &task.locality_hints,
+                        )
+                    {
                         continue;
                     }
                     if let Some(ready) = &pipeline_ready_partitions {
@@ -786,6 +856,7 @@ impl Coordinator {
                     }
                     task.state = TaskState::Running;
                     task.assigned_worker = Some(worker_id.to_string());
+                    task.running_since_ms = Some(now);
                     let stage = query
                         .stages
                         .get_mut(&stage_id)
@@ -899,10 +970,33 @@ impl Coordinator {
             .queries
             .get_mut(query_id)
             .ok_or_else(|| FfqError::Planning(format!("unknown query: {query_id}")))?;
-        let latest_attempt = latest_attempt_map(query)
+        let mut latest_attempt = latest_attempt_map(query)
             .get(&(stage_id, task_id))
             .copied()
             .unwrap_or(attempt);
+        if attempt < latest_attempt {
+            if state == TaskState::Succeeded
+                && adopt_older_attempt_success_from_speculation(
+                    query,
+                    stage_id,
+                    task_id,
+                    attempt,
+                    latest_attempt,
+                )
+            {
+                latest_attempt = attempt;
+            } else {
+                debug!(
+                    query_id = %query_id,
+                    stage_id,
+                    task_id,
+                    attempt,
+                    operator = "CoordinatorReportTaskStatus",
+                    "ignoring stale status report from old attempt"
+                );
+                return Ok(());
+            }
+        }
         if attempt < latest_attempt {
             debug!(
                 query_id = %query_id,
@@ -1012,13 +1106,40 @@ impl Coordinator {
             .get(&key)
             .map(|t| t.required_custom_ops.clone())
             .ok_or_else(|| FfqError::Planning("unknown task status report".to_string()))?;
+        let task_locality_hints = query
+            .tasks
+            .get(&key)
+            .map(|t| t.locality_hints.clone())
+            .ok_or_else(|| FfqError::Planning("unknown task status report".to_string()))?;
         let assigned_worker_cached = query
             .tasks
             .get(&key)
             .and_then(|t| t.assigned_worker.clone());
+        let task_running_since = query.tasks.get(&key).and_then(|t| t.running_since_ms);
+        let task_is_speculative = query.tasks.get(&key).is_some_and(|t| t.is_speculative);
         if let Some(task) = query.tasks.get_mut(&key) {
             task.state = state;
             task.message = message.clone();
+            match state {
+                TaskState::Running => {
+                    if task.running_since_ms.is_none() {
+                        task.running_since_ms = Some(now);
+                    }
+                }
+                TaskState::Queued => task.running_since_ms = None,
+                TaskState::Succeeded | TaskState::Failed => task.running_since_ms = None,
+            }
+        }
+        if prev_state == TaskState::Running
+            && matches!(state, TaskState::Succeeded | TaskState::Failed)
+            && let Some(start_ms) = task_running_since
+        {
+            let dur_ms = now.saturating_sub(start_ms);
+            stage.completed_runtime_ms_samples.push(dur_ms);
+            if stage.completed_runtime_ms_samples.len() > 128 {
+                let keep_from = stage.completed_runtime_ms_samples.len().saturating_sub(128);
+                stage.completed_runtime_ms_samples.drain(0..keep_from);
+            }
         }
         match state {
             TaskState::Queued => {
@@ -1032,6 +1153,10 @@ impl Coordinator {
                 stage.metrics.succeeded_tasks += 1;
                 if let Some(worker) = worker_id.or(assigned_worker_cached.as_deref()) {
                     self.worker_failures.remove(worker);
+                }
+                if task_is_speculative {
+                    stage.metrics.speculative_newer_attempt_wins =
+                        stage.metrics.speculative_newer_attempt_wins.saturating_add(1);
                 }
             }
             TaskState::Failed => {
@@ -1074,6 +1199,9 @@ impl Coordinator {
                             layout_version,
                             layout_fingerprint,
                             required_custom_ops: task_required_custom_ops,
+                            locality_hints: task_locality_hints,
+                            running_since_ms: None,
+                            is_speculative: false,
                             message: format!("retry scheduled after failure: {message}"),
                         },
                     );
@@ -1127,6 +1255,7 @@ impl Coordinator {
                     .iter()
                     .cloned()
                     .collect(),
+                locality_tags: parse_locality_tags(custom_operator_capabilities),
             },
         );
         Ok(())
@@ -1506,6 +1635,7 @@ fn build_query_runtime(
     collect_custom_ops(&plan, &mut required_custom_ops);
     let mut required_custom_ops = required_custom_ops.into_iter().collect::<Vec<_>>();
     required_custom_ops.sort();
+    let all_scan_locality_hints = collect_scan_locality_hints(&plan);
     let stage_reduce_task_counts = collect_stage_reduce_task_counts(&plan);
 
     for node in dag.stages {
@@ -1530,12 +1660,18 @@ fn build_query_runtime(
                     adaptive_reduce_tasks: task_count,
                     ..StageMetrics::default()
                 },
+                completed_runtime_ms_samples: Vec::new(),
             },
         );
         // v1 simplification: each scheduled task carries the submitted physical plan bytes.
         // Stage boundaries are still respected by coordinator scheduling.
         let fragment = physical_plan_json.to_vec();
         for task_id in 0..task_count {
+            let locality_hints = if node.parents.is_empty() {
+                all_scan_locality_hints.clone()
+            } else {
+                Vec::new()
+            };
             let assigned_reduce_partitions = if is_reduce_stage {
                 vec![task_id]
             } else {
@@ -1558,6 +1694,9 @@ fn build_query_runtime(
                     layout_version: 1,
                     layout_fingerprint: 0,
                     required_custom_ops: required_custom_ops.clone(),
+                    locality_hints,
+                    running_since_ms: None,
+                    is_speculative: false,
                     message: String::new(),
                 },
             );
@@ -1685,6 +1824,7 @@ fn advance_stage_barriers_and_finalize_layout(
                 (
                     t.plan_fragment_json.clone(),
                     t.required_custom_ops.clone(),
+                    t.locality_hints.clone(),
                     t.query_id.clone(),
                 )
             })
@@ -1703,7 +1843,7 @@ fn advance_stage_barriers_and_finalize_layout(
                 query.tasks.insert(
                     (stage_id, task_id as u64, 1),
                     TaskRuntime {
-                        query_id: template.2.clone(),
+                        query_id: template.3.clone(),
                         stage_id,
                         task_id: task_id as u64,
                         attempt: 1,
@@ -1717,6 +1857,9 @@ fn advance_stage_barriers_and_finalize_layout(
                         layout_version,
                         layout_fingerprint,
                         required_custom_ops: template.1.clone(),
+                        locality_hints: template.2.clone(),
+                        running_since_ms: None,
+                        is_speculative: false,
                         message: String::new(),
                     },
                 );
@@ -1920,6 +2063,282 @@ fn collect_custom_ops(plan: &PhysicalPlan, out: &mut HashSet<String>) {
             collect_custom_ops(&x.input, out);
         }
     }
+}
+
+fn collect_scan_locality_hints(plan: &PhysicalPlan) -> Vec<String> {
+    fn visit(plan: &PhysicalPlan, out: &mut HashSet<String>) {
+        match plan {
+            PhysicalPlan::ParquetScan(scan) => {
+                out.insert(format!("table:{}", scan.table));
+            }
+            PhysicalPlan::ParquetWrite(x) => visit(&x.input, out),
+            PhysicalPlan::Filter(x) => visit(&x.input, out),
+            PhysicalPlan::InSubqueryFilter(x) => {
+                visit(&x.input, out);
+                visit(&x.subquery, out);
+            }
+            PhysicalPlan::ExistsSubqueryFilter(x) => {
+                visit(&x.input, out);
+                visit(&x.subquery, out);
+            }
+            PhysicalPlan::ScalarSubqueryFilter(x) => {
+                visit(&x.input, out);
+                visit(&x.subquery, out);
+            }
+            PhysicalPlan::Project(x) => visit(&x.input, out),
+            PhysicalPlan::Window(x) => visit(&x.input, out),
+            PhysicalPlan::CoalesceBatches(x) => visit(&x.input, out),
+            PhysicalPlan::PartialHashAggregate(x) => visit(&x.input, out),
+            PhysicalPlan::FinalHashAggregate(x) => visit(&x.input, out),
+            PhysicalPlan::HashJoin(x) => {
+                visit(&x.left, out);
+                visit(&x.right, out);
+                for alt in &x.alternatives {
+                    visit(&alt.left, out);
+                    visit(&alt.right, out);
+                }
+            }
+            PhysicalPlan::Exchange(x) => match x {
+                ExchangeExec::ShuffleWrite(e) => visit(&e.input, out),
+                ExchangeExec::ShuffleRead(e) => visit(&e.input, out),
+                ExchangeExec::Broadcast(e) => visit(&e.input, out),
+            },
+            PhysicalPlan::Limit(x) => visit(&x.input, out),
+            PhysicalPlan::TopKByScore(x) => visit(&x.input, out),
+            PhysicalPlan::UnionAll(x) => {
+                visit(&x.left, out);
+                visit(&x.right, out);
+            }
+            PhysicalPlan::CteRef(x) => visit(&x.plan, out),
+            PhysicalPlan::VectorTopK(_) => {}
+            PhysicalPlan::Custom(x) => visit(&x.input, out),
+        }
+    }
+    let mut hints = HashSet::new();
+    visit(plan, &mut hints);
+    let mut out = hints.into_iter().collect::<Vec<_>>();
+    out.sort();
+    out
+}
+
+fn parse_locality_tags(caps: &[String]) -> HashSet<String> {
+    caps.iter()
+        .filter_map(|c| c.strip_prefix("locality:").map(|s| s.to_string()))
+        .collect()
+}
+
+fn worker_matches_locality(worker: Option<&WorkerHeartbeat>, locality_hints: &[String]) -> bool {
+    if locality_hints.is_empty() {
+        return true;
+    }
+    let Some(worker) = worker else {
+        return false;
+    };
+    locality_hints.iter().any(|hint| worker.locality_tags.contains(hint))
+}
+
+fn has_any_live_worker_for_locality(
+    heartbeats: &HashMap<String, WorkerHeartbeat>,
+    blacklisted_workers: &HashSet<String>,
+    now_ms: u64,
+    liveness_timeout_ms: u64,
+    locality_hints: &[String],
+) -> bool {
+    heartbeats.iter().any(|(worker, hb)| {
+        if blacklisted_workers.contains(worker) {
+            return false;
+        }
+        if liveness_timeout_ms > 0 && now_ms.saturating_sub(hb.last_seen_ms) > liveness_timeout_ms {
+            return false;
+        }
+        locality_hints.iter().any(|hint| hb.locality_tags.contains(hint))
+    })
+}
+
+fn stage_p95_runtime_ms(samples: &[u64]) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let idx = ((sorted.len().saturating_sub(1) as f64) * 0.95).round() as usize;
+    sorted.get(idx).copied()
+}
+
+fn enqueue_speculative_attempts(
+    query_id: &str,
+    query: &mut QueryRuntime,
+    now_ms: u64,
+    min_completed_samples: u32,
+    p95_multiplier: f64,
+    min_runtime_ms: u64,
+    max_task_attempts: u32,
+) {
+    let latest_attempts = latest_attempt_map(query);
+    let mut launches = Vec::new();
+    for task in query.tasks.values() {
+        if task.state != TaskState::Running {
+            continue;
+        }
+        if latest_attempts
+            .get(&(task.stage_id, task.task_id))
+            .is_some_and(|a| *a != task.attempt)
+        {
+            continue;
+        }
+        if task.attempt >= max_task_attempts {
+            continue;
+        }
+        let Some(start_ms) = task.running_since_ms else {
+            continue;
+        };
+        let observed_runtime = now_ms.saturating_sub(start_ms);
+        let Some(stage_rt) = query.stages.get(&task.stage_id) else {
+            continue;
+        };
+        if stage_rt.completed_runtime_ms_samples.len() < min_completed_samples as usize {
+            continue;
+        }
+        let Some(p95_ms) = stage_p95_runtime_ms(&stage_rt.completed_runtime_ms_samples) else {
+            continue;
+        };
+        let threshold = ((p95_ms as f64) * p95_multiplier.max(1.0))
+            .round()
+            .max(min_runtime_ms as f64) as u64;
+        if observed_runtime < threshold {
+            continue;
+        }
+        launches.push((
+            task.stage_id,
+            task.task_id,
+            task.attempt,
+            task.plan_fragment_json.clone(),
+            task.assigned_reduce_partitions.clone(),
+            task.assigned_reduce_split_index,
+            task.assigned_reduce_split_count,
+            task.layout_version,
+            task.layout_fingerprint,
+            task.required_custom_ops.clone(),
+            task.locality_hints.clone(),
+            threshold,
+            observed_runtime,
+        ));
+    }
+
+    for (
+        stage_id,
+        task_id,
+        attempt,
+        plan_fragment_json,
+        assigned_reduce_partitions,
+        assigned_reduce_split_index,
+        assigned_reduce_split_count,
+        layout_version,
+        layout_fingerprint,
+        required_custom_ops,
+        locality_hints,
+        threshold,
+        observed_runtime,
+    ) in launches
+    {
+        let next_attempt = attempt.saturating_add(1);
+        let key = (stage_id, task_id, next_attempt);
+        if query.tasks.contains_key(&key) {
+            continue;
+        }
+        query.tasks.insert(
+            key,
+            TaskRuntime {
+                query_id: query_id.to_string(),
+                stage_id,
+                task_id,
+                attempt: next_attempt,
+                state: TaskState::Queued,
+                assigned_worker: None,
+                ready_at_ms: now_ms,
+                plan_fragment_json,
+                assigned_reduce_partitions,
+                assigned_reduce_split_index,
+                assigned_reduce_split_count,
+                layout_version,
+                layout_fingerprint,
+                required_custom_ops,
+                locality_hints,
+                running_since_ms: None,
+                is_speculative: true,
+                message: format!(
+                    "speculative attempt scheduled (runtime_ms={} threshold_ms={})",
+                    observed_runtime, threshold
+                ),
+            },
+        );
+        if let Some(stage) = query.stages.get_mut(&stage_id) {
+            stage.metrics.queued_tasks = stage.metrics.queued_tasks.saturating_add(1);
+            stage.metrics.speculative_attempts_launched =
+                stage.metrics.speculative_attempts_launched.saturating_add(1);
+            push_stage_aqe_event(
+                &mut stage.metrics,
+                format!(
+                    "speculative_launch stage={} task={} old_attempt={} new_attempt={} runtime_ms={} threshold_ms={}",
+                    stage_id, task_id, attempt, next_attempt, observed_runtime, threshold
+                ),
+            );
+        }
+    }
+}
+
+fn adopt_older_attempt_success_from_speculation(
+    query: &mut QueryRuntime,
+    stage_id: u64,
+    task_id: u64,
+    attempt: u32,
+    latest_attempt: u32,
+) -> bool {
+    if latest_attempt <= attempt {
+        return false;
+    }
+    let newer_attempts = query
+        .tasks
+        .values()
+        .filter(|t| t.stage_id == stage_id && t.task_id == task_id && t.attempt > attempt)
+        .cloned()
+        .collect::<Vec<_>>();
+    if newer_attempts.is_empty() {
+        return false;
+    }
+    if newer_attempts.iter().any(|t| t.state == TaskState::Succeeded) {
+        return false;
+    }
+    if !newer_attempts.iter().any(|t| t.is_speculative) {
+        return false;
+    }
+
+    let keys_to_remove = newer_attempts
+        .iter()
+        .map(|t| (t.stage_id, t.task_id, t.attempt))
+        .collect::<Vec<_>>();
+    let mut removed_queued = 0_u32;
+    let mut removed_running = 0_u32;
+    for key in keys_to_remove {
+        if let Some(removed) = query.tasks.remove(&key) {
+            match removed.state {
+                TaskState::Queued => removed_queued = removed_queued.saturating_add(1),
+                TaskState::Running => removed_running = removed_running.saturating_add(1),
+                TaskState::Succeeded | TaskState::Failed => {}
+            }
+        }
+    }
+    if let Some(stage) = query.stages.get_mut(&stage_id) {
+        stage.metrics.queued_tasks = stage.metrics.queued_tasks.saturating_sub(removed_queued);
+        stage.metrics.running_tasks = stage.metrics.running_tasks.saturating_sub(removed_running);
+        stage.metrics.failed_tasks = stage
+            .metrics
+            .failed_tasks
+            .saturating_add(removed_queued.saturating_add(removed_running));
+        stage.metrics.speculative_older_attempt_wins =
+            stage.metrics.speculative_older_attempt_wins.saturating_add(1);
+    }
+    true
 }
 
 fn worker_supports_task(caps: Option<&HashSet<String>>, required_custom_ops: &[String]) -> bool {
@@ -2378,6 +2797,15 @@ mod tests {
         }))
     }
 
+    fn single_scan_plan(table: &str) -> PhysicalPlan {
+        PhysicalPlan::ParquetScan(ParquetScanExec {
+            table: table.to_string(),
+            schema: Some(Schema::empty()),
+            projection: None,
+            filters: vec![],
+        })
+    }
+
     #[test]
     fn coordinator_schedules_and_tracks_query_state() {
         let mut c = Coordinator::new(CoordinatorConfig::default());
@@ -2557,6 +2985,70 @@ mod tests {
             .expect("heartbeat custom");
         let custom_assignments = c.get_task("w_custom", 10).expect("custom assignments");
         assert_eq!(custom_assignments.len(), 1);
+    }
+
+    #[test]
+    fn coordinator_launches_speculative_attempt_for_straggler_and_accepts_older_success() {
+        let mut c = Coordinator::new(CoordinatorConfig {
+            speculative_execution_enabled: true,
+            speculative_min_completed_samples: 1,
+            speculative_p95_multiplier: 1.0,
+            speculative_min_runtime_ms: 1,
+            retry_backoff_base_ms: 0,
+            ..CoordinatorConfig::default()
+        });
+        let plan = serde_json::to_vec(&single_scan_plan("t")).expect("plan");
+        c.submit_query("qspec".to_string(), &plan).expect("submit");
+
+        let first = c.get_task("wslow", 1).expect("first task");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].attempt, 1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        {
+            let q = c.queries.get_mut("qspec").expect("query");
+            let st = q.stages.get_mut(&0).expect("stage");
+            st.completed_runtime_ms_samples.push(1);
+        }
+        let speculative = c.get_task("wfast", 1).expect("speculative task");
+        assert_eq!(speculative.len(), 1);
+        assert_eq!(speculative[0].attempt, 2);
+
+        c.report_task_status(
+            "qspec",
+            first[0].stage_id,
+            first[0].task_id,
+            first[0].attempt,
+            first[0].layout_version,
+            first[0].layout_fingerprint,
+            TaskState::Succeeded,
+            Some("wslow"),
+            "older attempt won".to_string(),
+        )
+        .expect("report success");
+        let st = c.get_query_status("qspec").expect("status");
+        assert_eq!(st.state, QueryState::Succeeded);
+        let stage = st.stage_metrics.get(&0).expect("stage metrics");
+        assert!(stage.speculative_older_attempt_wins >= 1);
+    }
+
+    #[test]
+    fn coordinator_prefers_locality_matching_worker_for_scan_tasks() {
+        let mut c = Coordinator::new(CoordinatorConfig {
+            locality_preference_enabled: true,
+            ..CoordinatorConfig::default()
+        });
+        let plan = serde_json::to_vec(&single_scan_plan("lineitem")).expect("plan");
+        c.submit_query("qlocal".to_string(), &plan).expect("submit");
+
+        c.heartbeat("w_remote", 0, &["locality:table:orders".to_string()])
+            .expect("remote heartbeat");
+        c.heartbeat("w_local", 0, &["locality:table:lineitem".to_string()])
+            .expect("local heartbeat");
+
+        let remote = c.get_task("w_remote", 1).expect("remote task");
+        assert!(remote.is_empty());
+        let local = c.get_task("w_local", 1).expect("local task");
+        assert_eq!(local.len(), 1);
     }
 
     #[test]
