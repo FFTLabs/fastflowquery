@@ -266,8 +266,10 @@ Commands:
 ```bash
 make bench-v2-window-embedded
 make bench-v2-adaptive-shuffle-embedded
+make bench-v2-pipelined-shuffle
 make bench-v2-window-compare BASELINE=<baseline.json-or-dir> CANDIDATE=<candidate.json-or-dir>
 make bench-v2-adaptive-shuffle-compare BASELINE=<baseline.json-or-dir> CANDIDATE=<candidate.json-or-dir>
+make bench-v2-pipelined-shuffle-gate CANDIDATE=<candidate.json>
 ```
 
 Pass criteria:
@@ -275,7 +277,8 @@ Pass criteria:
 1. benchmark runs complete with all rows marked `success=true`
 2. comparator exits `0` for window matrix thresholds
 3. comparator exits `0` for adaptive-shuffle matrix thresholds
-4. CI `bench-13_3` workflow can run optional regression gates without manual patching
+4. pipelined-shuffle gate exits `0` (TTFR improvement and throughput bounds)
+5. CI `bench-13_3` workflow can run benchmark gates without manual patching
 
 Primary references:
 
@@ -284,7 +287,10 @@ Primary references:
 3. `scripts/run-bench-v2-adaptive-shuffle.sh`
 4. `tests/bench/thresholds/window_regression_thresholds.json`
 5. `tests/bench/thresholds/adaptive_shuffle_regression_thresholds.json`
-6. `docs/v2/adaptive-shuffle-tuning.md`
+6. `tests/bench/thresholds/pipelined_shuffle_ttfr_thresholds.json`
+7. `scripts/run-bench-v2-pipelined-shuffle.sh`
+8. `scripts/check-bench-v2-pipelined-ttfr.py`
+9. `docs/v2/adaptive-shuffle-tuning.md`
 
 Pass criteria:
 

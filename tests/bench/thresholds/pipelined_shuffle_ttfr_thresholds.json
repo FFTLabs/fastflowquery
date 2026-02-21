@@ -1,0 +1,5 @@
+{
+  "min_ttfr_improvement_pct": 10.0,
+  "max_total_runtime_regression_pct": 12.0,
+  "max_throughput_regression_pct": 12.0
+}

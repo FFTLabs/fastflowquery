@@ -237,6 +237,37 @@ jobs:
           fi
           make bench-v2-adaptive-shuffle-compare BASELINE="${BASELINE}" CANDIDATE="${{ steps.adaptive_candidate.outputs.json }}" THRESHOLD="${THRESHOLD}"
 
+      - name: Run pipelined-shuffle TTFR benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.matrix.outputs.mode }}" == "full" ]]; then
+            export FFQ_PIPE_TTFR_ROWS=600000
+            export FFQ_PIPE_TTFR_WARMUP=1
+            export FFQ_PIPE_TTFR_ITERATIONS=3
+          else
+            export FFQ_PIPE_TTFR_ROWS=250000
+            export FFQ_PIPE_TTFR_WARMUP=1
+            export FFQ_PIPE_TTFR_ITERATIONS=2
+          fi
+          export FFQ_PIPE_TTFR_SHUFFLE_PARTITIONS=64
+          make bench-v2-pipelined-shuffle
+
+      - name: Resolve pipelined TTFR candidate artifact
+        id: pipelined_candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          CANDIDATE_JSON="$(ls -t tests/bench/results/bench_v2_pipelined_shuffle_ttfr_*.json | head -n1)"
+          echo "json=${CANDIDATE_JSON}" >> "$GITHUB_OUTPUT"
+          echo "pipelined_candidate_json=${CANDIDATE_JSON}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pipelined TTFR threshold gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          make bench-v2-pipelined-shuffle-gate CANDIDATE="${{ steps.pipelined_candidate.outputs.json }}"
+
       - name: Upload benchmark artifacts
         uses: actions/upload-artifact@v4
         with:

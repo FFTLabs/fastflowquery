@@ -29,6 +29,8 @@ SHELL := /bin/bash
 	bench-v2-adaptive-shuffle-embedded \
 	bench-v2-adaptive-shuffle-distributed \
 	bench-v2-adaptive-shuffle-compare \
+	bench-v2-pipelined-shuffle \
+	bench-v2-pipelined-shuffle-gate \
 	bench-v2-join-radix \
 	bench-v2-join-bloom \
 	bench-13.4-official-embedded \
@@ -148,6 +150,14 @@ bench-v2-adaptive-shuffle-compare:
 	@test -n "$$BASELINE" || (echo "BASELINE is required (json file or dir)" && exit 1)
 	@test -n "$$CANDIDATE" || (echo "CANDIDATE is required (json file or dir)" && exit 1)
 	./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}" --threshold-file "$${THRESHOLD_FILE:-tests/bench/thresholds/adaptive_shuffle_regression_thresholds.json}"
+
+bench-v2-pipelined-shuffle:
+	./scripts/run-bench-v2-pipelined-shuffle.sh
+
+bench-v2-pipelined-shuffle-gate:
+	@CANDIDATE="$${CANDIDATE:-$$(ls -t tests/bench/results/bench_v2_pipelined_shuffle_ttfr_*.json 2>/dev/null | head -n1)}"; \
+	test -n "$$CANDIDATE" || (echo "CANDIDATE is required (or run bench-v2-pipelined-shuffle first)" && exit 1); \
+	./scripts/check-bench-v2-pipelined-ttfr.py --candidate "$$CANDIDATE" --threshold-file "$${THRESHOLD_FILE:-tests/bench/thresholds/pipelined_shuffle_ttfr_thresholds.json}"
 
 bench-v2-join-radix:
 	cargo run -p ffq-client --example bench_join_radix
