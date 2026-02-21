@@ -384,3 +384,122 @@ impl StorageProvider for ObjectStoreProvider {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use futures::TryStreamExt;
+    use parquet::arrow::ArrowWriter;
+
+    use crate::TableStats;
+
+    #[test]
+    fn object_store_uri_detection_requires_scheme() {
+        assert!(is_object_store_uri("s3://bucket/path.parquet"));
+        assert!(is_object_store_uri("gs://bucket/path.parquet"));
+        assert!(is_object_store_uri("file:///tmp/x.parquet"));
+        assert!(!is_object_store_uri("/tmp/x.parquet"));
+        assert!(!is_object_store_uri("relative/path.parquet"));
+    }
+
+    #[test]
+    fn object_store_scan_reads_file_uri_parquet() {
+        let p = unique_path("object_store_file_uri_scan", "parquet");
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("name", arrow_schema::DataType::Utf8, false),
+        ]));
+        write_parquet_file(
+            &p,
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+            ],
+        );
+
+        let uri = Url::from_file_path(&p).expect("file uri").to_string();
+        let provider = ObjectStoreProvider::new();
+        let table = TableDef {
+            name: "t".to_string(),
+            uri,
+            paths: vec![],
+            format: "parquet".to_string(),
+            schema: Some(schema.as_ref().clone()),
+            stats: TableStats::default(),
+            options: HashMap::new(),
+        };
+        let node = provider
+            .scan(&table, Some(vec!["id".to_string()]), vec![])
+            .expect("scan");
+        let stream = node
+            .execute(Arc::new(TaskContext {
+                batch_size_rows: 1024,
+                mem_budget_bytes: usize::MAX,
+            }))
+            .expect("execute");
+        let batches =
+            futures::executor::block_on(stream.try_collect::<Vec<RecordBatch>>()).expect("collect");
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 3);
+        assert_eq!(batches[0].schema().fields().len(), 1);
+        assert_eq!(batches[0].schema().field(0).name(), "id");
+
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn object_store_scan_retries_then_fails_for_missing_object() {
+        let missing = unique_path("object_store_missing", "parquet");
+        let uri = Url::from_file_path(&missing).expect("file uri").to_string();
+        let schema = Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]);
+        let mut options = HashMap::new();
+        options.insert("object_store.retry_attempts".to_string(), "2".to_string());
+        options.insert("object_store.retry_backoff_ms".to_string(), "0".to_string());
+        let table = TableDef {
+            name: "missing".to_string(),
+            uri,
+            paths: vec![],
+            format: "parquet".to_string(),
+            schema: Some(schema),
+            stats: TableStats::default(),
+            options,
+        };
+        let provider = ObjectStoreProvider::new();
+        let node = provider.scan(&table, None, vec![]).expect("scan");
+        let err = node
+            .execute(Arc::new(TaskContext {
+                batch_size_rows: 1024,
+                mem_budget_bytes: usize::MAX,
+            }))
+            .expect_err("expected failure");
+        let msg = err.to_string();
+        assert!(msg.contains("after 2 attempts"));
+        assert!(msg.contains("object-store fetch failed"));
+    }
+
+    fn write_parquet_file(path: &std::path::Path, schema: Arc<Schema>, cols: Vec<ArrayRef>) {
+        let batch = RecordBatch::try_new(schema.clone(), cols).expect("build batch");
+        let file = File::create(path).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+    }
+
+    fn unique_path(prefix: &str, ext: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ffq_storage_{prefix}_{nanos}.{ext}"))
+    }
+}

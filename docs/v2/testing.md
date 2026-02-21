@@ -130,6 +130,28 @@ Primary references:
 2. `crates/common/src/metrics.rs`
 3. `crates/storage/src/parquet_provider.rs` (tests module)
 
+### 1.2) Object-store parquet validation (EPIC 8.4)
+
+Commands:
+
+```bash
+cargo test -p ffq-storage --features s3 object_store_uri_detection_requires_scheme -- --nocapture
+cargo test -p ffq-storage --features s3 object_store_scan_reads_file_uri_parquet -- --nocapture
+cargo test -p ffq-storage --features s3 object_store_scan_retries_then_fails_for_missing_object -- --nocapture
+```
+
+Pass criteria:
+
+1. provider accepts URI-style object-store paths and rejects non-URI paths for object-store flow
+2. file-URI object-store scan returns correct parquet rows/columns
+3. missing-object path fails only after configured retry count with explicit attempt count in error text
+
+Primary references:
+
+1. `crates/storage/src/object_store_provider.rs`
+2. `crates/client/src/runtime.rs`
+3. `crates/distributed/src/worker.rs`
+
 ## 2) Distributed
 
 Commands:

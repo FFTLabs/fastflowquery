@@ -115,18 +115,55 @@ Execution integration:
 1. Embedded runtime invokes `ParquetProvider::scan(...)` in `crates/client/src/runtime.rs`.
 2. Worker runtime invokes the same provider in `crates/distributed/src/worker.rs`.
 
-## Optional Object Store Behavior (`s3`)
+## Object Store Behavior (`s3`)
 
 Surface exists behind feature `s3`:
-- `crates/storage/src/object_store_provider.rs`
-- `crates/storage/Cargo.toml` feature `s3`
+1. `crates/storage/src/object_store_provider.rs`
+2. `crates/storage/Cargo.toml` feature `s3`
+3. runtime routing in:
+   - `crates/client/src/runtime.rs`
+   - `crates/distributed/src/worker.rs`
 
-Current state (v1 as implemented):
-1. `ObjectStoreProvider` exists and implements `StorageProvider`.
-2. `scan` currently returns `Unsupported` (experimental placeholder).
-3. `estimate_stats` still returns table stats if provided.
+Current behavior:
+1. URI-style parquet table paths (`scheme://...`) route to `ObjectStoreProvider`.
+2. Local file paths still route to `ParquetProvider`.
+3. Object-store scans currently support parquet format.
+4. Provider executes resilient object reads with retry + backoff + timeout controls.
 
-Implication: object-store wiring is intentionally non-default and currently not a complete scan path.
+### Retry, timeout, multipart-style range fetch
+
+Provider fetch path:
+1. performs `head` to discover object size
+2. uses full get for small objects
+3. uses ranged chunk reads for large objects (`range_chunk_size_bytes`) and reassembles bytes
+4. retries transient failures with configured attempt/backoff policy
+
+Config controls:
+
+Environment:
+1. `FFQ_OBJECT_STORE_RETRY_ATTEMPTS`
+2. `FFQ_OBJECT_STORE_RETRY_BACKOFF_MS`
+3. `FFQ_OBJECT_STORE_MAX_CONCURRENCY`
+4. `FFQ_OBJECT_STORE_RANGE_CHUNK_SIZE`
+5. `FFQ_OBJECT_STORE_TIMEOUT_SECS`
+6. `FFQ_OBJECT_STORE_CONNECT_TIMEOUT_SECS`
+
+Table options:
+1. `object_store.retry_attempts`
+2. `object_store.retry_backoff_ms`
+3. `object_store.max_concurrency`
+4. `object_store.range_chunk_size_bytes`
+5. `object_store.timeout_secs`
+6. `object_store.connect_timeout_secs`
+
+Credential/config chain:
+1. Any `object_store.<key>=<value>` option is forwarded to `object_store::parse_url_opts`.
+2. Provider-specific keys for S3/GCS/Azure can be set in table options or standard environment variables used by the underlying object-store SDK path.
+
+Operational guidance:
+1. start with moderate retries (`3`) and short backoff (`250ms`)
+2. set `range_chunk_size_bytes` based on network characteristics
+3. tune `max_concurrency` to avoid read amplification and memory spikes
 
 ## Optional Qdrant Behavior (`qdrant`)
 
