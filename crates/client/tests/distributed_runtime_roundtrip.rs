@@ -21,8 +21,8 @@ use ffq_distributed::{
 };
 #[cfg(feature = "vector")]
 use ffq_planner::LiteralValue;
-use ffq_storage::{TableDef, TableStats};
 use ffq_shuffle::ShuffleCompressionCodec;
+use ffq_storage::{TableDef, TableStats};
 use parquet::arrow::ArrowWriter;
 use tokio::sync::Mutex;
 use tonic::transport::Server;

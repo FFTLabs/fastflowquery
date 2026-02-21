@@ -75,10 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let adaptive_shuffle_max_partitions_per_task =
         env_u32_or_default("FFQ_ADAPTIVE_SHUFFLE_MAX_PARTITIONS_PER_TASK", 0);
     let pipelined_shuffle_enabled = env_bool_or_default("FFQ_PIPELINED_SHUFFLE_ENABLED", false);
-    let pipelined_shuffle_min_map_completion_ratio = env_f64_or_default(
-        "FFQ_PIPELINED_SHUFFLE_MIN_MAP_COMPLETION_RATIO",
-        0.5,
-    );
+    let pipelined_shuffle_min_map_completion_ratio =
+        env_f64_or_default("FFQ_PIPELINED_SHUFFLE_MIN_MAP_COMPLETION_RATIO", 0.5);
     let pipelined_shuffle_min_committed_offset_bytes =
         env_u64_or_default("FFQ_PIPELINED_SHUFFLE_MIN_COMMITTED_OFFSET_BYTES", 1);
     let catalog_path = env::var("FFQ_COORDINATOR_CATALOG_PATH").ok();

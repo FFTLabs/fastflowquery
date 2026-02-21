@@ -23,5 +23,5 @@ pub mod reader;
 pub mod writer;
 
 pub use layout::*;
-pub use reader::ShuffleReader;
+pub use reader::{FetchedPartitionChunk, ShuffleReader};
 pub use writer::{ShuffleWriter, aggregate_partition_chunks};

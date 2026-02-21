@@ -178,10 +178,16 @@ message FetchShufflePartitionRequest {
   uint64 map_task = 3;
   uint32 attempt = 4;
   uint32 reduce_partition = 5;
+  uint64 start_offset = 6;
+  uint64 max_bytes = 7;
 }
 
 message ShufflePartitionChunk {
   bytes payload = 1;
+  uint64 start_offset = 2;
+  uint64 end_offset = 3;
+  uint64 watermark_offset = 4;
+  bool finalized = 5;
 }
 
 message HeartbeatRequest {

@@ -236,19 +236,27 @@ impl ShuffleService for CoordinatorServices {
         let req = request.into_inner();
         let coordinator = self.coordinator.lock().await;
         let chunks = coordinator
-            .fetch_shuffle_partition_chunks(
+            .fetch_shuffle_partition_chunks_range(
                 &req.query_id,
                 req.stage_id,
                 req.map_task,
                 req.attempt,
                 req.reduce_partition,
+                req.start_offset,
+                req.max_bytes,
             )
             .map_err(to_status)?;
         drop(coordinator);
 
-        let out = chunks
-            .into_iter()
-            .map(|payload| Ok(v1::ShufflePartitionChunk { payload }));
+        let out = chunks.into_iter().map(|c| {
+            Ok(v1::ShufflePartitionChunk {
+                payload: c.payload,
+                start_offset: c.start_offset,
+                end_offset: c.end_offset,
+                watermark_offset: c.watermark_offset,
+                finalized: c.finalized,
+            })
+        });
         Ok(Response::new(Box::pin(stream::iter(out))))
     }
 }
@@ -416,31 +424,65 @@ impl ShuffleService for WorkerShuffleService {
             .parse::<u64>()
             .map_err(|e| Status::invalid_argument(format!("query_id must be numeric: {e}")))?;
         let reader = ShuffleReader::new(&self.shuffle_root);
-        let chunks = if req.attempt == 0 {
-            let (_attempt, chunks) = reader
-                .fetch_partition_chunks_latest(
+        let (attempt, chunks) = if req.attempt == 0 {
+            let attempt = reader
+                .latest_attempt(query_num, req.stage_id, req.map_task)
+                .map_err(to_status)?
+                .ok_or_else(|| {
+                    Status::failed_precondition("no shuffle attempts found for map task")
+                })?;
+            let chunks = reader
+                .fetch_partition_chunks_range(
                     query_num,
                     req.stage_id,
                     req.map_task,
+                    attempt,
                     req.reduce_partition,
+                    req.start_offset,
+                    req.max_bytes,
                 )
                 .map_err(to_status)?;
-            chunks
+            (attempt, chunks)
         } else {
-            reader
-                .fetch_partition_chunks(
+            let chunks = reader
+                .fetch_partition_chunks_range(
                     query_num,
                     req.stage_id,
                     req.map_task,
                     req.attempt,
                     req.reduce_partition,
+                    req.start_offset,
+                    req.max_bytes,
                 )
-                .map_err(to_status)?
+                .map_err(to_status)?;
+            (req.attempt, chunks)
         };
 
-        let out = chunks
-            .into_iter()
-            .map(|payload| Ok(v1::ShufflePartitionChunk { payload }));
+        let meta_key = (req.query_id, req.stage_id, req.map_task, attempt);
+        let part_meta = self
+            .map_outputs
+            .lock()
+            .await
+            .get(&meta_key)
+            .and_then(|parts| {
+                parts
+                    .iter()
+                    .find(|p| p.reduce_partition == req.reduce_partition)
+                    .cloned()
+            });
+        let (watermark_offset, finalized) = part_meta
+            .map(|m| (m.committed_offset, m.finalized))
+            .unwrap_or((0, false));
+
+        let out = chunks.into_iter().map(move |c| {
+            Ok(v1::ShufflePartitionChunk {
+                start_offset: c.start_offset,
+                end_offset: c.start_offset + c.payload.len() as u64,
+                payload: c.payload,
+                watermark_offset,
+                finalized,
+            })
+        });
         Ok(Response::new(Box::pin(stream::iter(out))))
     }
 }
@@ -448,11 +490,16 @@ impl ShuffleService for WorkerShuffleService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use arrow_schema::Schema;
     use ffq_planner::{
         ExchangeExec, ParquetScanExec, PartitioningSpec, PhysicalPlan, ShuffleReadExchange,
         ShuffleWriteExchange,
     };
+    use ffq_shuffle::layout::shuffle_path;
+    use tokio_stream::StreamExt;
 
     fn shuffle_plan(partitions: usize) -> PhysicalPlan {
         PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
@@ -518,37 +565,37 @@ mod tests {
                         bytes: 8,
                         rows: 1,
                         batches: 1,
-                    stream_epoch: 1,
-                    committed_offset: 0,
-                    finalized: true,
-},
+                        stream_epoch: 1,
+                        committed_offset: 0,
+                        finalized: true,
+                    },
                     v1::MapOutputPartition {
                         reduce_partition: 1,
                         bytes: 120,
                         rows: 1,
                         batches: 1,
-                    stream_epoch: 1,
-                    committed_offset: 0,
-                    finalized: true,
-},
+                        stream_epoch: 1,
+                        committed_offset: 0,
+                        finalized: true,
+                    },
                     v1::MapOutputPartition {
                         reduce_partition: 2,
                         bytes: 8,
                         rows: 1,
                         batches: 1,
-                    stream_epoch: 1,
-                    committed_offset: 0,
-                    finalized: true,
-},
+                        stream_epoch: 1,
+                        committed_offset: 0,
+                        finalized: true,
+                    },
                     v1::MapOutputPartition {
                         reduce_partition: 3,
                         bytes: 8,
                         rows: 1,
                         batches: 1,
-                    stream_epoch: 1,
-                    committed_offset: 0,
-                    finalized: true,
-},
+                        stream_epoch: 1,
+                        committed_offset: 0,
+                        finalized: true,
+                    },
                 ],
             }))
             .await
@@ -632,5 +679,92 @@ mod tests {
             .map(|b| (b.upper_bound_bytes, b.partition_count))
             .collect::<Vec<_>>();
         assert_eq!(grpc_hist, direct_hist);
+    }
+
+    #[tokio::test]
+    async fn worker_shuffle_fetch_supports_range_and_returns_chunk_offsets_and_watermark() {
+        let base = std::env::temp_dir().join(format!(
+            "ffq-grpc-fetch-range-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).expect("create temp root");
+        let svc = WorkerShuffleService::new(&base);
+
+        let query_id = "9010".to_string();
+        let stage_id = 1_u64;
+        let map_task = 0_u64;
+        let attempt = 1_u32;
+        let reduce_partition = 3_u32;
+
+        let rel = shuffle_path(
+            query_id.parse().expect("numeric query"),
+            stage_id,
+            map_task,
+            attempt,
+            reduce_partition,
+        );
+        let payload = (0_u8..32).collect::<Vec<_>>();
+        let full = base.join(rel);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).expect("mkdirs");
+        }
+        fs::write(&full, &payload).expect("write payload");
+
+        svc.register_map_output(Request::new(v1::RegisterMapOutputRequest {
+            query_id: query_id.clone(),
+            stage_id,
+            map_task,
+            attempt,
+            layout_version: 1,
+            layout_fingerprint: 7,
+            partitions: vec![v1::MapOutputPartition {
+                reduce_partition,
+                bytes: payload.len() as u64,
+                rows: 2,
+                batches: 1,
+                stream_epoch: 1,
+                committed_offset: 24,
+                finalized: false,
+            }],
+        }))
+        .await
+        .expect("register");
+
+        let response = svc
+            .fetch_shuffle_partition(Request::new(v1::FetchShufflePartitionRequest {
+                query_id,
+                stage_id,
+                map_task,
+                attempt,
+                reduce_partition,
+                start_offset: 8,
+                max_bytes: 10,
+            }))
+            .await
+            .expect("fetch");
+        let mut stream = response.into_inner();
+        let mut chunks = Vec::new();
+        while let Some(next) = stream.next().await {
+            chunks.push(next.expect("chunk"));
+        }
+
+        assert!(!chunks.is_empty(), "expected at least one streamed chunk");
+        let stitched = chunks
+            .iter()
+            .flat_map(|c| c.payload.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(stitched, payload[8..18].to_vec());
+        assert_eq!(chunks[0].start_offset, 8);
+        assert_eq!(
+            chunks.last().expect("last").end_offset,
+            8 + stitched.len() as u64
+        );
+        assert!(chunks.iter().all(|c| c.watermark_offset == 24));
+        assert!(chunks.iter().all(|c| !c.finalized));
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

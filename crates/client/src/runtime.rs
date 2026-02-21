@@ -4011,15 +4011,13 @@ fn build_agg_specs(
                 }
                 AggExpr::Avg(_) => DataType::Float64,
             },
-            AggregateMode::Final => {
-                match expr {
-                    AggExpr::ApproxCountDistinct(_) => DataType::Int64,
-                    _ => {
-                        let col_idx = group_exprs.len() + idx;
-                        input_schema.field(col_idx).data_type().clone()
-                    }
+            AggregateMode::Final => match expr {
+                AggExpr::ApproxCountDistinct(_) => DataType::Int64,
+                _ => {
+                    let col_idx = group_exprs.len() + idx;
+                    input_schema.field(col_idx).data_type().clone()
                 }
-            }
+            },
         };
         specs.push(AggSpec {
             expr: expr.clone(),

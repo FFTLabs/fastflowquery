@@ -22,6 +22,15 @@ pub struct ShuffleReader {
     fetch_chunk_bytes: usize,
 }
 
+/// One byte-range chunk fetched from a partition payload file.
+#[derive(Debug, Clone)]
+pub struct FetchedPartitionChunk {
+    /// Inclusive start byte offset in partition file.
+    pub start_offset: u64,
+    /// Chunk payload bytes.
+    pub payload: Vec<u8>,
+}
+
 impl ShuffleReader {
     /// Create a reader rooted at `root_dir`.
     pub fn new(root_dir: impl Into<PathBuf>) -> Self {
@@ -172,6 +181,40 @@ impl ShuffleReader {
             let end = (offset + self.fetch_chunk_bytes).min(bytes.len());
             out.push(bytes[offset..end].to_vec());
             offset = end;
+        }
+        Ok(out)
+    }
+
+    /// Read a byte-range from one partition payload and split it into
+    /// fetch-sized chunks with offsets.
+    pub fn fetch_partition_chunks_range(
+        &self,
+        query_id: u64,
+        stage_id: u64,
+        map_task: u64,
+        attempt: u32,
+        reduce_partition: u32,
+        start_offset: u64,
+        max_bytes: u64,
+    ) -> Result<Vec<FetchedPartitionChunk>> {
+        let rel = shuffle_path(query_id, stage_id, map_task, attempt, reduce_partition);
+        let bytes = fs::read(self.root_dir.join(rel))?;
+        let start = (start_offset as usize).min(bytes.len());
+        let span = if max_bytes == 0 {
+            bytes.len().saturating_sub(start)
+        } else {
+            (max_bytes as usize).min(bytes.len().saturating_sub(start))
+        };
+        let end = start.saturating_add(span);
+        let mut out = Vec::new();
+        let mut offset = start;
+        while offset < end {
+            let chunk_end = (offset + self.fetch_chunk_bytes).min(end);
+            out.push(FetchedPartitionChunk {
+                start_offset: offset as u64,
+                payload: bytes[offset..chunk_end].to_vec(),
+            });
+            offset = chunk_end;
         }
         Ok(out)
     }

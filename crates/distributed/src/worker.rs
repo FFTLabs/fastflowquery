@@ -40,9 +40,9 @@ use ffq_planner::{
     WindowExpr, WindowFrameBound, WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits,
     WindowFunction, WindowOrderExpr,
 };
-use ffq_shuffle::{ShuffleReader, ShuffleWriter};
 use ffq_shuffle::ShuffleCompressionCodec;
 use ffq_shuffle::aggregate_partition_chunks;
+use ffq_shuffle::{ShuffleReader, ShuffleWriter};
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
 use ffq_storage::qdrant_provider::QdrantProvider;
@@ -393,7 +393,9 @@ where
                 join_bloom_bits: self.config.join_bloom_bits,
                 shuffle_compression_codec: self.config.shuffle_compression_codec,
                 reduce_fetch_window_partitions: self.config.reduce_fetch_window_partitions,
-                map_output_publish_window_partitions: self.config.map_output_publish_window_partitions,
+                map_output_publish_window_partitions: self
+                    .config
+                    .map_output_publish_window_partitions,
                 spill_dir: self.config.spill_dir.clone(),
                 shuffle_root: self.config.shuffle_root.clone(),
                 assigned_reduce_partitions: assignment.assigned_reduce_partitions.clone(),
@@ -414,9 +416,8 @@ where
                             "task execution succeeded"
                         );
                         if !exec_result.map_output_partitions.is_empty() {
-                            let publish_window = task_ctx
-                                .map_output_publish_window_partitions
-                                .max(1) as usize;
+                            let publish_window =
+                                task_ctx.map_output_publish_window_partitions.max(1) as usize;
                             for chunk in exec_result.map_output_partitions.chunks(publish_window) {
                                 control_plane
                                     .register_map_output(&assignment, chunk.to_vec())
@@ -1475,8 +1476,8 @@ fn write_stage_shuffle_outputs(
     ctx: &TaskContext,
 ) -> Result<Vec<MapOutputPartitionMeta>> {
     let started = Instant::now();
-    let writer = ShuffleWriter::new(&ctx.shuffle_root)
-        .with_compression_codec(ctx.shuffle_compression_codec);
+    let writer =
+        ShuffleWriter::new(&ctx.shuffle_root).with_compression_codec(ctx.shuffle_compression_codec);
     let mut chunk_index = HashMap::<u32, Vec<ffq_shuffle::ShufflePartitionChunkMeta>>::new();
     for batch in &child.batches {
         let one = ExecOutput {
@@ -3890,15 +3891,13 @@ fn build_agg_specs(
                 }
                 AggExpr::Avg(_) => DataType::Float64,
             },
-            AggregateMode::Final => {
-                match expr {
-                    AggExpr::ApproxCountDistinct(_) => DataType::Int64,
-                    _ => {
-                        let col_idx = group_exprs.len() + idx;
-                        input_schema.field(col_idx).data_type().clone()
-                    }
+            AggregateMode::Final => match expr {
+                AggExpr::ApproxCountDistinct(_) => DataType::Int64,
+                _ => {
+                    let col_idx = group_exprs.len() + idx;
+                    input_schema.field(col_idx).data_type().clone()
                 }
-            }
+            },
         };
         specs.push(AggSpec {
             expr: expr.clone(),

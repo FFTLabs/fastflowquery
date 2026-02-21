@@ -22,7 +22,7 @@ use ffq_common::adaptive::{
 use ffq_common::metrics::global_metrics;
 use ffq_common::{FfqError, Result, SchemaInferencePolicy};
 use ffq_planner::{ExchangeExec, PartitioningSpec, PhysicalPlan};
-use ffq_shuffle::ShuffleReader;
+use ffq_shuffle::{FetchedPartitionChunk, ShuffleReader};
 use ffq_storage::Catalog;
 use ffq_storage::parquet_provider::ParquetProvider;
 use tracing::{debug, info, warn};
@@ -210,6 +210,21 @@ pub struct MapOutputPartitionMeta {
     /// Highest committed readable byte offset in the partition stream.
     pub committed_offset: u64,
     /// Whether the partition stream is finalized for this attempt.
+    pub finalized: bool,
+}
+
+#[derive(Debug, Clone)]
+/// One streamed shuffle chunk with readable-boundary metadata.
+pub struct ShuffleFetchChunk {
+    /// Payload bytes for this chunk.
+    pub payload: Vec<u8>,
+    /// Inclusive start byte offset in the partition payload.
+    pub start_offset: u64,
+    /// Exclusive end byte offset in the partition payload.
+    pub end_offset: u64,
+    /// Highest committed readable byte offset known for this partition.
+    pub watermark_offset: u64,
+    /// Whether this partition stream is finalized for the selected attempt.
     pub finalized: bool,
 }
 
@@ -658,20 +673,20 @@ impl Coordinator {
                 let Some(stage_runtime) = query.stages.get(&stage_id) else {
                     continue;
                 };
-                let stage_parents_done = all_parents_done_for_stage(query, stage_id, &latest_states);
-                let pipeline_ready_partitions = if self.config.pipelined_shuffle_enabled
-                    && !stage_parents_done
-                {
-                    Some(ready_reduce_partitions_for_stage(
-                        query_id,
-                        query,
-                        stage_id,
-                        &map_outputs_snapshot,
-                        self.config.pipelined_shuffle_min_committed_offset_bytes,
-                    ))
-                } else {
-                    None
-                };
+                let stage_parents_done =
+                    all_parents_done_for_stage(query, stage_id, &latest_states);
+                let pipeline_ready_partitions =
+                    if self.config.pipelined_shuffle_enabled && !stage_parents_done {
+                        Some(ready_reduce_partitions_for_stage(
+                            query_id,
+                            query,
+                            stage_id,
+                            &map_outputs_snapshot,
+                            self.config.pipelined_shuffle_min_committed_offset_bytes,
+                        ))
+                    } else {
+                        None
+                    };
                 if !matches!(
                     stage_runtime.barrier_state,
                     StageBarrierState::NotApplicable | StageBarrierState::ReduceSchedulable
@@ -1195,21 +1210,34 @@ impl Coordinator {
         self.blacklisted_workers.contains(worker_id)
     }
 
-    /// Read shuffle partition bytes for the requested map attempt.
-    pub fn fetch_shuffle_partition_chunks(
+    /// Read shuffle partition bytes for the requested map attempt and byte range.
+    pub fn fetch_shuffle_partition_chunks_range(
         &self,
         query_id: &str,
         stage_id: u64,
         map_task: u64,
         attempt: u32,
         reduce_partition: u32,
-    ) -> Result<Vec<Vec<u8>>> {
+        start_offset: u64,
+        max_bytes: u64,
+    ) -> Result<Vec<ShuffleFetchChunk>> {
         let key = (query_id.to_string(), stage_id, map_task, attempt);
-        if !self.map_outputs.contains_key(&key) {
-            return Err(FfqError::Planning(
-                "map output not registered for requested attempt".to_string(),
-            ));
-        }
+        let parts = self.map_outputs.get(&key).ok_or_else(|| {
+            FfqError::Planning("map output not registered for requested attempt".to_string())
+        })?;
+        let part_meta = parts
+            .iter()
+            .find(|p| p.reduce_partition == reduce_partition)
+            .cloned()
+            .unwrap_or(MapOutputPartitionMeta {
+                reduce_partition,
+                bytes: 0,
+                rows: 0,
+                batches: 0,
+                stream_epoch: 0,
+                committed_offset: 0,
+                finalized: false,
+            });
 
         let query_num = query_id.parse::<u64>().map_err(|e| {
             FfqError::InvalidConfig(format!(
@@ -1217,7 +1245,25 @@ impl Coordinator {
             ))
         })?;
         let reader = ShuffleReader::new(&self.config.shuffle_root);
-        reader.fetch_partition_chunks(query_num, stage_id, map_task, attempt, reduce_partition)
+        let chunks = reader.fetch_partition_chunks_range(
+            query_num,
+            stage_id,
+            map_task,
+            attempt,
+            reduce_partition,
+            start_offset,
+            max_bytes,
+        )?;
+        Ok(chunks
+            .into_iter()
+            .map(|c: FetchedPartitionChunk| ShuffleFetchChunk {
+                end_offset: c.start_offset + c.payload.len() as u64,
+                payload: c.payload,
+                start_offset: c.start_offset,
+                watermark_offset: part_meta.committed_offset,
+                finalized: part_meta.finalized,
+            })
+            .collect())
     }
 }
 
@@ -2321,37 +2367,37 @@ mod tests {
                     bytes: 10,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 1,
                     bytes: 20,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 2,
                     bytes: 30,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 3,
                     bytes: 40,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
             ],
         )
         .expect("register");
@@ -2406,37 +2452,37 @@ mod tests {
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 1,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 2,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 3,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
             ],
         )
         .expect("register map output");
@@ -2509,10 +2555,10 @@ mod tests {
                 bytes: 5,
                 rows: 1,
                 batches: 1,
-            stream_epoch: 1,
-            committed_offset: 0,
-            finalized: true,
-}],
+                stream_epoch: 1,
+                committed_offset: 0,
+                finalized: true,
+            }],
         )
         .expect("stale map output ignored");
         assert_eq!(c.map_output_registry_size(), 0);
@@ -2530,37 +2576,37 @@ mod tests {
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 1,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 2,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 3,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
             ],
         )
         .expect("register map output");
@@ -2657,37 +2703,37 @@ mod tests {
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 1,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 2,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 3,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
             ],
         )
         .expect("register map2");
@@ -2762,37 +2808,37 @@ mod tests {
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 1,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 2,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 3,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
             ],
         )
         .expect("register map2");
@@ -2960,37 +3006,37 @@ mod tests {
                     bytes: 8,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 1,
                     bytes: 120,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 2,
                     bytes: 8,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 3,
                     bytes: 8,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
             ],
         )
         .expect("register");
@@ -3073,37 +3119,37 @@ mod tests {
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 1,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 2,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
                 MapOutputPartitionMeta {
                     reduce_partition: 3,
                     bytes: 5,
                     rows: 1,
                     batches: 1,
-                stream_epoch: 1,
-                committed_offset: 0,
-                finalized: true,
-},
+                    stream_epoch: 1,
+                    committed_offset: 0,
+                    finalized: true,
+                },
             ],
         )
         .expect("register");
@@ -3338,7 +3384,12 @@ mod tests {
         )
         .expect("register");
         let boundaries = c
-            .map_output_readable_boundaries("306", map_task.stage_id, map_task.task_id, map_task.attempt)
+            .map_output_readable_boundaries(
+                "306",
+                map_task.stage_id,
+                map_task.task_id,
+                map_task.attempt,
+            )
             .expect("boundaries");
         assert_eq!(boundaries.len(), 2);
         assert_eq!(boundaries[0].reduce_partition, 1);

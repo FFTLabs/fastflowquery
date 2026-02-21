@@ -258,7 +258,10 @@ fn to_unix_ms(ts: SystemTime) -> Result<u64> {
         .map_err(|e| FfqError::Execution(format!("clock error: {e}")))
 }
 
-fn encode_ipc_payload(batches: &[RecordBatch], schema: &arrow::datatypes::Schema) -> Result<Vec<u8>> {
+fn encode_ipc_payload(
+    batches: &[RecordBatch],
+    schema: &arrow::datatypes::Schema,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     {
         let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut out, schema)
@@ -431,7 +434,8 @@ mod tests {
     #[test]
     fn appends_multiple_chunks_and_records_chunk_index_entries() {
         let root = temp_shuffle_root();
-        let writer = ShuffleWriter::new(&root).with_compression_codec(ShuffleCompressionCodec::Zstd);
+        let writer =
+            ShuffleWriter::new(&root).with_compression_codec(ShuffleCompressionCodec::Zstd);
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let b1 = RecordBatch::try_new(
             schema.clone(),
@@ -451,14 +455,8 @@ mod tests {
             .expect("chunk2");
         let mut by_part = HashMap::<u32, Vec<ShufflePartitionChunkMeta>>::new();
         by_part.insert(0, vec![c1.clone(), c2.clone()]);
-        let parts = super::aggregate_partition_chunks(
-            9,
-            1,
-            0,
-            1,
-            ShuffleCompressionCodec::Zstd,
-            by_part,
-        );
+        let parts =
+            super::aggregate_partition_chunks(9, 1, 0, 1, ShuffleCompressionCodec::Zstd, by_part);
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].chunks.len(), 2);
         assert_eq!(parts[0].chunks[0].offset_bytes, c1.offset_bytes);

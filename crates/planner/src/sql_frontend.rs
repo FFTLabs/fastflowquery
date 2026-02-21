@@ -1904,7 +1904,8 @@ mod tests {
         } else {
             let err = plan.expect_err("expected unsupported without approx feature");
             assert!(
-                err.to_string().contains("APPROX_COUNT_DISTINCT is disabled"),
+                err.to_string()
+                    .contains("APPROX_COUNT_DISTINCT is disabled"),
                 "err={err}"
             );
         }
