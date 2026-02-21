@@ -2,8 +2,8 @@
 
 - Status: draft
 - Owner: @ffq-docs
-- Last Verified Commit: TBD
-- Last Verified Date: TBD
+- Last Verified Commit: e2baae0
+- Last Verified Date: 2026-02-21
 - Source: inherited/adapted from prior version docs; v2 verification pending
 
 

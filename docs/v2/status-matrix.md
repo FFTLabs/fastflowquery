@@ -2,8 +2,8 @@
 
 - Status: verified
 - Owner: @ffq-docs
-- Last Verified Commit: dd45319
-- Last Verified Date: 2026-02-19
+- Last Verified Commit: e2baae0
+- Last Verified Date: 2026-02-21
 
 Source plan: `tickets/eng/Plan_v2.md`.
 
