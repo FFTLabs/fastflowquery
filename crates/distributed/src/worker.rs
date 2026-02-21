@@ -153,6 +153,10 @@ pub struct TaskExecutionResult {
     pub publish_results: bool,
     /// Human-readable completion message.
     pub message: String,
+    /// Observed reducer in-flight bytes for this task.
+    pub reduce_fetch_inflight_bytes: u64,
+    /// Observed reducer queue depth for this task.
+    pub reduce_fetch_queue_depth: u32,
 }
 
 #[async_trait]
@@ -167,6 +171,8 @@ pub trait WorkerControlPlane: Send + Sync {
         assignment: &TaskAssignment,
         state: TaskState,
         message: String,
+        reduce_fetch_inflight_bytes: u64,
+        reduce_fetch_queue_depth: u32,
     ) -> Result<()>;
     /// Register map output partition metadata for a completed map task.
     async fn register_map_output(
@@ -282,6 +288,8 @@ impl TaskExecutor for DefaultTaskExecutor {
             output_batches: Vec::new(),
             publish_results: false,
             message: String::new(),
+            reduce_fetch_inflight_bytes: 0,
+            reduce_fetch_queue_depth: 0,
         };
         if stage.children.is_empty() {
             result.message = format!("sink stage rows={}", count_rows(&output.batches));
@@ -290,12 +298,21 @@ impl TaskExecutor for DefaultTaskExecutor {
             let mut sink = self.sink_outputs.lock().await;
             sink.entry(ctx.query_id.clone())
                 .or_default()
-                .extend(output.batches);
+                .extend(output.batches.clone());
         } else {
             result.message = format!(
                 "map stage wrote {} partitions",
                 result.map_output_partitions.len()
             );
+        }
+        if !ctx.assigned_reduce_partitions.is_empty() {
+            let (_, _, bytes) = batch_stats(&output.batches);
+            result.reduce_fetch_inflight_bytes = bytes;
+            result.reduce_fetch_queue_depth = ctx
+                .assigned_reduce_partitions
+                .len()
+                .try_into()
+                .unwrap_or(u32::MAX);
         }
         info!(
             query_id = %ctx.query_id,
@@ -392,10 +409,12 @@ where
                 join_bloom_enabled: self.config.join_bloom_enabled,
                 join_bloom_bits: self.config.join_bloom_bits,
                 shuffle_compression_codec: self.config.shuffle_compression_codec,
-                reduce_fetch_window_partitions: self.config.reduce_fetch_window_partitions,
-                map_output_publish_window_partitions: self
-                    .config
-                    .map_output_publish_window_partitions,
+                reduce_fetch_window_partitions: assignment
+                    .recommended_reduce_fetch_window_partitions
+                    .max(1),
+                map_output_publish_window_partitions: assignment
+                    .recommended_map_output_publish_window_partitions
+                    .max(1),
                 spill_dir: self.config.spill_dir.clone(),
                 shuffle_root: self.config.shuffle_root.clone(),
                 assigned_reduce_partitions: assignment.assigned_reduce_partitions.clone(),
@@ -404,6 +423,16 @@ where
             };
             handles.push(tokio::spawn(async move {
                 let _permit = permit;
+                let _ = control_plane
+                    .report_task_status(
+                        &worker_id,
+                        &assignment,
+                        TaskState::Running,
+                        "running".to_string(),
+                        0,
+                        assignment.recommended_reduce_fetch_window_partitions.max(1),
+                    )
+                    .await;
                 let result = task_executor.execute(&assignment, &task_ctx).await;
                 match result {
                     Ok(exec_result) => {
@@ -459,6 +488,8 @@ where
                                 &assignment,
                                 TaskState::Succeeded,
                                 exec_result.message,
+                                exec_result.reduce_fetch_inflight_bytes,
+                                exec_result.reduce_fetch_queue_depth,
                             )
                             .await
                     }
@@ -474,7 +505,14 @@ where
                             "task execution failed"
                         );
                         let _ = control_plane
-                            .report_task_status(&worker_id, &assignment, TaskState::Failed, msg)
+                            .report_task_status(
+                                &worker_id,
+                                &assignment,
+                                TaskState::Failed,
+                                msg,
+                                0,
+                                0,
+                            )
                             .await;
                         Err(e)
                     }
@@ -546,9 +584,11 @@ impl WorkerControlPlane for InProcessControlPlane {
         assignment: &TaskAssignment,
         state: TaskState,
         message: String,
+        reduce_fetch_inflight_bytes: u64,
+        reduce_fetch_queue_depth: u32,
     ) -> Result<()> {
         let mut c = self.coordinator.lock().await;
-        c.report_task_status(
+        c.report_task_status_with_pressure(
             &assignment.query_id,
             assignment.stage_id,
             assignment.task_id,
@@ -558,6 +598,8 @@ impl WorkerControlPlane for InProcessControlPlane {
             state,
             Some(worker_id),
             message,
+            reduce_fetch_inflight_bytes,
+            reduce_fetch_queue_depth,
         )
     }
 
@@ -620,6 +662,10 @@ impl WorkerControlPlane for GrpcControlPlane {
                 assigned_reduce_split_count: t.assigned_reduce_split_count,
                 layout_version: t.layout_version,
                 layout_fingerprint: t.layout_fingerprint,
+                recommended_map_output_publish_window_partitions: t
+                    .recommended_map_output_publish_window_partitions,
+                recommended_reduce_fetch_window_partitions: t
+                    .recommended_reduce_fetch_window_partitions,
             })
             .collect())
     }
@@ -630,6 +676,8 @@ impl WorkerControlPlane for GrpcControlPlane {
         assignment: &TaskAssignment,
         state: TaskState,
         message: String,
+        reduce_fetch_inflight_bytes: u64,
+        reduce_fetch_queue_depth: u32,
     ) -> Result<()> {
         let mut client = self.control.lock().await;
         client
@@ -642,6 +690,8 @@ impl WorkerControlPlane for GrpcControlPlane {
                 layout_fingerprint: assignment.layout_fingerprint,
                 state: proto_task_state(state) as i32,
                 message,
+                reduce_fetch_inflight_bytes,
+                reduce_fetch_queue_depth,
             })
             .await
             .map_err(map_tonic_err)?;

@@ -64,6 +64,8 @@ message TaskAssignment {
   uint32 assigned_reduce_split_count = 8;
   uint32 layout_version = 9;
   uint64 layout_fingerprint = 10;
+  uint32 recommended_map_output_publish_window_partitions = 11;
+  uint32 recommended_reduce_fetch_window_partitions = 12;
 }
 
 message GetTaskResponse {
@@ -79,6 +81,8 @@ message ReportTaskStatusRequest {
   string message = 6;
   uint32 layout_version = 7;
   uint64 layout_fingerprint = 8;
+  uint64 reduce_fetch_inflight_bytes = 9;
+  uint32 reduce_fetch_queue_depth = 10;
 }
 
 message ReportTaskStatusResponse {}
@@ -114,6 +118,10 @@ message StageMetrics {
   repeated PartitionBytesHistogramBucket partition_bytes_histogram = 14;
   uint32 skew_split_tasks = 15;
   uint32 layout_finalize_count = 16;
+  uint64 backpressure_inflight_bytes = 17;
+  uint32 backpressure_queue_depth = 18;
+  uint32 map_publish_window_partitions = 19;
+  uint32 reduce_fetch_window_partitions = 20;
 }
 
 message PartitionBytesHistogramBucket {

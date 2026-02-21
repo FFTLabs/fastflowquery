@@ -107,7 +107,7 @@ impl ControlPlane for CoordinatorServices {
         let req = request.into_inner();
         let mut coordinator = self.coordinator.lock().await;
         coordinator
-            .report_task_status(
+            .report_task_status_with_pressure(
                 &req.query_id,
                 req.stage_id,
                 req.task_id,
@@ -117,6 +117,8 @@ impl ControlPlane for CoordinatorServices {
                 core_task_state(req.state)?,
                 None,
                 req.message,
+                req.reduce_fetch_inflight_bytes,
+                req.reduce_fetch_queue_depth,
             )
             .map_err(to_status)?;
         Ok(Response::new(v1::ReportTaskStatusResponse {}))
@@ -317,6 +319,9 @@ fn proto_task_assignment(task: CoreTaskAssignment) -> v1::TaskAssignment {
         assigned_reduce_split_count: task.assigned_reduce_split_count,
         layout_version: task.layout_version,
         layout_fingerprint: task.layout_fingerprint,
+        recommended_map_output_publish_window_partitions: task
+            .recommended_map_output_publish_window_partitions,
+        recommended_reduce_fetch_window_partitions: task.recommended_reduce_fetch_window_partitions,
     }
 }
 
@@ -348,6 +353,10 @@ fn proto_query_status(status: CoreQueryStatus) -> v1::QueryStatus {
                 .collect(),
             skew_split_tasks: m.skew_split_tasks,
             layout_finalize_count: m.layout_finalize_count,
+            backpressure_inflight_bytes: m.backpressure_inflight_bytes,
+            backpressure_queue_depth: m.backpressure_queue_depth,
+            map_publish_window_partitions: m.map_publish_window_partitions,
+            reduce_fetch_window_partitions: m.reduce_fetch_window_partitions,
         })
         .collect::<Vec<_>>();
     stage_metrics.sort_by_key(|m| m.stage_id);
@@ -692,6 +701,8 @@ mod tests {
                 layout_fingerprint: map_task.layout_fingerprint,
                 state: v1::TaskState::Succeeded as i32,
                 message: "map done".to_string(),
+                reduce_fetch_inflight_bytes: 0,
+                reduce_fetch_queue_depth: 0,
             }))
             .await
             .expect("grpc report map success");
@@ -710,6 +721,16 @@ mod tests {
             reduce_tasks
                 .iter()
                 .all(|t| !t.assigned_reduce_partitions.is_empty())
+        );
+        assert!(
+            reduce_tasks
+                .iter()
+                .all(|t| t.recommended_map_output_publish_window_partitions >= 1)
+        );
+        assert!(
+            reduce_tasks
+                .iter()
+                .all(|t| t.recommended_reduce_fetch_window_partitions >= 1)
         );
 
         let grpc_status = services

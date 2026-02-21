@@ -73,6 +73,14 @@ pub struct CoordinatorConfig {
     /// Minimum committed stream offset (bytes) required for a reduce partition
     /// to be considered readable in pipelined scheduling.
     pub pipelined_shuffle_min_committed_offset_bytes: u64,
+    /// Target reducer in-flight bytes used by backpressure throttling.
+    pub backpressure_target_inflight_bytes: u64,
+    /// Target reducer queue depth used by backpressure throttling.
+    pub backpressure_target_queue_depth: u32,
+    /// Max map-output publish window used when system is unconstrained.
+    pub backpressure_max_map_publish_window_partitions: u32,
+    /// Max reduce-fetch window used when system is unconstrained.
+    pub backpressure_max_reduce_fetch_window_partitions: u32,
 }
 
 impl Default for CoordinatorConfig {
@@ -93,6 +101,10 @@ impl Default for CoordinatorConfig {
             pipelined_shuffle_enabled: false,
             pipelined_shuffle_min_map_completion_ratio: 0.5,
             pipelined_shuffle_min_committed_offset_bytes: 1,
+            backpressure_target_inflight_bytes: 64 * 1024 * 1024,
+            backpressure_target_queue_depth: 32,
+            backpressure_max_map_publish_window_partitions: 8,
+            backpressure_max_reduce_fetch_window_partitions: 8,
         }
     }
 }
@@ -157,6 +169,10 @@ pub struct TaskAssignment {
     pub layout_version: u32,
     /// Deterministic fingerprint of assignment layout for this stage version.
     pub layout_fingerprint: u64,
+    /// Suggested map-output publish window for this task.
+    pub recommended_map_output_publish_window_partitions: u32,
+    /// Suggested reduce-fetch window for this task.
+    pub recommended_reduce_fetch_window_partitions: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -192,6 +208,14 @@ pub struct StageMetrics {
     pub skew_split_tasks: u32,
     /// Number of times layout was finalized for the stage.
     pub layout_finalize_count: u32,
+    /// Last observed reducer in-flight bytes for this stage.
+    pub backpressure_inflight_bytes: u64,
+    /// Last observed reducer queue depth for this stage.
+    pub backpressure_queue_depth: u32,
+    /// Current recommended map publish window.
+    pub map_publish_window_partitions: u32,
+    /// Current recommended reduce fetch window.
+    pub reduce_fetch_window_partitions: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +328,12 @@ struct WorkerHeartbeat {
     custom_operator_capabilities: HashSet<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ReduceBackpressureSample {
+    inflight_bytes: u64,
+    queue_depth: u32,
+}
+
 #[derive(Debug, Clone)]
 struct QueryRuntime {
     state: QueryState,
@@ -326,6 +356,7 @@ pub struct Coordinator {
     blacklisted_workers: HashSet<String>,
     worker_failures: HashMap<String, u32>,
     worker_heartbeats: HashMap<String, WorkerHeartbeat>,
+    reduce_backpressure: HashMap<(String, u64, u64, u32), ReduceBackpressureSample>,
 }
 
 impl Coordinator {
@@ -657,6 +688,16 @@ impl Coordinator {
             if running_for_query >= self.config.max_concurrent_tasks_per_query {
                 continue;
             }
+            let (observed_inflight, observed_queue_depth) =
+                aggregate_reduce_backpressure(&self.reduce_backpressure, query_id);
+            let (map_publish_window, reduce_fetch_window) = recommended_backpressure_windows(
+                observed_inflight,
+                observed_queue_depth,
+                self.config.backpressure_target_inflight_bytes,
+                self.config.backpressure_target_queue_depth,
+                self.config.backpressure_max_map_publish_window_partitions,
+                self.config.backpressure_max_reduce_fetch_window_partitions,
+            );
             let mut query_budget = self
                 .config
                 .max_concurrent_tasks_per_query
@@ -755,7 +796,15 @@ impl Coordinator {
                         assigned_reduce_split_count: task.assigned_reduce_split_count,
                         layout_version: task.layout_version,
                         layout_fingerprint: task.layout_fingerprint,
+                        recommended_map_output_publish_window_partitions: map_publish_window,
+                        recommended_reduce_fetch_window_partitions: reduce_fetch_window,
                     });
+                    if let Some(stage) = query.stages.get_mut(&stage_id) {
+                        stage.metrics.backpressure_inflight_bytes = observed_inflight;
+                        stage.metrics.backpressure_queue_depth = observed_queue_depth;
+                        stage.metrics.map_publish_window_partitions = map_publish_window;
+                        stage.metrics.reduce_fetch_window_partitions = reduce_fetch_window;
+                    }
                     remaining = remaining.saturating_sub(1);
                     query_budget = query_budget.saturating_sub(1);
                     debug!(
@@ -786,6 +835,36 @@ impl Coordinator {
         state: TaskState,
         worker_id: Option<&str>,
         message: String,
+    ) -> Result<()> {
+        self.report_task_status_with_pressure(
+            query_id,
+            stage_id,
+            task_id,
+            attempt,
+            layout_version,
+            layout_fingerprint,
+            state,
+            worker_id,
+            message,
+            0,
+            0,
+        )
+    }
+
+    /// Record a task attempt status transition and reducer backpressure sample.
+    pub fn report_task_status_with_pressure(
+        &mut self,
+        query_id: &str,
+        stage_id: u64,
+        task_id: u64,
+        attempt: u32,
+        layout_version: u32,
+        layout_fingerprint: u64,
+        state: TaskState,
+        worker_id: Option<&str>,
+        message: String,
+        reduce_fetch_inflight_bytes: u64,
+        reduce_fetch_queue_depth: u32,
     ) -> Result<()> {
         let now = now_ms()?;
         self.requeue_stale_workers(now)?;
@@ -845,7 +924,24 @@ impl Coordinator {
             .map(|t| t.state)
             .ok_or_else(|| FfqError::Planning("unknown task status report".to_string()))?;
 
+        let bp_key = (query_id.to_string(), stage_id, task_id, attempt);
+        if reduce_fetch_inflight_bytes > 0 || reduce_fetch_queue_depth > 0 {
+            self.reduce_backpressure.insert(
+                bp_key.clone(),
+                ReduceBackpressureSample {
+                    inflight_bytes: reduce_fetch_inflight_bytes,
+                    queue_depth: reduce_fetch_queue_depth,
+                },
+            );
+        }
+        if matches!(state, TaskState::Failed) {
+            self.reduce_backpressure.remove(&bp_key);
+        }
         if prev_state == state {
+            if let Some(stage) = query.stages.get_mut(&stage_id) {
+                stage.metrics.backpressure_inflight_bytes = reduce_fetch_inflight_bytes;
+                stage.metrics.backpressure_queue_depth = reduce_fetch_queue_depth;
+            }
             return Ok(());
         }
         let stage = query
@@ -956,6 +1052,8 @@ impl Coordinator {
                 }
             }
         }
+        stage.metrics.backpressure_inflight_bytes = reduce_fetch_inflight_bytes;
+        stage.metrics.backpressure_queue_depth = reduce_fetch_queue_depth;
         update_scheduler_metrics(query_id, stage_id, &stage.metrics);
 
         if query.state != QueryState::Failed && is_query_succeeded(query) {
@@ -1922,6 +2020,46 @@ fn merge_map_output_partitions(
     let mut merged = by_partition.into_values().collect::<Vec<_>>();
     merged.sort_by_key(|p| p.reduce_partition);
     *existing = merged;
+}
+
+fn aggregate_reduce_backpressure(
+    samples: &HashMap<(String, u64, u64, u32), ReduceBackpressureSample>,
+    query_id: &str,
+) -> (u64, u32) {
+    samples
+        .iter()
+        .filter(|((qid, _, _, _), _)| qid == query_id)
+        .fold((0_u64, 0_u32), |acc, (_, s)| {
+            (
+                acc.0.saturating_add(s.inflight_bytes),
+                acc.1.saturating_add(s.queue_depth),
+            )
+        })
+}
+
+fn recommended_backpressure_windows(
+    inflight_bytes: u64,
+    queue_depth: u32,
+    target_inflight_bytes: u64,
+    target_queue_depth: u32,
+    max_map_window: u32,
+    max_reduce_window: u32,
+) -> (u32, u32) {
+    let max_map = max_map_window.max(1);
+    let max_reduce = max_reduce_window.max(1);
+    let bytes_ratio = if target_inflight_bytes == 0 {
+        1.0
+    } else {
+        inflight_bytes as f64 / target_inflight_bytes as f64
+    };
+    let queue_ratio = if target_queue_depth == 0 {
+        1.0
+    } else {
+        queue_depth as f64 / target_queue_depth as f64
+    };
+    let pressure = bytes_ratio.max(queue_ratio).max(1.0);
+    let divisor = pressure.ceil() as u32;
+    ((max_map / divisor).max(1), (max_reduce / divisor).max(1))
 }
 
 fn is_query_succeeded(query: &QueryRuntime) -> bool {
@@ -3394,6 +3532,99 @@ mod tests {
             reduce_tasks
                 .iter()
                 .all(|t| t.assigned_reduce_partitions == vec![0])
+        );
+    }
+
+    #[test]
+    fn coordinator_backpressure_throttles_assignment_windows() {
+        let mut c = Coordinator::new(CoordinatorConfig {
+            backpressure_target_inflight_bytes: 10,
+            backpressure_target_queue_depth: 2,
+            backpressure_max_map_publish_window_partitions: 8,
+            backpressure_max_reduce_fetch_window_partitions: 8,
+            ..CoordinatorConfig::default()
+        });
+        let plan = PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
+            input: Box::new(PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(
+                ShuffleWriteExchange {
+                    input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
+                        table: "t".to_string(),
+                        schema: Some(Schema::empty()),
+                        projection: None,
+                        filters: vec![],
+                    })),
+                    partitioning: PartitioningSpec::HashKeys {
+                        keys: vec!["k".to_string()],
+                        partitions: 4,
+                    },
+                },
+            ))),
+            partitioning: PartitioningSpec::HashKeys {
+                keys: vec!["k".to_string()],
+                partitions: 4,
+            },
+        }));
+        let bytes = serde_json::to_vec(&plan).expect("plan");
+        c.submit_query("308".to_string(), &bytes).expect("submit");
+
+        let map_task = c.get_task("w1", 10).expect("map").remove(0);
+        c.report_task_status_with_pressure(
+            &map_task.query_id,
+            map_task.stage_id,
+            map_task.task_id,
+            map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
+            TaskState::Running,
+            Some("w1"),
+            "running".to_string(),
+            40,
+            8,
+        )
+        .expect("running pressure");
+
+        c.register_map_output(
+            map_task.query_id.clone(),
+            map_task.stage_id,
+            map_task.task_id,
+            map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
+            vec![MapOutputPartitionMeta {
+                reduce_partition: 0,
+                bytes: 100,
+                rows: 10,
+                batches: 1,
+                stream_epoch: 1,
+                committed_offset: 100,
+                finalized: true,
+            }],
+        )
+        .expect("register map");
+        c.report_task_status(
+            &map_task.query_id,
+            map_task.stage_id,
+            map_task.task_id,
+            map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
+            TaskState::Succeeded,
+            Some("w1"),
+            "map done".to_string(),
+        )
+        .expect("map success");
+
+        let reduce_tasks = c.get_task("w2", 10).expect("reduce");
+        assert!(!reduce_tasks.is_empty());
+        assert!(
+            reduce_tasks
+                .iter()
+                .all(|t| t.recommended_map_output_publish_window_partitions <= 2)
+        );
+        assert!(
+            reduce_tasks
+                .iter()
+                .all(|t| t.recommended_reduce_fetch_window_partitions <= 2)
         );
     }
 
