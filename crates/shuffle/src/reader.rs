@@ -217,56 +217,75 @@ fn decode_ipc_read<R: Read>(reader: R) -> Result<Vec<RecordBatch>> {
 }
 
 fn decode_partition_payload<R: Read>(mut reader: R) -> Result<Vec<RecordBatch>> {
-    let mut magic = [0_u8; 4];
-    reader.read_exact(&mut magic)?;
-    if &magic != SHUFFLE_PAYLOAD_MAGIC {
-        let mut legacy = magic.to_vec();
-        reader.read_to_end(&mut legacy)?;
-        return decode_ipc_bytes(&legacy);
+    let mut raw = Vec::new();
+    reader.read_to_end(&mut raw)?;
+    if raw.len() < 4 || &raw[0..4] != SHUFFLE_PAYLOAD_MAGIC {
+        return decode_ipc_bytes(&raw);
     }
 
-    let mut rest_header = [0_u8; SHUFFLE_PAYLOAD_HEADER_LEN - 4];
-    reader.read_exact(&mut rest_header)?;
-    let version = rest_header[0];
-    if version != 1 {
-        return Err(FfqError::Execution(format!(
-            "unsupported shuffle payload version {version}"
-        )));
-    }
-    let codec = codec_from_u8(rest_header[1])?;
-    let _uncompressed_bytes = u64::from_le_bytes([
-        rest_header[4],
-        rest_header[5],
-        rest_header[6],
-        rest_header[7],
-        rest_header[8],
-        rest_header[9],
-        rest_header[10],
-        rest_header[11],
-    ]);
-    let compressed_bytes = u64::from_le_bytes([
-        rest_header[12],
-        rest_header[13],
-        rest_header[14],
-        rest_header[15],
-        rest_header[16],
-        rest_header[17],
-        rest_header[18],
-        rest_header[19],
-    ]);
-    let mut limited = reader.take(compressed_bytes);
-    match codec {
-        ShuffleCompressionCodec::None => decode_ipc_read(&mut limited),
-        ShuffleCompressionCodec::Lz4 => {
-            let decoder = FrameDecoder::new(&mut limited);
-            decode_ipc_read(decoder)
+    let mut pos = 0_usize;
+    let mut out = Vec::new();
+    while pos < raw.len() {
+        if raw.len().saturating_sub(pos) < SHUFFLE_PAYLOAD_HEADER_LEN {
+            return Err(FfqError::Execution(
+                "truncated shuffle framed payload header".to_string(),
+            ));
         }
-        ShuffleCompressionCodec::Zstd => {
-            let decoder = zstd::stream::read::Decoder::new(&mut limited)
-                .map_err(|e| FfqError::Execution(format!("zstd decode init failed: {e}")))?;
-            decode_ipc_read(decoder)
+        if &raw[pos..pos + 4] != SHUFFLE_PAYLOAD_MAGIC {
+            return Err(FfqError::Execution(
+                "invalid shuffle framed payload magic".to_string(),
+            ));
         }
+        let version = raw[pos + 4];
+        if version != 1 {
+            return Err(FfqError::Execution(format!(
+                "unsupported shuffle payload version {version}"
+            )));
+        }
+        let codec = codec_from_u8(raw[pos + 5])?;
+        let _uncompressed_bytes = u64::from_le_bytes([
+            raw[pos + 8],
+            raw[pos + 9],
+            raw[pos + 10],
+            raw[pos + 11],
+            raw[pos + 12],
+            raw[pos + 13],
+            raw[pos + 14],
+            raw[pos + 15],
+        ]);
+        let compressed_bytes = u64::from_le_bytes([
+            raw[pos + 16],
+            raw[pos + 17],
+            raw[pos + 18],
+            raw[pos + 19],
+            raw[pos + 20],
+            raw[pos + 21],
+            raw[pos + 22],
+            raw[pos + 23],
+        ]) as usize;
+        pos += SHUFFLE_PAYLOAD_HEADER_LEN;
+        if raw.len().saturating_sub(pos) < compressed_bytes {
+            return Err(FfqError::Execution(
+                "truncated shuffle framed payload body".to_string(),
+            ));
+        }
+        let payload = &raw[pos..pos + compressed_bytes];
+        let mut batches = match codec {
+            ShuffleCompressionCodec::None => decode_ipc_bytes(payload)?,
+            ShuffleCompressionCodec::Lz4 => {
+                let decoder = FrameDecoder::new(Cursor::new(payload));
+                decode_ipc_read(decoder)?
+            }
+            ShuffleCompressionCodec::Zstd => {
+                let decoder = zstd::stream::read::Decoder::new(Cursor::new(payload))
+                    .map_err(|e| FfqError::Execution(format!("zstd decode init failed: {e}")))?;
+                decode_ipc_read(decoder)?
+            }
+        };
+        out.append(&mut batches);
+        pos += compressed_bytes;
     }
+    Ok(out)
 }
 
 fn codec_from_u8(raw: u8) -> Result<ShuffleCompressionCodec> {

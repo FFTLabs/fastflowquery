@@ -42,6 +42,7 @@ use ffq_planner::{
 };
 use ffq_shuffle::{ShuffleReader, ShuffleWriter};
 use ffq_shuffle::ShuffleCompressionCodec;
+use ffq_shuffle::aggregate_partition_chunks;
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
 use ffq_storage::qdrant_provider::QdrantProvider;
@@ -1473,22 +1474,37 @@ fn write_stage_shuffle_outputs(
     let started = Instant::now();
     let writer = ShuffleWriter::new(&ctx.shuffle_root)
         .with_compression_codec(ctx.shuffle_compression_codec);
-    let partitioned = partition_batches(child, partitioning)?;
-    let mut metas = Vec::new();
-    for (reduce, batches) in partitioned {
-        if batches.is_empty() {
-            continue;
+    let mut chunk_index = HashMap::<u32, Vec<ffq_shuffle::ShufflePartitionChunkMeta>>::new();
+    for batch in &child.batches {
+        let one = ExecOutput {
+            schema: Arc::clone(&child.schema),
+            batches: vec![batch.clone()],
+        };
+        let partitioned = partition_batches(&one, partitioning)?;
+        for (reduce, batches) in partitioned {
+            if batches.is_empty() {
+                continue;
+            }
+            let chunk = writer.append_partition_chunk(
+                query_numeric_id,
+                ctx.stage_id,
+                ctx.task_id,
+                ctx.attempt,
+                reduce,
+                &batches,
+                child.schema.as_ref(),
+            )?;
+            chunk_index.entry(reduce).or_default().push(chunk);
         }
-        let meta = writer.write_partition(
-            query_numeric_id,
-            ctx.stage_id,
-            ctx.task_id,
-            ctx.attempt,
-            reduce,
-            &batches,
-        )?;
-        metas.push(meta);
     }
+    let metas = aggregate_partition_chunks(
+        query_numeric_id,
+        ctx.stage_id,
+        ctx.task_id,
+        ctx.attempt,
+        ctx.shuffle_compression_codec,
+        chunk_index,
+    );
     let index = writer.write_map_task_index(
         query_numeric_id,
         ctx.stage_id,

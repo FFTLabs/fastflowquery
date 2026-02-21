@@ -68,10 +68,32 @@ pub struct ShufflePartitionMeta {
     /// Compression codec used for this partition payload.
     #[serde(default)]
     pub codec: ShuffleCompressionCodec,
+    /// Chunk metadata entries appended to this partition payload file.
+    #[serde(default)]
+    pub chunks: Vec<ShufflePartitionChunkMeta>,
     /// Row count in payload.
     pub rows: u64,
     /// Batch count in payload.
     pub batches: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Metadata describing one appended chunk in a partition payload file.
+pub struct ShufflePartitionChunkMeta {
+    /// Byte offset in partition payload file where this chunk frame starts.
+    pub offset_bytes: u64,
+    /// Total framed bytes written for this chunk (header + compressed payload).
+    pub frame_bytes: u64,
+    /// Compressed payload bytes for this chunk.
+    pub compressed_bytes: u64,
+    /// Uncompressed Arrow IPC bytes for this chunk.
+    pub uncompressed_bytes: u64,
+    /// Rows contained in this chunk.
+    pub rows: u64,
+    /// Record batches contained in this chunk.
+    pub batches: u64,
+    /// Adler-32 checksum for the framed chunk payload.
+    pub checksum32: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
