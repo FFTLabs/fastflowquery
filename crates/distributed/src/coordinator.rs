@@ -60,6 +60,16 @@ pub struct CoordinatorConfig {
     ///
     /// `0` disables this split rule.
     pub adaptive_shuffle_max_partitions_per_task: u32,
+    /// Enables pipelined shuffle scheduling.
+    ///
+    /// When enabled, reduce tasks may be scheduled before all map tasks are
+    /// finished if enough parent progress and partition outputs are available.
+    pub pipelined_shuffle_enabled: bool,
+    /// Minimum parent-stage completion ratio required before pipelined reduce
+    /// scheduling starts.
+    ///
+    /// Range is clamped to `[0.0, 1.0]`.
+    pub pipelined_shuffle_min_map_completion_ratio: f64,
 }
 
 impl Default for CoordinatorConfig {
@@ -77,6 +87,8 @@ impl Default for CoordinatorConfig {
             adaptive_shuffle_min_reduce_tasks: 1,
             adaptive_shuffle_max_reduce_tasks: 0,
             adaptive_shuffle_max_partitions_per_task: 0,
+            pipelined_shuffle_enabled: false,
+            pipelined_shuffle_min_map_completion_ratio: 0.5,
         }
     }
 }
@@ -623,14 +635,36 @@ impl Coordinator {
                 now,
             );
             let latest_attempts = latest_attempt_map(query);
-            for stage_id in runnable_stages(query) {
+            let latest_states = latest_task_states(query);
+            for stage_id in runnable_stages_with_pipeline(
+                query_id,
+                query,
+                &latest_states,
+                &map_outputs_snapshot,
+                self.config.pipelined_shuffle_enabled,
+                self.config.pipelined_shuffle_min_map_completion_ratio,
+            ) {
                 let Some(stage_runtime) = query.stages.get(&stage_id) else {
                     continue;
+                };
+                let stage_parents_done = all_parents_done_for_stage(query, stage_id, &latest_states);
+                let pipeline_ready_partitions = if self.config.pipelined_shuffle_enabled
+                    && !stage_parents_done
+                {
+                    Some(ready_reduce_partitions_for_stage(
+                        query_id,
+                        query,
+                        stage_id,
+                        &map_outputs_snapshot,
+                    ))
+                } else {
+                    None
                 };
                 if !matches!(
                     stage_runtime.barrier_state,
                     StageBarrierState::NotApplicable | StageBarrierState::ReduceSchedulable
-                ) {
+                ) && !(self.config.pipelined_shuffle_enabled && !stage_parents_done)
+                {
                     continue;
                 }
                 for task in query.tasks.values_mut().filter(|t| {
@@ -647,6 +681,16 @@ impl Coordinator {
                     }
                     if !worker_supports_task(worker_caps.as_ref(), &task.required_custom_ops) {
                         continue;
+                    }
+                    if let Some(ready) = &pipeline_ready_partitions {
+                        if task.assigned_reduce_partitions.is_empty()
+                            || !task
+                                .assigned_reduce_partitions
+                                .iter()
+                                .all(|p| ready.contains(p))
+                        {
+                            continue;
+                        }
                     }
                     task.state = TaskState::Running;
                     task.assigned_worker = Some(worker_id.to_string());
@@ -991,8 +1035,11 @@ impl Coordinator {
             );
             return Ok(());
         }
+        let registry_key = (query_id.clone(), stage_id, map_task, attempt);
         self.map_outputs
-            .insert((query_id.clone(), stage_id, map_task, attempt), partitions);
+            .entry(registry_key)
+            .and_modify(|existing| merge_map_output_partitions(existing, &partitions))
+            .or_insert(partitions);
         let latest = self.latest_map_partitions_for_stage(&query_id, stage_id);
         let mut rows = 0_u64;
         let mut bytes = 0_u64;
@@ -1551,20 +1598,119 @@ fn worker_supports_task(caps: Option<&HashSet<String>>, required_custom_ops: &[S
     required_custom_ops.iter().all(|op| caps.contains(op))
 }
 
-fn runnable_stages(query: &QueryRuntime) -> Vec<u64> {
+fn runnable_stages_with_pipeline(
+    query_id: &str,
+    query: &QueryRuntime,
+    latest_states: &HashMap<(u64, u64), TaskState>,
+    map_outputs: &HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>,
+    pipelined_shuffle_enabled: bool,
+    min_completion_ratio: f64,
+) -> Vec<u64> {
     let mut out = Vec::new();
+    let min_ratio = min_completion_ratio.clamp(0.0, 1.0);
     for (sid, stage) in &query.stages {
-        let all_parents_done = stage.parents.iter().all(|pid| {
-            latest_task_states(query)
-                .into_iter()
-                .filter(|((stage_id, _), _)| stage_id == pid)
-                .all(|(_, state)| state == TaskState::Succeeded)
+        let parents_done = all_parents_done_for_stage(query, *sid, latest_states);
+        if parents_done {
+            out.push(*sid);
+            continue;
+        }
+        if !pipelined_shuffle_enabled || stage.parents.is_empty() {
+            continue;
+        }
+        let parent_ready = stage.parents.iter().all(|pid| {
+            let ratio = stage_completion_ratio(*pid, latest_states);
+            ratio >= min_ratio && has_any_map_output_for_stage(query_id, *pid, map_outputs)
         });
-        if all_parents_done {
+        if !parent_ready {
+            continue;
+        }
+        let ready = ready_reduce_partitions_for_stage(query_id, query, *sid, map_outputs);
+        if !ready.is_empty() {
             out.push(*sid);
         }
     }
     out
+}
+
+fn stage_completion_ratio(stage_id: u64, latest_states: &HashMap<(u64, u64), TaskState>) -> f64 {
+    let mut total = 0_u64;
+    let mut succeeded = 0_u64;
+    for ((sid, _), state) in latest_states {
+        if *sid != stage_id {
+            continue;
+        }
+        total += 1;
+        if *state == TaskState::Succeeded {
+            succeeded += 1;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        succeeded as f64 / total as f64
+    }
+}
+
+fn all_parents_done_for_stage(
+    query: &QueryRuntime,
+    stage_id: u64,
+    latest_states: &HashMap<(u64, u64), TaskState>,
+) -> bool {
+    let Some(stage) = query.stages.get(&stage_id) else {
+        return false;
+    };
+    stage.parents.iter().all(|pid| {
+        latest_states
+            .iter()
+            .filter(|((sid, _), _)| sid == pid)
+            .all(|(_, state)| *state == TaskState::Succeeded)
+    })
+}
+
+fn has_any_map_output_for_stage(
+    query_id: &str,
+    stage_id: u64,
+    map_outputs: &HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>,
+) -> bool {
+    map_outputs
+        .iter()
+        .any(|((qid, sid, _, _), parts)| qid == query_id && *sid == stage_id && !parts.is_empty())
+}
+
+fn ready_reduce_partitions_for_stage(
+    query_id: &str,
+    query: &QueryRuntime,
+    reduce_stage_id: u64,
+    map_outputs: &HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>,
+) -> HashSet<u32> {
+    let Some(stage) = query.stages.get(&reduce_stage_id) else {
+        return HashSet::new();
+    };
+    let Some(parent_stage_id) = stage.parents.first().copied() else {
+        return HashSet::new();
+    };
+    let mut out = HashSet::new();
+    for p in latest_partition_bytes_for_stage(query_id, parent_stage_id, map_outputs).keys() {
+        out.insert(*p);
+    }
+    out
+}
+
+fn merge_map_output_partitions(
+    existing: &mut Vec<MapOutputPartitionMeta>,
+    incoming: &[MapOutputPartitionMeta],
+) {
+    let mut by_partition = existing
+        .iter()
+        .cloned()
+        .map(|p| (p.reduce_partition, p))
+        .collect::<HashMap<_, _>>();
+    for p in incoming {
+        by_partition.insert(p.reduce_partition, p.clone());
+    }
+    let mut merged = by_partition.into_values().collect::<Vec<_>>();
+    merged.sort_by_key(|p| p.reduce_partition);
+    *existing = merged;
 }
 
 fn is_query_succeeded(query: &QueryRuntime) -> bool {
@@ -2805,5 +2951,65 @@ mod tests {
         let query = c.queries.get("304").expect("query runtime");
         let reduce_stage = query.stages.get(&0).expect("reduce stage");
         assert_eq!(reduce_stage.layout_finalize_count, 1);
+    }
+
+    #[test]
+    fn coordinator_allows_pipelined_reduce_assignment_when_partition_ready() {
+        let mut c = Coordinator::new(CoordinatorConfig {
+            pipelined_shuffle_enabled: true,
+            pipelined_shuffle_min_map_completion_ratio: 0.0,
+            ..CoordinatorConfig::default()
+        });
+        let plan = PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
+            input: Box::new(PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(
+                ShuffleWriteExchange {
+                    input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
+                        table: "t".to_string(),
+                        schema: Some(Schema::empty()),
+                        projection: None,
+                        filters: vec![],
+                    })),
+                    partitioning: PartitioningSpec::HashKeys {
+                        keys: vec!["k".to_string()],
+                        partitions: 4,
+                    },
+                },
+            ))),
+            partitioning: PartitioningSpec::HashKeys {
+                keys: vec!["k".to_string()],
+                partitions: 4,
+            },
+        }));
+        let bytes = serde_json::to_vec(&plan).expect("plan");
+        c.submit_query("305".to_string(), &bytes).expect("submit");
+
+        let map_task = c.get_task("w1", 10).expect("map").remove(0);
+        c.register_map_output(
+            "305".to_string(),
+            map_task.stage_id,
+            map_task.task_id,
+            map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
+            vec![MapOutputPartitionMeta {
+                reduce_partition: 0,
+                bytes: 10,
+                rows: 2,
+                batches: 1,
+            }],
+        )
+        .expect("register partial");
+
+        let reduce_tasks = c.get_task("w2", 10).expect("pipelined reduce task");
+        assert!(
+            !reduce_tasks.is_empty(),
+            "expected at least one pipelined reduce task assignment"
+        );
+        assert!(
+            reduce_tasks
+                .iter()
+                .all(|t| t.assigned_reduce_partitions == vec![0]),
+            "only ready partition should be schedulable before map completion"
+        );
     }
 }

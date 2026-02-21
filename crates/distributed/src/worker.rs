@@ -76,6 +76,10 @@ pub struct WorkerConfig {
     pub join_bloom_bits: u8,
     /// Shuffle partition payload compression codec.
     pub shuffle_compression_codec: ShuffleCompressionCodec,
+    /// Number of partition metadata entries to publish per register call.
+    pub map_output_publish_window_partitions: u32,
+    /// Number of assigned reduce partitions fetched per read window.
+    pub reduce_fetch_window_partitions: u32,
     /// Local spill directory for memory-pressure fallback paths.
     pub spill_dir: PathBuf,
     /// Root directory containing shuffle data.
@@ -92,6 +96,8 @@ impl Default for WorkerConfig {
             join_bloom_enabled: true,
             join_bloom_bits: 20,
             shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
+            map_output_publish_window_partitions: 1,
+            reduce_fetch_window_partitions: 4,
             spill_dir: PathBuf::from(".ffq_spill"),
             shuffle_root: PathBuf::from("."),
         }
@@ -119,6 +125,10 @@ pub struct TaskContext {
     pub join_bloom_bits: u8,
     /// Shuffle partition payload compression codec.
     pub shuffle_compression_codec: ShuffleCompressionCodec,
+    /// Number of assigned reduce partitions fetched per read window.
+    pub reduce_fetch_window_partitions: u32,
+    /// Number of partition metadata entries to publish per register call.
+    pub map_output_publish_window_partitions: u32,
     /// Local spill directory.
     pub spill_dir: PathBuf,
     /// Root directory containing shuffle data.
@@ -381,6 +391,8 @@ where
                 join_bloom_enabled: self.config.join_bloom_enabled,
                 join_bloom_bits: self.config.join_bloom_bits,
                 shuffle_compression_codec: self.config.shuffle_compression_codec,
+                reduce_fetch_window_partitions: self.config.reduce_fetch_window_partitions,
+                map_output_publish_window_partitions: self.config.map_output_publish_window_partitions,
                 spill_dir: self.config.spill_dir.clone(),
                 shuffle_root: self.config.shuffle_root.clone(),
                 assigned_reduce_partitions: assignment.assigned_reduce_partitions.clone(),
@@ -401,12 +413,15 @@ where
                             "task execution succeeded"
                         );
                         if !exec_result.map_output_partitions.is_empty() {
-                            control_plane
-                                .register_map_output(
-                                    &assignment,
-                                    exec_result.map_output_partitions.clone(),
-                                )
-                                .await?;
+                            let publish_window = task_ctx
+                                .map_output_publish_window_partitions
+                                .max(1) as usize;
+                            for chunk in exec_result.map_output_partitions.chunks(publish_window) {
+                                control_plane
+                                    .register_map_output(&assignment, chunk.to_vec())
+                                    .await?;
+                                tokio::task::yield_now().await;
+                            }
                         }
                         if exec_result.publish_results {
                             let payload = encode_record_batches_ipc(&exec_result.output_batches)?;
@@ -1556,21 +1571,27 @@ fn read_stage_input_from_shuffle(
                     ctx.assigned_reduce_partitions, partitions, ctx.stage_id, ctx.task_id
                 )));
             }
-            for reduce in assigned {
-                if let Ok((_attempt, batches)) =
-                    reader.read_partition_latest(query_numeric_id, upstream_stage_id, 0, reduce)
-                {
-                    let batches = filter_partition_batches_for_assigned_shard(
-                        batches,
-                        partitioning,
-                        ctx.assigned_reduce_split_index,
-                        ctx.assigned_reduce_split_count,
-                    )?;
-                    if schema_hint.is_none() && !batches.is_empty() {
-                        schema_hint = Some(batches[0].schema());
+            let fetch_window = ctx.reduce_fetch_window_partitions.max(1) as usize;
+            for chunk in assigned.chunks(fetch_window) {
+                for reduce in chunk {
+                    if let Ok((_attempt, batches)) = reader.read_partition_latest(
+                        query_numeric_id,
+                        upstream_stage_id,
+                        0,
+                        *reduce,
+                    ) {
+                        let batches = filter_partition_batches_for_assigned_shard(
+                            batches,
+                            partitioning,
+                            ctx.assigned_reduce_split_index,
+                            ctx.assigned_reduce_split_count,
+                        )?;
+                        if schema_hint.is_none() && !batches.is_empty() {
+                            schema_hint = Some(batches[0].schema());
+                        }
+                        out_batches.extend(batches);
+                        read_partitions += 1;
                     }
-                    out_batches.extend(batches);
-                    read_partitions += 1;
                 }
             }
             if out_batches.is_empty() && schema_hint.is_none() {

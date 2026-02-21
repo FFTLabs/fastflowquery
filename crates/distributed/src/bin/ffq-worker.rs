@@ -58,6 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cpu_slots = env_usize_or_default("FFQ_WORKER_CPU_SLOTS", 2);
     let per_task_memory_budget_bytes =
         env_usize_or_default("FFQ_WORKER_MEM_BUDGET_BYTES", 64 * 1024 * 1024);
+    let map_output_publish_window_partitions =
+        env_u64_or_default("FFQ_MAP_OUTPUT_PUBLISH_WINDOW_PARTITIONS", 1) as u32;
+    let reduce_fetch_window_partitions =
+        env_u64_or_default("FFQ_REDUCE_FETCH_WINDOW_PARTITIONS", 4) as u32;
     let poll_ms = env_u64_or_default("FFQ_WORKER_POLL_MS", 20);
     let shuffle_codec = parse_shuffle_codec(&env_or_default("FFQ_SHUFFLE_COMPRESSION", "lz4"));
     let catalog_path = env::var("FFQ_WORKER_CATALOG_PATH").ok();
@@ -74,6 +78,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cpu_slots,
             per_task_memory_budget_bytes,
             shuffle_compression_codec: shuffle_codec,
+            map_output_publish_window_partitions,
+            reduce_fetch_window_partitions,
             spill_dir: spill_dir.clone().into(),
             shuffle_root: shuffle_root.clone().into(),
             ..WorkerConfig::default()
