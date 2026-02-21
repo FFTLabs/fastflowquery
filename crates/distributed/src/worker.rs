@@ -1772,12 +1772,12 @@ fn read_partition_incremental_latest(
             watermark.saturating_sub(cursor),
         )?;
         if !fetched.is_empty() {
-            let stitched = fetched
+            let chunk_payloads = fetched
                 .into_iter()
-                .flat_map(|c| c.payload.into_iter())
+                .map(|c| c.payload)
                 .collect::<Vec<_>>();
-            if !stitched.is_empty() {
-                let mut decoded = reader.read_partition_from_streamed_chunks([stitched])?;
+            if !chunk_payloads.is_empty() {
+                let mut decoded = reader.read_partition_from_streamed_chunks(chunk_payloads)?;
                 out_batches.append(&mut decoded);
             }
         }
@@ -1808,14 +1808,14 @@ fn read_partition_incremental_latest(
             if fetched.is_empty() {
                 break;
             }
-            let stitched = fetched
+            let chunk_payloads = fetched
                 .into_iter()
-                .flat_map(|c| c.payload.into_iter())
+                .map(|c| c.payload)
                 .collect::<Vec<_>>();
-            if stitched.is_empty() {
+            if chunk_payloads.is_empty() {
                 break;
             }
-            let mut decoded = reader.read_partition_from_streamed_chunks([stitched])?;
+            let mut decoded = reader.read_partition_from_streamed_chunks(chunk_payloads)?;
             out_batches.append(&mut decoded);
             next_cursor = frame_end;
         }

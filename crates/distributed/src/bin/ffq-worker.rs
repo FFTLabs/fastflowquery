@@ -69,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env_usize_or_default("FFQ_STREAM_MAX_PARTITIONS_PER_STREAM", 65536);
     let max_chunks_per_response = env_usize_or_default("FFQ_STREAM_MAX_CHUNKS_PER_RESPONSE", 1024);
     let inactive_stream_ttl_ms = env_u64_or_default("FFQ_STREAM_INACTIVE_TTL_MS", 10 * 60 * 1000);
+    let shuffle_fetch_chunk_bytes = env_usize_or_default("FFQ_SHUFFLE_FETCH_CHUNK_BYTES", 64 * 1024);
     let catalog_path = env::var("FFQ_WORKER_CATALOG_PATH").ok();
 
     std::fs::create_dir_all(&shuffle_root)?;
@@ -107,6 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_partitions_per_stream,
         max_chunks_per_response,
         inactive_stream_ttl_ms,
+        shuffle_fetch_chunk_bytes,
     );
     println!(
         "ffq-worker {worker_id} started (coordinator={coordinator_endpoint}, shuffle_bind={shuffle_addr}, spill_dir={spill_dir})"

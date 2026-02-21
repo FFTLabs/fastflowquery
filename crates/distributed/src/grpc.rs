@@ -399,6 +399,7 @@ pub struct WorkerShuffleService {
     max_partitions_per_stream: usize,
     max_chunks_per_response: usize,
     inactive_stream_ttl_ms: u64,
+    fetch_chunk_bytes: usize,
 }
 
 impl WorkerShuffleService {
@@ -410,6 +411,7 @@ impl WorkerShuffleService {
             65536,
             1024,
             10 * 60 * 1000, // 10 minutes
+            64 * 1024,
         )
     }
 
@@ -420,6 +422,7 @@ impl WorkerShuffleService {
         max_partitions_per_stream: usize,
         max_chunks_per_response: usize,
         inactive_stream_ttl_ms: u64,
+        fetch_chunk_bytes: usize,
     ) -> Self {
         Self {
             shuffle_root: shuffle_root.into(),
@@ -430,6 +433,7 @@ impl WorkerShuffleService {
             max_partitions_per_stream: max_partitions_per_stream.max(1),
             max_chunks_per_response: max_chunks_per_response.max(1),
             inactive_stream_ttl_ms,
+            fetch_chunk_bytes: fetch_chunk_bytes.max(1),
         }
     }
 }
@@ -544,39 +548,17 @@ impl ShuffleService for WorkerShuffleService {
                 )));
             }
         }
-        let reader = ShuffleReader::new(&self.shuffle_root);
-        let (attempt, chunks) = if req.attempt == 0 {
+        let reader = ShuffleReader::new(&self.shuffle_root).with_fetch_chunk_bytes(self.fetch_chunk_bytes);
+        let attempt = if req.attempt == 0 {
             let attempt = reader
                 .latest_attempt(query_num, req.stage_id, req.map_task)
                 .map_err(to_status)?
                 .ok_or_else(|| {
                     Status::failed_precondition("no shuffle attempts found for map task")
                 })?;
-            let chunks = reader
-                .fetch_partition_chunks_range(
-                    query_num,
-                    req.stage_id,
-                    req.map_task,
-                    attempt,
-                    req.reduce_partition,
-                    req.start_offset,
-                    req.max_bytes,
-                )
-                .map_err(to_status)?;
-            (attempt, chunks)
+            attempt
         } else {
-            let chunks = reader
-                .fetch_partition_chunks_range(
-                    query_num,
-                    req.stage_id,
-                    req.map_task,
-                    req.attempt,
-                    req.reduce_partition,
-                    req.start_offset,
-                    req.max_bytes,
-                )
-                .map_err(to_status)?;
-            (req.attempt, chunks)
+            req.attempt
         };
 
         let meta_key = (meta_key.0, meta_key.1, meta_key.2, attempt);
@@ -625,32 +607,33 @@ impl ShuffleService for WorkerShuffleService {
                 stream_epoch,
             })]
         } else {
-            let end_limit = start.saturating_add(requested);
-            let mut filtered = chunks
+            let mut chunks = reader
+                .fetch_partition_chunks_range(
+                    query_num,
+                    req.stage_id,
+                    req.map_task,
+                    attempt,
+                    req.reduce_partition,
+                    start,
+                    requested,
+                )
+                .map_err(to_status)?
                 .into_iter()
-                .filter_map(|c| {
-                    let chunk_start = c.start_offset.max(start);
-                    let chunk_end = (c.start_offset + c.payload.len() as u64).min(end_limit);
-                    if chunk_end <= chunk_start {
-                        return None;
-                    }
-                    let trim_start = (chunk_start - c.start_offset) as usize;
-                    let trim_end = (chunk_end - c.start_offset) as usize;
-                    let payload = c.payload[trim_start..trim_end].to_vec();
-                    Some(Ok(v1::ShufflePartitionChunk {
-                        start_offset: chunk_start,
-                        end_offset: chunk_end,
-                        payload,
+                .map(|c| {
+                    Ok(v1::ShufflePartitionChunk {
+                        start_offset: c.start_offset,
+                        end_offset: c.start_offset + c.payload.len() as u64,
+                        payload: c.payload,
                         watermark_offset,
                         finalized,
                         stream_epoch,
-                    }))
+                    })
                 })
                 .collect::<Vec<_>>();
-            if filtered.len() > self.max_chunks_per_response {
-                filtered.truncate(self.max_chunks_per_response);
+            if chunks.len() > self.max_chunks_per_response {
+                chunks.truncate(self.max_chunks_per_response);
             }
-            if filtered.is_empty() {
+            if chunks.is_empty() {
                 vec![Ok(v1::ShufflePartitionChunk {
                     start_offset: start,
                     end_offset: start,
@@ -660,7 +643,7 @@ impl ShuffleService for WorkerShuffleService {
                     stream_epoch,
                 })]
             } else {
-                filtered
+                chunks
             }
         };
         Ok(Response::new(Box::pin(stream::iter(out))))
@@ -1177,7 +1160,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&base).expect("create temp root");
-        let svc = WorkerShuffleService::with_limits(&base, 2, 1, 2, 1);
+        let svc = WorkerShuffleService::with_limits(&base, 2, 1, 2, 1, 64 * 1024);
 
         let query_id = "9020".to_string();
         let stage_id = 1_u64;

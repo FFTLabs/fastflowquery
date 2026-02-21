@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 use arrow::record_batch::RecordBatch;
@@ -173,16 +173,16 @@ impl ShuffleReader {
         attempt: u32,
         reduce_partition: u32,
     ) -> Result<Vec<Vec<u8>>> {
-        let rel = shuffle_path(query_id, stage_id, map_task, attempt, reduce_partition);
-        let bytes = fs::read(self.root_dir.join(rel))?;
-        let mut out = Vec::new();
-        let mut offset = 0;
-        while offset < bytes.len() {
-            let end = (offset + self.fetch_chunk_bytes).min(bytes.len());
-            out.push(bytes[offset..end].to_vec());
-            offset = end;
-        }
-        Ok(out)
+        let chunks = self.fetch_partition_chunks_range(
+            query_id,
+            stage_id,
+            map_task,
+            attempt,
+            reduce_partition,
+            0,
+            0,
+        )?;
+        Ok(chunks.into_iter().map(|c| c.payload).collect())
     }
 
     /// Read a byte-range from one partition payload and split it into
@@ -198,23 +198,31 @@ impl ShuffleReader {
         max_bytes: u64,
     ) -> Result<Vec<FetchedPartitionChunk>> {
         let rel = shuffle_path(query_id, stage_id, map_task, attempt, reduce_partition);
-        let bytes = fs::read(self.root_dir.join(rel))?;
-        let start = (start_offset as usize).min(bytes.len());
+        let mut file = fs::File::open(self.root_dir.join(rel))?;
+        let file_len = file.metadata()?.len() as usize;
+        let start = (start_offset as usize).min(file_len);
         let span = if max_bytes == 0 {
-            bytes.len().saturating_sub(start)
+            file_len.saturating_sub(start)
         } else {
-            (max_bytes as usize).min(bytes.len().saturating_sub(start))
+            (max_bytes as usize).min(file_len.saturating_sub(start))
         };
-        let end = start.saturating_add(span);
+        if span == 0 {
+            return Ok(Vec::new());
+        }
+        file.seek(SeekFrom::Start(start as u64))?;
         let mut out = Vec::new();
-        let mut offset = start;
-        while offset < end {
-            let chunk_end = (offset + self.fetch_chunk_bytes).min(end);
+        let mut offset = start as u64;
+        let mut remaining = span;
+        while remaining > 0 {
+            let take = self.fetch_chunk_bytes.min(remaining);
+            let mut payload = vec![0_u8; take];
+            file.read_exact(&mut payload)?;
             out.push(FetchedPartitionChunk {
-                start_offset: offset as u64,
-                payload: bytes[offset..chunk_end].to_vec(),
+                start_offset: offset,
+                payload,
             });
-            offset = chunk_end;
+            offset += take as u64;
+            remaining -= take;
         }
         Ok(out)
     }
@@ -248,7 +256,7 @@ impl ShuffleReader {
 }
 
 fn decode_ipc_bytes(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
-    decode_ipc_read(Cursor::new(bytes.to_vec()))
+    decode_ipc_read(Cursor::new(bytes))
 }
 
 fn decode_ipc_read<R: Read>(reader: R) -> Result<Vec<RecordBatch>> {
