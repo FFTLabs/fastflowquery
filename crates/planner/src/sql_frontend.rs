@@ -1025,6 +1025,23 @@ fn try_parse_agg(
                 ));
             }
         }
+        "APPROX_COUNT_DISTINCT" => {
+            if is_distinct {
+                return Err(FfqError::Unsupported(
+                    "APPROX_COUNT_DISTINCT(DISTINCT ...) is invalid".to_string(),
+                ));
+            }
+            if !cfg!(feature = "approx") {
+                return Err(FfqError::Unsupported(
+                    "APPROX_COUNT_DISTINCT is disabled; enable planner feature 'approx'"
+                        .to_string(),
+                ));
+            }
+            AggExpr::ApproxCountDistinct(function_arg_to_expr(
+                required_arg(arg0, "APPROX_COUNT_DISTINCT")?,
+                params,
+            )?)
+        }
         _ if is_distinct => {
             return Err(FfqError::Unsupported(format!(
                 "{fname}(DISTINCT ...) is not supported in v1 (only COUNT(DISTINCT ...) is supported)"
@@ -1873,6 +1890,23 @@ mod tests {
                 other => panic!("expected Aggregate, got {other:?}"),
             },
             other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_approx_count_distinct_when_feature_disabled() {
+        let plan = sql_to_logical(
+            "SELECT APPROX_COUNT_DISTINCT(v) AS acd FROM t",
+            &HashMap::new(),
+        );
+        if cfg!(feature = "approx") {
+            assert!(plan.is_ok(), "approx feature enabled should parse");
+        } else {
+            let err = plan.expect_err("expected unsupported without approx feature");
+            assert!(
+                err.to_string().contains("APPROX_COUNT_DISTINCT is disabled"),
+                "err={err}"
+            );
         }
     }
 

@@ -293,3 +293,51 @@ k=b|cd=2\n";
     let _ = std::fs::remove_file(parquet_path);
     let _ = std::fs::remove_dir_all(spill_dir);
 }
+
+#[cfg(feature = "approx")]
+#[test]
+fn approx_count_distinct_is_plausible_with_tolerance() {
+    let parquet_path = support::unique_path("ffq_hash_agg_approx_cd", "parquet");
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+
+    let mut values = Vec::new();
+    for i in 0_i64..1000_i64 {
+        values.push(i);
+        values.push(i);
+        if i % 7 == 0 {
+            values.push(i);
+        }
+    }
+    support::write_parquet(
+        &parquet_path,
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(values))],
+    );
+
+    let mut cfg = EngineConfig::default();
+    cfg.mem_budget_bytes = 256;
+    let engine = Engine::new(cfg).expect("engine");
+    register_src_table(&engine, &parquet_path, schema.as_ref());
+
+    let batches = futures::executor::block_on(
+        engine
+            .sql("SELECT APPROX_COUNT_DISTINCT(v) AS acd FROM t")
+            .expect("sql")
+            .collect(),
+    )
+    .expect("collect");
+    let arr = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("int64");
+    let estimate = arr.value(0) as f64;
+    let expected = 1000_f64;
+    let rel_err = ((estimate - expected) / expected).abs();
+    assert!(
+        rel_err <= 0.10,
+        "approx_count_distinct too far off: estimate={estimate}, expected={expected}, rel_err={rel_err}"
+    );
+
+    let _ = std::fs::remove_file(parquet_path);
+}

@@ -27,6 +27,7 @@ qdrant = ["ffq-storage/qdrant", "vector", "ffq-distributed?/qdrant"]
 s3 = ["ffq-storage/s3"]
 python = ["dep:pyo3"]
 ffi = []
+approx = ["ffq-planner/approx", "ffq-distributed?/approx"]
 profiling = [
   "ffq-common/profiling",
   "ffq-execution/profiling",

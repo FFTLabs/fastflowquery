@@ -1198,12 +1198,88 @@ enum AggState {
     Min(Option<ScalarValue>),
     Max(Option<ScalarValue>),
     Avg { sum: f64, count: i64 },
+    Hll(HllSketch),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SpillRow {
     key: Vec<ScalarValue>,
     states: Vec<AggState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HllSketch {
+    p: u8,
+    registers: Vec<u8>,
+}
+
+impl HllSketch {
+    fn new(p: u8) -> Self {
+        let precision = p.clamp(4, 16);
+        let m = 1usize << precision;
+        Self {
+            p: precision,
+            registers: vec![0; m],
+        }
+    }
+
+    fn add_scalar(&mut self, value: &ScalarValue) {
+        if matches!(value, ScalarValue::Null) {
+            return;
+        }
+        let mut h = DefaultHasher::new();
+        value.hash(&mut h);
+        self.add_hash(h.finish());
+    }
+
+    fn add_hash(&mut self, hash: u64) {
+        let mask = (1_u64 << self.p) - 1;
+        let idx = (hash & mask) as usize;
+        let w = hash >> self.p;
+        let max_rank = (64 - self.p) as u8 + 1;
+        let rank = if w == 0 {
+            max_rank
+        } else {
+            (w.trailing_zeros() as u8 + 1).min(max_rank)
+        };
+        if rank > self.registers[idx] {
+            self.registers[idx] = rank;
+        }
+    }
+
+    fn merge(&mut self, other: &Self) -> Result<()> {
+        if self.p != other.p || self.registers.len() != other.registers.len() {
+            return Err(FfqError::Execution(
+                "incompatible HLL sketch precision".to_string(),
+            ));
+        }
+        for (a, b) in self.registers.iter_mut().zip(other.registers.iter()) {
+            *a = (*a).max(*b);
+        }
+        Ok(())
+    }
+
+    fn estimate(&self) -> f64 {
+        let m = self.registers.len() as f64;
+        let alpha = match self.registers.len() {
+            16 => 0.673,
+            32 => 0.697,
+            64 => 0.709,
+            _ => 0.7213 / (1.0 + 1.079 / m),
+        };
+        let z = self
+            .registers
+            .iter()
+            .map(|r| 2_f64.powi(-(*r as i32)))
+            .sum::<f64>();
+        let raw = alpha * m * m / z;
+        let zeros = self.registers.iter().filter(|r| **r == 0).count() as f64;
+        if raw <= 2.5 * m && zeros > 0.0 {
+            m * (m / zeros).ln()
+        } else {
+            raw
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3929,14 +4005,20 @@ fn build_agg_specs(
                             .to_string(),
                     ));
                 }
+                AggExpr::ApproxCountDistinct(_) => DataType::Utf8,
                 AggExpr::Sum(e) | AggExpr::Min(e) | AggExpr::Max(e) => {
                     expr_data_type(e, input_schema)?
                 }
                 AggExpr::Avg(_) => DataType::Float64,
             },
             AggregateMode::Final => {
-                let col_idx = group_exprs.len() + idx;
-                input_schema.field(col_idx).data_type().clone()
+                match expr {
+                    AggExpr::ApproxCountDistinct(_) => DataType::Int64,
+                    _ => {
+                        let col_idx = group_exprs.len() + idx;
+                        input_schema.field(col_idx).data_type().clone()
+                    }
+                }
             }
         };
         specs.push(AggSpec {
@@ -3959,6 +4041,7 @@ fn init_states(specs: &[AggSpec]) -> Vec<AggState> {
         .map(|s| match s.expr {
             AggExpr::Count(_) => AggState::Count(0),
             AggExpr::CountDistinct(_) => AggState::Count(0),
+            AggExpr::ApproxCountDistinct(_) => AggState::Hll(HllSketch::new(12)),
             AggExpr::Sum(_) => match s.out_type {
                 DataType::Int64 => AggState::SumInt(0),
                 _ => AggState::SumFloat(0.0),
@@ -4003,6 +4086,7 @@ fn accumulate_batch(
                 let expr = match &spec.expr {
                     AggExpr::Count(e)
                     | AggExpr::CountDistinct(e)
+                    | AggExpr::ApproxCountDistinct(e)
                     | AggExpr::Sum(e)
                     | AggExpr::Min(e)
                     | AggExpr::Max(e)
@@ -4141,6 +4225,27 @@ fn update_state(
                 *count += add_count;
             }
         },
+        AggState::Hll(sketch) => match mode {
+            AggregateMode::Partial => {
+                sketch.add_scalar(&value);
+            }
+            AggregateMode::Final => {
+                if value == ScalarValue::Null {
+                    return Ok(());
+                }
+                let ScalarValue::Utf8(payload) = value else {
+                    return Err(FfqError::Execution(
+                        "invalid partial sketch state for APPROX_COUNT_DISTINCT".to_string(),
+                    ));
+                };
+                let other = serde_json::from_str::<HllSketch>(&payload).map_err(|e| {
+                    FfqError::Execution(format!(
+                        "failed to deserialize APPROX_COUNT_DISTINCT sketch: {e}"
+                    ))
+                })?;
+                sketch.merge(&other)?;
+            }
+        },
     }
 
     if let (AggExpr::Count(_), AggState::Count(acc)) = (&spec.expr, state) {
@@ -4277,6 +4382,16 @@ fn state_to_scalar(state: &AggState, expr: &AggExpr, mode: AggregateMode) -> Sca
                 ScalarValue::Null
             } else {
                 ScalarValue::Float64Bits((sum / (*count as f64)).to_bits())
+            }
+        }
+        (AggState::Hll(sketch), AggExpr::ApproxCountDistinct(_)) => {
+            if mode == AggregateMode::Partial {
+                match serde_json::to_string(sketch) {
+                    Ok(s) => ScalarValue::Utf8(s),
+                    Err(_) => ScalarValue::Null,
+                }
+            } else {
+                ScalarValue::Int64(sketch.estimate().round() as i64)
             }
         }
         _ => ScalarValue::Null,
@@ -4442,6 +4557,9 @@ fn merge_states(target: &mut [AggState], other: &[AggState]) -> Result<()> {
                 *asum += *bsum;
                 *acount += *bcount;
             }
+            (AggState::Hll(a), AggState::Hll(b)) => {
+                a.merge(b)?;
+            }
             _ => return Err(FfqError::Execution("spill state type mismatch".to_string())),
         }
     }
@@ -4525,6 +4643,7 @@ fn agg_state_estimate_bytes(v: &AggState) -> usize {
         AggState::SumFloat(_) => 8,
         AggState::Min(x) | AggState::Max(x) => x.as_ref().map_or(0, scalar_estimate_bytes),
         AggState::Avg { .. } => 16,
+        AggState::Hll(sketch) => sketch.registers.len(),
     }
 }
 

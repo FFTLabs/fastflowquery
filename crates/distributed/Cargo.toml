@@ -19,6 +19,7 @@ default = []
 grpc = ["dep:tokio", "dep:tonic", "dep:prost", "dep:tokio-stream"]
 vector = ["ffq-planner/vector", "ffq-execution/vector"]
 qdrant = ["vector", "ffq-storage/qdrant"]
+approx = ["ffq-planner/approx"]
 profiling = ["ffq-common/profiling", "ffq-execution/profiling"]
 
 [dependencies]

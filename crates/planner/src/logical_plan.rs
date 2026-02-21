@@ -492,6 +492,8 @@ pub enum AggExpr {
     Count(Expr),
     /// Count distinct non-null input values.
     CountDistinct(Expr),
+    /// Approximate count distinct using HyperLogLog sketch state.
+    ApproxCountDistinct(Expr),
     /// Sum numeric input.
     Sum(Expr),
     /// Minimum input value.
