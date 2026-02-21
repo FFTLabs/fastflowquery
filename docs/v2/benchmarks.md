@@ -489,13 +489,17 @@ Manifest contract validation:
    - Required env: `FFQ_COORDINATOR_ENDPOINT`.
 10. `make bench-v2-adaptive-shuffle-compare BASELINE=<json-or-dir> CANDIDATE=<json-or-dir> [THRESHOLD=0.10]`
    - Compares adaptive-shuffle artifacts with per-query thresholds from `tests/bench/thresholds/adaptive_shuffle_regression_thresholds.json`.
-11. `make tpch-dbgen-sf1`
+11. `make bench-v2-pipelined-shuffle`
+   - Runs pipelined shuffle TTFR benchmark scenarios.
+12. `make bench-v2-pipelined-shuffle-gate CANDIDATE=<json> [THRESHOLD_FILE=tests/bench/thresholds/pipelined_shuffle_ttfr_thresholds.json]`
+   - Applies TTFR/throughput regression gates for pipelined shuffle candidates.
+13. `make tpch-dbgen-sf1`
    - Generates official dbgen SF1 `.tbl` dataset.
-12. `make tpch-dbgen-parquet`
+14. `make tpch-dbgen-parquet`
    - Converts dbgen `.tbl` to deterministic parquet for FFQ benchmark paths.
-13. `make bench-13.4-official-embedded`
+15. `make bench-13.4-official-embedded`
    - Runs official SF1 parquet Q1/Q3 benchmark in embedded mode.
-14. `make bench-13.4-official-distributed`
+16. `make bench-13.4-official-distributed`
    - Runs official SF1 parquet Q1/Q3 benchmark in distributed mode (`FFQ_COORDINATOR_ENDPOINT` required).
 
 Legacy alias:
@@ -533,6 +537,11 @@ Adaptive shuffle regression thresholds:
 
 1. CI/manual adaptive shuffle gating uses `tests/bench/thresholds/adaptive_shuffle_regression_thresholds.json`.
 2. Thresholds can be tuned per scenario (`tiny`, `large`, `skewed`, `mixed`) without comparator changes.
+
+Pipelined shuffle TTFR thresholds:
+
+1. `make bench-v2-pipelined-shuffle-gate` uses `tests/bench/thresholds/pipelined_shuffle_ttfr_thresholds.json` by default.
+2. Threshold file can be overridden with `THRESHOLD_FILE=<path>` for tighter/looser gates per environment.
 
 Artifacts:
 

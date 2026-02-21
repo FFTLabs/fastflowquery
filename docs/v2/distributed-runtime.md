@@ -15,6 +15,7 @@ This page documents the distributed runtime execution contract in v2:
 4. liveness, retry/backoff, blacklisting
 5. capability-aware custom-operator assignment
 6. adaptive shuffle reduce-layout behavior (barrier-time planning)
+7. pipelined shuffle stream protocol and backpressure controls
 
 Related control-plane RPC details are documented in `docs/v2/control-plane.md`.
 Adaptive operator playbook and tuning profiles are documented in `docs/v2/adaptive-shuffle-tuning.md`.
@@ -128,6 +129,75 @@ Map output metadata is keyed by:
 `FetchShufflePartition` requires an exact key match for the requested attempt.
 This ensures stale map attempts are not used by downstream stages.
 
+## Pipelined Shuffle Stream Protocol
+
+Pipelined scheduling allows reduce tasks to start before all map tasks are terminal.
+
+### Stream metadata and readable boundaries
+
+Each `RegisterMapOutput` payload carries per-partition progress:
+
+1. `stream_epoch`
+2. `committed_offset`
+3. `finalized`
+
+Coordinator keeps latest-attempt partition metadata and only exposes committed ranges.
+
+### Incremental fetch contract
+
+`FetchShufflePartition` request carries:
+
+1. `start_offset`
+2. `max_bytes`
+3. `layout_version`
+4. `min_stream_epoch`
+
+Response chunks carry:
+
+1. `start_offset` / `end_offset`
+2. `watermark_offset` (highest currently readable byte)
+3. `finalized`
+4. `stream_epoch`
+
+Reader behavior:
+
+1. if `start_offset >= watermark_offset`, service returns EOF-style empty payload chunk
+2. stale epoch (`min_stream_epoch > available`) is rejected
+3. stale layout version is rejected when versioned fetch is requested
+
+### Pipelined scheduling gates
+
+Coordinator enables early reduce assignment when:
+
+1. `FFQ_PIPELINED_SHUFFLE_ENABLED=true`
+2. parent map completion ratio is above `FFQ_PIPELINED_SHUFFLE_MIN_MAP_COMPLETION_RATIO`
+3. required reduce partitions have `committed_offset >= FFQ_PIPELINED_SHUFFLE_MIN_COMMITTED_OFFSET_BYTES` (or are finalized)
+
+### Backpressure loop
+
+Reducers report:
+
+1. `reduce_fetch_inflight_bytes`
+2. `reduce_fetch_queue_depth`
+
+Coordinator computes recommended windows and returns them in `TaskAssignment`:
+
+1. `recommended_map_output_publish_window_partitions`
+2. `recommended_reduce_fetch_window_partitions`
+
+Observed values are published into stage metrics:
+
+1. `backpressure_inflight_bytes`
+2. `backpressure_queue_depth`
+3. `map_publish_window_partitions`
+4. `reduce_fetch_window_partitions`
+5. `backpressure_events`
+6. `stream_buffered_bytes`
+7. `stream_active_count`
+8. `first_chunk_ms`
+9. `first_reduce_row_ms`
+10. `stream_lag_ms`
+
 ## Adaptive Shuffle (Barrier-Time Layout Finalization)
 
 Adaptive shuffle is finalized exactly once after map completion and before reduce scheduling.
@@ -152,6 +222,12 @@ Exposed diagnostics in stage metrics:
 5. `partition_bytes_histogram`
 6. `skew_split_tasks`
 7. `layout_finalize_count`
+8. `first_chunk_ms`
+9. `first_reduce_row_ms`
+10. `stream_lag_ms`
+11. `stream_buffered_bytes`
+12. `stream_active_count`
+13. `backpressure_events`
 
 ## Minimal Runtime Walkthrough (Coordinator + 2 Workers)
 
@@ -174,6 +250,10 @@ cargo test -p ffq-distributed --features grpc coordinator_enforces_worker_and_qu
 cargo test -p ffq-distributed --features grpc coordinator_assigns_custom_operator_tasks_only_to_capable_workers
 cargo test -p ffq-distributed --features grpc coordinator_applies_barrier_time_adaptive_partition_coalescing
 cargo test -p ffq-distributed --features grpc coordinator_barrier_time_hot_partition_splitting_increases_reduce_tasks
+cargo test -p ffq-distributed --features grpc coordinator_allows_pipelined_reduce_assignment_when_partition_ready
+cargo test -p ffq-distributed --features grpc coordinator_pipeline_requires_committed_offset_threshold_before_scheduling
+cargo test -p ffq-distributed --features grpc coordinator_backpressure_throttles_assignment_windows
+cargo test -p ffq-distributed --features grpc worker_shuffle_fetch_respects_committed_watermark_and_emits_eof_marker
 ```
 
 Expected:

@@ -36,6 +36,16 @@ Server/client wiring:
 1. `RegisterMapOutput`
 2. `FetchShufflePartition` (stream)
 
+Pipelined stream contract:
+
+1. map-side registration updates per-partition stream metadata:
+   - `stream_epoch`
+   - `committed_offset`
+   - `finalized`
+2. reducers fetch by byte range (`start_offset`, `max_bytes`) and advance local cursors.
+3. fetch responses include `watermark_offset` and `finalized` so reducers can distinguish "more data coming" vs true EOF.
+4. coordinator/worker reject stale epoch/layout combinations to keep retry attempts isolated.
+
 ### HeartbeatService
 
 1. `Heartbeat`
@@ -57,6 +67,11 @@ Server/client wiring:
 5. worker calls `ReportTaskStatus` for each assignment
 6. worker may call `RegisterMapOutput` for map-stage outputs
 7. final stage may call `RegisterQueryResults`
+
+When pipelined shuffle is enabled:
+
+1. reducer tasks can be assigned before map-task completion if readiness thresholds are met.
+2. coordinator emits recommended map-publish and reduce-fetch window sizes for backpressure control.
 
 ### Client result retrieval
 

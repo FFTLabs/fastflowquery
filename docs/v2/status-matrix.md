@@ -42,9 +42,9 @@ Status legend:
 | `6.1 Streaming hash agg + robust spill` | not started | Gap | Gap | No v2 streaming spill redesign evidence. |
 | `6.2 Distinct aggregation (two-phase)` | not started | Gap | Gap | No two-phase distinct evidence. |
 | `6.3 Optional: approx aggregates / grouping sets` | not started | Gap | Gap | No approx/grouping sets evidence. |
-| `EPIC 7 — Shuffle & Distributed Execution v2` | partial | `crates/distributed/src/worker.rs`, `crates/distributed/src/coordinator.rs` | `crates/distributed/src/coordinator.rs` tests | Capability-aware scheduling implemented, but shuffle-v2 features are not. |
+| `EPIC 7 — Shuffle & Distributed Execution v2` | partial | `crates/distributed/src/worker.rs`, `crates/distributed/src/coordinator.rs`, `crates/distributed/src/grpc.rs` | `crates/distributed/src/coordinator.rs` tests, `crates/distributed/src/grpc.rs` tests | Capability-aware scheduling and pipelined-shuffle MVP are implemented; compression/zero-copy/speculation/memory-manager tracks remain open. |
 | `7.1 Shuffle compression` | not started | Gap | Gap | No shuffle compression evidence. |
-| `7.2 Pipelined shuffle (MVP)` | not started | Gap | Gap | No pipelined shuffle evidence. |
+| `7.2 Pipelined shuffle (MVP)` | done | `crates/distributed/src/coordinator.rs`, `crates/distributed/src/worker.rs`, `crates/distributed/src/grpc.rs`, `crates/distributed/proto/ffq_distributed.proto` | `coordinator_allows_pipelined_reduce_assignment_when_partition_ready`, `coordinator_pipeline_requires_committed_offset_threshold_before_scheduling`, `coordinator_backpressure_throttles_assignment_windows`, `worker_shuffle_fetch_respects_committed_watermark_and_emits_eof_marker` | MVP closes control-plane/worker streaming readiness, incremental fetch cursors, and backpressure windows; deeper transport optimization remains under `7.3`. |
 | `7.3 Fewer copies / network path` | not started | Gap | Gap | No copy-minimization benchmark evidence. |
 | `7.4 Speculative execution + better scheduling` | not started | Gap | Gap | No speculative execution evidence. |
 | `7.5 Memory/Spill Manager` | not started | Gap | Gap | No centralized memory manager evidence. |
