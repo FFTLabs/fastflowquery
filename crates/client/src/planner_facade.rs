@@ -57,6 +57,7 @@ impl PlannerFacade {
             ctx,
             OptimizerConfig {
                 broadcast_threshold_bytes: cfg.broadcast_threshold_bytes,
+                prefer_sort_merge_join: cfg.prefer_sort_merge_join,
             },
         )?;
         let analyzed = self.analyzer.analyze(opt, ctx)?;
@@ -74,6 +75,7 @@ impl PlannerFacade {
             ctx,
             OptimizerConfig {
                 broadcast_threshold_bytes: cfg.broadcast_threshold_bytes,
+                prefer_sort_merge_join: cfg.prefer_sort_merge_join,
             },
         )
     }

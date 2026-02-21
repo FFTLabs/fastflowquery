@@ -80,6 +80,17 @@ fn apply_config_map(
                     FfqError::InvalidConfig(format!("invalid join_bloom_bits '{value}': {e}"))
                 })?
             }
+            "prefer_sort_merge_join" => {
+                config.prefer_sort_merge_join = match value.to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" | "on" => true,
+                    "false" | "0" | "no" | "off" => false,
+                    other => {
+                        return Err(FfqError::InvalidConfig(format!(
+                            "invalid prefer_sort_merge_join '{other}'"
+                        )));
+                    }
+                };
+            }
             "spill_dir" => config.spill_dir = value.clone(),
             "catalog_path" => config.catalog_path = Some(value.clone()),
             "coordinator_endpoint" => config.coordinator_endpoint = Some(value.clone()),

@@ -86,6 +86,8 @@ pub struct EngineConfig {
     ///
     /// For example `20` means `1 << 20` bits (128KiB bitset).
     pub join_bloom_bits: u8,
+    /// Prefer sort-merge join strategy for eligible inner joins.
+    pub prefer_sort_merge_join: bool,
 
     /// Directory used for spill files.
     pub spill_dir: String,
@@ -124,6 +126,7 @@ impl Default for EngineConfig {
             join_radix_bits: 8,
             join_bloom_enabled: true,
             join_bloom_bits: 20,
+            prefer_sort_merge_join: false,
             spill_dir: "./ffq_spill".to_string(),
             catalog_path: None,
             coordinator_endpoint: None,

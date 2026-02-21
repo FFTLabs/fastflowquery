@@ -15,9 +15,9 @@ use ffq_execution::PhysicalOperatorFactory;
 use ffq_planner::LiteralValue;
 use ffq_planner::VectorTopKExec;
 use ffq_planner::{
-    CteRefExec, CustomExec, Expr, ParquetScanExec, PartitioningSpec, PhysicalPlan, UnionAllExec,
-    WindowExpr, WindowFrameBound, WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits,
-    WindowFunction, WindowOrderExpr,
+    BuildSide, CteRefExec, CustomExec, Expr, ParquetScanExec, PartitioningSpec, PhysicalPlan,
+    UnionAllExec, WindowExpr, WindowFrameBound, WindowFrameExclusion, WindowFrameSpec,
+    WindowFrameUnits, WindowFunction, WindowOrderExpr,
 };
 use ffq_storage::vector_index::{VectorIndexProvider, VectorTopKRow};
 use ffq_storage::{Catalog, TableDef, TableStats};
@@ -535,6 +535,62 @@ fn join_bloom_filter_prefilters_selective_probe_keys() {
         let key = vec![ScalarValue::Int64(k)];
         assert!(bloom.may_contain(&key));
     }
+}
+
+#[test]
+fn sort_merge_join_matches_inner_join_results_for_sorted_sources() {
+    let left_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("lv", DataType::Int64, false),
+    ]));
+    let right_schema = Arc::new(Schema::new(vec![
+        Field::new("k", DataType::Int64, false),
+        Field::new("rv", DataType::Int64, false),
+    ]));
+    let left = ExecOutput {
+        schema: left_schema.clone(),
+        batches: vec![
+            RecordBatch::try_new(
+                left_schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4])),
+                    Arc::new(Int64Array::from(vec![10_i64, 20, 30, 40])),
+                ],
+            )
+            .expect("left batch"),
+        ],
+    };
+    let right = ExecOutput {
+        schema: right_schema.clone(),
+        batches: vec![
+            RecordBatch::try_new(
+                right_schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![2_i64, 3, 5])),
+                    Arc::new(Int64Array::from(vec![200_i64, 300, 500])),
+                ],
+            )
+            .expect("right batch"),
+        ],
+    };
+
+    let out = super::run_sort_merge_join(
+        left,
+        right,
+        vec![("k".to_string(), "k".to_string())],
+        BuildSide::Right,
+    )
+    .expect("sort merge join");
+    let rows = rows_from_batches(&out).expect("rows");
+    assert_eq!(rows.len(), 2);
+    let keys = rows
+        .iter()
+        .map(|r| match &r[0] {
+            ScalarValue::Int64(v) => *v,
+            other => panic!("unexpected key value: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(keys, vec![2_i64, 3]);
 }
 
 #[cfg(feature = "vector")]

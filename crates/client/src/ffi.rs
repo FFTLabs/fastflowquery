@@ -169,6 +169,7 @@ fn apply_config_kv(config: &mut EngineConfig, kv: &str) -> std::result::Result<(
                     FfqError::InvalidConfig(format!("invalid join_bloom_bits '{value}': {e}"))
                 })?
             }
+            "prefer_sort_merge_join" => config.prefer_sort_merge_join = parse_bool(value)?,
             "spill_dir" => config.spill_dir = value.to_string(),
             "catalog_path" => config.catalog_path = Some(value.to_string()),
             "coordinator_endpoint" => config.coordinator_endpoint = Some(value.to_string()),

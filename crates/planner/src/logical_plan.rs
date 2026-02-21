@@ -32,6 +32,8 @@ pub enum JoinStrategyHint {
     BroadcastRight,
     /// Shuffle both sides by join key and join partition-wise.
     Shuffle,
+    /// Sort-merge join (inputs may require local sort before merge).
+    SortMerge,
 }
 
 /// Scalar expression used by logical and physical planning.

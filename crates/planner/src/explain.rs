@@ -459,6 +459,7 @@ fn fmt_join_hint(h: JoinStrategyHint) -> &'static str {
         JoinStrategyHint::BroadcastLeft => "broadcast_left",
         JoinStrategyHint::BroadcastRight => "broadcast_right",
         JoinStrategyHint::Shuffle => "shuffle",
+        JoinStrategyHint::SortMerge => "sort_merge",
     }
 }
 

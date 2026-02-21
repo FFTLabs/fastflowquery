@@ -10,12 +10,15 @@ use crate::logical_plan::{BinaryOp, Expr, JoinStrategyHint, JoinType, LiteralVal
 pub struct OptimizerConfig {
     /// Max table byte size eligible for broadcast join hinting.
     pub broadcast_threshold_bytes: u64,
+    /// Prefer sort-merge strategy for eligible joins.
+    pub prefer_sort_merge_join: bool,
 }
 
 impl Default for OptimizerConfig {
     fn default() -> Self {
         Self {
             broadcast_threshold_bytes: 64 * 1024 * 1024,
+            prefer_sort_merge_join: false,
         }
     }
 }
@@ -955,7 +958,9 @@ fn join_strategy_hint(
             let l_bytes = estimate_bytes(&left, ctx)?;
             let r_bytes = estimate_bytes(&right, ctx)?;
 
-            let hint = if let (Some(lb), Some(rb)) = (l_bytes, r_bytes) {
+            let hint = if cfg.prefer_sort_merge_join && matches!(join_type, JoinType::Inner) {
+                JoinStrategyHint::SortMerge
+            } else if let (Some(lb), Some(rb)) = (l_bytes, r_bytes) {
                 if lb <= cfg.broadcast_threshold_bytes && lb <= rb {
                     JoinStrategyHint::BroadcastLeft
                 } else if rb <= cfg.broadcast_threshold_bytes && rb < lb {
@@ -2153,11 +2158,12 @@ mod tests {
     use super::{Optimizer, OptimizerConfig, OptimizerContext, TableMetadata};
     use crate::analyzer::SchemaProvider;
     use crate::explain::explain_logical;
-    use crate::logical_plan::{Expr, JoinStrategyHint, LiteralValue, LogicalPlan};
+    use crate::logical_plan::{Expr, JoinStrategyHint, JoinType, LiteralValue, LogicalPlan};
 
     struct TestCtx {
         schema: SchemaRef,
         format: String,
+        stats: HashMap<String, (Option<u64>, Option<u64>)>,
     }
 
     impl SchemaProvider for TestCtx {
@@ -2167,8 +2173,8 @@ mod tests {
     }
 
     impl OptimizerContext for TestCtx {
-        fn table_stats(&self, _table: &str) -> ffq_common::Result<(Option<u64>, Option<u64>)> {
-            Ok((None, None))
+        fn table_stats(&self, table: &str) -> ffq_common::Result<(Option<u64>, Option<u64>)> {
+            Ok(self.stats.get(table).cloned().unwrap_or((None, None)))
         }
 
         fn table_metadata(&self, _table: &str) -> ffq_common::Result<Option<TableMetadata>> {
@@ -2210,6 +2216,7 @@ mod tests {
                 Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
             ])),
             format: "qdrant".to_string(),
+            stats: HashMap::new(),
         };
 
         let optimized = Optimizer::new()
@@ -2247,6 +2254,7 @@ mod tests {
                 Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
             ])),
             format: "parquet".to_string(),
+            stats: HashMap::new(),
         };
 
         let optimized = Optimizer::new()
@@ -2712,5 +2720,68 @@ mod subquery_integration_tests {
         assert!(result.is_ok(), "optimizer should not panic");
         let out = result.expect("no panic");
         assert!(out.is_err(), "optimizer should propagate planning error");
+    }
+
+    #[test]
+    fn join_strategy_hint_uses_sort_merge_when_enabled_by_config() {
+        struct SmjCtx {
+            schemas: HashMap<String, SchemaRef>,
+        }
+        impl SchemaProvider for SmjCtx {
+            fn table_schema(&self, table: &str) -> ffq_common::Result<SchemaRef> {
+                self.schemas.get(table).cloned().ok_or_else(|| {
+                    ffq_common::FfqError::Planning(format!("unknown table: {table}"))
+                })
+            }
+        }
+        impl OptimizerContext for SmjCtx {
+            fn table_stats(&self, table: &str) -> ffq_common::Result<(Option<u64>, Option<u64>)> {
+                let bytes = match table {
+                    "left_t" => Some(256 * 1024 * 1024),
+                    "right_t" => Some(320 * 1024 * 1024),
+                    _ => None,
+                };
+                Ok((bytes, None))
+            }
+        }
+
+        let schema = basic_schema("k");
+        let ctx = SmjCtx {
+            schemas: HashMap::from([
+                ("left_t".to_string(), schema.clone()),
+                ("right_t".to_string(), schema),
+            ]),
+        };
+        let plan = LogicalPlan::Join {
+            left: Box::new(LogicalPlan::TableScan {
+                table: "left_t".to_string(),
+                projection: None,
+                filters: vec![],
+            }),
+            right: Box::new(LogicalPlan::TableScan {
+                table: "right_t".to_string(),
+                projection: None,
+                filters: vec![],
+            }),
+            on: vec![("k".to_string(), "k".to_string())],
+            join_type: JoinType::Inner,
+            strategy_hint: JoinStrategyHint::Auto,
+        };
+        let optimized = Optimizer::new()
+            .optimize(
+                plan,
+                &ctx,
+                OptimizerConfig {
+                    broadcast_threshold_bytes: 64 * 1024 * 1024,
+                    prefer_sort_merge_join: true,
+                },
+            )
+            .expect("optimize");
+        match optimized {
+            LogicalPlan::Join { strategy_hint, .. } => {
+                assert_eq!(strategy_hint, JoinStrategyHint::SortMerge);
+            }
+            other => panic!("expected join plan, got {other:?}"),
+        }
     }
 }

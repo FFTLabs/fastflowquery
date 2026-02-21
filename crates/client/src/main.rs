@@ -230,6 +230,14 @@ fn parse_repl_opts(args: &[String]) -> Result<ReplOpts, Box<dyn std::error::Erro
                     .parse()
                     .map_err(|_| "invalid value for --join-bloom-bits")?;
             }
+            "--prefer-sort-merge-join" => {
+                i += 1;
+                config.prefer_sort_merge_join = parse_bool(
+                    args.get(i)
+                        .ok_or("missing value for --prefer-sort-merge-join")?,
+                    "--prefer-sort-merge-join",
+                )?;
+            }
             "--schema-inference" => {
                 i += 1;
                 let raw = args.get(i).ok_or("missing value for --schema-inference")?;
@@ -265,7 +273,7 @@ fn print_usage() {
     eprintln!("  ffq-client --plan \"<SQL>\"");
     eprintln!("  ffq-client query --sql \"<SQL>\" [--catalog PATH] [--plan]");
     eprintln!(
-        "  ffq-client repl [--catalog PATH] [--coordinator-endpoint URL] [--batch-size-rows N] [--mem-budget-bytes N] [--spill-dir PATH] [--shuffle-partitions N] [--broadcast-threshold-bytes N] [--join-radix-bits N] [--join-bloom-enabled true|false] [--join-bloom-bits N] [--schema-inference off|on|strict|permissive] [--schema-writeback true|false] [--schema-drift-policy fail|refresh]"
+        "  ffq-client repl [--catalog PATH] [--coordinator-endpoint URL] [--batch-size-rows N] [--mem-budget-bytes N] [--spill-dir PATH] [--shuffle-partitions N] [--broadcast-threshold-bytes N] [--join-radix-bits N] [--join-bloom-enabled true|false] [--join-bloom-bits N] [--prefer-sort-merge-join true|false] [--schema-inference off|on|strict|permissive] [--schema-writeback true|false] [--schema-drift-policy fail|refresh]"
     );
 }
 

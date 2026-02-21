@@ -947,6 +947,7 @@ fn eval_plan_for_stage(
                 left,
                 right,
                 on,
+                strategy_hint,
                 build_side,
                 ..
             } = join;
@@ -970,7 +971,11 @@ fn eval_plan_for_stage(
             )?;
             let (left_rows, left_batches, left_bytes) = batch_stats(&left.batches);
             let (right_rows, right_batches, right_bytes) = batch_stats(&right.batches);
-            let out = run_hash_join(left, right, on.clone(), *build_side, ctx)?;
+            let out = if matches!(strategy_hint, ffq_planner::JoinStrategyHint::SortMerge) {
+                run_sort_merge_join(left, right, on.clone(), *build_side)?
+            } else {
+                run_hash_join(left, right, on.clone(), *build_side, ctx)?
+            };
             Ok(OpEval {
                 out,
                 in_rows: left_rows + right_rows,
@@ -2141,6 +2146,105 @@ fn run_hash_join(
     })
 }
 
+fn run_sort_merge_join(
+    left: ExecOutput,
+    right: ExecOutput,
+    on: Vec<(String, String)>,
+    build_side: BuildSide,
+) -> Result<ExecOutput> {
+    let left_rows = rows_from_batches(&left)?;
+    let right_rows = rows_from_batches(&right)?;
+    let (build_rows, probe_rows, build_schema, probe_schema, build_input_side) = match build_side {
+        BuildSide::Left => (
+            &left_rows,
+            &right_rows,
+            left.schema.clone(),
+            right.schema.clone(),
+            JoinInputSide::Left,
+        ),
+        BuildSide::Right => (
+            &right_rows,
+            &left_rows,
+            right.schema.clone(),
+            left.schema.clone(),
+            JoinInputSide::Right,
+        ),
+    };
+    let build_key_names = join_key_names(&on, build_input_side, JoinExecSide::Build);
+    let probe_key_names = join_key_names(&on, build_input_side, JoinExecSide::Probe);
+    let build_key_idx = resolve_key_indexes(&build_schema, &build_key_names)?;
+    let probe_key_idx = resolve_key_indexes(&probe_schema, &probe_key_names)?;
+
+    let mut build_sorted = build_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, row)| {
+            let key = join_key_from_row(row, &build_key_idx);
+            (!key.iter().any(|v| *v == ScalarValue::Null)).then_some((idx, key))
+        })
+        .collect::<Vec<_>>();
+    let mut probe_sorted = probe_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, row)| {
+            let key = join_key_from_row(row, &probe_key_idx);
+            (!key.iter().any(|v| *v == ScalarValue::Null)).then_some((idx, key))
+        })
+        .collect::<Vec<_>>();
+    build_sorted.sort_by(|a, b| cmp_join_keys(&a.1, &b.1));
+    probe_sorted.sort_by(|a, b| cmp_join_keys(&a.1, &b.1));
+
+    let mut out_rows = Vec::new();
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < build_sorted.len() && j < probe_sorted.len() {
+        let ord = cmp_join_keys(&build_sorted[i].1, &probe_sorted[j].1);
+        if ord == Ordering::Less {
+            i += 1;
+            continue;
+        }
+        if ord == Ordering::Greater {
+            j += 1;
+            continue;
+        }
+        let i_start = i;
+        let j_start = j;
+        while i < build_sorted.len()
+            && cmp_join_keys(&build_sorted[i_start].1, &build_sorted[i].1) == Ordering::Equal
+        {
+            i += 1;
+        }
+        while j < probe_sorted.len()
+            && cmp_join_keys(&probe_sorted[j_start].1, &probe_sorted[j].1) == Ordering::Equal
+        {
+            j += 1;
+        }
+        for (build_row_idx, _) in &build_sorted[i_start..i] {
+            for (probe_row_idx, _) in &probe_sorted[j_start..j] {
+                out_rows.push(combine_join_rows(
+                    &build_rows[*build_row_idx],
+                    &probe_rows[*probe_row_idx],
+                    build_input_side,
+                ));
+            }
+        }
+    }
+
+    let output_schema = Arc::new(Schema::new(
+        left.schema
+            .fields()
+            .iter()
+            .chain(right.schema.fields().iter())
+            .map(|f| (**f).clone())
+            .collect::<Vec<_>>(),
+    ));
+    let batch = rows_to_batch(&output_schema, &out_rows)?;
+    Ok(ExecOutput {
+        schema: output_schema,
+        batches: vec![batch],
+    })
+}
+
 fn rows_from_batches(input: &ExecOutput) -> Result<Vec<Vec<ScalarValue>>> {
     let mut out = Vec::new();
     for batch in &input.batches {
@@ -3233,6 +3337,32 @@ fn strip_qual(name: &str) -> String {
 
 fn join_key_from_row(row: &[ScalarValue], idxs: &[usize]) -> Vec<ScalarValue> {
     idxs.iter().map(|i| row[*i].clone()).collect()
+}
+
+fn cmp_join_keys(a: &[ScalarValue], b: &[ScalarValue]) -> Ordering {
+    for (av, bv) in a.iter().zip(b.iter()) {
+        let ord = cmp_join_scalar(av, bv);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
+fn cmp_join_scalar(a: &ScalarValue, b: &ScalarValue) -> Ordering {
+    use ScalarValue::*;
+    match (a, b) {
+        (Null, Null) => Ordering::Equal,
+        (Null, _) => Ordering::Less,
+        (_, Null) => Ordering::Greater,
+        (Int64(x), Int64(y)) => x.cmp(y),
+        (Float64Bits(x), Float64Bits(y)) => f64::from_bits(*x).total_cmp(&f64::from_bits(*y)),
+        (Int64(x), Float64Bits(y)) => (*x as f64).total_cmp(&f64::from_bits(*y)),
+        (Float64Bits(x), Int64(y)) => f64::from_bits(*x).total_cmp(&(*y as f64)),
+        (Utf8(x), Utf8(y)) => x.cmp(y),
+        (Boolean(x), Boolean(y)) => x.cmp(y),
+        _ => format!("{a:?}").cmp(&format!("{b:?}")),
+    }
 }
 
 fn in_memory_hash_join(

@@ -265,7 +265,9 @@ pub fn create_physical_plan(
                         alternatives: Vec::new(),
                     }))
                 }
-                JoinStrategyHint::Shuffle | JoinStrategyHint::Auto => {
+                JoinStrategyHint::Shuffle
+                | JoinStrategyHint::Auto
+                | JoinStrategyHint::SortMerge => {
                     // v1: Auto treated as Shuffle at physical level unless optimizer already decided broadcast.
                     // Shuffle both sides by join keys.
                     let left_keys: Vec<String> = on.iter().map(|(lk, _)| lk.clone()).collect();
@@ -308,7 +310,7 @@ pub fn create_physical_plan(
                         on: on.clone(),
                         join_type: *join_type,
                         strategy_hint: *strategy_hint,
-                        build_side: BuildSide::Right, // arbitrary for shuffle-join, executor can decide
+                        build_side: BuildSide::Right, // arbitrary for shuffle/sort-merge shape, executor can decide
                         alternatives: if matches!(
                             *strategy_hint,
                             JoinStrategyHint::Auto | JoinStrategyHint::Shuffle
