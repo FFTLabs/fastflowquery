@@ -1315,6 +1315,34 @@ enum VectorRewriteDecision {
 }
 
 #[cfg(feature = "vector")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PushdownFilterOp {
+    Eq,
+    And,
+    Or,
+}
+
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone)]
+struct PushdownFilterCaps {
+    enabled: bool,
+    ops: HashSet<PushdownFilterOp>,
+}
+
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct QdrantFilterSpec {
+    must: Vec<QdrantMatchClause>,
+}
+
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+struct QdrantMatchClause {
+    field: String,
+    value: serde_json::Value,
+}
+
+#[cfg(feature = "vector")]
 fn evaluate_vector_topk_rewrite(
     exprs: &[(Expr, String)],
     input: &LogicalPlan,
@@ -1365,7 +1393,8 @@ fn evaluate_vector_topk_rewrite(
             _reason: "query arg is not vector literal",
         });
     };
-    let filter = match translate_qdrant_filter(filters) {
+    let caps = pushdown_filter_caps(ctx, table)?;
+    let filter = match translate_qdrant_filter(filters, &caps) {
         Ok(v) => v,
         Err(_) => {
             return Ok(VectorRewriteDecision::Fallback {
@@ -1385,6 +1414,49 @@ fn evaluate_vector_topk_rewrite(
 }
 
 #[cfg(feature = "vector")]
+fn pushdown_filter_caps(ctx: &dyn OptimizerContext, table: &str) -> Result<PushdownFilterCaps> {
+    let options = ctx.table_options(table)?.unwrap_or_default();
+    let enabled = options
+        .get("vector.filter.pushdown.enabled")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true);
+
+    let mut ops = HashSet::new();
+    let configured = options.get("vector.filter.pushdown.ops").map(|v| {
+        v.split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    });
+    if let Some(tokens) = configured {
+        for token in tokens {
+            match token.as_str() {
+                "eq" => {
+                    ops.insert(PushdownFilterOp::Eq);
+                }
+                "and" => {
+                    ops.insert(PushdownFilterOp::And);
+                }
+                "or" => {
+                    ops.insert(PushdownFilterOp::Or);
+                }
+                _ => {}
+            }
+        }
+    } else {
+        // qdrant provider subset currently supports conjunctive equality clauses.
+        ops.insert(PushdownFilterOp::Eq);
+        ops.insert(PushdownFilterOp::And);
+    }
+
+    Ok(PushdownFilterCaps { enabled, ops })
+}
+
+#[cfg(feature = "vector")]
 fn projection_supported_for_vector_topk(exprs: &[(Expr, String)]) -> bool {
     exprs.iter().all(|(e, _)| {
         matches!(
@@ -1398,57 +1470,98 @@ fn projection_supported_for_vector_topk(exprs: &[(Expr, String)]) -> bool {
 }
 
 #[cfg(feature = "vector")]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct QdrantFilterSpec {
-    must: Vec<QdrantMatchClause>,
-}
-
-#[cfg(feature = "vector")]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct QdrantMatchClause {
-    field: String,
-    value: serde_json::Value,
-}
-
-#[cfg(feature = "vector")]
-fn translate_qdrant_filter(filters: &[Expr]) -> Result<Option<String>> {
+fn translate_qdrant_filter(filters: &[Expr], caps: &PushdownFilterCaps) -> Result<Option<String>> {
     if filters.is_empty() {
         return Ok(None);
     }
-    let mut clauses = Vec::new();
-    for f in filters {
-        collect_qdrant_match_clauses(f, &mut clauses)?;
+    if !caps.enabled {
+        return Err(ffq_common::FfqError::Planning(
+            "connector filter pushdown is disabled".to_string(),
+        ));
     }
+    let dnf = normalize_pushdownable_dnf(filters, caps)?;
+    if dnf.len() != 1 {
+        return Err(ffq_common::FfqError::Planning(
+            "unsupported qdrant filter expression; disjunction is not supported by this connector path"
+                .to_string(),
+        ));
+    }
+    let clauses = dnf.into_iter().next().unwrap_or_default();
     let encoded = serde_json::to_string(&QdrantFilterSpec { must: clauses })
         .map_err(|e| ffq_common::FfqError::Planning(format!("qdrant filter encode failed: {e}")))?;
     Ok(Some(encoded))
 }
 
 #[cfg(feature = "vector")]
-fn collect_qdrant_match_clauses(e: &Expr, out: &mut Vec<QdrantMatchClause>) -> Result<()> {
+fn normalize_pushdownable_dnf(
+    filters: &[Expr],
+    caps: &PushdownFilterCaps,
+) -> Result<Vec<Vec<QdrantMatchClause>>> {
+    let mut out = vec![Vec::new()];
+    for f in filters {
+        let rhs = qdrant_dnf_expr(f, caps)?;
+        out = dnf_and_product(out, rhs)?;
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "vector")]
+fn qdrant_dnf_expr(e: &Expr, caps: &PushdownFilterCaps) -> Result<Vec<Vec<QdrantMatchClause>>> {
     match e {
-        Expr::And(a, b) => {
-            collect_qdrant_match_clauses(a, out)?;
-            collect_qdrant_match_clauses(b, out)?;
-            Ok(())
+        Expr::And(a, b) if caps.ops.contains(&PushdownFilterOp::And) => {
+            let left = qdrant_dnf_expr(a, caps)?;
+            let right = qdrant_dnf_expr(b, caps)?;
+            dnf_and_product(left, right)
         }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOp::Eq,
-            right,
-        } => {
+        Expr::Or(a, b) if caps.ops.contains(&PushdownFilterOp::Or) => {
+            let mut out = qdrant_dnf_expr(a, caps)?;
+            out.extend(qdrant_dnf_expr(b, caps)?);
+            Ok(out)
+        }
+        Expr::BinaryOp { left, op, right } if *op == BinaryOp::Eq => {
+            if !caps.ops.contains(&PushdownFilterOp::Eq) {
+                return Err(ffq_common::FfqError::Planning(
+                    "connector does not support equality filter pushdown".to_string(),
+                ));
+            }
             if let Some((field, value)) = eq_clause_parts(left, right) {
-                out.push(QdrantMatchClause { field, value });
-                return Ok(());
+                return Ok(vec![vec![QdrantMatchClause { field, value }]]);
             }
             Err(ffq_common::FfqError::Planning(
                 "unsupported qdrant filter expression; expected `col = literal`".to_string(),
             ))
         }
         _ => Err(ffq_common::FfqError::Planning(
-            "unsupported qdrant filter expression; only equality and AND are supported".to_string(),
+            "unsupported qdrant filter expression for pushdown; expected a DNF subset over `col = literal`"
+                .to_string(),
         )),
     }
+}
+
+#[cfg(feature = "vector")]
+fn dnf_and_product(
+    left: Vec<Vec<QdrantMatchClause>>,
+    right: Vec<Vec<QdrantMatchClause>>,
+) -> Result<Vec<Vec<QdrantMatchClause>>> {
+    const MAX_TERMS: usize = 256;
+    if left.is_empty() || right.is_empty() {
+        return Ok(Vec::new());
+    }
+    if left.len().saturating_mul(right.len()) > MAX_TERMS {
+        return Err(ffq_common::FfqError::Planning(
+            "filter pushdown DNF expansion too large".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(left.len() * right.len());
+    for l in &left {
+        for r in &right {
+            let mut conj = Vec::with_capacity(l.len() + r.len());
+            conj.extend(l.iter().cloned());
+            conj.extend(r.iter().cloned());
+            out.push(conj);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(feature = "vector")]
@@ -2242,11 +2355,12 @@ mod tests {
     use super::{Optimizer, OptimizerConfig, OptimizerContext, TableMetadata};
     use crate::analyzer::SchemaProvider;
     use crate::explain::explain_logical;
-    use crate::logical_plan::{Expr, JoinStrategyHint, JoinType, LiteralValue, LogicalPlan};
+    use crate::logical_plan::{Expr, JoinStrategyHint, LiteralValue, LogicalPlan};
 
     struct TestCtx {
         schema: SchemaRef,
         format: String,
+        options: HashMap<String, String>,
         stats: HashMap<String, (Option<u64>, Option<u64>)>,
     }
 
@@ -2264,7 +2378,7 @@ mod tests {
         fn table_metadata(&self, _table: &str) -> ffq_common::Result<Option<TableMetadata>> {
             Ok(Some(TableMetadata {
                 format: self.format.clone(),
-                options: HashMap::new(),
+                options: self.options.clone(),
             }))
         }
     }
@@ -2300,6 +2414,7 @@ mod tests {
                 Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
             ])),
             format: "qdrant".to_string(),
+            options: HashMap::new(),
             stats: HashMap::new(),
         };
 
@@ -2321,7 +2436,7 @@ mod tests {
                     assert_eq!(source, "docs_idx");
                     assert_eq!(query_vectors.len(), 1);
                     let query_vector = &query_vectors[0];
-                    assert_eq!(query_vector, vec![1.0, 0.0, 0.0]);
+                    assert_eq!(query_vector.as_slice(), &[1.0, 0.0, 0.0]);
                     assert_eq!(k, 5);
                 }
                 other => panic!("expected HybridVectorScan, got {other:?}"),
@@ -2340,6 +2455,7 @@ mod tests {
                 Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
             ])),
             format: "parquet".to_string(),
+            options: HashMap::new(),
             stats: HashMap::new(),
         };
 
@@ -2370,6 +2486,8 @@ mod tests {
                 Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
             ])),
             format: "qdrant".to_string(),
+            options: HashMap::new(),
+            stats: HashMap::new(),
         };
 
         let optimized = Optimizer::new()
@@ -2394,6 +2512,8 @@ mod tests {
                 Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
             ])),
             format: "qdrant".to_string(),
+            options: HashMap::new(),
+            stats: HashMap::new(),
         };
 
         let plan = LogicalPlan::Projection {
@@ -2452,6 +2572,118 @@ mod tests {
     }
 
     #[test]
+    fn pushdown_disabled_falls_back_without_error() {
+        let emb_field = Field::new("item", DataType::Float32, true);
+        let mut options = HashMap::new();
+        options.insert(
+            "vector.filter.pushdown.enabled".to_string(),
+            "false".to_string(),
+        );
+        let ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+            ])),
+            format: "qdrant".to_string(),
+            options,
+            stats: HashMap::new(),
+        };
+
+        let plan = LogicalPlan::Projection {
+            exprs: vec![
+                (Expr::Column("id".to_string()), "id".to_string()),
+                (Expr::Column("score".to_string()), "score".to_string()),
+                (Expr::Column("payload".to_string()), "payload".to_string()),
+            ],
+            input: Box::new(LogicalPlan::TopKByScore {
+                score_expr: Expr::CosineSimilarity {
+                    vector: Box::new(Expr::Column("emb".to_string())),
+                    query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+                },
+                k: 3,
+                input: Box::new(LogicalPlan::TableScan {
+                    table: "docs_idx".to_string(),
+                    projection: None,
+                    filters: vec![Expr::BinaryOp {
+                        left: Box::new(Expr::Column("language".to_string())),
+                        op: crate::logical_plan::BinaryOp::Eq,
+                        right: Box::new(Expr::Literal(LiteralValue::Utf8("de".to_string()))),
+                    }],
+                }),
+            }),
+        };
+
+        let optimized = Optimizer::new()
+            .optimize(plan, &ctx, OptimizerConfig::default())
+            .expect("optimize should not fail");
+        match optimized {
+            LogicalPlan::Projection { input, .. } => match *input {
+                LogicalPlan::TopKByScore { .. } => {}
+                other => panic!("expected TopKByScore fallback, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disjunction_filter_falls_back_when_or_not_supported() {
+        let emb_field = Field::new("item", DataType::Float32, true);
+        let ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+            ])),
+            format: "qdrant".to_string(),
+            options: HashMap::new(),
+            stats: HashMap::new(),
+        };
+
+        let plan = LogicalPlan::Projection {
+            exprs: vec![
+                (Expr::Column("id".to_string()), "id".to_string()),
+                (Expr::Column("score".to_string()), "score".to_string()),
+                (Expr::Column("payload".to_string()), "payload".to_string()),
+            ],
+            input: Box::new(LogicalPlan::TopKByScore {
+                score_expr: Expr::CosineSimilarity {
+                    vector: Box::new(Expr::Column("emb".to_string())),
+                    query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+                },
+                k: 3,
+                input: Box::new(LogicalPlan::TableScan {
+                    table: "docs_idx".to_string(),
+                    projection: None,
+                    filters: vec![Expr::Or(
+                        Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("language".to_string())),
+                            op: crate::logical_plan::BinaryOp::Eq,
+                            right: Box::new(Expr::Literal(LiteralValue::Utf8("de".to_string()))),
+                        }),
+                        Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("language".to_string())),
+                            op: crate::logical_plan::BinaryOp::Eq,
+                            right: Box::new(Expr::Literal(LiteralValue::Utf8("en".to_string()))),
+                        }),
+                    )],
+                }),
+            }),
+        };
+
+        let optimized = Optimizer::new()
+            .optimize(plan, &ctx, OptimizerConfig::default())
+            .expect("optimize should not fail");
+        match optimized {
+            LogicalPlan::Projection { input, .. } => match *input {
+                LogicalPlan::TopKByScore { .. } => {}
+                other => panic!("expected TopKByScore fallback, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unsupported_filter_shape_falls_back_without_error() {
         let emb_field = Field::new("item", DataType::Float32, true);
         let ctx = TestCtx {
@@ -2461,6 +2693,8 @@ mod tests {
                 Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
             ])),
             format: "qdrant".to_string(),
+            options: HashMap::new(),
+            stats: HashMap::new(),
         };
 
         let plan = LogicalPlan::Projection {
@@ -2514,6 +2748,8 @@ mod tests {
                 ),
             ])),
             format: "qdrant".to_string(),
+            options: HashMap::new(),
+            stats: HashMap::new(),
         };
         let parquet_ctx = TestCtx {
             schema: Arc::new(Schema::new(vec![
@@ -2522,6 +2758,8 @@ mod tests {
                 Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
             ])),
             format: "parquet".to_string(),
+            options: HashMap::new(),
+            stats: HashMap::new(),
         };
 
         let applied = Optimizer::new()
