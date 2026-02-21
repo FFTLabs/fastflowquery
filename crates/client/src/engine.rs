@@ -168,6 +168,18 @@ impl Engine {
         Ok(DataFrame::new(self.session.clone(), logical))
     }
 
+    /// Embeds input texts using a pluggable provider.
+    ///
+    /// This keeps model/vendor integration outside the core engine surface.
+    pub fn embed_texts<P: crate::embedding::EmbeddingProvider>(
+        &self,
+        provider: &P,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>> {
+        let _ = self;
+        provider.embed(texts)
+    }
+
     #[cfg(feature = "vector")]
     /// Convenience helper for vector top-k search.
     ///

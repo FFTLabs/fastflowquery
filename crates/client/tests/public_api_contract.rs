@@ -1,4 +1,5 @@
 use ffq_client::Engine;
+use ffq_client::SampleEmbeddingProvider;
 use ffq_common::EngineConfig;
 use ffq_storage::{TableDef, TableStats};
 use futures::TryStreamExt;
@@ -36,6 +37,13 @@ fn public_api_engine_and_dataframe_contract_v2() {
 
     let batches2 = futures::executor::block_on(df.collect()).expect("collect");
     assert!(!batches2.is_empty());
+
+    let emb = SampleEmbeddingProvider::new(8).expect("embedding provider");
+    let vectors = engine
+        .embed_texts(&emb, &["alpha".to_string(), "beta".to_string()])
+        .expect("embed texts");
+    assert_eq!(vectors.len(), 2);
+    assert_eq!(vectors[0].len(), 8);
 }
 
 #[cfg(feature = "vector")]
