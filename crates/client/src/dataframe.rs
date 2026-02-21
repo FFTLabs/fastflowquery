@@ -996,7 +996,7 @@ mod tests {
     fn vector_knn_overrides_update_physical_exec() {
         let mut plan = PhysicalPlan::VectorKnn(VectorKnnExec {
             source: "docs_idx".to_string(),
-            query_vector: vec![0.1, 0.2, 0.3],
+            query_vectors: vec![vec![0.1, 0.2, 0.3]],
             k: 5,
             ef_search: Some(64),
             prefilter: None,

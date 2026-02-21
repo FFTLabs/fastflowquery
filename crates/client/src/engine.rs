@@ -199,6 +199,38 @@ impl Engine {
         self.sql_with_params(&sql, params)
     }
 
+    #[cfg(feature = "vector")]
+    /// Convenience helper for batched vector top-k search against an index table.
+    ///
+    /// This bypasses SQL parsing and builds a `HybridVectorScan` directly.
+    pub fn hybrid_search_batch(
+        &self,
+        source: &str,
+        query_vecs: Vec<Vec<f32>>,
+        k: usize,
+    ) -> Result<DataFrame> {
+        if query_vecs.is_empty() {
+            return Err(ffq_common::FfqError::InvalidConfig(
+                "hybrid_search_batch requires at least one query vector".to_string(),
+            ));
+        }
+        if query_vecs.iter().any(Vec::is_empty) {
+            return Err(ffq_common::FfqError::InvalidConfig(
+                "hybrid_search_batch query vectors cannot be empty".to_string(),
+            ));
+        }
+        let logical = ffq_planner::LogicalPlan::HybridVectorScan {
+            source: source.to_string(),
+            query_vectors: query_vecs,
+            k,
+            ef_search: None,
+            prefilter: None,
+            metric: "cosine".to_string(),
+            provider: "qdrant".to_string(),
+        };
+        Ok(DataFrame::new(self.session.clone(), logical))
+    }
+
     /// Returns a [`DataFrame`] that scans a registered table.
     ///
     /// # Errors

@@ -263,8 +263,14 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             provider,
         } => {
             let qdim = query_vectors.first().map_or(0, Vec::len);
+            let qcount = query_vectors.len();
+            let cols = if qcount > 1 {
+                "[query_id,doc_id,_score,payload]"
+            } else {
+                "[id,_score,payload]"
+            };
             out.push_str(&format!(
-                "{pad}HybridVectorScan source={source} k={k} ef_search={ef_search:?} query_dim={qdim} metric={metric} provider={provider} prefilter={prefilter:?} columns=[id,_score,payload] rewrite=index_applied\n"
+                "{pad}HybridVectorScan source={source} k={k} ef_search={ef_search:?} query_count={qcount} query_dim={qdim} metric={metric} provider={provider} prefilter={prefilter:?} columns={cols} rewrite=index_applied\n"
             ));
         }
         LogicalPlan::InsertInto {
@@ -461,14 +467,22 @@ fn fmt_physical(plan: &PhysicalPlan, indent: usize, out: &mut String) {
             ));
         }
         PhysicalPlan::VectorKnn(exec) => {
+            let qdim = exec.query_vectors.first().map_or(0, Vec::len);
+            let cols = if exec.query_vectors.len() > 1 {
+                "[query_id,doc_id,_score,payload]"
+            } else {
+                "[id,_score,payload]"
+            };
             out.push_str(&format!(
-                "{pad}VectorKnn source={} k={} ef_search={:?} query_dim={} metric={} provider={} columns=[id,_score,payload]\n",
+                "{pad}VectorKnn source={} k={} ef_search={:?} query_count={} query_dim={} metric={} provider={} columns={}\n",
                 exec.source,
                 exec.k,
                 exec.ef_search,
-                exec.query_vector.len(),
+                exec.query_vectors.len(),
+                qdim,
                 exec.metric,
-                exec.provider
+                exec.provider,
+                cols
             ));
         }
         PhysicalPlan::Custom(custom) => {

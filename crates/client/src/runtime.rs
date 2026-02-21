@@ -1541,13 +1541,18 @@ fn execute_vector_knn(
     async move {
         let as_topk = ffq_planner::VectorTopKExec {
             table: exec.source.clone(),
-            query_vector: exec.query_vector.clone(),
+            query_vector: exec.query_vectors.first().cloned().unwrap_or_default(),
             k: exec.k,
             filter: exec.prefilter.clone(),
         };
         let table = catalog.get(&as_topk.table)?.clone();
         if let Some(rows) = mock_vector_rows_from_table(&table, as_topk.k)? {
-            return rows_to_vector_knn_output(rows);
+            let mut tagged = Vec::new();
+            let qcount = exec.query_vectors.len().max(1);
+            for query_id in 0..qcount {
+                tagged.extend(rows.iter().cloned().map(|r| (query_id, r)));
+            }
+            return rows_to_vector_knn_output(tagged, exec.query_vectors.len() > 1);
         }
         if table.format != "qdrant" {
             return Err(FfqError::Unsupported(format!(
@@ -1566,18 +1571,22 @@ fn execute_vector_knn(
         #[cfg(feature = "qdrant")]
         {
             let provider = QdrantProvider::from_table(&table)?;
-            let rows = provider
-                .topk(
-                    as_topk.query_vector.clone(),
-                    as_topk.k,
-                    as_topk.filter.clone(),
-                    VectorQueryOptions {
-                        metric: Some(exec.metric.clone()),
-                        ef_search: exec.ef_search,
-                    },
-                )
-                .await?;
-            rows_to_vector_knn_output(rows)
+            let mut tagged_rows = Vec::new();
+            for (query_id, query_vec) in exec.query_vectors.iter().cloned().enumerate() {
+                let rows = provider
+                    .topk(
+                        query_vec,
+                        as_topk.k,
+                        as_topk.filter.clone(),
+                        VectorQueryOptions {
+                            metric: Some(exec.metric.clone()),
+                            ef_search: exec.ef_search,
+                        },
+                    )
+                    .await?;
+                tagged_rows.extend(rows.into_iter().map(|r| (query_id, r)));
+            }
+            rows_to_vector_knn_output(tagged_rows, exec.query_vectors.len() > 1)
         }
     }
     .boxed()
@@ -1670,19 +1679,34 @@ fn rows_to_vector_topk_output(
 }
 
 fn rows_to_vector_knn_output(
-    rows: Vec<ffq_storage::vector_index::VectorTopKRow>,
+    rows: Vec<(usize, ffq_storage::vector_index::VectorTopKRow)>,
+    include_query_id: bool,
 ) -> Result<ExecOutput> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("_score", DataType::Float32, false),
-        Field::new("score", DataType::Float32, false),
-        Field::new("payload", DataType::Utf8, true),
-    ]));
+    let schema = if include_query_id {
+        Arc::new(Schema::new(vec![
+            Field::new("query_id", DataType::Int64, false),
+            Field::new("doc_id", DataType::Int64, false),
+            Field::new("_score", DataType::Float32, false),
+            Field::new("score", DataType::Float32, false),
+            Field::new("payload", DataType::Utf8, true),
+        ]))
+    } else {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_score", DataType::Float32, false),
+            Field::new("score", DataType::Float32, false),
+            Field::new("payload", DataType::Utf8, true),
+        ]))
+    };
+    let mut query_id_b = Int64Builder::with_capacity(rows.len());
     let mut id_b = Int64Builder::with_capacity(rows.len());
     let mut score_alias_b = arrow::array::Float32Builder::with_capacity(rows.len());
     let mut score_b = arrow::array::Float32Builder::with_capacity(rows.len());
     let mut payload_b = StringBuilder::with_capacity(rows.len(), rows.len() * 16);
-    for row in rows {
+    for (query_id, row) in rows {
+        if include_query_id {
+            query_id_b.append_value(query_id as i64);
+        }
         id_b.append_value(row.id);
         score_alias_b.append_value(row.score);
         score_b.append_value(row.score);
@@ -1692,16 +1716,16 @@ fn rows_to_vector_knn_output(
             payload_b.append_null();
         }
     }
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(id_b.finish()),
-            Arc::new(score_alias_b.finish()),
-            Arc::new(score_b.finish()),
-            Arc::new(payload_b.finish()),
-        ],
-    )
-    .map_err(|e| FfqError::Execution(format!("build VectorKnn record batch failed: {e}")))?;
+    let mut cols: Vec<ArrayRef> = Vec::new();
+    if include_query_id {
+        cols.push(Arc::new(query_id_b.finish()));
+    }
+    cols.push(Arc::new(id_b.finish()));
+    cols.push(Arc::new(score_alias_b.finish()));
+    cols.push(Arc::new(score_b.finish()));
+    cols.push(Arc::new(payload_b.finish()));
+    let batch = RecordBatch::try_new(schema.clone(), cols)
+        .map_err(|e| FfqError::Execution(format!("build VectorKnn record batch failed: {e}")))?;
     Ok(ExecOutput {
         schema,
         batches: vec![batch],

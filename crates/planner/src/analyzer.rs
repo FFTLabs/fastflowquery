@@ -615,12 +615,15 @@ impl Analyzer {
                     ));
                 }
                 let _ = provider.table_schema(&source)?;
-                let out_schema = Arc::new(Schema::new(vec![
-                    Field::new("id", DataType::Int64, false),
-                    Field::new("_score", DataType::Float32, false),
-                    Field::new("score", DataType::Float32, false),
-                    Field::new("payload", DataType::Utf8, true),
-                ]));
+                let mut out_fields = Vec::new();
+                if query_vectors.len() > 1 {
+                    out_fields.push(Field::new("query_id", DataType::Int64, false));
+                }
+                out_fields.push(Field::new("id", DataType::Int64, false));
+                out_fields.push(Field::new("_score", DataType::Float32, false));
+                out_fields.push(Field::new("score", DataType::Float32, false));
+                out_fields.push(Field::new("payload", DataType::Utf8, true));
+                let out_schema = Arc::new(Schema::new(out_fields));
                 let out_resolver = Resolver::anonymous(out_schema.clone());
                 Ok((
                     LogicalPlan::HybridVectorScan {

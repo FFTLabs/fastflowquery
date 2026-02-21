@@ -59,4 +59,11 @@ fn public_api_hybrid_search_convenience_exists() {
     let _ = engine
         .hybrid_search("docs", "id", "emb", vec![0.1_f32, 0.2, 0.3], 5)
         .expect("hybrid_search");
+    let _ = engine
+        .hybrid_search_batch(
+            "docs",
+            vec![vec![0.1_f32, 0.2, 0.3], vec![0.3_f32, 0.2, 0.1]],
+            5,
+        )
+        .expect("hybrid_search_batch");
 }

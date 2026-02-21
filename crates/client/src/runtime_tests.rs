@@ -30,7 +30,7 @@ use super::run_topk_by_score;
 use super::{
     EmbeddedRuntime, ExecOutput, JoinBloomFilter, QueryContext, Runtime, ScalarValue, TraceIds,
     embedded_adaptive_plan_for_partitioning_with_target, hash_key, join_key_from_row,
-    resolve_key_indexes, rows_from_batches, rows_to_vector_topk_output,
+    resolve_key_indexes, rows_from_batches, rows_to_vector_knn_output, rows_to_vector_topk_output,
     run_vector_topk_with_provider, run_window_exec, run_window_exec_with_ctx,
     scalar_estimate_bytes,
 };
@@ -123,6 +123,40 @@ fn vector_topk_exec_uses_provider_rows() {
     assert_eq!(b.schema().field(0).name(), "id");
     assert_eq!(b.schema().field(1).name(), "score");
     assert_eq!(b.schema().field(2).name(), "payload");
+}
+
+#[cfg(feature = "vector")]
+#[test]
+fn vector_knn_batched_rows_include_query_id_and_doc_id() {
+    let rows = vec![
+        (
+            0,
+            VectorTopKRow {
+                id: 7,
+                score: 0.77,
+                payload_json: None,
+            },
+        ),
+        (
+            1,
+            VectorTopKRow {
+                id: 3,
+                score: 0.91,
+                payload_json: Some("{\"lang\":\"de\"}".to_string()),
+            },
+        ),
+    ];
+    let out = rows_to_vector_knn_output(rows, true).expect("knn output");
+    assert_eq!(
+        out.schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>(),
+        vec!["query_id", "doc_id", "_score", "score", "payload"]
+    );
+    assert_eq!(out.batches.len(), 1);
+    assert_eq!(out.batches[0].num_rows(), 2);
 }
 
 #[test]

@@ -2346,10 +2346,12 @@ fn plan_output_columns(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result
             .into_iter()
             .map(std::string::ToString::to_string)
             .collect()),
-        LogicalPlan::HybridVectorScan { .. } => Ok(["id", "_score", "score", "payload"]
-            .into_iter()
-            .map(std::string::ToString::to_string)
-            .collect()),
+        LogicalPlan::HybridVectorScan { .. } => {
+            Ok(["query_id", "id", "doc_id", "_score", "score", "payload"]
+                .into_iter()
+                .map(std::string::ToString::to_string)
+                .collect())
+        }
         LogicalPlan::Join {
             left,
             right,

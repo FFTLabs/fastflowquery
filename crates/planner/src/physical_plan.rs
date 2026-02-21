@@ -374,8 +374,8 @@ pub struct VectorTopKExec {
 pub struct VectorKnnExec {
     /// Source table.
     pub source: String,
-    /// Query vector literal.
-    pub query_vector: Vec<f32>,
+    /// One or more query vector literals.
+    pub query_vectors: Vec<Vec<f32>>,
     /// Number of rows to return.
     pub k: usize,
     /// Optional query-time HNSW `ef_search` override.

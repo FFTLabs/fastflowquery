@@ -191,11 +191,7 @@ pub fn create_physical_plan(
         } => Ok(PhysicalPlan::VectorKnn(
             crate::physical_plan::VectorKnnExec {
                 source: source.clone(),
-                query_vector: query_vectors.first().cloned().ok_or_else(|| {
-                    ffq_common::FfqError::Planning(
-                        "HybridVectorScan requires at least one query vector".to_string(),
-                    )
-                })?,
+                query_vectors: query_vectors.clone(),
                 k: *k,
                 ef_search: *ef_search,
                 prefilter: prefilter.clone(),
