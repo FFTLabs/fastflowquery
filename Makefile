@@ -14,6 +14,7 @@ SHELL := /bin/bash
 	test-slow-official \
 	test-13.1-core \
 	test-13.1-vector \
+	test-13.1-object-store \
 	test-13.1-distributed \
 	test-13.1 \
 	bless-13.1-snapshots \
@@ -97,10 +98,15 @@ test-13.1-vector:
 	cargo test -p ffq-client --features vector --lib
 	cargo test -p ffq-client --features vector --test embedded_vector_topk
 
+test-13.1-object-store:
+	cargo test -p ffq-storage --features s3 object_store_uri_detection_requires_scheme -- --nocapture
+	cargo test -p ffq-storage --features s3 object_store_scan_reads_file_uri_parquet -- --nocapture
+	cargo test -p ffq-storage --features s3 object_store_scan_retries_then_fails_for_missing_object -- --nocapture
+
 test-13.1-distributed:
 	cargo test -p ffq-client --test distributed_runtime_roundtrip --features distributed
 
-test-13.1: test-13.1-core test-13.1-vector test-13.1-distributed
+test-13.1: test-13.1-core test-13.1-vector test-13.1-object-store test-13.1-distributed
 
 bless-13.1-snapshots:
 	BLESS=1 cargo test -p ffq-planner --test optimizer_golden
