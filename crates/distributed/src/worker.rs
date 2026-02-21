@@ -20,7 +20,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
     Array, ArrayRef, BooleanBuilder, FixedSizeListBuilder, Float32Builder, Float64Builder,
@@ -1550,6 +1550,8 @@ fn write_stage_shuffle_outputs(
     let started = Instant::now();
     let writer =
         ShuffleWriter::new(&ctx.shuffle_root).with_compression_codec(ctx.shuffle_compression_codec);
+    // Guardrail: periodically remove expired non-latest attempts to bound disk growth.
+    let _ = writer.cleanup_expired_attempts(Duration::from_secs(10 * 60), SystemTime::now());
     let mut chunk_index = HashMap::<u32, Vec<ffq_shuffle::ShufflePartitionChunkMeta>>::new();
     for batch in &child.batches {
         let one = ExecOutput {

@@ -64,6 +64,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env_u64_or_default("FFQ_REDUCE_FETCH_WINDOW_PARTITIONS", 4) as u32;
     let poll_ms = env_u64_or_default("FFQ_WORKER_POLL_MS", 20);
     let shuffle_codec = parse_shuffle_codec(&env_or_default("FFQ_SHUFFLE_COMPRESSION", "lz4"));
+    let max_active_streams = env_usize_or_default("FFQ_STREAM_MAX_ACTIVE_STREAMS", 4096);
+    let max_partitions_per_stream =
+        env_usize_or_default("FFQ_STREAM_MAX_PARTITIONS_PER_STREAM", 65536);
+    let max_chunks_per_response = env_usize_or_default("FFQ_STREAM_MAX_CHUNKS_PER_RESPONSE", 1024);
+    let inactive_stream_ttl_ms = env_u64_or_default("FFQ_STREAM_INACTIVE_TTL_MS", 10 * 60 * 1000);
     let catalog_path = env::var("FFQ_WORKER_CATALOG_PATH").ok();
 
     std::fs::create_dir_all(&shuffle_root)?;
@@ -96,7 +101,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let shuffle_service = WorkerShuffleService::new(shuffle_root);
+    let shuffle_service = WorkerShuffleService::with_limits(
+        shuffle_root,
+        max_active_streams,
+        max_partitions_per_stream,
+        max_chunks_per_response,
+        inactive_stream_ttl_ms,
+    );
     println!(
         "ffq-worker {worker_id} started (coordinator={coordinator_endpoint}, shuffle_bind={shuffle_addr}, spill_dir={spill_dir})"
     );

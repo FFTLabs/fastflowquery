@@ -19,6 +19,7 @@
 //! [`v1::FetchQueryResultsRequest`].
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, path::PathBuf};
 
 use ffq_shuffle::ShuffleReader;
@@ -387,15 +388,42 @@ pub struct WorkerShuffleService {
     shuffle_root: PathBuf,
     map_outputs: Arc<Mutex<HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>>>,
     layout_versions: Arc<Mutex<HashMap<(String, u64, u64, u32), u32>>>,
+    last_touched_ms: Arc<Mutex<HashMap<(String, u64, u64, u32), u64>>>,
+    max_active_streams: usize,
+    max_partitions_per_stream: usize,
+    max_chunks_per_response: usize,
+    inactive_stream_ttl_ms: u64,
 }
 
 impl WorkerShuffleService {
     /// Create service bound to a shuffle root directory.
     pub fn new(shuffle_root: impl Into<PathBuf>) -> Self {
+        Self::with_limits(
+            shuffle_root,
+            4096,
+            65536,
+            1024,
+            10 * 60 * 1000, // 10 minutes
+        )
+    }
+
+    /// Create service with explicit guardrail limits.
+    pub fn with_limits(
+        shuffle_root: impl Into<PathBuf>,
+        max_active_streams: usize,
+        max_partitions_per_stream: usize,
+        max_chunks_per_response: usize,
+        inactive_stream_ttl_ms: u64,
+    ) -> Self {
         Self {
             shuffle_root: shuffle_root.into(),
             map_outputs: Arc::new(Mutex::new(HashMap::new())),
             layout_versions: Arc::new(Mutex::new(HashMap::new())),
+            last_touched_ms: Arc::new(Mutex::new(HashMap::new())),
+            max_active_streams: max_active_streams.max(1),
+            max_partitions_per_stream: max_partitions_per_stream.max(1),
+            max_chunks_per_response: max_chunks_per_response.max(1),
+            inactive_stream_ttl_ms,
         }
     }
 }
@@ -406,6 +434,10 @@ impl ShuffleService for WorkerShuffleService {
         &self,
         request: Request<v1::RegisterMapOutputRequest>,
     ) -> Result<Response<v1::RegisterMapOutputResponse>, Status> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| Status::internal(format!("clock error: {e}")))?
+            .as_millis() as u64;
         let req = request.into_inner();
         let partitions = req
             .partitions
@@ -420,7 +452,46 @@ impl ShuffleService for WorkerShuffleService {
                 finalized: p.finalized,
             })
             .collect::<Vec<_>>();
+        if partitions.len() > self.max_partitions_per_stream {
+            return Err(Status::resource_exhausted(format!(
+                "stream metadata exceeds max_partitions_per_stream={} (got {})",
+                self.max_partitions_per_stream,
+                partitions.len()
+            )));
+        }
         let key = (req.query_id, req.stage_id, req.map_task, req.attempt);
+        let mut touched = self.last_touched_ms.lock().await;
+        if self.inactive_stream_ttl_ms > 0 {
+            let stale_before = now_ms.saturating_sub(self.inactive_stream_ttl_ms);
+            let stale_keys = touched
+                .iter()
+                .filter_map(|(k, ts)| (*ts <= stale_before).then_some(k.clone()))
+                .collect::<Vec<_>>();
+            if !stale_keys.is_empty() {
+                let mut outputs = self.map_outputs.lock().await;
+                let mut versions = self.layout_versions.lock().await;
+                for k in stale_keys {
+                    outputs.remove(&k);
+                    versions.remove(&k);
+                    touched.remove(&k);
+                }
+            }
+        }
+        if !touched.contains_key(&key) && touched.len() >= self.max_active_streams {
+            let mut entries = touched
+                .iter()
+                .map(|(k, ts)| (k.clone(), *ts))
+                .collect::<Vec<_>>();
+            entries.sort_by_key(|(_, ts)| *ts);
+            let evict_count = touched.len().saturating_sub(self.max_active_streams) + 1;
+            let mut outputs = self.map_outputs.lock().await;
+            let mut versions = self.layout_versions.lock().await;
+            for (evict_key, _) in entries.into_iter().take(evict_count) {
+                outputs.remove(&evict_key);
+                versions.remove(&evict_key);
+                touched.remove(&evict_key);
+            }
+        }
         let mut versions = self.layout_versions.lock().await;
         if let Some(existing) = versions.get(&key)
             && req.layout_version < *existing
@@ -429,7 +500,8 @@ impl ShuffleService for WorkerShuffleService {
         }
         versions.insert(key.clone(), req.layout_version);
         drop(versions);
-        self.map_outputs.lock().await.insert(key, partitions);
+        self.map_outputs.lock().await.insert(key.clone(), partitions);
+        touched.insert(key, now_ms);
         Ok(Response::new(v1::RegisterMapOutputResponse {}))
     }
 
@@ -440,6 +512,10 @@ impl ShuffleService for WorkerShuffleService {
         &self,
         request: Request<v1::FetchShufflePartitionRequest>,
     ) -> Result<Response<Self::FetchShufflePartitionStream>, Status> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| Status::internal(format!("clock error: {e}")))?
+            .as_millis() as u64;
         let req = request.into_inner();
         let query_num = req
             .query_id
@@ -498,6 +574,10 @@ impl ShuffleService for WorkerShuffleService {
         };
 
         let meta_key = (meta_key.0, meta_key.1, meta_key.2, attempt);
+        self.last_touched_ms
+            .lock()
+            .await
+            .insert(meta_key.clone(), now_ms);
         let part_meta = self
             .map_outputs
             .lock()
@@ -540,7 +620,7 @@ impl ShuffleService for WorkerShuffleService {
             })]
         } else {
             let end_limit = start.saturating_add(requested);
-            let filtered = chunks
+            let mut filtered = chunks
                 .into_iter()
                 .filter_map(|c| {
                     let chunk_start = c.start_offset.max(start);
@@ -561,6 +641,9 @@ impl ShuffleService for WorkerShuffleService {
                     }))
                 })
                 .collect::<Vec<_>>();
+            if filtered.len() > self.max_chunks_per_response {
+                filtered.truncate(self.max_chunks_per_response);
+            }
             if filtered.is_empty() {
                 vec![Ok(v1::ShufflePartitionChunk {
                     start_offset: start,
@@ -1056,6 +1139,144 @@ mod tests {
             .err()
             .expect("stale layout fetch should fail");
         assert_eq!(stale_layout_err.code(), tonic::Code::FailedPrecondition);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn worker_shuffle_service_enforces_stream_guardrails() {
+        let base = std::env::temp_dir().join(format!(
+            "ffq-grpc-guardrails-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).expect("create temp root");
+        let svc = WorkerShuffleService::with_limits(&base, 2, 1, 2, 1);
+
+        let query_id = "9020".to_string();
+        let stage_id = 1_u64;
+        let reduce_partition = 0_u32;
+        let payload = vec![7_u8; 200_000];
+        for map_task in 0_u64..3_u64 {
+            let rel = shuffle_path(
+                query_id.parse().expect("numeric query"),
+                stage_id,
+                map_task,
+                1,
+                reduce_partition,
+            );
+            let full = base.join(rel);
+            if let Some(parent) = full.parent() {
+                fs::create_dir_all(parent).expect("mkdirs");
+            }
+            fs::write(&full, &payload).expect("write payload");
+            let res = svc
+                .register_map_output(Request::new(v1::RegisterMapOutputRequest {
+                    query_id: query_id.clone(),
+                    stage_id,
+                    map_task,
+                    attempt: 1,
+                    layout_version: 1,
+                    layout_fingerprint: 1,
+                    partitions: vec![v1::MapOutputPartition {
+                        reduce_partition,
+                        bytes: payload.len() as u64,
+                        rows: 1,
+                        batches: 1,
+                        stream_epoch: 1,
+                        committed_offset: payload.len() as u64,
+                        finalized: true,
+                    }],
+                }))
+                .await;
+            if map_task == 2 {
+                assert!(
+                    res.is_ok(),
+                    "oldest stream should be evicted to admit new one"
+                );
+            }
+        }
+
+        // Oldest stream (map_task=0) should have been evicted.
+        let evicted = svc
+            .fetch_shuffle_partition(Request::new(v1::FetchShufflePartitionRequest {
+                query_id: query_id.clone(),
+                stage_id,
+                map_task: 0,
+                attempt: 1,
+                reduce_partition,
+                start_offset: 0,
+                max_bytes: 100,
+                layout_version: 1,
+                min_stream_epoch: 1,
+            }))
+            .await
+            .err()
+            .expect("evicted stream should fail");
+        assert_eq!(evicted.code(), tonic::Code::FailedPrecondition);
+
+        // Surviving stream should fetch and honor max_chunks_per_response=2.
+        let mut stream = svc
+            .fetch_shuffle_partition(Request::new(v1::FetchShufflePartitionRequest {
+                query_id: query_id.clone(),
+                stage_id,
+                map_task: 2,
+                attempt: 1,
+                reduce_partition,
+                start_offset: 0,
+                max_bytes: payload.len() as u64,
+                layout_version: 1,
+                min_stream_epoch: 1,
+            }))
+            .await
+            .expect("fetch surviving stream")
+            .into_inner();
+        let mut chunks = Vec::new();
+        while let Some(next) = stream.next().await {
+            chunks.push(next.expect("chunk"));
+        }
+        assert!(
+            chunks.len() <= 2,
+            "expected capped chunk response, got {}",
+            chunks.len()
+        );
+
+        // Per-stream partition metadata cap.
+        let over = svc
+            .register_map_output(Request::new(v1::RegisterMapOutputRequest {
+                query_id,
+                stage_id,
+                map_task: 99,
+                attempt: 1,
+                layout_version: 1,
+                layout_fingerprint: 1,
+                partitions: vec![
+                    v1::MapOutputPartition {
+                        reduce_partition: 0,
+                        bytes: 1,
+                        rows: 1,
+                        batches: 1,
+                        stream_epoch: 1,
+                        committed_offset: 1,
+                        finalized: true,
+                    },
+                    v1::MapOutputPartition {
+                        reduce_partition: 1,
+                        bytes: 1,
+                        rows: 1,
+                        batches: 1,
+                        stream_epoch: 1,
+                        committed_offset: 1,
+                        finalized: true,
+                    },
+                ],
+            }))
+            .await
+            .err()
+            .expect("partition cap should fail");
+        assert_eq!(over.code(), tonic::Code::ResourceExhausted);
 
         let _ = fs::remove_dir_all(&base);
     }
