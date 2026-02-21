@@ -682,3 +682,83 @@ fn shuffle_read_hash_split_assignment_shards_one_partition_deterministically() {
     assert_eq!(left + right, target.rows);
     let _ = std::fs::remove_dir_all(shuffle_root);
 }
+
+#[test]
+fn shuffle_read_incremental_cursor_reads_only_unseen_bytes() {
+    let shuffle_root = unique_path("ffq_shuffle_read_incremental_cursor", "dir");
+    let _ = std::fs::create_dir_all(&shuffle_root);
+    let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+    let partitioning = ffq_planner::PartitioningSpec::HashKeys {
+        keys: vec!["k".to_string()],
+        partitions: 1,
+    };
+
+    let batch1 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1_i64, 2]))],
+    )
+    .expect("batch1");
+    let batch2 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![3_i64, 4]))],
+    )
+    .expect("batch2");
+
+    let map_ctx = TaskContext {
+        query_id: "5004".to_string(),
+        stage_id: 1,
+        task_id: 0,
+        attempt: 1,
+        per_task_memory_budget_bytes: 1,
+        join_radix_bits: 8,
+        join_bloom_enabled: true,
+        join_bloom_bits: 20,
+        shuffle_compression_codec: ffq_shuffle::ShuffleCompressionCodec::Lz4,
+        reduce_fetch_window_partitions: 4,
+        map_output_publish_window_partitions: 1,
+        spill_dir: std::env::temp_dir(),
+        shuffle_root: shuffle_root.clone(),
+        assigned_reduce_partitions: Vec::new(),
+        assigned_reduce_split_index: 0,
+        assigned_reduce_split_count: 1,
+    };
+    let out1 = ExecOutput {
+        schema: Arc::clone(&schema),
+        batches: vec![batch1],
+    };
+    let out2 = ExecOutput {
+        schema,
+        batches: vec![batch2],
+    };
+    write_stage_shuffle_outputs(&out1, &partitioning, 5004, &map_ctx).expect("write chunk1");
+    let metas = write_stage_shuffle_outputs(&out2, &partitioning, 5004, &map_ctx)
+        .expect("write chunk2 and aggregate index");
+    assert_eq!(metas.len(), 1);
+    let target = metas[0].reduce_partition;
+
+    let reader = ShuffleReader::new(&shuffle_root);
+    let mut cursors = HashMap::<u32, u64>::new();
+
+    let (_attempt, first_batches) =
+        read_partition_incremental_latest(&reader, 5004, 1, 0, target, &mut cursors)
+            .expect("first incremental read");
+    let first_rows = first_batches
+        .iter()
+        .map(|b| b.num_rows() as u64)
+        .sum::<u64>();
+    assert_eq!(first_rows, 2);
+
+    let (_attempt, second_batches) =
+        read_partition_incremental_latest(&reader, 5004, 1, 0, target, &mut cursors)
+            .expect("second incremental read");
+    let second_rows = second_batches
+        .iter()
+        .map(|b| b.num_rows() as u64)
+        .sum::<u64>();
+    assert_eq!(
+        second_rows, 0,
+        "second incremental read should not decode already consumed bytes"
+    );
+
+    let _ = std::fs::remove_dir_all(shuffle_root);
+}

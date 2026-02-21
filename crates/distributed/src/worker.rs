@@ -1551,6 +1551,7 @@ fn read_stage_input_from_shuffle(
     let reader = ShuffleReader::new(&ctx.shuffle_root);
     let mut out_batches = Vec::new();
     let mut schema_hint: Option<SchemaRef> = None;
+    let mut partition_read_cursors = HashMap::<u32, u64>::new();
     let mut read_partitions = 0_u64;
     match partitioning {
         PartitioningSpec::Single => {
@@ -1597,24 +1598,25 @@ fn read_stage_input_from_shuffle(
             let fetch_window = ctx.reduce_fetch_window_partitions.max(1) as usize;
             for chunk in assigned.chunks(fetch_window) {
                 for reduce in chunk {
-                    if let Ok((_attempt, batches)) = reader.read_partition_latest(
+                    let (_attempt, batches) = read_partition_incremental_latest(
+                        &reader,
                         query_numeric_id,
                         upstream_stage_id,
                         0,
                         *reduce,
-                    ) {
-                        let batches = filter_partition_batches_for_assigned_shard(
-                            batches,
-                            partitioning,
-                            ctx.assigned_reduce_split_index,
-                            ctx.assigned_reduce_split_count,
-                        )?;
-                        if schema_hint.is_none() && !batches.is_empty() {
-                            schema_hint = Some(batches[0].schema());
-                        }
-                        out_batches.extend(batches);
-                        read_partitions += 1;
+                        &mut partition_read_cursors,
+                    )?;
+                    let batches = filter_partition_batches_for_assigned_shard(
+                        batches,
+                        partitioning,
+                        ctx.assigned_reduce_split_index,
+                        ctx.assigned_reduce_split_count,
+                    )?;
+                    if schema_hint.is_none() && !batches.is_empty() {
+                        schema_hint = Some(batches[0].schema());
                     }
+                    out_batches.extend(batches);
+                    read_partitions += 1;
                 }
             }
             if out_batches.is_empty() && schema_hint.is_none() {
@@ -1652,6 +1654,96 @@ fn read_stage_input_from_shuffle(
         started.elapsed().as_secs_f64(),
     );
     Ok(out)
+}
+
+fn read_partition_incremental_latest(
+    reader: &ShuffleReader,
+    query_numeric_id: u64,
+    upstream_stage_id: u64,
+    map_task: u64,
+    reduce_partition: u32,
+    read_cursors: &mut HashMap<u32, u64>,
+) -> Result<(u32, Vec<RecordBatch>)> {
+    let attempt = reader
+        .latest_attempt(query_numeric_id, upstream_stage_id, map_task)?
+        .ok_or_else(|| FfqError::Execution("no shuffle attempts found for map task".to_string()))?;
+    let index = reader.read_map_task_index(query_numeric_id, upstream_stage_id, map_task, attempt)?;
+    let Some(meta) = index
+        .partitions
+        .into_iter()
+        .find(|p| p.reduce_partition == reduce_partition)
+    else {
+        return Ok((attempt, Vec::new()));
+    };
+    let cursor = *read_cursors.get(&reduce_partition).unwrap_or(&0);
+    let watermark = meta.bytes;
+    if cursor >= watermark {
+        return Ok((attempt, Vec::new()));
+    }
+
+    let mut next_cursor = cursor;
+    let mut out_batches = Vec::new();
+    if meta.chunks.is_empty() {
+        let fetched = reader.fetch_partition_chunks_range(
+            query_numeric_id,
+            upstream_stage_id,
+            map_task,
+            attempt,
+            reduce_partition,
+            cursor,
+            watermark.saturating_sub(cursor),
+        )?;
+        if !fetched.is_empty() {
+            let stitched = fetched
+                .into_iter()
+                .flat_map(|c| c.payload.into_iter())
+                .collect::<Vec<_>>();
+            if !stitched.is_empty() {
+                let mut decoded = reader.read_partition_from_streamed_chunks([stitched])?;
+                out_batches.append(&mut decoded);
+            }
+        }
+        next_cursor = watermark;
+    } else {
+        let mut frame_chunks = meta.chunks;
+        frame_chunks.sort_by_key(|c| c.offset_bytes);
+        for frame in frame_chunks {
+            let frame_start = frame.offset_bytes;
+            let frame_end = frame.offset_bytes.saturating_add(frame.frame_bytes);
+            if frame_end <= cursor {
+                continue;
+            }
+            if frame_start < cursor {
+                return Err(FfqError::Execution(format!(
+                    "invalid incremental cursor {cursor} in middle of frame range [{frame_start}, {frame_end}) for reduce partition {reduce_partition}"
+                )));
+            }
+            let fetched = reader.fetch_partition_chunks_range(
+                query_numeric_id,
+                upstream_stage_id,
+                map_task,
+                attempt,
+                reduce_partition,
+                frame_start,
+                frame_end.saturating_sub(frame_start),
+            )?;
+            if fetched.is_empty() {
+                break;
+            }
+            let stitched = fetched
+                .into_iter()
+                .flat_map(|c| c.payload.into_iter())
+                .collect::<Vec<_>>();
+            if stitched.is_empty() {
+                break;
+            }
+            let mut decoded = reader.read_partition_from_streamed_chunks([stitched])?;
+            out_batches.append(&mut decoded);
+            next_cursor = frame_end;
+        }
+    }
+    read_cursors.insert(reduce_partition, next_cursor);
+    Ok((attempt, out_batches))
 }
 
 fn filter_partition_batches_for_assigned_shard(
