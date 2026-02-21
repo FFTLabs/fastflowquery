@@ -36,9 +36,9 @@ use ffq_execution::{
     global_physical_operator_registry,
 };
 use ffq_planner::{
-    AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, PartitioningSpec, PhysicalPlan, WindowExpr,
-    WindowFrameBound, WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits, WindowFunction,
-    WindowOrderExpr,
+    AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, JoinType, PartitioningSpec, PhysicalPlan,
+    WindowExpr, WindowFrameBound, WindowFrameExclusion, WindowFrameSpec, WindowFrameUnits,
+    WindowFunction, WindowOrderExpr,
 };
 use ffq_shuffle::{ShuffleReader, ShuffleWriter};
 use ffq_storage::parquet_provider::ParquetProvider;
@@ -947,6 +947,7 @@ fn eval_plan_for_stage(
                 left,
                 right,
                 on,
+                join_type,
                 strategy_hint,
                 build_side,
                 ..
@@ -974,7 +975,7 @@ fn eval_plan_for_stage(
             let out = if matches!(strategy_hint, ffq_planner::JoinStrategyHint::SortMerge) {
                 run_sort_merge_join(left, right, on.clone(), *build_side)?
             } else {
-                run_hash_join(left, right, on.clone(), *build_side, ctx)?
+                run_hash_join(left, right, on.clone(), *join_type, *build_side, ctx)?
             };
             Ok(OpEval {
                 out,
@@ -2024,6 +2025,7 @@ fn run_hash_join(
     left: ExecOutput,
     right: ExecOutput,
     on: Vec<(String, String)>,
+    join_type: JoinType,
     build_side: BuildSide,
     ctx: &TaskContext,
 ) -> Result<ExecOutput> {
@@ -2061,14 +2063,17 @@ fn run_hash_join(
     let build_key_idx = resolve_key_indexes(&build_schema, &build_key_names)?;
     let probe_key_idx = resolve_key_indexes(&probe_schema, &probe_key_names)?;
 
-    let output_schema = Arc::new(Schema::new(
-        left.schema
-            .fields()
-            .iter()
-            .chain(right.schema.fields().iter())
-            .map(|f| (**f).clone())
-            .collect::<Vec<_>>(),
-    ));
+    let output_schema = match join_type {
+        JoinType::Semi | JoinType::Anti => left.schema.clone(),
+        _ => Arc::new(Schema::new(
+            left.schema
+                .fields()
+                .iter()
+                .chain(right.schema.fields().iter())
+                .map(|f| (**f).clone())
+                .collect::<Vec<_>>(),
+        )),
+    };
 
     let probe_prefilter_storage = if ctx.join_bloom_enabled && !build_rows.is_empty() {
         let mut bloom = JoinBloomFilter::new(ctx.join_bloom_bits, 3);
@@ -2107,17 +2112,22 @@ fn run_hash_join(
         .map(|v| v.as_slice())
         .unwrap_or(probe_rows);
 
-    let joined_rows = if ctx.per_task_memory_budget_bytes > 0
+    let mut match_output = if !matches!(join_type, JoinType::Semi | JoinType::Anti)
+        && ctx.per_task_memory_budget_bytes > 0
         && estimate_join_rows_bytes(build_rows) > ctx.per_task_memory_budget_bytes
     {
-        grace_hash_join(
+        let rows = grace_hash_join(
             build_rows,
             probe_rows,
             &build_key_idx,
             &probe_key_idx,
             build_input_side,
             ctx,
-        )?
+        )?;
+        JoinMatchOutput {
+            rows,
+            matched_left: vec![false; left_rows.len()],
+        }
     } else {
         if ctx.join_radix_bits > 0 {
             in_memory_radix_hash_join(
@@ -2126,6 +2136,7 @@ fn run_hash_join(
                 &build_key_idx,
                 &probe_key_idx,
                 build_input_side,
+                left_rows.len(),
                 ctx.join_radix_bits,
             )
         } else {
@@ -2135,11 +2146,27 @@ fn run_hash_join(
                 &build_key_idx,
                 &probe_key_idx,
                 build_input_side,
+                left_rows.len(),
             )
         }
     };
 
-    let batch = rows_to_batch(&output_schema, &joined_rows)?;
+    if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+        match_output.rows = left_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, row)| {
+                let keep = match join_type {
+                    JoinType::Semi => match_output.matched_left[idx],
+                    JoinType::Anti => !match_output.matched_left[idx],
+                    _ => false,
+                };
+                keep.then(|| row.clone())
+            })
+            .collect();
+    }
+
+    let batch = rows_to_batch(&output_schema, &match_output.rows)?;
     Ok(ExecOutput {
         schema: output_schema,
         batches: vec![batch],
@@ -3339,6 +3366,10 @@ fn join_key_from_row(row: &[ScalarValue], idxs: &[usize]) -> Vec<ScalarValue> {
     idxs.iter().map(|i| row[*i].clone()).collect()
 }
 
+fn join_key_has_null(key: &[ScalarValue]) -> bool {
+    key.iter().any(|v| *v == ScalarValue::Null)
+}
+
 fn cmp_join_keys(a: &[ScalarValue], b: &[ScalarValue]) -> Ordering {
     for (av, bv) in a.iter().zip(b.iter()) {
         let ord = cmp_join_scalar(av, bv);
@@ -3371,25 +3402,36 @@ fn in_memory_hash_join(
     build_key_idx: &[usize],
     probe_key_idx: &[usize],
     build_side: JoinInputSide,
-) -> Vec<Vec<ScalarValue>> {
+    left_len: usize,
+) -> JoinMatchOutput {
     let mut ht: HashMap<Vec<ScalarValue>, Vec<usize>> = HashMap::new();
     for (idx, row) in build_rows.iter().enumerate() {
-        ht.entry(join_key_from_row(row, build_key_idx))
-            .or_default()
-            .push(idx);
+        let key = join_key_from_row(row, build_key_idx);
+        if join_key_has_null(&key) {
+            continue;
+        }
+        ht.entry(key).or_default().push(idx);
     }
 
     let mut out = Vec::new();
-    for probe in probe_rows {
+    let mut matched_left = vec![false; left_len];
+    for (probe_idx, probe) in probe_rows.iter().enumerate() {
         let probe_key = join_key_from_row(probe, probe_key_idx);
+        if join_key_has_null(&probe_key) {
+            continue;
+        }
         if let Some(build_matches) = ht.get(&probe_key) {
             for build_idx in build_matches {
                 let build = &build_rows[*build_idx];
                 out.push(combine_join_rows(build, probe, build_side));
+                mark_join_match(&mut matched_left, build_side, *build_idx, probe_idx);
             }
         }
     }
-    out
+    JoinMatchOutput {
+        rows: out,
+        matched_left,
+    }
 }
 
 fn in_memory_radix_hash_join(
@@ -3398,8 +3440,9 @@ fn in_memory_radix_hash_join(
     build_key_idx: &[usize],
     probe_key_idx: &[usize],
     build_side: JoinInputSide,
+    left_len: usize,
     radix_bits: u8,
-) -> Vec<Vec<ScalarValue>> {
+) -> JoinMatchOutput {
     let bits = radix_bits.min(12);
     if bits == 0 {
         return in_memory_hash_join(
@@ -3408,6 +3451,7 @@ fn in_memory_radix_hash_join(
             build_key_idx,
             probe_key_idx,
             build_side,
+            left_len,
         );
     }
 
@@ -3417,18 +3461,25 @@ fn in_memory_radix_hash_join(
     let mut probe_parts = vec![Vec::<(usize, Vec<ScalarValue>, u64)>::new(); partitions];
     for (idx, row) in build_rows.iter().enumerate() {
         let key = join_key_from_row(row, build_key_idx);
+        if join_key_has_null(&key) {
+            continue;
+        }
         let key_hash = hash_key(&key);
         let part = (key_hash & mask) as usize;
         build_parts[part].push((idx, key, key_hash));
     }
     for (idx, row) in probe_rows.iter().enumerate() {
         let key = join_key_from_row(row, probe_key_idx);
+        if join_key_has_null(&key) {
+            continue;
+        }
         let key_hash = hash_key(&key);
         let part = (key_hash & mask) as usize;
         probe_parts[part].push((idx, key, key_hash));
     }
 
     let mut out = Vec::new();
+    let mut matched_left = vec![false; left_len];
     for part in 0..partitions {
         if build_parts[part].is_empty() || probe_parts[part].is_empty() {
             continue;
@@ -3444,12 +3495,37 @@ fn in_memory_radix_hash_join(
                         let build = &build_rows[*build_idx];
                         let probe = &probe_rows[*probe_idx];
                         out.push(combine_join_rows(build, probe, build_side));
+                        mark_join_match(&mut matched_left, build_side, *build_idx, *probe_idx);
                     }
                 }
             }
         }
     }
-    out
+    JoinMatchOutput {
+        rows: out,
+        matched_left,
+    }
+}
+
+struct JoinMatchOutput {
+    rows: Vec<Vec<ScalarValue>>,
+    matched_left: Vec<bool>,
+}
+
+fn mark_join_match(
+    matched_left: &mut [bool],
+    build_side: JoinInputSide,
+    build_idx: usize,
+    probe_idx: usize,
+) {
+    match build_side {
+        JoinInputSide::Left => {
+            matched_left[build_idx] = true;
+        }
+        JoinInputSide::Right => {
+            matched_left[probe_idx] = true;
+        }
+    }
 }
 
 fn combine_join_rows(

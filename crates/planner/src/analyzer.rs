@@ -207,17 +207,27 @@ impl Analyzer {
                         let out_schema = in_schema.clone();
                         let out_resolver = Resolver::anonymous(out_schema.clone());
                         let _ = target_dt;
-                        Ok((
-                            LogicalPlan::InSubqueryFilter {
-                                input: Box::new(ain),
-                                expr: coerced_left,
-                                subquery: Box::new(coerced_subquery),
-                                negated,
-                                correlation: SubqueryCorrelation::Uncorrelated,
-                            },
-                            out_schema,
-                            out_resolver,
-                        ))
+                        if let Some(rewritten) = self.rewrite_uncorrelated_in_subquery_to_join(
+                            ain.clone(),
+                            in_schema.clone(),
+                            coerced_left.clone(),
+                            coerced_subquery.clone(),
+                            negated,
+                        ) {
+                            Ok((rewritten, out_schema, out_resolver))
+                        } else {
+                            Ok((
+                                LogicalPlan::InSubqueryFilter {
+                                    input: Box::new(ain),
+                                    expr: coerced_left,
+                                    subquery: Box::new(coerced_subquery),
+                                    negated,
+                                    correlation: SubqueryCorrelation::Uncorrelated,
+                                },
+                                out_schema,
+                                out_resolver,
+                            ))
+                        }
                     }
                     Err(err) => {
                         if let Some(rewritten) = self.try_decorrelate_in_subquery(
@@ -279,12 +289,12 @@ impl Analyzer {
                 let out_schema = in_schema.clone();
                 let out_resolver = Resolver::anonymous(out_schema.clone());
                 Ok((
-                    LogicalPlan::ExistsSubqueryFilter {
-                        input: Box::new(ain),
-                        subquery: Box::new(asub),
+                    self.rewrite_uncorrelated_exists_subquery_to_join(
+                        ain,
+                        in_schema.clone(),
+                        asub,
                         negated,
-                        correlation: SubqueryCorrelation::Uncorrelated,
-                    },
+                    ),
                     out_schema,
                     out_resolver,
                 ))
@@ -836,6 +846,139 @@ impl Analyzer {
         }))
     }
 
+    fn rewrite_uncorrelated_in_subquery_to_join(
+        &self,
+        input: LogicalPlan,
+        input_schema: SchemaRef,
+        expr: Expr,
+        subquery: LogicalPlan,
+        negated: bool,
+    ) -> Option<LogicalPlan> {
+        let (left_key_name, left_key_index) = match expr {
+            Expr::ColumnRef { name, index } => (name, index),
+            _ => return None,
+        };
+        let right_key_name = "__in_key".to_string();
+
+        let right_non_null = LogicalPlan::Filter {
+            predicate: Expr::IsNotNull(Box::new(Expr::ColumnRef {
+                name: right_key_name.clone(),
+                index: 0,
+            })),
+            input: Box::new(subquery.clone()),
+        };
+        let left_non_null = LogicalPlan::Filter {
+            predicate: Expr::IsNotNull(Box::new(Expr::ColumnRef {
+                name: left_key_name.clone(),
+                index: left_key_index,
+            })),
+            input: Box::new(input),
+        };
+        let on = vec![(left_key_name, right_key_name.clone())];
+        let join_hint = crate::logical_plan::JoinStrategyHint::Auto;
+
+        if !negated {
+            return Some(LogicalPlan::Join {
+                left: Box::new(left_non_null),
+                right: Box::new(right_non_null),
+                on,
+                join_type: crate::logical_plan::JoinType::Semi,
+                strategy_hint: join_hint,
+            });
+        }
+
+        // SQL NOT IN semantics in WHERE:
+        // - lhs NULL => UNKNOWN (filtered out)
+        // - rhs contains NULL => UNKNOWN for every lhs no-match row (filtered out)
+        // We model this as: anti(lhs, rhs_non_null) then anti(., rhs_null_exists).
+        let anti_equal = LogicalPlan::Join {
+            left: Box::new(left_non_null),
+            right: Box::new(right_non_null),
+            on,
+            join_type: crate::logical_plan::JoinType::Anti,
+            strategy_hint: join_hint,
+        };
+        let rhs_null = LogicalPlan::Filter {
+            predicate: Expr::IsNull(Box::new(Expr::ColumnRef {
+                name: right_key_name,
+                index: 0,
+            })),
+            input: Box::new(subquery),
+        };
+        let anti_cols = identity_projection_exprs(&input_schema);
+        let anti_with_const = LogicalPlan::Projection {
+            exprs: anti_cols
+                .into_iter()
+                .chain(std::iter::once((
+                    Expr::Literal(LiteralValue::Int64(1)),
+                    "__not_in_guard".to_string(),
+                )))
+                .collect(),
+            input: Box::new(anti_equal),
+        };
+        let rhs_null_with_const = LogicalPlan::Projection {
+            exprs: vec![(
+                Expr::Literal(LiteralValue::Int64(1)),
+                "__not_in_guard".to_string(),
+            )],
+            input: Box::new(rhs_null),
+        };
+        let anti_rhs_null = LogicalPlan::Join {
+            left: Box::new(anti_with_const),
+            right: Box::new(rhs_null_with_const),
+            on: vec![("__not_in_guard".to_string(), "__not_in_guard".to_string())],
+            join_type: crate::logical_plan::JoinType::Anti,
+            strategy_hint: join_hint,
+        };
+        Some(LogicalPlan::Projection {
+            exprs: identity_projection_exprs(&input_schema),
+            input: Box::new(anti_rhs_null),
+        })
+    }
+
+    fn rewrite_uncorrelated_exists_subquery_to_join(
+        &self,
+        input: LogicalPlan,
+        input_schema: SchemaRef,
+        subquery: LogicalPlan,
+        negated: bool,
+    ) -> LogicalPlan {
+        // EXISTS is true for every input row iff subquery is non-empty.
+        // We encode this as a semi/anti join on a constant key.
+        let join_hint = crate::logical_plan::JoinStrategyHint::Auto;
+        let left_key = "__exists_key_l".to_string();
+        let right_key = "__exists_key_r".to_string();
+        let left_with_key = LogicalPlan::Projection {
+            exprs: identity_projection_exprs(&input_schema)
+                .into_iter()
+                .chain(std::iter::once((
+                    Expr::Literal(LiteralValue::Int64(1)),
+                    left_key.clone(),
+                )))
+                .collect(),
+            input: Box::new(input),
+        };
+        let right_with_key = LogicalPlan::Projection {
+            exprs: vec![(Expr::Literal(LiteralValue::Int64(1)), right_key.clone())],
+            input: Box::new(subquery),
+        };
+        let join = LogicalPlan::Join {
+            left: Box::new(left_with_key),
+            right: Box::new(right_with_key),
+            on: vec![(left_key, right_key)],
+            join_type: if negated {
+                crate::logical_plan::JoinType::Anti
+            } else {
+                crate::logical_plan::JoinType::Semi
+            },
+            strategy_hint: join_hint,
+        };
+        LogicalPlan::Projection {
+            exprs: identity_projection_exprs(&input_schema),
+            input: Box::new(join),
+        }
+    }
+
     fn analyze_agg(&self, agg: AggExpr, resolver: &Resolver) -> Result<(AggExpr, DataType)> {
         match agg {
             AggExpr::Count(e) => {
@@ -1351,6 +1494,23 @@ fn split_conjuncts(expr: Expr) -> Vec<Expr> {
     }
 }
 
+fn identity_projection_exprs(schema: &SchemaRef) -> Vec<(Expr, String)> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            (
+                Expr::ColumnRef {
+                    name: field.name().clone(),
+                    index: idx,
+                },
+                field.name().clone(),
+            )
+        })
+        .collect()
+}
+
 fn combine_conjuncts(mut exprs: Vec<Expr>) -> Expr {
     let mut it = exprs.drain(..);
     let first = it
@@ -1802,7 +1962,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
     use super::{Analyzer, SchemaProvider};
-    use crate::logical_plan::{JoinType, LogicalPlan, SubqueryCorrelation};
+    use crate::logical_plan::{JoinType, LogicalPlan};
     use crate::sql_frontend::sql_to_logical;
 
     struct TestSchemaProvider {
@@ -1862,7 +2022,7 @@ mod tests {
     }
 
     #[test]
-    fn analyze_exists_subquery_marks_uncorrelated() {
+    fn analyze_exists_subquery_rewrites_to_semijoin() {
         let mut schemas = HashMap::new();
         schemas.insert(
             "t".to_string(),
@@ -1882,10 +2042,43 @@ mod tests {
         let analyzed = analyzer.analyze(plan, &provider).expect("analyze");
         match analyzed {
             LogicalPlan::Projection { input, .. } => match input.as_ref() {
-                LogicalPlan::ExistsSubqueryFilter { correlation, .. } => {
-                    assert_eq!(correlation, &SubqueryCorrelation::Uncorrelated);
+                LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                    LogicalPlan::Join { join_type, .. } => {
+                        assert_eq!(*join_type, JoinType::Semi);
+                    }
+                    other => panic!("expected semi Join, got {other:?}"),
+                },
+                other => panic!("expected intermediate Projection, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_uncorrelated_in_rewrites_to_semijoin() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        schemas.insert(
+            "s".to_string(),
+            Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, true)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT a FROM t WHERE a IN (SELECT b FROM s)",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let analyzed = analyzer.analyze(plan, &provider).expect("analyze");
+        match analyzed {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Join { join_type, .. } => {
+                    assert_eq!(*join_type, JoinType::Semi);
                 }
-                other => panic!("expected ExistsSubqueryFilter, got {other:?}"),
+                other => panic!("expected semi Join, got {other:?}"),
             },
             other => panic!("expected Projection, got {other:?}"),
         }
