@@ -70,6 +70,9 @@ pub struct CoordinatorConfig {
     ///
     /// Range is clamped to `[0.0, 1.0]`.
     pub pipelined_shuffle_min_map_completion_ratio: f64,
+    /// Minimum committed stream offset (bytes) required for a reduce partition
+    /// to be considered readable in pipelined scheduling.
+    pub pipelined_shuffle_min_committed_offset_bytes: u64,
 }
 
 impl Default for CoordinatorConfig {
@@ -89,6 +92,7 @@ impl Default for CoordinatorConfig {
             adaptive_shuffle_max_partitions_per_task: 0,
             pipelined_shuffle_enabled: false,
             pipelined_shuffle_min_map_completion_ratio: 0.5,
+            pipelined_shuffle_min_committed_offset_bytes: 1,
         }
     }
 }
@@ -649,6 +653,7 @@ impl Coordinator {
                 &map_outputs_snapshot,
                 self.config.pipelined_shuffle_enabled,
                 self.config.pipelined_shuffle_min_map_completion_ratio,
+                self.config.pipelined_shuffle_min_committed_offset_bytes,
             ) {
                 let Some(stage_runtime) = query.stages.get(&stage_id) else {
                     continue;
@@ -662,6 +667,7 @@ impl Coordinator {
                         query,
                         stage_id,
                         &map_outputs_snapshot,
+                        self.config.pipelined_shuffle_min_committed_offset_bytes,
                     ))
                 } else {
                     None
@@ -1629,6 +1635,7 @@ fn runnable_stages_with_pipeline(
     map_outputs: &HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>,
     pipelined_shuffle_enabled: bool,
     min_completion_ratio: f64,
+    min_committed_offset_bytes: u64,
 ) -> Vec<u64> {
     let mut out = Vec::new();
     let min_ratio = min_completion_ratio.clamp(0.0, 1.0);
@@ -1648,7 +1655,13 @@ fn runnable_stages_with_pipeline(
         if !parent_ready {
             continue;
         }
-        let ready = ready_reduce_partitions_for_stage(query_id, query, *sid, map_outputs);
+        let ready = ready_reduce_partitions_for_stage(
+            query_id,
+            query,
+            *sid,
+            map_outputs,
+            min_committed_offset_bytes,
+        );
         if !ready.is_empty() {
             out.push(*sid);
         }
@@ -1706,6 +1719,7 @@ fn ready_reduce_partitions_for_stage(
     query: &QueryRuntime,
     reduce_stage_id: u64,
     map_outputs: &HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>,
+    min_committed_offset_bytes: u64,
 ) -> HashSet<u32> {
     let Some(stage) = query.stages.get(&reduce_stage_id) else {
         return HashSet::new();
@@ -1713,9 +1727,54 @@ fn ready_reduce_partitions_for_stage(
     let Some(parent_stage_id) = stage.parents.first().copied() else {
         return HashSet::new();
     };
+    let latest = latest_partition_stream_progress_for_stage(query_id, parent_stage_id, map_outputs);
     let mut out = HashSet::new();
-    for p in latest_partition_bytes_for_stage(query_id, parent_stage_id, map_outputs).keys() {
-        out.insert(*p);
+    for (partition, (_, committed_offset, finalized)) in latest {
+        if finalized || committed_offset >= min_committed_offset_bytes {
+            out.insert(partition);
+        }
+    }
+    out
+}
+
+fn latest_partition_stream_progress_for_stage(
+    query_id: &str,
+    stage_id: u64,
+    map_outputs: &HashMap<(String, u64, u64, u32), Vec<MapOutputPartitionMeta>>,
+) -> HashMap<u32, (u32, u64, bool)> {
+    let mut latest_attempt_by_task = HashMap::<u64, u32>::new();
+    for ((qid, sid, map_task, attempt), _) in map_outputs {
+        if qid == query_id && *sid == stage_id {
+            latest_attempt_by_task
+                .entry(*map_task)
+                .and_modify(|a| *a = (*a).max(*attempt))
+                .or_insert(*attempt);
+        }
+    }
+
+    let mut out = HashMap::<u32, (u32, u64, bool)>::new();
+    for ((qid, sid, map_task, attempt), partitions) in map_outputs {
+        if qid != query_id || *sid != stage_id {
+            continue;
+        }
+        if !latest_attempt_by_task
+            .get(map_task)
+            .is_some_and(|latest| *latest == *attempt)
+        {
+            continue;
+        }
+        for p in partitions {
+            out.entry(p.reduce_partition)
+                .and_modify(|cur| {
+                    if p.stream_epoch > cur.0 {
+                        *cur = (p.stream_epoch, p.committed_offset, p.finalized);
+                    } else if p.stream_epoch == cur.0 {
+                        cur.1 = cur.1.max(p.committed_offset);
+                        cur.2 = cur.2 || p.finalized;
+                    }
+                })
+                .or_insert((p.stream_epoch, p.committed_offset, p.finalized));
+        }
     }
     out
 }
@@ -3120,10 +3179,10 @@ mod tests {
                 bytes: 10,
                 rows: 2,
                 batches: 1,
-            stream_epoch: 1,
-            committed_offset: 0,
-            finalized: true,
-}],
+                stream_epoch: 1,
+                committed_offset: 10,
+                finalized: false,
+            }],
         )
         .expect("register partial");
 
@@ -3137,6 +3196,89 @@ mod tests {
                 .iter()
                 .all(|t| t.assigned_reduce_partitions == vec![0]),
             "only ready partition should be schedulable before map completion"
+        );
+    }
+
+    #[test]
+    fn coordinator_pipeline_requires_committed_offset_threshold_before_scheduling() {
+        let mut c = Coordinator::new(CoordinatorConfig {
+            pipelined_shuffle_enabled: true,
+            pipelined_shuffle_min_map_completion_ratio: 0.0,
+            pipelined_shuffle_min_committed_offset_bytes: 64,
+            ..CoordinatorConfig::default()
+        });
+        let plan = PhysicalPlan::Exchange(ExchangeExec::ShuffleRead(ShuffleReadExchange {
+            input: Box::new(PhysicalPlan::Exchange(ExchangeExec::ShuffleWrite(
+                ShuffleWriteExchange {
+                    input: Box::new(PhysicalPlan::ParquetScan(ParquetScanExec {
+                        table: "t".to_string(),
+                        schema: Some(Schema::empty()),
+                        projection: None,
+                        filters: vec![],
+                    })),
+                    partitioning: PartitioningSpec::HashKeys {
+                        keys: vec!["k".to_string()],
+                        partitions: 4,
+                    },
+                },
+            ))),
+            partitioning: PartitioningSpec::HashKeys {
+                keys: vec!["k".to_string()],
+                partitions: 4,
+            },
+        }));
+        let bytes = serde_json::to_vec(&plan).expect("plan");
+        c.submit_query("307".to_string(), &bytes).expect("submit");
+
+        let map_task = c.get_task("w1", 10).expect("map").remove(0);
+        c.register_map_output(
+            "307".to_string(),
+            map_task.stage_id,
+            map_task.task_id,
+            map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
+            vec![MapOutputPartitionMeta {
+                reduce_partition: 0,
+                bytes: 32,
+                rows: 1,
+                batches: 1,
+                stream_epoch: 1,
+                committed_offset: 32,
+                finalized: false,
+            }],
+        )
+        .expect("register partial under threshold");
+        assert!(
+            c.get_task("w2", 10)
+                .expect("no reduce before threshold")
+                .is_empty()
+        );
+
+        c.register_map_output(
+            "307".to_string(),
+            map_task.stage_id,
+            map_task.task_id,
+            map_task.attempt,
+            map_task.layout_version,
+            map_task.layout_fingerprint,
+            vec![MapOutputPartitionMeta {
+                reduce_partition: 0,
+                bytes: 96,
+                rows: 2,
+                batches: 2,
+                stream_epoch: 1,
+                committed_offset: 96,
+                finalized: false,
+            }],
+        )
+        .expect("register partial over threshold");
+        let reduce_tasks = c.get_task("w2", 10).expect("reduce after threshold");
+        assert!(!reduce_tasks.is_empty());
+        assert!(
+            reduce_tasks
+                .iter()
+                .all(|t| t.assigned_reduce_partitions == vec![0])
         );
     }
 

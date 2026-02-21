@@ -79,6 +79,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "FFQ_PIPELINED_SHUFFLE_MIN_MAP_COMPLETION_RATIO",
         0.5,
     );
+    let pipelined_shuffle_min_committed_offset_bytes =
+        env_u64_or_default("FFQ_PIPELINED_SHUFFLE_MIN_COMMITTED_OFFSET_BYTES", 1);
     let catalog_path = env::var("FFQ_COORDINATOR_CATALOG_PATH").ok();
     std::fs::create_dir_all(&shuffle_root)?;
     let catalog = load_catalog(catalog_path.clone())?;
@@ -98,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             adaptive_shuffle_max_partitions_per_task,
             pipelined_shuffle_enabled,
             pipelined_shuffle_min_map_completion_ratio,
+            pipelined_shuffle_min_committed_offset_bytes,
             ..CoordinatorConfig::default()
         },
         catalog,
@@ -105,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let services = CoordinatorServices::from_shared(Arc::clone(&coordinator));
 
     println!(
-        "ffq-coordinator listening on {addr} (shuffle_root={shuffle_root}, blacklist_threshold={blacklist_failure_threshold}, worker_limit={max_concurrent_tasks_per_worker}, query_limit={max_concurrent_tasks_per_query}, max_attempts={max_task_attempts}, retry_backoff_ms={retry_backoff_base_ms}, liveness_timeout_ms={worker_liveness_timeout_ms}, adaptive_shuffle_target_bytes={adaptive_shuffle_target_bytes}, adaptive_shuffle_min_reduce_tasks={adaptive_shuffle_min_reduce_tasks}, adaptive_shuffle_max_reduce_tasks={adaptive_shuffle_max_reduce_tasks}, adaptive_shuffle_max_partitions_per_task={adaptive_shuffle_max_partitions_per_task}, pipelined_shuffle_enabled={pipelined_shuffle_enabled}, pipelined_shuffle_min_map_completion_ratio={pipelined_shuffle_min_map_completion_ratio}, catalog_path={})",
+        "ffq-coordinator listening on {addr} (shuffle_root={shuffle_root}, blacklist_threshold={blacklist_failure_threshold}, worker_limit={max_concurrent_tasks_per_worker}, query_limit={max_concurrent_tasks_per_query}, max_attempts={max_task_attempts}, retry_backoff_ms={retry_backoff_base_ms}, liveness_timeout_ms={worker_liveness_timeout_ms}, adaptive_shuffle_target_bytes={adaptive_shuffle_target_bytes}, adaptive_shuffle_min_reduce_tasks={adaptive_shuffle_min_reduce_tasks}, adaptive_shuffle_max_reduce_tasks={adaptive_shuffle_max_reduce_tasks}, adaptive_shuffle_max_partitions_per_task={adaptive_shuffle_max_partitions_per_task}, pipelined_shuffle_enabled={pipelined_shuffle_enabled}, pipelined_shuffle_min_map_completion_ratio={pipelined_shuffle_min_map_completion_ratio}, pipelined_shuffle_min_committed_offset_bytes={pipelined_shuffle_min_committed_offset_bytes}, catalog_path={})",
         catalog_path.unwrap_or_else(|| "<none>".to_string())
     );
 
