@@ -38,6 +38,8 @@ use ffq_planner::{
     PhysicalPlan, WindowExpr, WindowFrameBound, WindowFrameExclusion, WindowFrameSpec,
     WindowFrameUnits, WindowFunction, WindowOrderExpr,
 };
+#[cfg(feature = "s3")]
+use ffq_storage::object_store_provider::{ObjectStoreProvider, is_object_store_uri};
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
 use ffq_storage::qdrant_provider::QdrantProvider;
@@ -444,7 +446,15 @@ fn execute_plan_with_cache(
         let eval = match plan {
             PhysicalPlan::ParquetScan(scan) => {
                 let table = catalog.get(&scan.table)?.clone();
-                let provider = ParquetProvider::new();
+                #[cfg(feature = "s3")]
+                let provider: Arc<dyn StorageProvider> =
+                    if table.data_paths()?.iter().any(|p| is_object_store_uri(p)) {
+                        Arc::new(ObjectStoreProvider::new())
+                    } else {
+                        Arc::new(ParquetProvider::new())
+                    };
+                #[cfg(not(feature = "s3"))]
+                let provider: Arc<dyn StorageProvider> = Arc::new(ParquetProvider::new());
                 let node = provider.scan(&table, scan.projection, scan.filters)?;
                 let stream = node.execute(Arc::new(TaskContext {
                     batch_size_rows: ctx.batch_size_rows,

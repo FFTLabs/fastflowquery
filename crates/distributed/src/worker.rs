@@ -43,6 +43,8 @@ use ffq_planner::{
 use ffq_shuffle::ShuffleCompressionCodec;
 use ffq_shuffle::aggregate_partition_chunks;
 use ffq_shuffle::{ShuffleReader, ShuffleWriter};
+#[cfg(feature = "s3")]
+use ffq_storage::object_store_provider::{ObjectStoreProvider, is_object_store_uri};
 use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
 use ffq_storage::qdrant_provider::QdrantProvider;
@@ -904,7 +906,15 @@ fn eval_plan_for_stage(
             if let Some(schema) = &scan.schema {
                 table.schema = Some(schema.clone());
             }
-            let provider = ParquetProvider::new();
+            #[cfg(feature = "s3")]
+            let provider: Arc<dyn StorageProvider> =
+                if table.data_paths()?.iter().any(|p| is_object_store_uri(p)) {
+                    Arc::new(ObjectStoreProvider::new())
+                } else {
+                    Arc::new(ParquetProvider::new())
+                };
+            #[cfg(not(feature = "s3"))]
+            let provider: Arc<dyn StorageProvider> = Arc::new(ParquetProvider::new());
             let node = provider.scan(&table, scan.projection.clone(), scan.filters.clone())?;
             let stream = node.execute(Arc::new(ExecTaskContext {
                 batch_size_rows: ctx.batch_size_rows,
