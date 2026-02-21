@@ -1957,6 +1957,14 @@ struct SpillRow {
     states: Vec<AggState>,
 }
 
+#[derive(Debug, Clone)]
+struct GroupEntry {
+    key: Vec<ScalarValue>,
+    states: Vec<AggState>,
+}
+
+type GroupMap = HashMap<Vec<u8>, GroupEntry>;
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct JoinSpillRow {
     key: Vec<ScalarValue>,
@@ -3693,8 +3701,9 @@ fn run_hash_aggregate(
     .entered();
     let input_schema = child.schema;
     let specs = build_agg_specs(&aggr_exprs, &input_schema, &group_exprs, mode)?;
-    let mut groups: HashMap<Vec<ScalarValue>, Vec<AggState>> = HashMap::new();
+    let mut groups: GroupMap = HashMap::new();
     let mut spills = Vec::<PathBuf>::new();
+    let mut spill_seq: u64 = 0;
 
     for batch in &child.batches {
         accumulate_batch(
@@ -3705,15 +3714,21 @@ fn run_hash_aggregate(
             batch,
             &mut groups,
         )?;
-        maybe_spill(&mut groups, &mut spills, ctx)?;
+        maybe_spill(&mut groups, &mut spills, &mut spill_seq, ctx)?;
     }
 
     if group_exprs.is_empty() && groups.is_empty() {
-        groups.insert(vec![], init_states(&specs));
+        groups.insert(
+            encode_group_key(&[]),
+            GroupEntry {
+                key: vec![],
+                states: init_states(&specs),
+            },
+        );
     }
 
     if !groups.is_empty() {
-        maybe_spill(&mut groups, &mut spills, ctx)?;
+        maybe_spill(&mut groups, &mut spills, &mut spill_seq, ctx)?;
     }
     if !spills.is_empty() {
         for path in &spills {
@@ -3782,7 +3797,7 @@ fn accumulate_batch(
     group_exprs: &[Expr],
     input_schema: &SchemaRef,
     batch: &RecordBatch,
-    groups: &mut HashMap<Vec<ScalarValue>, Vec<AggState>>,
+    groups: &mut GroupMap,
 ) -> Result<()> {
     let group_arrays = match mode {
         AggregateMode::Partial => {
@@ -3847,8 +3862,14 @@ fn accumulate_batch(
             .iter()
             .map(|a| scalar_from_array(a, row))
             .collect::<Result<Vec<_>>>()?;
-
-        let state_vec = groups.entry(key).or_insert_with(|| init_states(specs));
+        let encoded_key = encode_group_key(&key);
+        let state_vec = &mut groups
+            .entry(encoded_key)
+            .or_insert_with(|| GroupEntry {
+                key: key.clone(),
+                states: init_states(specs),
+            })
+            .states;
         for (idx, spec) in specs.iter().enumerate() {
             let value = scalar_from_array(&agg_arrays[idx], row)?;
             update_state(
@@ -3949,13 +3970,13 @@ fn update_state(
 }
 
 fn build_output(
-    groups: HashMap<Vec<ScalarValue>, Vec<AggState>>,
+    groups: GroupMap,
     specs: &[AggSpec],
     group_exprs: &[Expr],
     input_schema: &SchemaRef,
     mode: AggregateMode,
 ) -> Result<ExecOutput> {
-    let mut keys: Vec<Vec<ScalarValue>> = groups.keys().cloned().collect();
+    let mut keys: Vec<Vec<ScalarValue>> = groups.values().map(|e| e.key.clone()).collect();
     keys.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
 
     let mut fields = Vec::<Field>::new();
@@ -3978,7 +3999,8 @@ fn build_output(
         let mut hidden_counts = Vec::new();
         for key in &keys {
             let states = groups
-                .get(key)
+                .get(&encode_group_key(key))
+                .map(|e| &e.states)
                 .ok_or_else(|| FfqError::Execution("missing aggregate state".to_string()))?;
             let state = &states[aidx];
             values.push(state_to_scalar(state, &spec.expr, mode));
@@ -4062,8 +4084,9 @@ fn state_to_scalar(state: &AggState, expr: &AggExpr, mode: AggregateMode) -> Sca
 }
 
 fn maybe_spill(
-    groups: &mut HashMap<Vec<ScalarValue>, Vec<AggState>>,
+    groups: &mut GroupMap,
     spills: &mut Vec<PathBuf>,
+    spill_seq: &mut u64,
     ctx: &TaskContext,
 ) -> Result<()> {
     if groups.is_empty() || ctx.per_task_memory_budget_bytes == 0 {
@@ -4074,45 +4097,74 @@ fn maybe_spill(
         return Ok(());
     }
 
-    let spill_started = Instant::now();
     fs::create_dir_all(&ctx.spill_dir)?;
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| FfqError::Execution(format!("clock error: {e}")))?
         .as_nanos();
-    let path = PathBuf::from(&ctx.spill_dir).join(format!("agg_spill_{suffix}.jsonl"));
+    let target_bytes = ctx.per_task_memory_budget_bytes.saturating_mul(3) / 4;
+    let target_bytes = target_bytes.max(1);
+    let mut partition_cursor = 0_u8;
+    let mut empty_partition_streak = 0_u8;
+    const SPILL_PARTITIONS: u8 = 16;
 
-    let file = File::create(&path)?;
-    let mut writer = BufWriter::new(file);
-    for (key, states) in groups.iter() {
-        let row = SpillRow {
-            key: key.clone(),
-            states: states.clone(),
-        };
-        let line = serde_json::to_string(&row)
-            .map_err(|e| FfqError::Execution(format!("spill serialize failed: {e}")))?;
-        writer.write_all(line.as_bytes())?;
-        writer.write_all(b"\n")?;
+    while !groups.is_empty() && estimate_groups_bytes(groups) > target_bytes {
+        let spill_started = Instant::now();
+        let path = PathBuf::from(&ctx.spill_dir).join(format!(
+            "agg_spill_{suffix}_{:06}_p{:02}.jsonl",
+            *spill_seq, partition_cursor
+        ));
+        *spill_seq += 1;
+
+        let mut to_spill = groups
+            .keys()
+            .filter(|key| {
+                (hash_encoded_key(key) % SPILL_PARTITIONS as u64) as u8 == partition_cursor
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if to_spill.is_empty() {
+            empty_partition_streak += 1;
+            if empty_partition_streak >= SPILL_PARTITIONS {
+                to_spill = groups.keys().cloned().collect::<Vec<_>>();
+            } else {
+                partition_cursor = (partition_cursor + 1) % SPILL_PARTITIONS;
+                continue;
+            }
+        }
+        empty_partition_streak = 0;
+
+        let file = File::create(&path)?;
+        let mut writer = BufWriter::new(file);
+        for encoded in to_spill {
+            if let Some(entry) = groups.remove(&encoded) {
+                let row = SpillRow {
+                    key: entry.key,
+                    states: entry.states,
+                };
+                let line = serde_json::to_string(&row)
+                    .map_err(|e| FfqError::Execution(format!("spill serialize failed: {e}")))?;
+                writer.write_all(line.as_bytes())?;
+                writer.write_all(b"\n")?;
+            }
+        }
+        writer.flush()?;
+        let spill_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        global_metrics().record_spill(
+            &ctx.query_id,
+            ctx.stage_id,
+            ctx.task_id,
+            "aggregate",
+            spill_bytes,
+            spill_started.elapsed().as_secs_f64(),
+        );
+        spills.push(path);
+        partition_cursor = (partition_cursor + 1) % SPILL_PARTITIONS;
     }
-    writer.flush()?;
-    let spill_bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    global_metrics().record_spill(
-        &ctx.query_id,
-        ctx.stage_id,
-        ctx.task_id,
-        "aggregate",
-        spill_bytes,
-        spill_started.elapsed().as_secs_f64(),
-    );
-    groups.clear();
-    spills.push(path);
     Ok(())
 }
 
-fn merge_spill_file(
-    path: &PathBuf,
-    groups: &mut HashMap<Vec<ScalarValue>, Vec<AggState>>,
-) -> Result<()> {
+fn merge_spill_file(path: &PathBuf, groups: &mut GroupMap) -> Result<()> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     for line in reader.lines() {
@@ -4122,10 +4174,17 @@ fn merge_spill_file(
         }
         let row: SpillRow = serde_json::from_str(&line)
             .map_err(|e| FfqError::Execution(format!("spill deserialize failed: {e}")))?;
-        if let Some(existing) = groups.get_mut(&row.key) {
-            merge_states(existing, &row.states)?;
+        let encoded = encode_group_key(&row.key);
+        if let Some(existing) = groups.get_mut(&encoded) {
+            merge_states(&mut existing.states, &row.states)?;
         } else {
-            groups.insert(row.key, row.states);
+            groups.insert(
+                encoded,
+                GroupEntry {
+                    key: row.key,
+                    states: row.states,
+                },
+            );
         }
     }
     Ok(())
@@ -4183,14 +4242,62 @@ fn merge_states(target: &mut [AggState], other: &[AggState]) -> Result<()> {
     Ok(())
 }
 
-fn estimate_groups_bytes(groups: &HashMap<Vec<ScalarValue>, Vec<AggState>>) -> usize {
+fn estimate_groups_bytes(groups: &GroupMap) -> usize {
     let mut total = 0_usize;
-    for (k, v) in groups {
+    for (encoded, entry) in groups {
         total += 96;
-        total += k.iter().map(scalar_estimate_bytes).sum::<usize>();
-        total += v.iter().map(agg_state_estimate_bytes).sum::<usize>();
+        total += encoded.len();
+        total += entry.key.iter().map(scalar_estimate_bytes).sum::<usize>();
+        total += entry
+            .states
+            .iter()
+            .map(agg_state_estimate_bytes)
+            .sum::<usize>();
     }
     total
+}
+
+fn hash_encoded_key(key: &[u8]) -> u64 {
+    let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
+fn encode_group_key(values: &[ScalarValue]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 16);
+    for value in values {
+        match value {
+            ScalarValue::Null => out.push(0),
+            ScalarValue::Int64(v) => {
+                out.push(1);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            ScalarValue::Float64Bits(v) => {
+                out.push(2);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            ScalarValue::Boolean(v) => {
+                out.push(3);
+                out.push(u8::from(*v));
+            }
+            ScalarValue::Utf8(s) => {
+                out.push(4);
+                let len = s.len() as u32;
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            ScalarValue::VectorF32Bits(v) => {
+                out.push(5);
+                let len = v.len() as u32;
+                out.extend_from_slice(&len.to_le_bytes());
+                for bits in v {
+                    out.extend_from_slice(&bits.to_le_bytes());
+                }
+            }
+        }
+        out.push(0xff);
+    }
+    out
 }
 
 fn scalar_estimate_bytes(v: &ScalarValue) -> usize {
