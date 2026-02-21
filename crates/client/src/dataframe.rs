@@ -2,7 +2,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use ffq_common::{FfqError, Result};
 use ffq_execution::stream::SendableRecordBatchStream;
-use ffq_planner::{AggExpr, Expr, JoinType, LogicalPlan};
+use ffq_planner::{AggExpr, Expr, JoinType, LogicalPlan, PhysicalPlan};
 use ffq_storage::parquet_provider::ParquetProvider;
 use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
@@ -62,6 +62,16 @@ pub enum WriteMode {
 pub struct DataFrame {
     session: SharedSession,
     logical_plan: LogicalPlan,
+}
+
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, Default)]
+/// Per-query overrides for index-backed vector KNN execution.
+pub struct VectorKnnOverrides {
+    /// Optional metric override (`cosine`, `dot`, `l2`).
+    pub metric: Option<String>,
+    /// Optional HNSW `ef_search` override.
+    pub ef_search: Option<usize>,
 }
 
 impl DataFrame {
@@ -201,6 +211,20 @@ impl DataFrame {
         self.create_execution_stream().await
     }
 
+    #[cfg(feature = "vector")]
+    /// Executes this plan with vector KNN query-time overrides.
+    ///
+    /// Overrides are applied to all `VectorKnn` operators in the physical plan for this call only.
+    pub async fn collect_with_vector_knn_overrides(
+        &self,
+        overrides: VectorKnnOverrides,
+    ) -> Result<Vec<RecordBatch>> {
+        let stream = self
+            .create_execution_stream_with_vector_overrides(Some(overrides))
+            .await?;
+        stream.try_collect().await
+    }
+
     /// Executes this plan and writes output to parquet, replacing destination by default.
     ///
     /// If `path` ends with `.parquet`, output is written to that file.
@@ -337,6 +361,15 @@ impl DataFrame {
     }
 
     async fn create_execution_stream(&self) -> Result<SendableRecordBatchStream> {
+        self.create_execution_stream_with_vector_overrides(None)
+            .await
+    }
+
+    async fn create_execution_stream_with_vector_overrides(
+        &self,
+        #[cfg(feature = "vector")] vector_overrides: Option<VectorKnnOverrides>,
+        #[cfg(not(feature = "vector"))] _vector_overrides: Option<()>,
+    ) -> Result<SendableRecordBatchStream> {
         self.ensure_inferred_parquet_schemas()?;
         // Ensure both SQL-built and DataFrame-built plans go through the same analyze/optimize pipeline.
         let (analyzed, catalog_snapshot) = {
@@ -353,7 +386,11 @@ impl DataFrame {
             (analyzed, std::sync::Arc::new((*cat_guard).clone()))
         };
 
-        let physical = self.session.planner.create_physical_plan(&analyzed)?;
+        let mut physical = self.session.planner.create_physical_plan(&analyzed)?;
+        #[cfg(feature = "vector")]
+        if let Some(overrides) = vector_overrides {
+            apply_vector_knn_overrides(&mut physical, &overrides)?;
+        }
 
         let stats_collector = Arc::new(RuntimeStatsCollector::default());
         let ctx = QueryContext {
@@ -516,6 +553,93 @@ impl DataFrame {
             self.session.persist_catalog()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "vector")]
+fn apply_vector_knn_overrides(
+    plan: &mut PhysicalPlan,
+    overrides: &VectorKnnOverrides,
+) -> Result<()> {
+    fn validate_metric(metric: &str) -> Result<()> {
+        if matches!(metric, "cosine" | "dot" | "l2") {
+            return Ok(());
+        }
+        Err(ffq_common::FfqError::InvalidConfig(format!(
+            "unsupported vector metric override '{metric}'"
+        )))
+    }
+
+    if let Some(metric) = overrides.metric.as_deref() {
+        validate_metric(metric)?;
+    }
+    if let Some(ef) = overrides.ef_search
+        && ef == 0
+    {
+        return Err(ffq_common::FfqError::InvalidConfig(
+            "vector ef_search override must be > 0".to_string(),
+        ));
+    }
+
+    match plan {
+        PhysicalPlan::VectorKnn(exec) => {
+            if let Some(metric) = overrides.metric.as_deref() {
+                exec.metric = metric.to_string();
+            }
+            if overrides.ef_search.is_some() {
+                exec.ef_search = overrides.ef_search;
+            }
+            Ok(())
+        }
+        PhysicalPlan::Filter(exec) => apply_vector_knn_overrides(&mut exec.input, overrides),
+        PhysicalPlan::InSubqueryFilter(exec) => {
+            apply_vector_knn_overrides(&mut exec.input, overrides)?;
+            apply_vector_knn_overrides(&mut exec.subquery, overrides)
+        }
+        PhysicalPlan::ExistsSubqueryFilter(exec) => {
+            apply_vector_knn_overrides(&mut exec.input, overrides)?;
+            apply_vector_knn_overrides(&mut exec.subquery, overrides)
+        }
+        PhysicalPlan::ScalarSubqueryFilter(exec) => {
+            apply_vector_knn_overrides(&mut exec.input, overrides)?;
+            apply_vector_knn_overrides(&mut exec.subquery, overrides)
+        }
+        PhysicalPlan::Project(exec) => apply_vector_knn_overrides(&mut exec.input, overrides),
+        PhysicalPlan::PartialHashAggregate(exec) => {
+            apply_vector_knn_overrides(&mut exec.input, overrides)
+        }
+        PhysicalPlan::FinalHashAggregate(exec) => {
+            apply_vector_knn_overrides(&mut exec.input, overrides)
+        }
+        PhysicalPlan::Window(exec) => apply_vector_knn_overrides(&mut exec.input, overrides),
+        PhysicalPlan::CoalesceBatches(exec) => {
+            apply_vector_knn_overrides(&mut exec.input, overrides)
+        }
+        PhysicalPlan::Exchange(exec) => match exec {
+            ffq_planner::ExchangeExec::ShuffleWrite(x) => {
+                apply_vector_knn_overrides(&mut x.input, overrides)
+            }
+            ffq_planner::ExchangeExec::ShuffleRead(x) => {
+                apply_vector_knn_overrides(&mut x.input, overrides)
+            }
+            ffq_planner::ExchangeExec::Broadcast(x) => {
+                apply_vector_knn_overrides(&mut x.input, overrides)
+            }
+        },
+        PhysicalPlan::HashJoin(exec) => {
+            apply_vector_knn_overrides(&mut exec.left, overrides)?;
+            apply_vector_knn_overrides(&mut exec.right, overrides)
+        }
+        PhysicalPlan::Limit(exec) => apply_vector_knn_overrides(&mut exec.input, overrides),
+        PhysicalPlan::TopKByScore(exec) => apply_vector_knn_overrides(&mut exec.input, overrides),
+        PhysicalPlan::UnionAll(exec) => {
+            apply_vector_knn_overrides(&mut exec.left, overrides)?;
+            apply_vector_knn_overrides(&mut exec.right, overrides)
+        }
+        PhysicalPlan::CteRef(exec) => apply_vector_knn_overrides(&mut exec.plan, overrides),
+        PhysicalPlan::ParquetWrite(exec) => apply_vector_knn_overrides(&mut exec.input, overrides),
+        PhysicalPlan::Custom(exec) => apply_vector_knn_overrides(&mut exec.input, overrides),
+        PhysicalPlan::ParquetScan(_) | PhysicalPlan::VectorTopK(_) => Ok(()),
     }
 }
 
@@ -823,7 +947,12 @@ fn replace_dir_atomically(staged: &Path, target: &Path) -> Result<()> {
 mod tests {
     use std::collections::HashMap;
 
+    #[cfg(feature = "vector")]
+    use ffq_planner::{PhysicalPlan, VectorKnnExec};
+
     use super::CatalogProvider;
+    #[cfg(feature = "vector")]
+    use super::{VectorKnnOverrides, apply_vector_knn_overrides};
     use ffq_planner::OptimizerContext;
 
     #[test]
@@ -860,5 +989,31 @@ mod tests {
             opts.get("qdrant.collection").expect("collection option"),
             "docs"
         );
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn vector_knn_overrides_update_physical_exec() {
+        let mut plan = PhysicalPlan::VectorKnn(VectorKnnExec {
+            source: "docs_idx".to_string(),
+            query_vector: vec![0.1, 0.2, 0.3],
+            k: 5,
+            ef_search: Some(64),
+            prefilter: None,
+            metric: "cosine".to_string(),
+            provider: "qdrant".to_string(),
+        });
+        let overrides = VectorKnnOverrides {
+            metric: Some("dot".to_string()),
+            ef_search: Some(256),
+        };
+        apply_vector_knn_overrides(&mut plan, &overrides).expect("apply overrides");
+        match plan {
+            PhysicalPlan::VectorKnn(exec) => {
+                assert_eq!(exec.metric, "dot");
+                assert_eq!(exec.ef_search, Some(256));
+            }
+            other => panic!("expected VectorKnn plan, got {other:?}"),
+        }
     }
 }

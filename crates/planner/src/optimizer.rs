@@ -665,6 +665,7 @@ fn proj_rewrite(
             source,
             query_vectors,
             k,
+            ef_search,
             prefilter,
             metric,
             provider,
@@ -673,6 +674,7 @@ fn proj_rewrite(
                 source,
                 query_vectors,
                 k,
+                ef_search,
                 prefilter,
                 metric,
                 provider,
@@ -1138,6 +1140,7 @@ fn try_rewrite_projection_topk_to_vector(
             source,
             query_vector,
             k,
+            ef_search,
             prefilter,
             metric,
             provider,
@@ -1145,6 +1148,7 @@ fn try_rewrite_projection_topk_to_vector(
             source,
             query_vectors: vec![query_vector],
             k,
+            ef_search,
             prefilter,
             metric,
             provider,
@@ -1219,6 +1223,7 @@ fn try_rewrite_projection_topk_to_two_phase(
             source: index_table,
             query_vectors: vec![query_vector.clone()],
             k: prefetch_k,
+            ef_search: None,
             prefilter: None,
             metric: "cosine".to_string(),
             provider: "qdrant".to_string(),
@@ -1305,6 +1310,7 @@ enum VectorRewriteDecision {
         source: String,
         query_vector: Vec<f32>,
         k: usize,
+        ef_search: Option<usize>,
         prefilter: Option<String>,
         metric: String,
         provider: String,
@@ -1378,10 +1384,15 @@ fn evaluate_vector_topk_rewrite(
             _reason: "table format is not qdrant",
         });
     }
-    let Expr::CosineSimilarity { vector, query } = score_expr else {
-        return Ok(VectorRewriteDecision::Fallback {
-            _reason: "score expr is not cosine_similarity",
-        });
+    let (metric, vector, query) = match score_expr {
+        Expr::CosineSimilarity { vector, query } => ("cosine", vector, query),
+        Expr::DotProduct { vector, query } => ("dot", vector, query),
+        Expr::L2Distance { vector, query } => ("l2", vector, query),
+        _ => {
+            return Ok(VectorRewriteDecision::Fallback {
+                _reason: "score expr is not vector metric function",
+            });
+        }
     };
     if !matches!(vector.as_ref(), Expr::Column(_) | Expr::ColumnRef { .. }) {
         return Ok(VectorRewriteDecision::Fallback {
@@ -1393,6 +1404,26 @@ fn evaluate_vector_topk_rewrite(
             _reason: "query arg is not vector literal",
         });
     };
+    let options = ctx.table_options(table)?.unwrap_or_default();
+    if let Some(max_k) = parse_usize_opt(&options, "vector.knn.max_k")?
+        && *k > max_k
+    {
+        return Err(ffq_common::FfqError::Planning(format!(
+            "vector k={} exceeds configured cap vector.knn.max_k={max_k}",
+            *k
+        )));
+    }
+    let ef_search = parse_usize_opt(&options, "vector.ef_search")?;
+    if let (Some(ef), Some(max_ef)) = (
+        ef_search,
+        parse_usize_opt(&options, "vector.knn.max_ef_search")?,
+    ) && ef > max_ef
+    {
+        return Err(ffq_common::FfqError::Planning(format!(
+            "vector ef_search={} exceeds configured cap vector.knn.max_ef_search={max_ef}",
+            ef
+        )));
+    }
     let caps = pushdown_filter_caps(ctx, table)?;
     let filter = match translate_qdrant_filter(filters, &caps) {
         Ok(v) => v,
@@ -1407,10 +1438,27 @@ fn evaluate_vector_topk_rewrite(
         source: table.clone(),
         query_vector: query_vector.clone(),
         k: *k,
+        ef_search,
         prefilter: filter,
-        metric: "cosine".to_string(),
+        metric: metric.to_string(),
         provider: "qdrant".to_string(),
     })
+}
+
+#[cfg(feature = "vector")]
+fn parse_usize_opt(options: &HashMap<String, String>, key: &str) -> Result<Option<usize>> {
+    let Some(raw) = options.get(key) else {
+        return Ok(None);
+    };
+    let parsed = raw.parse::<usize>().map_err(|e| {
+        ffq_common::FfqError::Planning(format!("invalid '{key}' value '{raw}': {e}"))
+    })?;
+    if parsed == 0 {
+        return Err(ffq_common::FfqError::Planning(format!(
+            "'{key}' must be > 0"
+        )));
+    }
+    Ok(Some(parsed))
 }
 
 #[cfg(feature = "vector")]
@@ -1699,6 +1747,7 @@ fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy
             source,
             query_vectors,
             k,
+            ef_search,
             prefilter,
             metric,
             provider,
@@ -1706,6 +1755,7 @@ fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy
             source,
             query_vectors,
             k,
+            ef_search,
             prefilter,
             metric,
             provider,
@@ -1835,6 +1885,7 @@ fn try_map_children(
             source,
             query_vectors,
             k,
+            ef_search,
             prefilter,
             metric,
             provider,
@@ -1842,6 +1893,7 @@ fn try_map_children(
             source,
             query_vectors,
             k,
+            ef_search,
             prefilter,
             metric,
             provider,
@@ -2044,6 +2096,7 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
             source,
             query_vectors,
             k,
+            ef_search,
             prefilter,
             metric,
             provider,
@@ -2051,6 +2104,7 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
             source,
             query_vectors,
             k,
+            ef_search,
             prefilter,
             metric,
             provider,
@@ -2443,6 +2497,88 @@ mod tests {
             },
             other => panic!("expected Projection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rewrite_uses_metric_and_ef_search_knobs() {
+        let emb_field = Field::new("item", DataType::Float32, true);
+        let mut options = HashMap::new();
+        options.insert("vector.ef_search".to_string(), "128".to_string());
+        let ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+            ])),
+            format: "qdrant".to_string(),
+            options,
+            stats: HashMap::new(),
+        };
+
+        let plan = LogicalPlan::Projection {
+            exprs: vec![
+                (Expr::Column("id".to_string()), "id".to_string()),
+                (Expr::Column("score".to_string()), "score".to_string()),
+                (Expr::Column("payload".to_string()), "payload".to_string()),
+            ],
+            input: Box::new(LogicalPlan::TopKByScore {
+                score_expr: Expr::DotProduct {
+                    vector: Box::new(Expr::Column("emb".to_string())),
+                    query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+                },
+                k: 5,
+                input: Box::new(LogicalPlan::TableScan {
+                    table: "docs_idx".to_string(),
+                    projection: None,
+                    filters: vec![],
+                }),
+            }),
+        };
+
+        let optimized = Optimizer::new()
+            .optimize(plan, &ctx, OptimizerConfig::default())
+            .expect("optimize");
+        match optimized {
+            LogicalPlan::Projection { input, .. } => match *input {
+                LogicalPlan::HybridVectorScan {
+                    metric, ef_search, ..
+                } => {
+                    assert_eq!(metric, "dot");
+                    assert_eq!(ef_search, Some(128));
+                }
+                other => panic!("expected HybridVectorScan, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_fails_when_k_exceeds_cap() {
+        let emb_field = Field::new("item", DataType::Float32, true);
+        let mut options = HashMap::new();
+        options.insert("vector.knn.max_k".to_string(), "4".to_string());
+        let ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+            ])),
+            format: "qdrant".to_string(),
+            options,
+            stats: HashMap::new(),
+        };
+
+        let err = Optimizer::new()
+            .optimize(
+                topk_plan(&["id", "score", "payload"]),
+                &ctx,
+                OptimizerConfig::default(),
+            )
+            .expect_err("k cap violation");
+        assert!(
+            err.to_string().contains("vector.knn.max_k"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

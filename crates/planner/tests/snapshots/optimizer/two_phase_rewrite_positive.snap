@@ -21,6 +21,7 @@ Projection
         title := docs.title
         lang := docs.lang
         emb := docs.emb
+        _score := _score
         score := score
         payload := payload
         Join type=Inner strategy=broadcast_right
@@ -30,4 +31,4 @@ Projection
               projection=None
               pushed_filters=0
           right:
-            HybridVectorScan source=docs_idx k=6 query_dim=3 metric=cosine provider=qdrant prefilter=None columns=[id,_score,payload] rewrite=index_applied
+            HybridVectorScan source=docs_idx k=6 ef_search=None query_dim=3 metric=cosine provider=qdrant prefilter=None columns=[id,_score,payload] rewrite=index_applied

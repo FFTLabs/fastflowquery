@@ -378,6 +378,8 @@ pub struct VectorKnnExec {
     pub query_vector: Vec<f32>,
     /// Number of rows to return.
     pub k: usize,
+    /// Optional query-time HNSW `ef_search` override.
+    pub ef_search: Option<usize>,
     /// Optional provider-specific prefilter payload.
     pub prefilter: Option<String>,
     /// Distance/similarity metric identifier.

@@ -49,7 +49,7 @@ use ffq_storage::parquet_provider::ParquetProvider;
 #[cfg(feature = "qdrant")]
 use ffq_storage::qdrant_provider::QdrantProvider;
 #[cfg(feature = "qdrant")]
-use ffq_storage::vector_index::VectorIndexProvider;
+use ffq_storage::vector_index::{VectorIndexProvider, VectorQueryOptions};
 use ffq_storage::{Catalog, StorageProvider};
 use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
@@ -1525,6 +1525,7 @@ fn execute_vector_topk(
             exec.query_vector.clone(),
             exec.k,
             exec.filter.clone(),
+            VectorQueryOptions::default(),
         ))?;
         rows_to_vector_topk_output(rows)
     }
@@ -1565,6 +1566,10 @@ fn execute_vector_knn(
             topk.query_vector.clone(),
             topk.k,
             topk.filter.clone(),
+            VectorQueryOptions {
+                metric: Some(exec.metric.clone()),
+                ef_search: exec.ef_search,
+            },
         ))?;
         rows_to_vector_knn_output(rows)
     }

@@ -257,13 +257,14 @@ fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
             source,
             query_vectors,
             k,
+            ef_search,
             prefilter,
             metric,
             provider,
         } => {
             let qdim = query_vectors.first().map_or(0, Vec::len);
             out.push_str(&format!(
-                "{pad}HybridVectorScan source={source} k={k} query_dim={qdim} metric={metric} provider={provider} prefilter={prefilter:?} columns=[id,_score,payload] rewrite=index_applied\n"
+                "{pad}HybridVectorScan source={source} k={k} ef_search={ef_search:?} query_dim={qdim} metric={metric} provider={provider} prefilter={prefilter:?} columns=[id,_score,payload] rewrite=index_applied\n"
             ));
         }
         LogicalPlan::InsertInto {
@@ -461,9 +462,10 @@ fn fmt_physical(plan: &PhysicalPlan, indent: usize, out: &mut String) {
         }
         PhysicalPlan::VectorKnn(exec) => {
             out.push_str(&format!(
-                "{pad}VectorKnn source={} k={} query_dim={} metric={} provider={} columns=[id,_score,payload]\n",
+                "{pad}VectorKnn source={} k={} ef_search={:?} query_dim={} metric={} provider={} columns=[id,_score,payload]\n",
                 exec.source,
                 exec.k,
+                exec.ef_search,
                 exec.query_vector.len(),
                 exec.metric,
                 exec.provider

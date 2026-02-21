@@ -13,6 +13,15 @@ pub struct VectorTopKRow {
     pub payload_json: Option<String>,
 }
 
+/// Query-time knobs for vector index providers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VectorQueryOptions {
+    /// Optional query-time metric override (`cosine`, `dot`, `l2`).
+    pub metric: Option<String>,
+    /// Optional query-time HNSW `ef_search` override.
+    pub ef_search: Option<usize>,
+}
+
 /// Vector index abstraction used by `VectorTopKExec`.
 pub trait VectorIndexProvider: Send + Sync {
     /// Fetch top-k rows for `query_vec`, optionally applying provider-specific filter.
@@ -21,5 +30,6 @@ pub trait VectorIndexProvider: Send + Sync {
         query_vec: Vec<f32>,
         k: usize,
         filter: Option<String>,
+        options: VectorQueryOptions,
     ) -> BoxFuture<'a, Result<Vec<VectorTopKRow>>>;
 }

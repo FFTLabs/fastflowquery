@@ -486,6 +486,8 @@ pub enum LogicalPlan {
         query_vectors: Vec<Vec<f32>>,
         /// Number of rows to keep.
         k: usize,
+        /// Optional query-time HNSW `ef_search` override.
+        ef_search: Option<usize>,
         /// Optional provider-specific prefilter payload.
         prefilter: Option<String>,
         /// Distance/similarity metric (for example `cosine`).

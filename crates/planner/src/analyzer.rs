@@ -589,6 +589,7 @@ impl Analyzer {
                 source,
                 query_vectors,
                 k,
+                ef_search,
                 prefilter,
                 metric,
                 provider: backend,
@@ -599,6 +600,18 @@ impl Analyzer {
                 if query_vectors.is_empty() || query_vectors.iter().any(Vec::is_empty) {
                     return Err(FfqError::Planning(
                         "HybridVectorScan query vector(s) cannot be empty".to_string(),
+                    ));
+                }
+                if !matches!(metric.as_str(), "cosine" | "dot" | "l2") {
+                    return Err(FfqError::Planning(format!(
+                        "HybridVectorScan metric must be one of cosine|dot|l2, got '{metric}'"
+                    )));
+                }
+                if let Some(ef) = ef_search
+                    && ef == 0
+                {
+                    return Err(FfqError::Planning(
+                        "HybridVectorScan ef_search must be > 0".to_string(),
                     ));
                 }
                 let _ = provider.table_schema(&source)?;
@@ -614,6 +627,7 @@ impl Analyzer {
                         source,
                         query_vectors,
                         k,
+                        ef_search,
                         prefilter,
                         metric,
                         provider: backend,

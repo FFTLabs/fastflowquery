@@ -184,6 +184,7 @@ pub fn create_physical_plan(
             source,
             query_vectors,
             k,
+            ef_search,
             prefilter,
             metric,
             provider,
@@ -196,6 +197,7 @@ pub fn create_physical_plan(
                     )
                 })?,
                 k: *k,
+                ef_search: *ef_search,
                 prefilter: prefilter.clone(),
                 metric: metric.clone(),
                 provider: provider.clone(),

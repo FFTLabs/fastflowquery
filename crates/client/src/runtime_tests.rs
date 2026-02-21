@@ -19,7 +19,7 @@ use ffq_planner::{
     UnionAllExec, WindowExpr, WindowFrameBound, WindowFrameExclusion, WindowFrameSpec,
     WindowFrameUnits, WindowFunction, WindowOrderExpr,
 };
-use ffq_storage::vector_index::{VectorIndexProvider, VectorTopKRow};
+use ffq_storage::vector_index::{VectorIndexProvider, VectorQueryOptions, VectorTopKRow};
 use ffq_storage::{Catalog, TableDef, TableStats};
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
@@ -44,6 +44,7 @@ impl VectorIndexProvider for MockVectorProvider {
         _query_vec: Vec<f32>,
         _k: usize,
         _filter: Option<String>,
+        _options: VectorQueryOptions,
     ) -> BoxFuture<'a, ffq_common::Result<Vec<VectorTopKRow>>> {
         Box::pin(async {
             Ok(vec![

@@ -44,6 +44,8 @@ pub mod repl;
 /// TPC-H `.tbl` fixture conversion and validation helpers.
 pub mod tpch_tbl;
 
+#[cfg(feature = "vector")]
+pub use dataframe::VectorKnnOverrides;
 pub use dataframe::{DataFrame, WriteMode};
 pub use engine::Engine;
 pub use expr::*;

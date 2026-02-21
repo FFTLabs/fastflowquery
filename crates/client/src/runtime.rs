@@ -45,6 +45,8 @@ use ffq_storage::parquet_provider::ParquetProvider;
 use ffq_storage::qdrant_provider::QdrantProvider;
 #[cfg(any(feature = "qdrant", test))]
 use ffq_storage::vector_index::VectorIndexProvider;
+#[cfg(any(feature = "qdrant", test))]
+use ffq_storage::vector_index::VectorQueryOptions;
 use ffq_storage::{Catalog, StorageProvider};
 use futures::future::BoxFuture;
 use futures::{FutureExt, TryStreamExt};
@@ -1569,6 +1571,10 @@ fn execute_vector_knn(
                     as_topk.query_vector.clone(),
                     as_topk.k,
                     as_topk.filter.clone(),
+                    VectorQueryOptions {
+                        metric: Some(exec.metric.clone()),
+                        ef_search: exec.ef_search,
+                    },
                 )
                 .await?;
             rows_to_vector_knn_output(rows)
@@ -1583,7 +1589,12 @@ async fn run_vector_topk_with_provider(
     provider: &dyn VectorIndexProvider,
 ) -> Result<ExecOutput> {
     let rows = provider
-        .topk(exec.query_vector.clone(), exec.k, exec.filter.clone())
+        .topk(
+            exec.query_vector.clone(),
+            exec.k,
+            exec.filter.clone(),
+            VectorQueryOptions::default(),
+        )
         .await?;
     rows_to_vector_topk_output(rows)
 }
