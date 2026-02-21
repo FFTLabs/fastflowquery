@@ -146,10 +146,12 @@ impl DataFrame {
             &self.session.config,
         )?;
         let physical = self.session.planner.create_physical_plan(&opt)?;
+        let table_stats = render_table_stats_section(&opt, &*cat);
         Ok(format!(
-            "== Logical Plan ==\n{}\n== Physical Plan ==\n{}",
+            "== Logical Plan ==\n{}\n== Physical Plan ==\n{}\n== Table Stats ==\n{}",
             ffq_planner::explain_logical(&opt),
-            ffq_planner::explain_physical(&physical)
+            ffq_planner::explain_physical(&physical),
+            table_stats
         ))
     }
 
@@ -581,6 +583,43 @@ fn collect_table_refs(plan: &LogicalPlan, out: &mut Vec<String>) {
             collect_table_refs(input, out);
         }
     }
+}
+
+fn render_table_stats_section(plan: &LogicalPlan, catalog: &ffq_storage::Catalog) -> String {
+    let mut names = Vec::new();
+    collect_table_refs(plan, &mut names);
+    let mut seen = std::collections::HashSet::new();
+    names.retain(|n| seen.insert(n.clone()));
+    if names.is_empty() {
+        return "no table scans".to_string();
+    }
+    let mut lines = Vec::new();
+    for name in names {
+        match catalog.get(&name) {
+            Ok(table) => {
+                let bytes = table
+                    .stats
+                    .bytes
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let rows = table
+                    .stats
+                    .rows
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let file_count = table
+                    .options
+                    .get("stats.parquet.file_count")
+                    .cloned()
+                    .unwrap_or_else(|| "n/a".to_string());
+                lines.push(format!(
+                    "- {name}: bytes={bytes} rows={rows} file_count={file_count}"
+                ));
+            }
+            Err(_) => lines.push(format!("- {name}: missing from catalog")),
+        }
+    }
+    lines.join("\n")
 }
 
 fn write_single_parquet_file(

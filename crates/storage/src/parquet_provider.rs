@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Arc;
@@ -9,10 +10,12 @@ use ffq_common::{FfqError, Result};
 use ffq_execution::{ExecNode, SendableRecordBatchStream, StreamAdapter, TaskContext};
 use ffq_planner::{BinaryOp, Expr, LiteralValue};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::file::statistics::Statistics as ParquetStatistics;
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::TableDef;
 use crate::provider::{Stats, StorageExecNode, StorageProvider};
+use crate::stats::{ColumnRangeStats, ParquetFileStats, ScalarStatValue};
 
 /// Local parquet-backed [`StorageProvider`] implementation.
 ///
@@ -119,6 +122,62 @@ impl ParquetProvider {
                 path: path.clone(),
                 size_bytes: md.len(),
                 mtime_ns,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Collects parquet file statistics used for optimizer heuristics and pruning.
+    ///
+    /// Per file captures:
+    /// - `row_count`
+    /// - `size_bytes`
+    /// - per-column min/max (for supported parquet statistics types)
+    ///
+    /// # Errors
+    /// Returns an error when file metadata or parquet metadata read fails.
+    pub fn collect_parquet_file_stats(paths: &[String]) -> Result<Vec<ParquetFileStats>> {
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            let md = std::fs::metadata(path).map_err(|e| {
+                FfqError::InvalidConfig(format!(
+                    "failed to stat parquet path '{}' for stats collection: {e}",
+                    path
+                ))
+            })?;
+            let file = File::open(path)?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+                FfqError::Execution(format!(
+                    "parquet stats reader build failed for '{}': {e}",
+                    path
+                ))
+            })?;
+            let meta = builder.metadata();
+            let row_count = meta.file_metadata().num_rows() as u64;
+
+            let mut column_ranges = HashMap::<String, ColumnRangeStats>::new();
+            for rg in meta.row_groups() {
+                for col in rg.columns() {
+                    let Some(stats) = col.statistics() else {
+                        continue;
+                    };
+                    let Some(range) = column_range_from_parquet_stats(stats) else {
+                        continue;
+                    };
+                    let name = col.column_descr().name().to_string();
+                    match column_ranges.get_mut(&name) {
+                        Some(existing) => merge_column_ranges(existing, &range),
+                        None => {
+                            column_ranges.insert(name, range);
+                        }
+                    }
+                }
+            }
+            out.push(ParquetFileStats {
+                path: path.clone(),
+                size_bytes: md.len(),
+                row_count,
+                column_ranges,
             });
         }
         Ok(out)
@@ -308,12 +367,18 @@ impl StorageProvider for ParquetProvider {
         let all_paths = table.data_paths()?;
         let partition_columns = table.partition_columns();
         let partition_layout = table.partition_layout();
-        let paths =
+        let partition_pruned_paths =
             if partition_columns.is_empty() || partition_layout != "hive" || filters.is_empty() {
                 all_paths
             } else {
                 prune_partition_paths_hive(&all_paths, &partition_columns, &filters)
             };
+        let file_stats = read_parquet_file_stats_metadata(table).unwrap_or_default();
+        let paths = if filters.is_empty() || file_stats.is_empty() {
+            partition_pruned_paths
+        } else {
+            prune_paths_with_file_stats(&partition_pruned_paths, &filters, &file_stats)
+        };
         let source_schema = match &table.schema {
             Some(s) => Arc::new(s.clone()),
             None => Arc::new(Self::infer_parquet_schema(&paths)?),
@@ -599,6 +664,206 @@ fn ordering_to_i8(ord: std::cmp::Ordering) -> i8 {
     }
 }
 
+fn column_range_from_parquet_stats(stats: &ParquetStatistics) -> Option<ColumnRangeStats> {
+    match stats {
+        ParquetStatistics::Boolean(s) => Some(ColumnRangeStats {
+            min: ScalarStatValue::Bool(*s.min_opt()?),
+            max: ScalarStatValue::Bool(*s.max_opt()?),
+        }),
+        ParquetStatistics::Int32(s) => Some(ColumnRangeStats {
+            min: ScalarStatValue::Int64(*s.min_opt()? as i64),
+            max: ScalarStatValue::Int64(*s.max_opt()? as i64),
+        }),
+        ParquetStatistics::Int64(s) => Some(ColumnRangeStats {
+            min: ScalarStatValue::Int64(*s.min_opt()?),
+            max: ScalarStatValue::Int64(*s.max_opt()?),
+        }),
+        ParquetStatistics::Float(s) => Some(ColumnRangeStats {
+            min: ScalarStatValue::Float64(*s.min_opt()? as f64),
+            max: ScalarStatValue::Float64(*s.max_opt()? as f64),
+        }),
+        ParquetStatistics::Double(s) => Some(ColumnRangeStats {
+            min: ScalarStatValue::Float64(*s.min_opt()?),
+            max: ScalarStatValue::Float64(*s.max_opt()?),
+        }),
+        ParquetStatistics::ByteArray(s) => {
+            let min = std::str::from_utf8(s.min_opt()?.data()).ok()?.to_string();
+            let max = std::str::from_utf8(s.max_opt()?.data()).ok()?.to_string();
+            Some(ColumnRangeStats {
+                min: ScalarStatValue::Utf8(min),
+                max: ScalarStatValue::Utf8(max),
+            })
+        }
+        ParquetStatistics::FixedLenByteArray(s) => {
+            let min = std::str::from_utf8(s.min_opt()?.data()).ok()?.to_string();
+            let max = std::str::from_utf8(s.max_opt()?.data()).ok()?.to_string();
+            Some(ColumnRangeStats {
+                min: ScalarStatValue::Utf8(min),
+                max: ScalarStatValue::Utf8(max),
+            })
+        }
+        ParquetStatistics::Int96(_) => None,
+    }
+}
+
+fn merge_column_ranges(current: &mut ColumnRangeStats, incoming: &ColumnRangeStats) {
+    if scalar_stat_cmp(&incoming.min, &current.min).is_some_and(|ord| matches!(ord, Ordering::Less))
+    {
+        current.min = incoming.min.clone();
+    }
+    if scalar_stat_cmp(&incoming.max, &current.max)
+        .is_some_and(|ord| matches!(ord, Ordering::Greater))
+    {
+        current.max = incoming.max.clone();
+    }
+}
+
+fn scalar_stat_cmp(left: &ScalarStatValue, right: &ScalarStatValue) -> Option<Ordering> {
+    match (left, right) {
+        (ScalarStatValue::Int64(a), ScalarStatValue::Int64(b)) => Some(a.cmp(b)),
+        (ScalarStatValue::Float64(a), ScalarStatValue::Float64(b)) => a.partial_cmp(b),
+        (ScalarStatValue::Int64(a), ScalarStatValue::Float64(b)) => (*a as f64).partial_cmp(b),
+        (ScalarStatValue::Float64(a), ScalarStatValue::Int64(b)) => a.partial_cmp(&(*b as f64)),
+        (ScalarStatValue::Bool(a), ScalarStatValue::Bool(b)) => Some(a.cmp(b)),
+        (ScalarStatValue::Utf8(a), ScalarStatValue::Utf8(b)) => Some(a.cmp(b)),
+        _ => None,
+    }
+}
+
+fn read_parquet_file_stats_metadata(table: &TableDef) -> Option<Vec<ParquetFileStats>> {
+    let raw = table.options.get("stats.parquet.files")?;
+    serde_json::from_str(raw).ok()
+}
+
+fn prune_paths_with_file_stats(
+    paths: &[String],
+    filters: &[Expr],
+    file_stats: &[ParquetFileStats],
+) -> Vec<String> {
+    let by_path = file_stats
+        .iter()
+        .map(|s| (s.path.as_str(), s))
+        .collect::<HashMap<_, _>>();
+    paths
+        .iter()
+        .filter(|path| {
+            let Some(stats) = by_path.get(path.as_str()) else {
+                return true;
+            };
+            !filters.iter().any(|f| {
+                matches!(
+                    eval_file_stats_predicate(f, &stats.column_ranges),
+                    Tri::False
+                )
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+fn eval_file_stats_predicate(expr: &Expr, ranges: &HashMap<String, ColumnRangeStats>) -> Tri {
+    match expr {
+        Expr::And(l, r) => match (
+            eval_file_stats_predicate(l, ranges),
+            eval_file_stats_predicate(r, ranges),
+        ) {
+            (Tri::False, _) | (_, Tri::False) => Tri::False,
+            (Tri::True, Tri::True) => Tri::True,
+            _ => Tri::Unknown,
+        },
+        Expr::Or(l, r) => match (
+            eval_file_stats_predicate(l, ranges),
+            eval_file_stats_predicate(r, ranges),
+        ) {
+            (Tri::True, _) | (_, Tri::True) => Tri::True,
+            (Tri::False, Tri::False) => Tri::False,
+            _ => Tri::Unknown,
+        },
+        Expr::Not(inner) => match eval_file_stats_predicate(inner, ranges) {
+            Tri::True => Tri::False,
+            Tri::False => Tri::True,
+            Tri::Unknown => Tri::Unknown,
+        },
+        Expr::BinaryOp { left, op, right } => eval_file_stats_binary(left, *op, right, ranges),
+        _ => Tri::Unknown,
+    }
+}
+
+fn eval_file_stats_binary(
+    left: &Expr,
+    op: BinaryOp,
+    right: &Expr,
+    ranges: &HashMap<String, ColumnRangeStats>,
+) -> Tri {
+    if let Some((column, lit)) = column_and_literal(left, right) {
+        return eval_file_range(column, op, lit, ranges);
+    }
+    if let Some((column, lit)) = column_and_literal(right, left) {
+        let swapped = match op {
+            BinaryOp::Lt => BinaryOp::Gt,
+            BinaryOp::LtEq => BinaryOp::GtEq,
+            BinaryOp::Gt => BinaryOp::Lt,
+            BinaryOp::GtEq => BinaryOp::LtEq,
+            other => other,
+        };
+        return eval_file_range(column, swapped, lit, ranges);
+    }
+    Tri::Unknown
+}
+
+fn eval_file_range(
+    column: &str,
+    op: BinaryOp,
+    literal: &LiteralValue,
+    ranges: &HashMap<String, ColumnRangeStats>,
+) -> Tri {
+    let Some(range) = ranges.get(column) else {
+        return Tri::Unknown;
+    };
+    let min_cmp = compare_scalar_stat_literal(&range.min, literal);
+    let max_cmp = compare_scalar_stat_literal(&range.max, literal);
+    match op {
+        BinaryOp::Eq => match (min_cmp, max_cmp) {
+            (Some(min), Some(max)) if min == 1 || max == -1 => Tri::False,
+            _ => Tri::Unknown,
+        },
+        BinaryOp::NotEq => match (min_cmp, max_cmp, scalar_stat_cmp(&range.min, &range.max)) {
+            (Some(0), Some(0), Some(Ordering::Equal)) => Tri::False,
+            _ => Tri::Unknown,
+        },
+        BinaryOp::Lt => match min_cmp {
+            Some(ord) if ord >= 0 => Tri::False,
+            _ => Tri::Unknown,
+        },
+        BinaryOp::LtEq => match min_cmp {
+            Some(ord) if ord == 1 => Tri::False,
+            _ => Tri::Unknown,
+        },
+        BinaryOp::Gt => match max_cmp {
+            Some(ord) if ord <= 0 => Tri::False,
+            _ => Tri::Unknown,
+        },
+        BinaryOp::GtEq => match max_cmp {
+            Some(ord) if ord == -1 => Tri::False,
+            _ => Tri::Unknown,
+        },
+        _ => Tri::Unknown,
+    }
+}
+
+fn compare_scalar_stat_literal(left: &ScalarStatValue, right: &LiteralValue) -> Option<i8> {
+    let ord = match (left, right) {
+        (ScalarStatValue::Int64(a), LiteralValue::Int64(b)) => a.cmp(b),
+        (ScalarStatValue::Float64(a), LiteralValue::Float64(b)) => a.partial_cmp(b)?,
+        (ScalarStatValue::Int64(a), LiteralValue::Float64(b)) => (*a as f64).partial_cmp(b)?,
+        (ScalarStatValue::Float64(a), LiteralValue::Int64(b)) => a.partial_cmp(&(*b as f64))?,
+        (ScalarStatValue::Bool(a), LiteralValue::Boolean(b)) => a.cmp(b),
+        (ScalarStatValue::Utf8(a), LiteralValue::Utf8(b)) => a.cmp(b),
+        _ => return None,
+    };
+    Some(ordering_to_i8(ord))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -764,6 +1029,79 @@ mod tests {
         }];
         let pruned = prune_partition_paths_hive(&paths, &["ds".to_string()], &filters);
         assert_eq!(pruned, paths);
+    }
+
+    #[test]
+    fn collect_parquet_file_stats_extracts_rows_size_and_min_max() {
+        let p = unique_path("stats_collect", "parquet");
+        write_parquet_file(
+            &p,
+            Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(vec![2_i64, 9, 4])) as ArrayRef],
+        );
+        let paths = vec![p.to_string_lossy().to_string()];
+        let stats = ParquetProvider::collect_parquet_file_stats(&paths).expect("collect stats");
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].row_count, 3);
+        assert!(stats[0].size_bytes > 0);
+        let v = stats[0].column_ranges.get("v").expect("range");
+        assert_eq!(v.min, ScalarStatValue::Int64(2));
+        assert_eq!(v.max, ScalarStatValue::Int64(9));
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn file_stats_pruning_rejects_files_outside_range() {
+        let paths = vec![
+            "/tmp/t/a.parquet".to_string(),
+            "/tmp/t/b.parquet".to_string(),
+            "/tmp/t/c.parquet".to_string(),
+        ];
+        let stats = vec![
+            ParquetFileStats {
+                path: "/tmp/t/a.parquet".to_string(),
+                size_bytes: 1,
+                row_count: 1,
+                column_ranges: HashMap::from([(
+                    "x".to_string(),
+                    ColumnRangeStats {
+                        min: ScalarStatValue::Int64(1),
+                        max: ScalarStatValue::Int64(5),
+                    },
+                )]),
+            },
+            ParquetFileStats {
+                path: "/tmp/t/b.parquet".to_string(),
+                size_bytes: 1,
+                row_count: 1,
+                column_ranges: HashMap::from([(
+                    "x".to_string(),
+                    ColumnRangeStats {
+                        min: ScalarStatValue::Int64(8),
+                        max: ScalarStatValue::Int64(10),
+                    },
+                )]),
+            },
+            ParquetFileStats {
+                path: "/tmp/t/c.parquet".to_string(),
+                size_bytes: 1,
+                row_count: 1,
+                column_ranges: HashMap::from([(
+                    "x".to_string(),
+                    ColumnRangeStats {
+                        min: ScalarStatValue::Int64(12),
+                        max: ScalarStatValue::Int64(15),
+                    },
+                )]),
+            },
+        ];
+        let filters = vec![Expr::BinaryOp {
+            left: Box::new(Expr::Column("x".to_string())),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Literal(LiteralValue::Int64(9))),
+        }];
+        let pruned = prune_paths_with_file_stats(&paths, &filters, &stats);
+        assert_eq!(pruned, vec!["/tmp/t/b.parquet".to_string()]);
     }
 
     fn write_parquet_file(path: &std::path::Path, schema: Arc<Schema>, cols: Vec<ArrayRef>) {

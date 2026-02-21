@@ -74,12 +74,12 @@ impl Session {
         } else {
             Catalog::new()
         };
-        if config.schema_inference.allows_inference() {
+        {
             let mut changed = false;
             for mut table in catalog.tables() {
-                let inferred =
+                let inferred_or_stats_changed =
                     maybe_infer_table_schema_on_register(config.schema_inference, &mut table)?;
-                changed |= inferred;
+                changed |= inferred_or_stats_changed;
                 catalog.register_table(table);
             }
             if changed && config.schema_writeback {

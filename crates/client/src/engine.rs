@@ -8,8 +8,8 @@ use arrow_schema::Schema;
 use ffq_common::{EngineConfig, Result, SchemaInferencePolicy};
 use ffq_execution::{ScalarUdf, deregister_scalar_udf, register_scalar_udf};
 use ffq_planner::{LiteralValue, OptimizerRule, ScalarUdfTypeResolver};
-use ffq_storage::TableDef;
 use ffq_storage::parquet_provider::{FileFingerprint, ParquetProvider};
+use ffq_storage::{ParquetFileStats, TableDef};
 
 use crate::DataFrame;
 use crate::physical_registry::PhysicalOperatorFactory;
@@ -365,7 +365,7 @@ pub(crate) fn maybe_infer_table_schema_on_register(
         || !table.format.eq_ignore_ascii_case("parquet")
         || table.schema.is_some()
     {
-        return Ok(false);
+        return maybe_collect_parquet_file_stats_on_register(table);
     }
     let paths = table.data_paths()?;
     let fingerprint = ParquetProvider::fingerprint_paths(&paths)?;
@@ -381,6 +381,7 @@ pub(crate) fn maybe_infer_table_schema_on_register(
     })?;
     table.schema = Some(schema);
     annotate_schema_inference_metadata(table, &fingerprint)?;
+    let _ = maybe_collect_parquet_file_stats_on_register(table)?;
     Ok(true)
 }
 
@@ -418,4 +419,44 @@ pub(crate) fn read_schema_fingerprint_metadata(
         ))
     })?;
     Ok(Some(fp))
+}
+
+pub(crate) fn maybe_collect_parquet_file_stats_on_register(table: &mut TableDef) -> Result<bool> {
+    if !table.format.eq_ignore_ascii_case("parquet") {
+        return Ok(false);
+    }
+    let paths = table.data_paths()?;
+    let file_stats = ParquetProvider::collect_parquet_file_stats(&paths)?;
+    if file_stats.is_empty() {
+        return Ok(false);
+    }
+    let total_rows = file_stats
+        .iter()
+        .fold(0_u64, |acc, s| acc.saturating_add(s.row_count));
+    let total_bytes = file_stats
+        .iter()
+        .fold(0_u64, |acc, s| acc.saturating_add(s.size_bytes));
+    table.stats.rows = Some(total_rows);
+    table.stats.bytes = Some(total_bytes);
+    annotate_parquet_file_stats_metadata(table, &file_stats)?;
+    Ok(true)
+}
+
+pub(crate) fn annotate_parquet_file_stats_metadata(
+    table: &mut TableDef,
+    file_stats: &[ParquetFileStats],
+) -> Result<()> {
+    table.options.insert(
+        "stats.parquet.files".to_string(),
+        serde_json::to_string(file_stats).map_err(|e| {
+            ffq_common::FfqError::InvalidConfig(format!(
+                "failed to encode parquet file stats metadata: {e}"
+            ))
+        })?,
+    );
+    table.options.insert(
+        "stats.parquet.file_count".to_string(),
+        file_stats.len().to_string(),
+    );
+    Ok(())
 }
