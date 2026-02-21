@@ -83,12 +83,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env_bool_or_default("FFQ_SPECULATIVE_EXECUTION_ENABLED", true);
     let speculative_min_completed_samples =
         env_u32_or_default("FFQ_SPECULATIVE_MIN_COMPLETED_SAMPLES", 5);
-    let speculative_p95_multiplier =
-        env_f64_or_default("FFQ_SPECULATIVE_P95_MULTIPLIER", 1.5);
-    let speculative_min_runtime_ms =
-        env_u64_or_default("FFQ_SPECULATIVE_MIN_RUNTIME_MS", 250);
-    let locality_preference_enabled =
-        env_bool_or_default("FFQ_LOCALITY_PREFERENCE_ENABLED", true);
+    let speculative_p95_multiplier = env_f64_or_default("FFQ_SPECULATIVE_P95_MULTIPLIER", 1.5);
+    let speculative_min_runtime_ms = env_u64_or_default("FFQ_SPECULATIVE_MIN_RUNTIME_MS", 250);
+    let locality_preference_enabled = env_bool_or_default("FFQ_LOCALITY_PREFERENCE_ENABLED", true);
     let catalog_path = env::var("FFQ_COORDINATOR_CATALOG_PATH").ok();
     std::fs::create_dir_all(&shuffle_root)?;
     let catalog = load_catalog(catalog_path.clone())?;

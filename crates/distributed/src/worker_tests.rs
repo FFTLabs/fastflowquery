@@ -811,9 +811,8 @@ fn shuffle_read_incremental_cursor_resets_when_latest_attempt_changes() {
 
     let reader = ShuffleReader::new(&shuffle_root);
     let mut cursors = HashMap::<u32, (u32, u64)>::new();
-    let (attempt1, first) =
-        read_partition_incremental_latest(&reader, 5006, 1, 0, 0, &mut cursors)
-            .expect("read attempt1");
+    let (attempt1, first) = read_partition_incremental_latest(&reader, 5006, 1, 0, 0, &mut cursors)
+        .expect("read attempt1");
     assert_eq!(attempt1, 1);
     assert_eq!(first.iter().map(|b| b.num_rows() as u64).sum::<u64>(), 3);
 

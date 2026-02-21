@@ -58,6 +58,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cpu_slots = env_usize_or_default("FFQ_WORKER_CPU_SLOTS", 2);
     let per_task_memory_budget_bytes =
         env_usize_or_default("FFQ_WORKER_MEM_BUDGET_BYTES", 64 * 1024 * 1024);
+    let engine_memory_budget_bytes = env_usize_or_default(
+        "FFQ_WORKER_ENGINE_MEM_BUDGET_BYTES",
+        per_task_memory_budget_bytes.saturating_mul(cpu_slots.max(1)),
+    );
+    let batch_size_rows = env_usize_or_default("FFQ_WORKER_BATCH_SIZE_ROWS", 8192);
     let map_output_publish_window_partitions =
         env_u64_or_default("FFQ_MAP_OUTPUT_PUBLISH_WINDOW_PARTITIONS", 1) as u32;
     let reduce_fetch_window_partitions =
@@ -69,7 +74,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env_usize_or_default("FFQ_STREAM_MAX_PARTITIONS_PER_STREAM", 65536);
     let max_chunks_per_response = env_usize_or_default("FFQ_STREAM_MAX_CHUNKS_PER_RESPONSE", 1024);
     let inactive_stream_ttl_ms = env_u64_or_default("FFQ_STREAM_INACTIVE_TTL_MS", 10 * 60 * 1000);
-    let shuffle_fetch_chunk_bytes = env_usize_or_default("FFQ_SHUFFLE_FETCH_CHUNK_BYTES", 64 * 1024);
+    let shuffle_fetch_chunk_bytes =
+        env_usize_or_default("FFQ_SHUFFLE_FETCH_CHUNK_BYTES", 64 * 1024);
     let catalog_path = env::var("FFQ_WORKER_CATALOG_PATH").ok();
 
     std::fs::create_dir_all(&shuffle_root)?;
@@ -83,6 +89,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             worker_id: worker_id.clone(),
             cpu_slots,
             per_task_memory_budget_bytes,
+            engine_memory_budget_bytes,
+            batch_size_rows,
             shuffle_compression_codec: shuffle_codec,
             map_output_publish_window_partitions,
             reduce_fetch_window_partitions,

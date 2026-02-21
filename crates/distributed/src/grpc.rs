@@ -510,7 +510,10 @@ impl ShuffleService for WorkerShuffleService {
         }
         versions.insert(key.clone(), req.layout_version);
         drop(versions);
-        self.map_outputs.lock().await.insert(key.clone(), partitions);
+        self.map_outputs
+            .lock()
+            .await
+            .insert(key.clone(), partitions);
         touched.insert(key, now_ms);
         Ok(Response::new(v1::RegisterMapOutputResponse {}))
     }
@@ -548,7 +551,8 @@ impl ShuffleService for WorkerShuffleService {
                 )));
             }
         }
-        let reader = ShuffleReader::new(&self.shuffle_root).with_fetch_chunk_bytes(self.fetch_chunk_bytes);
+        let reader =
+            ShuffleReader::new(&self.shuffle_root).with_fetch_chunk_bytes(self.fetch_chunk_bytes);
         let attempt = if req.attempt == 0 {
             let attempt = reader
                 .latest_attempt(query_num, req.stage_id, req.map_task)

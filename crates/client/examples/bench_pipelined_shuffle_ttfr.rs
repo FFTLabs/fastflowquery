@@ -9,8 +9,8 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use ffq_common::{FfqError, Result};
 use ffq_distributed::{
-    Coordinator, CoordinatorConfig, DefaultTaskExecutor, InProcessControlPlane, QueryState,
-    Worker, WorkerConfig,
+    Coordinator, CoordinatorConfig, DefaultTaskExecutor, InProcessControlPlane, QueryState, Worker,
+    WorkerConfig,
 };
 use ffq_planner::{AggExpr, Expr, LogicalPlan, PhysicalPlannerConfig, create_physical_plan};
 use ffq_storage::{Catalog, TableDef, TableStats};
@@ -129,7 +129,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_mode(opts: &CliOptions, parquet_path: &Path, pipelined_shuffle: bool) -> Result<ModeMetrics> {
+async fn run_mode(
+    opts: &CliOptions,
+    parquet_path: &Path,
+    pipelined_shuffle: bool,
+) -> Result<ModeMetrics> {
     let mut ttfr_samples = Vec::with_capacity(opts.iterations);
     let mut total_samples = Vec::with_capacity(opts.iterations);
 
@@ -330,7 +334,10 @@ fn write_synthetic_lineitem(path: &Path, rows: usize) -> Result<()> {
             .collect::<Vec<_>>();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(keys)), Arc::new(Float64Array::from(qty))],
+            vec![
+                Arc::new(Int64Array::from(keys)),
+                Arc::new(Float64Array::from(qty)),
+            ],
         )
         .map_err(|e| FfqError::Execution(format!("build synthetic batch failed: {e}")))?;
         writer

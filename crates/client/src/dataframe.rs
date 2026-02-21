@@ -357,6 +357,8 @@ impl DataFrame {
         let ctx = QueryContext {
             batch_size_rows: self.session.config.batch_size_rows,
             mem_budget_bytes: self.session.config.mem_budget_bytes,
+            spill_trigger_ratio_num: 1,
+            spill_trigger_ratio_den: 1,
             broadcast_threshold_bytes: self.session.config.broadcast_threshold_bytes,
             join_radix_bits: self.session.config.join_radix_bits,
             join_bloom_enabled: self.session.config.join_bloom_enabled,

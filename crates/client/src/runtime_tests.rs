@@ -333,6 +333,8 @@ fn window_exec_spills_under_tight_memory_budget_and_cleans_temp_files() {
     let ctx = QueryContext {
         batch_size_rows: 512,
         mem_budget_bytes: 256,
+        spill_trigger_ratio_num: 1,
+        spill_trigger_ratio_den: 1,
         broadcast_threshold_bytes: u64::MAX,
         join_radix_bits: 8,
         join_bloom_enabled: true,
@@ -429,6 +431,8 @@ fn materialized_cte_ref_executes_shared_subplan_once() {
         QueryContext {
             batch_size_rows: 1024,
             mem_budget_bytes: 64 * 1024 * 1024,
+            spill_trigger_ratio_num: 1,
+            spill_trigger_ratio_den: 1,
             broadcast_threshold_bytes: u64::MAX,
             join_radix_bits: 8,
             join_bloom_enabled: true,

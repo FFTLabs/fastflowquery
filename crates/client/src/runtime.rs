@@ -18,6 +18,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::physical_registry::PhysicalOperatorRegistry;
@@ -30,7 +31,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::adaptive::{AdaptiveReducePlan, plan_adaptive_reduce_layout};
 use ffq_common::metrics::global_metrics;
-use ffq_common::{FfqError, Result};
+use ffq_common::{FfqError, MemoryPressureSignal, MemorySpillManager, Result};
 use ffq_execution::{SendableRecordBatchStream, StreamAdapter, TaskContext, compile_expr};
 use ffq_planner::{
     AggExpr, BinaryOp, BuildSide, ExchangeExec, Expr, JoinType, LiteralValue, PartitioningSpec,
@@ -52,6 +53,7 @@ use tracing::{Instrument, info, info_span};
 use tracing::{debug, error};
 
 const E_SUBQUERY_SCALAR_ROW_VIOLATION: &str = "E_SUBQUERY_SCALAR_ROW_VIOLATION";
+const MIN_RUNTIME_BATCH_SIZE_ROWS: usize = 256;
 
 #[derive(Debug, Clone)]
 /// Per-query runtime controls.
@@ -61,12 +63,39 @@ const E_SUBQUERY_SCALAR_ROW_VIOLATION: &str = "E_SUBQUERY_SCALAR_ROW_VIOLATION";
 pub struct QueryContext {
     pub batch_size_rows: usize,
     pub mem_budget_bytes: usize,
+    pub spill_trigger_ratio_num: u32,
+    pub spill_trigger_ratio_den: u32,
     pub broadcast_threshold_bytes: u64,
     pub join_radix_bits: u8,
     pub join_bloom_enabled: bool,
     pub join_bloom_bits: u8,
     pub spill_dir: String,
     pub(crate) stats_collector: Option<Arc<RuntimeStatsCollector>>,
+}
+
+fn embedded_memory_manager(base_batch_size_rows: usize) -> Arc<MemorySpillManager> {
+    static MANAGER: OnceLock<Arc<MemorySpillManager>> = OnceLock::new();
+    Arc::clone(MANAGER.get_or_init(|| {
+        let engine_budget = std::env::var("FFQ_ENGINE_MEM_BUDGET_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+        MemorySpillManager::new(
+            engine_budget,
+            base_batch_size_rows,
+            MIN_RUNTIME_BATCH_SIZE_ROWS,
+        )
+    }))
+}
+
+fn spill_signal_for_ctx(ctx: &QueryContext) -> MemoryPressureSignal {
+    MemoryPressureSignal {
+        pressure: ffq_common::MemoryPressure::Normal,
+        effective_mem_budget_bytes: ctx.mem_budget_bytes,
+        suggested_batch_size_rows: ctx.batch_size_rows,
+        spill_trigger_ratio_num: ctx.spill_trigger_ratio_num.max(1),
+        spill_trigger_ratio_den: ctx.spill_trigger_ratio_den.max(1),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -309,6 +338,21 @@ impl Runtime for EmbeddedRuntime {
         physical_registry: Arc<PhysicalOperatorRegistry>,
     ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
         async move {
+            let requested = if ctx.mem_budget_bytes == usize::MAX {
+                0
+            } else {
+                ctx.mem_budget_bytes
+            };
+            let manager = embedded_memory_manager(ctx.batch_size_rows);
+            let reservation = manager.reserve(requested);
+            let signal = reservation.signal();
+            let mut exec_ctx = ctx;
+            if requested > 0 {
+                exec_ctx.mem_budget_bytes = signal.effective_mem_budget_bytes;
+            }
+            exec_ctx.batch_size_rows = signal.suggested_batch_size_rows;
+            exec_ctx.spill_trigger_ratio_num = signal.spill_trigger_ratio_num;
+            exec_ctx.spill_trigger_ratio_den = signal.spill_trigger_ratio_den;
             let trace = Arc::new(TraceIds {
                 query_id: local_query_id()?,
                 stage_id: 0,
@@ -321,8 +365,14 @@ impl Runtime for EmbeddedRuntime {
                 mode = "embedded",
                 "query execution started"
             );
-            let exec =
-                execute_plan(plan, ctx, catalog, physical_registry, Arc::clone(&trace)).await?;
+            let exec = execute_plan(
+                plan,
+                exec_ctx,
+                catalog,
+                physical_registry,
+                Arc::clone(&trace),
+            )
+            .await?;
             info!(
                 query_id = %trace.query_id,
                 stage_id = trace.stage_id,
@@ -1743,8 +1793,9 @@ fn run_hash_join(
         .map(|v| v.as_slice())
         .unwrap_or(probe_rows);
 
+    let spill_signal = spill_signal_for_ctx(ctx);
     let mut match_output = if ctx.mem_budget_bytes > 0
-        && estimate_join_rows_bytes(build_rows) > ctx.mem_budget_bytes
+        && spill_signal.should_spill(estimate_join_rows_bytes(build_rows))
     {
         grace_hash_join(
             build_rows,
@@ -2031,6 +2082,8 @@ fn run_window_exec(input: ExecOutput, exprs: &[WindowExpr]) -> Result<ExecOutput
     let default_ctx = QueryContext {
         batch_size_rows: 8192,
         mem_budget_bytes: usize::MAX,
+        spill_trigger_ratio_num: 1,
+        spill_trigger_ratio_den: 1,
         broadcast_threshold_bytes: u64::MAX,
         join_radix_bits: 8,
         join_bloom_enabled: true,
@@ -2123,7 +2176,8 @@ fn evaluate_window_expr_spill_aware(
     let row_count = input.batches.iter().map(|b| b.num_rows()).sum::<usize>();
     let estimated = estimate_window_eval_context_bytes(eval_ctx)
         + estimate_window_output_bytes(row_count, output_type);
-    if ctx.mem_budget_bytes == 0 || estimated <= ctx.mem_budget_bytes {
+    let spill_signal = spill_signal_for_ctx(ctx);
+    if ctx.mem_budget_bytes == 0 || !spill_signal.should_spill(estimated) {
         return evaluate_window_expr_with_ctx(input, w, eval_ctx);
     }
 
@@ -4442,12 +4496,13 @@ fn maybe_spill(
     ctx: &QueryContext,
     trace: &TraceIds,
 ) -> Result<()> {
+    let spill_signal = spill_signal_for_ctx(ctx);
     if groups.is_empty() || ctx.mem_budget_bytes == 0 {
         return Ok(());
     }
 
     let estimated = estimate_groups_bytes(groups);
-    if estimated <= ctx.mem_budget_bytes {
+    if !spill_signal.should_spill(estimated) {
         return Ok(());
     }
 
@@ -4456,7 +4511,7 @@ fn maybe_spill(
         .duration_since(UNIX_EPOCH)
         .map_err(|e| FfqError::Execution(format!("clock error: {e}")))?
         .as_nanos();
-    let target_bytes = ctx.mem_budget_bytes.saturating_mul(3) / 4;
+    let target_bytes = spill_signal.spill_target_bytes(3, 4);
     let target_bytes = target_bytes.max(1);
     let mut partition_cursor = 0_u8;
     let mut empty_partition_streak = 0_u8;

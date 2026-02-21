@@ -1155,8 +1155,10 @@ impl Coordinator {
                     self.worker_failures.remove(worker);
                 }
                 if task_is_speculative {
-                    stage.metrics.speculative_newer_attempt_wins =
-                        stage.metrics.speculative_newer_attempt_wins.saturating_add(1);
+                    stage.metrics.speculative_newer_attempt_wins = stage
+                        .metrics
+                        .speculative_newer_attempt_wins
+                        .saturating_add(1);
                 }
             }
             TaskState::Failed => {
@@ -2134,7 +2136,9 @@ fn worker_matches_locality(worker: Option<&WorkerHeartbeat>, locality_hints: &[S
     let Some(worker) = worker else {
         return false;
     };
-    locality_hints.iter().any(|hint| worker.locality_tags.contains(hint))
+    locality_hints
+        .iter()
+        .any(|hint| worker.locality_tags.contains(hint))
 }
 
 fn has_any_live_worker_for_locality(
@@ -2151,7 +2155,9 @@ fn has_any_live_worker_for_locality(
         if liveness_timeout_ms > 0 && now_ms.saturating_sub(hb.last_seen_ms) > liveness_timeout_ms {
             return false;
         }
-        locality_hints.iter().any(|hint| hb.locality_tags.contains(hint))
+        locality_hints
+            .iter()
+            .any(|hint| hb.locality_tags.contains(hint))
     })
 }
 
@@ -2274,8 +2280,10 @@ fn enqueue_speculative_attempts(
         );
         if let Some(stage) = query.stages.get_mut(&stage_id) {
             stage.metrics.queued_tasks = stage.metrics.queued_tasks.saturating_add(1);
-            stage.metrics.speculative_attempts_launched =
-                stage.metrics.speculative_attempts_launched.saturating_add(1);
+            stage.metrics.speculative_attempts_launched = stage
+                .metrics
+                .speculative_attempts_launched
+                .saturating_add(1);
             push_stage_aqe_event(
                 &mut stage.metrics,
                 format!(
@@ -2306,7 +2314,10 @@ fn adopt_older_attempt_success_from_speculation(
     if newer_attempts.is_empty() {
         return false;
     }
-    if newer_attempts.iter().any(|t| t.state == TaskState::Succeeded) {
+    if newer_attempts
+        .iter()
+        .any(|t| t.state == TaskState::Succeeded)
+    {
         return false;
     }
     if !newer_attempts.iter().any(|t| t.is_speculative) {
@@ -2335,8 +2346,10 @@ fn adopt_older_attempt_success_from_speculation(
             .metrics
             .failed_tasks
             .saturating_add(removed_queued.saturating_add(removed_running));
-        stage.metrics.speculative_older_attempt_wins =
-            stage.metrics.speculative_older_attempt_wins.saturating_add(1);
+        stage.metrics.speculative_older_attempt_wins = stage
+            .metrics
+            .speculative_older_attempt_wins
+            .saturating_add(1);
     }
     true
 }
@@ -4235,7 +4248,12 @@ mod tests {
             .expect("map stage metrics");
         assert_eq!(map_stage.map_output_bytes, 100);
         assert!(map_stage.stream_active_count >= 1);
-        assert!(map_stage.backpressure_events.iter().any(|e| e.contains("window_update")));
+        assert!(
+            map_stage
+                .backpressure_events
+                .iter()
+                .any(|e| e.contains("window_update"))
+        );
 
         let reduce_stage = st
             .stage_metrics

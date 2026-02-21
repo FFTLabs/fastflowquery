@@ -30,7 +30,7 @@ use arrow::compute::concat_batches;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::metrics::global_metrics;
-use ffq_common::{FfqError, Result};
+use ffq_common::{FfqError, MemoryPressureSignal, MemorySpillManager, Result};
 use ffq_execution::{
     PhysicalOperatorRegistry, TaskContext as ExecTaskContext, compile_expr,
     global_physical_operator_registry,
@@ -59,6 +59,7 @@ use crate::coordinator::{Coordinator, MapOutputPartitionMeta, TaskAssignment, Ta
 use crate::grpc::v1;
 
 const E_SUBQUERY_SCALAR_ROW_VIOLATION: &str = "E_SUBQUERY_SCALAR_ROW_VIOLATION";
+const MIN_TASK_BATCH_SIZE_ROWS: usize = 256;
 
 #[derive(Debug, Clone)]
 /// Worker resource/configuration controls.
@@ -69,6 +70,8 @@ pub struct WorkerConfig {
     pub cpu_slots: usize,
     /// Per-task soft memory budget.
     pub per_task_memory_budget_bytes: usize,
+    /// Engine-level memory budget shared by all concurrent tasks on this worker.
+    pub engine_memory_budget_bytes: usize,
     /// Number of radix bits for in-memory hash join partitioning.
     pub join_radix_bits: u8,
     /// Enables build-side bloom prefiltering on probe rows for join execution.
@@ -81,6 +84,8 @@ pub struct WorkerConfig {
     pub map_output_publish_window_partitions: u32,
     /// Number of assigned reduce partitions fetched per read window.
     pub reduce_fetch_window_partitions: u32,
+    /// Base execution batch size used when pressure is normal.
+    pub batch_size_rows: usize,
     /// Local spill directory for memory-pressure fallback paths.
     pub spill_dir: PathBuf,
     /// Root directory containing shuffle data.
@@ -93,12 +98,14 @@ impl Default for WorkerConfig {
             worker_id: "worker-1".to_string(),
             cpu_slots: 2,
             per_task_memory_budget_bytes: 64 * 1024 * 1024,
+            engine_memory_budget_bytes: 128 * 1024 * 1024,
             join_radix_bits: 8,
             join_bloom_enabled: true,
             join_bloom_bits: 20,
             shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
             map_output_publish_window_partitions: 1,
             reduce_fetch_window_partitions: 4,
+            batch_size_rows: 8192,
             spill_dir: PathBuf::from(".ffq_spill"),
             shuffle_root: PathBuf::from("."),
         }
@@ -118,6 +125,12 @@ pub struct TaskContext {
     pub attempt: u32,
     /// Per-task soft memory budget.
     pub per_task_memory_budget_bytes: usize,
+    /// Runtime batch size hint for operator execution.
+    pub batch_size_rows: usize,
+    /// Spill trigger ratio numerator.
+    pub spill_trigger_ratio_num: u32,
+    /// Spill trigger ratio denominator.
+    pub spill_trigger_ratio_den: u32,
     /// Number of radix bits for in-memory hash join partitioning.
     pub join_radix_bits: u8,
     /// Enables build-side bloom prefiltering on probe rows for join execution.
@@ -140,6 +153,16 @@ pub struct TaskContext {
     pub assigned_reduce_split_index: u32,
     /// Hash-shard split count for assigned reduce partitions.
     pub assigned_reduce_split_count: u32,
+}
+
+fn spill_signal_for_task_ctx(ctx: &TaskContext) -> MemoryPressureSignal {
+    MemoryPressureSignal {
+        pressure: ffq_common::MemoryPressure::Normal,
+        effective_mem_budget_bytes: ctx.per_task_memory_budget_bytes,
+        suggested_batch_size_rows: ctx.batch_size_rows,
+        spill_trigger_ratio_num: ctx.spill_trigger_ratio_num.max(1),
+        spill_trigger_ratio_den: ctx.spill_trigger_ratio_den.max(1),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -339,6 +362,7 @@ where
     control_plane: Arc<C>,
     task_executor: Arc<E>,
     cpu_slots: Arc<Semaphore>,
+    memory_manager: Arc<MemorySpillManager>,
 }
 
 impl<C, E> Worker<C, E>
@@ -349,11 +373,17 @@ where
     /// Build worker runtime with control plane and task executor.
     pub fn new(config: WorkerConfig, control_plane: Arc<C>, task_executor: Arc<E>) -> Self {
         let slots = config.cpu_slots.max(1);
+        let memory_manager = MemorySpillManager::new(
+            config.engine_memory_budget_bytes,
+            config.batch_size_rows,
+            MIN_TASK_BATCH_SIZE_ROWS,
+        );
         Self {
             config,
             control_plane,
             task_executor,
             cpu_slots: Arc::new(Semaphore::new(slots)),
+            memory_manager,
         }
     }
 
@@ -399,12 +429,18 @@ where
             let worker_id = self.config.worker_id.clone();
             let control_plane = Arc::clone(&self.control_plane);
             let task_executor = Arc::clone(&self.task_executor);
+            let requested = self.config.per_task_memory_budget_bytes;
+            let reservation = self.memory_manager.reserve(requested);
+            let signal = reservation.signal();
             let task_ctx = TaskContext {
                 query_id: assignment.query_id.clone(),
                 stage_id: assignment.stage_id,
                 task_id: assignment.task_id,
                 attempt: assignment.attempt,
-                per_task_memory_budget_bytes: self.config.per_task_memory_budget_bytes,
+                per_task_memory_budget_bytes: signal.effective_mem_budget_bytes,
+                batch_size_rows: signal.suggested_batch_size_rows,
+                spill_trigger_ratio_num: signal.spill_trigger_ratio_num,
+                spill_trigger_ratio_den: signal.spill_trigger_ratio_den,
                 join_radix_bits: self.config.join_radix_bits,
                 join_bloom_enabled: self.config.join_bloom_enabled,
                 join_bloom_bits: self.config.join_bloom_bits,
@@ -422,6 +458,7 @@ where
                 assigned_reduce_split_count: assignment.assigned_reduce_split_count,
             };
             handles.push(tokio::spawn(async move {
+                let _reservation = reservation;
                 let _permit = permit;
                 let _ = control_plane
                     .report_task_status(
@@ -874,7 +911,7 @@ fn eval_plan_for_stage(
                 scan.filters.iter().map(|f| format!("{f:?}")).collect(),
             )?;
             let stream = node.execute(Arc::new(ExecTaskContext {
-                batch_size_rows: 8192,
+                batch_size_rows: ctx.batch_size_rows,
                 mem_budget_bytes: ctx.per_task_memory_budget_bytes,
             }))?;
             let schema = stream.schema();
@@ -1772,10 +1809,7 @@ fn read_partition_incremental_latest(
             watermark.saturating_sub(cursor),
         )?;
         if !fetched.is_empty() {
-            let chunk_payloads = fetched
-                .into_iter()
-                .map(|c| c.payload)
-                .collect::<Vec<_>>();
+            let chunk_payloads = fetched.into_iter().map(|c| c.payload).collect::<Vec<_>>();
             if !chunk_payloads.is_empty() {
                 let mut decoded = reader.read_partition_from_streamed_chunks(chunk_payloads)?;
                 out_batches.append(&mut decoded);
@@ -1808,10 +1842,7 @@ fn read_partition_incremental_latest(
             if fetched.is_empty() {
                 break;
             }
-            let chunk_payloads = fetched
-                .into_iter()
-                .map(|c| c.payload)
-                .collect::<Vec<_>>();
+            let chunk_payloads = fetched.into_iter().map(|c| c.payload).collect::<Vec<_>>();
             if chunk_payloads.is_empty() {
                 break;
             }
@@ -2418,9 +2449,10 @@ fn run_hash_join(
         .map(|v| v.as_slice())
         .unwrap_or(probe_rows);
 
+    let spill_signal = spill_signal_for_task_ctx(ctx);
     let mut match_output = if !matches!(join_type, JoinType::Semi | JoinType::Anti)
         && ctx.per_task_memory_budget_bytes > 0
-        && estimate_join_rows_bytes(build_rows) > ctx.per_task_memory_budget_bytes
+        && spill_signal.should_spill(estimate_join_rows_bytes(build_rows))
     {
         let rows = grace_hash_join(
             build_rows,
@@ -4432,11 +4464,12 @@ fn maybe_spill(
     spill_seq: &mut u64,
     ctx: &TaskContext,
 ) -> Result<()> {
+    let spill_signal = spill_signal_for_task_ctx(ctx);
     if groups.is_empty() || ctx.per_task_memory_budget_bytes == 0 {
         return Ok(());
     }
     let estimated = estimate_groups_bytes(groups);
-    if estimated <= ctx.per_task_memory_budget_bytes {
+    if !spill_signal.should_spill(estimated) {
         return Ok(());
     }
 
@@ -4445,7 +4478,7 @@ fn maybe_spill(
         .duration_since(UNIX_EPOCH)
         .map_err(|e| FfqError::Execution(format!("clock error: {e}")))?
         .as_nanos();
-    let target_bytes = ctx.per_task_memory_budget_bytes.saturating_mul(3) / 4;
+    let target_bytes = spill_signal.spill_target_bytes(3, 4);
     let target_bytes = target_bytes.max(1);
     let mut partition_cursor = 0_u8;
     let mut empty_partition_streak = 0_u8;
