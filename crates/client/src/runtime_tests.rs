@@ -26,7 +26,7 @@ use futures::future::BoxFuture;
 use parquet::arrow::ArrowWriter;
 
 #[cfg(feature = "vector")]
-use super::run_topk_by_score;
+use super::{run_topk_by_score, rows_to_vector_knn_output};
 use super::{
     EmbeddedRuntime, ExecOutput, JoinBloomFilter, QueryContext, Runtime, ScalarValue, TraceIds,
     embedded_adaptive_plan_for_partitioning_with_target, hash_key, join_key_from_row,

@@ -10,6 +10,10 @@ use qdrant_client::qdrant::{
 use crate::vector_index::{VectorIndexProvider, VectorQueryOptions, VectorTopKRow};
 
 #[derive(Clone)]
+/// Qdrant-backed implementation of [`crate::vector_index::VectorIndexProvider`].
+///
+/// The provider is created from a catalog table definition and uses table
+/// `options` to configure the Qdrant endpoint/collection and payload behavior.
 pub struct QdrantProvider {
     client: Qdrant,
     collection: String,
@@ -26,6 +30,17 @@ impl std::fmt::Debug for QdrantProvider {
 }
 
 impl QdrantProvider {
+    /// Build a Qdrant provider from a catalog table definition.
+    ///
+    /// Supported table options:
+    /// - `qdrant.endpoint`: Qdrant HTTP endpoint (defaults to `http://127.0.0.1:6334`)
+    /// - `qdrant.collection`: collection name (falls back to `table.uri`, then `table.name`)
+    /// - `qdrant.with_payload`: `true|false` (`1|0`) to include payload JSON in results
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Qdrant client cannot be initialized from the
+    /// configured endpoint.
     pub fn from_table(table: &crate::TableDef) -> Result<Self> {
         let endpoint = table
             .options

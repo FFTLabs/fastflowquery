@@ -3,6 +3,8 @@ use arrow_schema::SchemaRef;
 use ffq_common::{FfqError, Result};
 use ffq_execution::stream::SendableRecordBatchStream;
 use ffq_planner::{AggExpr, Expr, JoinType, LogicalPlan};
+#[cfg(feature = "vector")]
+use ffq_planner::PhysicalPlan;
 use ffq_storage::parquet_provider::ParquetProvider;
 use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
@@ -368,7 +370,7 @@ impl DataFrame {
     async fn create_execution_stream_with_vector_overrides(
         &self,
         #[cfg(feature = "vector")] vector_overrides: Option<VectorKnnOverrides>,
-        #[cfg(not(feature = "vector"))] _vector_overrides: Option<()>,
+        #[cfg(not(feature = "vector"))] vector_overrides: Option<()>,
     ) -> Result<SendableRecordBatchStream> {
         self.ensure_inferred_parquet_schemas()?;
         // Ensure both SQL-built and DataFrame-built plans go through the same analyze/optimize pipeline.
@@ -386,11 +388,8 @@ impl DataFrame {
             (analyzed, std::sync::Arc::new((*cat_guard).clone()))
         };
 
-        let physical = self.session.planner.create_physical_plan(&analyzed)?;
-        #[cfg(feature = "vector")]
-        if let Some(overrides) = vector_overrides {
-            apply_vector_knn_overrides(&mut physical, &overrides)?;
-        }
+        let physical =
+            create_physical_plan_with_vector_overrides(&self.session.planner, &analyzed, vector_overrides)?;
 
         let stats_collector = Arc::new(RuntimeStatsCollector::default());
         let ctx = QueryContext {
@@ -554,6 +553,28 @@ impl DataFrame {
         }
         Ok(())
     }
+}
+
+#[cfg(feature = "vector")]
+fn create_physical_plan_with_vector_overrides(
+    planner: &crate::planner_facade::PlannerFacade,
+    analyzed: &LogicalPlan,
+    vector_overrides: Option<VectorKnnOverrides>,
+) -> Result<PhysicalPlan> {
+    let mut physical = planner.create_physical_plan(analyzed)?;
+    if let Some(overrides) = vector_overrides {
+        apply_vector_knn_overrides(&mut physical, &overrides)?;
+    }
+    Ok(physical)
+}
+
+#[cfg(not(feature = "vector"))]
+fn create_physical_plan_with_vector_overrides(
+    planner: &crate::planner_facade::PlannerFacade,
+    analyzed: &LogicalPlan,
+    _vector_overrides: Option<()>,
+) -> Result<ffq_planner::PhysicalPlan> {
+    planner.create_physical_plan(analyzed)
 }
 
 #[cfg(feature = "vector")]
