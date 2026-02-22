@@ -2,8 +2,8 @@
 
 - Status: draft
 - Owner: @ffq-api
-- Last Verified Commit: TBD
-- Last Verified Date: TBD
+- Last Verified Commit: 7888e4c
+- Last Verified Date: 2026-02-21
 
 ## Scope
 
@@ -91,6 +91,18 @@ Removing or changing them incompatibly is also a breaking change when the featur
 ### `vector`
 
 1. `Engine::hybrid_search`
+2. `Engine::hybrid_search_batch`
+3. `ffq_client::VectorKnnOverrides`
+
+### `embedding-http`
+
+1. `ffq_client::HttpEmbeddingProvider`
+
+Always-available embedding API surface (not feature-gated):
+
+1. `Engine::embed_texts`
+2. `ffq_client::EmbeddingProvider`
+3. `ffq_client::SampleEmbeddingProvider`
 
 ### `profiling`
 

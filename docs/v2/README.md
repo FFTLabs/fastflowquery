@@ -82,6 +82,8 @@ The matrix below is the complete required v2 doc set. Ownership can be updated a
 | Runtime | `docs/v2/custom-operators-deployment.md` | `@ffq-runtime` | draft |
 | Runtime | `docs/v2/shuffle-stage-model.md` | `@ffq-runtime` | draft |
 | Runtime | `docs/v2/operators-core.md` | `@ffq-runtime` | draft |
+| Runtime | `docs/v2/join-system-v2.md` | `@ffq-runtime` | draft |
+| Runtime | `docs/v2/aggregation-v2.md` | `@ffq-runtime` | draft |
 | Runtime | `docs/v2/observability.md` | `@ffq-runtime` | draft |
 | API | `docs/v2/api-contract.md` | `@ffq-api` | draft |
 | API | `docs/v2/extensibility.md` | `@ffq-api` | draft |

@@ -9,6 +9,18 @@
 
 This document describes the bootstrapped v2 vector retrieval path as currently implemented, including brute-force rerank, qdrant-backed index routing, fallback semantics, and the two-phase retrieval pattern.
 
+## EPIC 9 status (implemented subset)
+
+This page documents the currently implemented subset of EPIC 9:
+
+1. hybrid logical node and physical vector KNN execution path (`HybridVectorScan` -> `VectorKnnExec`)
+2. connector-aware prefilter pushdown subset (qdrant-focused)
+3. `metric` / `ef_search` vector KNN knobs
+4. batched hybrid query API (`Engine::hybrid_search_batch`)
+5. pluggable embedding provider trait with sample and optional HTTP provider
+
+It does not yet claim a fully generalized multi-provider hybrid engine.
+
 ## Feature Flags
 
 | Flag | Meaning |
@@ -75,6 +87,31 @@ Execution contract:
 
 If `qdrant` feature is disabled and runtime tries to execute a qdrant index operator, execution returns an unsupported-feature error.
 
+## Hybrid node + score column (`9.1`, partial)
+
+In the newer v2 hybrid path, planner/runtime also support:
+
+1. logical node: `HybridVectorScan`
+2. physical node: `VectorKnnExec`
+
+`HybridVectorScan` carries:
+
+1. `source`
+2. `query_vectors`
+3. `k`
+4. `ef_search`
+5. `prefilter`
+6. `metric`
+7. `provider`
+
+Explain output includes hybrid/vector node details (query count/dim, metric, provider, prefilter).
+
+Score-column contract:
+
+1. qdrant/index-backed vector results expose a score column in output (`score`)
+2. optimizer rewrite snapshots also validate projected score semantics and explain visibility
+3. SQL-facing `_score` naming conventions are partially documented through explain/optimizer snapshots and vector execution schemas, but end-user naming contracts are still evolving by path (brute-force vs index-backed)
+
 ## Qdrant connector (v1)
 
 `QdrantProvider` uses table options:
@@ -130,6 +167,28 @@ When rewrite candidates include table-scan filters, v1 translates only:
 
 Anything else (range, OR, functions, non-literal comparison) causes rewrite fallback.
 
+This is the implemented `9.2` subset today: connector-aware in practice for qdrant, but not yet a generalized capability-negotiation contract across multiple vector providers.
+
+## `VectorKnnExec` knobs (`9.3`, partial)
+
+`VectorKnnExec` exposes tuning knobs and filter payload in physical planning/runtime:
+
+1. `k`
+2. `metric` (`cosine`, `dot`, `l2`)
+3. `ef_search` (optional provider-specific HNSW search override)
+4. `prefilter` (optional provider payload filter)
+
+Sources of knob values:
+
+1. optimizer rewrite from table options (for example `vector.metric`, `vector.ef_search`)
+2. per-query overrides through `VectorKnnOverrides` in DataFrame APIs
+3. direct hybrid logical plan construction (`Engine::hybrid_search_batch`)
+
+Validation:
+
+1. metric values are validated against supported set
+2. `ef_search` must be `> 0` when provided
+
 ## Two-phase retrieval pattern
 
 v1 also supports a two-phase retrieval rewrite for doc tables configured with vector index metadata:
@@ -148,6 +207,42 @@ Required table options on docs table:
 5. `vector.prefetch_cap` (optional hard cap)
 
 This keeps exact ranking quality while reducing candidate set size.
+
+## Batched query mode (`9.4`, partial)
+
+`Engine::hybrid_search_batch(...)` provides a batched vector query API.
+
+Behavior:
+
+1. accepts `query_vecs: Vec<Vec<f32>>`
+2. validates non-empty batch and non-empty vectors
+3. builds `LogicalPlan::HybridVectorScan` directly (bypasses SQL parsing)
+4. preserves `k`, `metric`, `provider`, and optional future runtime tuning hooks through the logical node
+
+Current note:
+
+1. API shape is implemented and contract-tested
+2. dedicated throughput/recall benchmark characterization for batched mode is still limited
+
+## Stable embedding API / provider plugin (`9.5`, partial)
+
+`ffq-client` exposes a pluggable embedding contract:
+
+1. `EmbeddingProvider::embed(&[String]) -> Result<Vec<Vec<f32>>>`
+
+Built-in implementations:
+
+1. `SampleEmbeddingProvider` (deterministic test/example provider)
+2. `HttpEmbeddingProvider` (feature `embedding-http`) for remote HTTP embedding services
+
+Engine integration:
+
+1. `Engine::embed_texts(&provider, texts)` delegates to the provider without coupling core engine logic to a model vendor
+
+Current limits:
+
+1. embedding result caching is not implemented yet
+2. provider registry/discovery is not a generalized plugin runtime; users pass provider instances directly
 
 ## Quick examples
 
@@ -202,3 +297,7 @@ With docs table vector options configured and qdrant index table registered, opt
 4. Provider contract and qdrant implementation:
    - `crates/storage/src/vector_index.rs`
    - `crates/storage/src/qdrant_provider.rs`
+5. Hybrid/batched query and embedding provider API:
+   - `crates/client/src/engine.rs`
+   - `crates/client/src/embedding.rs`
+   - `crates/client/tests/public_api_contract.rs`

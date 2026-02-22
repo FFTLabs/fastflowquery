@@ -2,8 +2,8 @@
 
 - Status: verified
 - Owner: @ffq-planner
-- Last Verified Commit: TBD
-- Last Verified Date: TBD
+- Last Verified Commit: 7888e4c
+- Last Verified Date: 2026-02-21
 
 This page is the SQL support contract for v2 as implemented now.
 
@@ -275,3 +275,18 @@ FROM r;
 3. `docs/v2/runtime-portability.md`
 4. `docs/v2/migration-v1-to-v2.md`
 5. `docs/v2/testing.md`
+
+## Correctness Evidence Map
+
+EPIC 3 correctness is locked by these suites/artifacts:
+
+1. CTE/subquery behavior:
+   - `crates/client/tests/embedded_cte_subquery.rs`
+   - `crates/client/tests/embedded_cte_subquery_golden.rs`
+   - `crates/client/tests/snapshots/subquery/embedded_cte_subquery_edge_matrix.snap`
+2. window behavior:
+   - `crates/client/tests/embedded_window_functions.rs`
+   - `crates/client/tests/embedded_window_golden.rs`
+   - `crates/client/tests/snapshots/window/embedded_window_edge_matrix.snap`
+3. embedded/distributed parity:
+   - `crates/client/tests/distributed_runtime_roundtrip.rs`

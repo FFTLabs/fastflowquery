@@ -30,7 +30,7 @@ use super::run_topk_by_score;
 use super::{
     EmbeddedRuntime, ExecOutput, JoinBloomFilter, QueryContext, Runtime, ScalarValue, TraceIds,
     embedded_adaptive_plan_for_partitioning_with_target, hash_key, join_key_from_row,
-    resolve_key_indexes, rows_from_batches, rows_to_vector_knn_output, rows_to_vector_topk_output,
+    resolve_key_indexes, rows_from_batches, rows_to_vector_topk_output,
     run_vector_topk_with_provider, run_window_exec, run_window_exec_with_ctx,
     scalar_estimate_bytes,
 };

@@ -16,6 +16,7 @@ This page documents the distributed runtime execution contract in v2:
 5. capability-aware custom-operator assignment
 6. adaptive shuffle reduce-layout behavior (barrier-time planning)
 7. pipelined shuffle stream protocol and backpressure controls
+8. speculative execution for straggler mitigation (partial)
 
 Related control-plane RPC details are documented in `docs/v2/control-plane.md`.
 Adaptive operator playbook and tuning profiles are documented in `docs/v2/adaptive-shuffle-tuning.md`.
@@ -229,6 +230,30 @@ Exposed diagnostics in stage metrics:
 12. `stream_active_count`
 13. `backpressure_events`
 
+## Speculative Execution (Partial)
+
+Speculative execution is available for straggler mitigation in distributed scheduling.
+
+Coordinator behavior:
+
+1. tracks task runtime samples by stage
+2. computes a straggler threshold from completed-task runtime distribution (`p95`-based multiplier)
+3. launches a speculative attempt on another worker when a running task exceeds threshold and minimum runtime
+4. preserves latest-attempt correctness rules so duplicate success does not corrupt query state
+
+Current status:
+
+1. speculative attempt scheduling and race resolution are implemented
+2. stage metrics expose speculative attempt counters
+3. locality-aware scheduling remains limited and is not yet a full placement strategy
+
+Relevant config knobs (coordinator):
+
+1. `speculative_execution_enabled`
+2. `speculative_min_completed_samples`
+3. `speculative_p95_multiplier`
+4. `speculative_min_runtime_ms`
+
 ## Minimal Runtime Walkthrough (Coordinator + 2 Workers)
 
 1. client submits query plan
@@ -254,6 +279,7 @@ cargo test -p ffq-distributed --features grpc coordinator_allows_pipelined_reduc
 cargo test -p ffq-distributed --features grpc coordinator_pipeline_requires_committed_offset_threshold_before_scheduling
 cargo test -p ffq-distributed --features grpc coordinator_backpressure_throttles_assignment_windows
 cargo test -p ffq-distributed --features grpc worker_shuffle_fetch_respects_committed_watermark_and_emits_eof_marker
+cargo test -p ffq-distributed --features grpc coordinator_launches_speculative_attempt_for_straggler_and_accepts_older_success
 ```
 
 Expected:
@@ -262,3 +288,5 @@ Expected:
 2. failing workers can be blacklisted
 3. per-worker/per-query assignment limits are enforced
 4. custom-op tasks are assigned only to capable workers
+5. pipelined shuffle readiness/backpressure checks pass
+6. speculative attempt scheduling triggers on straggler test and query state remains correct

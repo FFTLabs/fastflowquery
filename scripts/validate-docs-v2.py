@@ -6,6 +6,8 @@ Checks:
 2. Markdown links in v2 docs (and root entry docs) resolve.
 3. Every heading in `tickets/eng/Plan_v2.md` is mapped in
    `docs/v2/status-matrix.md` table's "Plan heading" column.
+4. For every `done`/`partial` status-matrix row, at least one docs markdown file
+   is referenced and all referenced repository paths exist.
 """
 
 from __future__ import annotations
@@ -159,21 +161,76 @@ def plan_headings() -> set[str]:
 
 
 def mapped_plan_headings() -> set[str]:
+    return {canonical(row["heading"]) for row in status_matrix_rows()}
+
+
+def status_matrix_rows() -> list[dict[str, str]]:
     text = read_text(DOCS_V2_STATUS)
-    out: set[str] = set()
+    rows: list[dict[str, str]] = []
     for line in text.splitlines():
         if not line.startswith("|"):
             continue
         cols = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cols) < 2:
+        if len(cols) < 5:
             continue
-        first = cols[0]
-        if first.lower() in {"plan heading", "---"}:
+        heading = cols[0]
+        if heading.lower() in {"plan heading", "---"} or not heading:
             continue
-        if not first:
-            continue
-        out.add(canonical(first))
+        rows.append(
+            {
+                "heading": heading,
+                "status": cols[1].strip().lower(),
+                "evidence_docs_code": cols[2],
+                "evidence_tests": cols[3],
+                "gap_note": cols[4],
+            }
+        )
+    return rows
+
+
+def extract_repo_paths(text: str) -> set[str]:
+    out: set[str] = set()
+    for m in re.finditer(r"`([^`]+)`", text):
+        candidate = m.group(1).strip()
+        if "/" in candidate:
+            out.add(candidate)
+    for m in re.finditer(r"(?<![A-Za-z0-9_.-])([.]?/?(?:docs|crates|scripts|tickets|include|examples|\.github)/[A-Za-z0-9_./-]+)", text):
+        out.add(m.group(1).strip())
     return out
+
+
+def check_status_matrix_traceability(errors: list[str]) -> None:
+    allowed_statuses = {"done", "partial", "not started"}
+    for row in status_matrix_rows():
+        heading = row["heading"]
+        status = row["status"]
+        if status not in allowed_statuses:
+            errors.append(
+                f"docs/v2/status-matrix.md: invalid status '{status}' for heading '{heading}'"
+            )
+            continue
+
+        refs = extract_repo_paths(row["evidence_docs_code"]) | extract_repo_paths(
+            row["evidence_tests"]
+        )
+        for ref in sorted(refs):
+            path = ROOT / ref
+            if not path.exists():
+                errors.append(
+                    f"docs/v2/status-matrix.md: heading '{heading}' references missing path '{ref}'"
+                )
+
+        if status in {"done", "partial"}:
+            docs_refs = [
+                ref
+                for ref in refs
+                if ref.startswith("docs/") and ref.endswith(".md")
+            ]
+            if not docs_refs:
+                errors.append(
+                    "docs/v2/status-matrix.md: "
+                    f"heading '{heading}' is '{status}' but has no docs reference in evidence columns"
+                )
 
 
 def check_plan_coverage(errors: list[str]) -> None:
@@ -191,6 +248,7 @@ def main() -> int:
     check_required_pages(errors)
     check_links(errors)
     check_plan_coverage(errors)
+    check_status_matrix_traceability(errors)
 
     if errors:
         print("docs-v2 guardrails: FAILED")
@@ -204,4 +262,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

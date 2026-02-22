@@ -115,6 +115,49 @@ Execution integration:
 1. Embedded runtime invokes `ParquetProvider::scan(...)` in `crates/client/src/runtime.rs`.
 2. Worker runtime invokes the same provider in `crates/distributed/src/worker.rs`.
 
+### Partitioned tables + partition pruning (EPIC 8.1, partial)
+
+Current support includes hive-style partition pruning for parquet path expansion.
+
+Behavior (supported subset):
+
+1. partition values encoded in path segments (for example `.../dt=2026-01-01/country=de/...`)
+2. equality and range predicates on partition columns can prune candidate files
+3. non-pushdownable predicates fall back to normal scan-time filtering
+
+Evidence:
+
+1. `crates/storage/src/parquet_provider.rs`
+2. test `partition_pruning_hive_matches_eq_and_range_filters`
+
+Current limits:
+
+1. partition layout/catalog contracts are still lightweight (not a full metastore model)
+2. pruning support is subset-based, not full SQL predicate normalization across all expressions
+
+### Statistics collection (EPIC 8.2, partial)
+
+FFQ exposes two levels of storage stats today:
+
+1. table-level heuristic stats (`TableStats`: `rows`, `bytes`)
+2. parquet file metadata stats (`ParquetFileStats`: `row_count`, `size_bytes`, per-column min/max where available)
+
+Where they live:
+
+1. `crates/storage/src/stats.rs`
+2. `crates/storage/src/parquet_provider.rs`
+3. `crates/storage/src/provider.rs` (`estimate_stats`)
+
+How they are used today:
+
+1. planner/optimizer heuristics (for example join strategy decisions) use table-level estimated rows/bytes
+2. parquet metadata extraction supports richer persisted file stats and cache metadata
+
+Current limits:
+
+1. optimizer use of file-level min/max is partial and not a full cost-based framework
+2. `EXPLAIN` visibility for all file-level statistics remains limited
+
 ## Object Store Behavior (`s3`)
 
 Surface exists behind feature `s3`:

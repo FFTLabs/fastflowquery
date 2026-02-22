@@ -173,6 +173,51 @@ Failure modes:
 2. missing path metadata
 3. file open/decode errors
 
+### 7.1 Partitioned tables and pruning (EPIC 8.1, partial)
+
+FFQ supports a practical subset of partition pruning for parquet datasets arranged in hive-style paths.
+
+Mental model:
+
+1. partition columns can be encoded in directory names (for example `k=v`)
+2. provider can prune files before scan if filter predicates are compatible
+3. remaining predicates still execute normally in query runtime
+
+Current scope:
+
+1. equality and range-style pruning for supported partition predicates
+2. subset behavior, not full SQL predicate canonicalization
+
+Evidence:
+
+1. `crates/storage/src/parquet_provider.rs`
+2. test `partition_pruning_hive_matches_eq_and_range_filters`
+
+### 7.2 Statistics collection and optimizer heuristics (EPIC 8.2, partial)
+
+FFQ stores/uses statistics at multiple levels:
+
+1. `TableDef.stats` (`rows`, `bytes`) for lightweight optimizer heuristics
+2. parquet file metadata stats (row count, file size, per-column min/max when available)
+
+Why this matters:
+
+1. optimizer can make better join-strategy decisions with realistic row/byte estimates
+2. persisted file metadata can support future pruning/CBO improvements
+
+Current limit:
+
+1. stats integration is heuristic/partial, not full cost-based optimization
+
+### 7.3 File-level cache and object-store reliability (EPIC 8.3 / 8.4)
+
+The storage path also includes:
+
+1. process-local parquet metadata/block caches (TTL + hit/miss metrics)
+2. object-store parquet reads (feature `s3`) with retry/backoff/timeout/ranged fetch controls
+
+These are operational features that improve repeat-query latency and remote-read stability, but they are not yet a full production storage subsystem for every cloud/provider scenario.
+
 ## 8) Profile Manifests
 
 Profile manifests are prebuilt catalog files for known fixture sets.

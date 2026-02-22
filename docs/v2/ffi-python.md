@@ -2,8 +2,8 @@
 
 - Status: draft
 - Owner: @ffq-api
-- Last Verified Commit: TBD
-- Last Verified Date: TBD
+- Last Verified Commit: 7888e4c
+- Last Verified Date: 2026-02-21
 
 ## Scope
 

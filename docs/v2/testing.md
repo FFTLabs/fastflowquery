@@ -152,6 +152,83 @@ Primary references:
 2. `crates/client/src/runtime.rs`
 3. `crates/distributed/src/worker.rs`
 
+### 1.2b) Partition pruning + stats validation (EPIC 8.1 / 8.2)
+
+Commands:
+
+```bash
+cargo test -p ffq-storage partition_pruning_hive_matches_eq_and_range_filters -- --nocapture
+```
+
+Pass criteria:
+
+1. hive-style partition pruning removes non-matching file paths for equality/range filters
+2. pruned scan result remains correct
+3. storage metadata/stats extraction path remains compatible with parquet provider scan path
+
+Primary references:
+
+1. `docs/v2/storage-catalog.md`
+2. `crates/storage/src/parquet_provider.rs`
+3. `crates/storage/src/stats.rs`
+
+### 1.3) Join System v2 validation (EPIC 5)
+
+Commands:
+
+```bash
+cargo test -p ffq-client --test embedded_hash_join
+cargo test -p ffq-client --test embedded_cte_subquery
+cargo test -p ffq-client runtime_tests::join_prefers_sort_merge_when_hint_is_set -- --exact
+make bench-v2-join-radix
+make bench-v2-join-bloom
+```
+
+Pass criteria:
+
+1. hash-join suite passes (including inner/outer/semi/anti correctness paths)
+2. `EXISTS`/`IN` rewrite paths validate semi/anti behavior via subquery suite
+3. targeted sort-merge selection test passes when the hint/config path is enabled
+4. radix microbench reports baseline vs radix timing comparison output
+5. bloom microbench reports selective prefilter impact in probe-side path
+
+Primary references:
+
+1. `docs/v2/join-system-v2.md`
+2. `crates/client/src/runtime.rs`
+3. `crates/planner/src/physical_planner.rs`
+4. `crates/planner/src/optimizer.rs`
+5. `crates/client/tests/embedded_hash_join.rs`
+6. `crates/client/tests/embedded_cte_subquery.rs`
+7. `crates/client/examples/bench_join_radix.rs`
+8. `crates/client/examples/bench_join_bloom.rs`
+
+### 1.4) Aggregation v2 validation (EPIC 6)
+
+Commands:
+
+```bash
+cargo test -p ffq-client --test embedded_hash_aggregate
+cargo test -p ffq-client --test distributed_runtime_roundtrip distributed_embedded_roundtrip_matches_expected_snapshots_and_parity -- --exact
+cargo test -p ffq-client --features approx --test embedded_hash_aggregate approx_count_distinct_is_plausible_with_tolerance -- --exact
+```
+
+Pass criteria:
+
+1. grouped aggregate spill/non-spill paths are deterministic and parity-stable
+2. `COUNT(DISTINCT ...)` grouped queries are correct and spill-stable
+3. distributed and embedded aggregate outputs match parity expectations for distinct paths
+4. `APPROX_COUNT_DISTINCT` remains within tolerance when `approx` feature is enabled
+
+Primary references:
+
+1. `docs/v2/aggregation-v2.md`
+2. `crates/client/src/runtime.rs`
+3. `crates/planner/src/physical_planner.rs`
+4. `crates/planner/src/sql_frontend.rs`
+5. `crates/client/tests/embedded_hash_aggregate.rs`
+6. `crates/client/tests/distributed_runtime_roundtrip.rs`
+
 ## 2) Distributed
 
 Commands:
@@ -174,6 +251,41 @@ Primary references:
 2. `crates/client/tests/integration_distributed.rs`
 3. `crates/client/tests/distributed_runtime_roundtrip.rs`
 
+## 2.1) AQE / Adaptive Shuffle (EPIC 4)
+
+Commands:
+
+```bash
+cargo test -p ffq-distributed --features grpc coordinator_fans_out_reduce_stage_tasks_from_shuffle_layout
+cargo test -p ffq-distributed --features grpc coordinator_applies_barrier_time_adaptive_partition_coalescing
+cargo test -p ffq-distributed --features grpc coordinator_barrier_time_hot_partition_splitting_increases_reduce_tasks
+cargo test -p ffq-distributed --features grpc coordinator_finalizes_adaptive_layout_once_before_reduce_scheduling
+cargo test -p ffq-distributed --features grpc coordinator_ignores_stale_reports_from_old_adaptive_layout
+cargo test -p ffq-distributed --features grpc coordinator_adaptive_shuffle_retries_failed_map_attempt_and_completes
+cargo test -p ffq-distributed --features grpc coordinator_adaptive_shuffle_recovers_from_worker_death_during_map_and_reduce
+make bench-v2-adaptive-shuffle-embedded
+make bench-v2-adaptive-shuffle-compare BASELINE=<baseline.json-or-dir> CANDIDATE=<candidate.json-or-dir>
+```
+
+Pass criteria:
+
+1. reduce stages fan out according to finalized adaptive layout
+2. coalesce/split decisions are deterministic for identical metadata
+3. hot partition skew splits increase effective reduce fanout when required
+4. stale layout reports are ignored without corrupting query state
+5. map/reduce failure-retry paths complete without deadlock
+6. benchmark comparator exits `0` for adaptive-shuffle thresholds
+
+Primary references:
+
+1. `docs/v2/adaptive-shuffle-tuning.md`
+2. `docs/v2/distributed-runtime.md`
+3. `crates/common/src/adaptive.rs`
+4. `crates/distributed/src/coordinator.rs`
+5. `crates/client/src/runtime.rs`
+6. `scripts/run-bench-v2-adaptive-shuffle.sh`
+7. `tests/bench/thresholds/adaptive_shuffle_regression_thresholds.json`
+
 ## 3) Vector / RAG
 
 Commands:
@@ -182,6 +294,8 @@ Commands:
 make test-13.1-vector
 cargo test -p ffq-client --test embedded_two_phase_retrieval --features vector
 cargo test -p ffq-client --test qdrant_routing --features "vector,qdrant"
+cargo test -p ffq-client --test public_api_contract --features vector
+cargo test -p ffq-client --features embedding-http --lib embedding::tests
 ```
 
 Pass criteria:
@@ -190,6 +304,8 @@ Pass criteria:
 2. optimizer vector rewrite goldens pass
 3. fallback behavior for unsupported shapes is validated
 4. qdrant routing tests pass when `qdrant` feature is enabled
+5. public API contract includes hybrid batch query convenience path
+6. embedding provider API tests pass (sample provider always; HTTP provider path when feature enabled)
 
 Primary references:
 
@@ -197,6 +313,45 @@ Primary references:
 2. `crates/client/tests/embedded_two_phase_retrieval.rs`
 3. `crates/client/tests/qdrant_routing.rs`
 4. `crates/planner/tests/optimizer_golden.rs`
+5. `crates/client/tests/public_api_contract.rs`
+6. `crates/client/src/embedding.rs`
+
+## 3.1) SQL Semantics (EPIC 3)
+
+Commands:
+
+```bash
+cargo test -p ffq-client --test embedded_hash_join
+cargo test -p ffq-client --test embedded_case_expr
+cargo test -p ffq-client --test embedded_cte_subquery
+cargo test -p ffq-client --test embedded_cte_subquery_golden
+cargo test -p ffq-client --test embedded_window_functions
+cargo test -p ffq-client --test embedded_window_golden
+cargo test -p ffq-client --test distributed_runtime_roundtrip
+```
+
+Pass criteria:
+
+1. outer join correctness snapshots pass (`LEFT/RIGHT/FULL`)
+2. CASE projection/filter semantics pass
+3. CTE/subquery semantics pass (including scalar/EXISTS/IN paths)
+4. CTE/subquery golden edge matrix snapshot is stable
+5. window function/frame/null/tie semantics pass
+6. window golden edge matrix snapshot is stable
+7. embedded and distributed parity checks pass for correlated/subquery/window shapes
+
+Primary references:
+
+1. `docs/v2/sql-semantics.md`
+2. `crates/client/tests/embedded_hash_join.rs`
+3. `crates/client/tests/embedded_case_expr.rs`
+4. `crates/client/tests/embedded_cte_subquery.rs`
+5. `crates/client/tests/embedded_cte_subquery_golden.rs`
+6. `crates/client/tests/snapshots/subquery/embedded_cte_subquery_edge_matrix.snap`
+7. `crates/client/tests/embedded_window_functions.rs`
+8. `crates/client/tests/embedded_window_golden.rs`
+9. `crates/client/tests/snapshots/window/embedded_window_edge_matrix.snap`
+10. `crates/client/tests/distributed_runtime_roundtrip.rs`
 
 ## 4) FFI
 
