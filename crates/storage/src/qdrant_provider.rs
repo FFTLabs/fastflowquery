@@ -3,11 +3,17 @@ use std::collections::HashMap;
 use ffq_common::{FfqError, Result};
 use futures::future::{BoxFuture, FutureExt};
 use qdrant_client::Qdrant;
-use qdrant_client::qdrant::{Condition, Filter, SearchPointsBuilder, Value, point_id};
+use qdrant_client::qdrant::{
+    Condition, Filter, SearchParamsBuilder, SearchPointsBuilder, Value, point_id,
+};
 
-use crate::vector_index::{VectorIndexProvider, VectorTopKRow};
+use crate::vector_index::{VectorIndexProvider, VectorQueryOptions, VectorTopKRow};
 
 #[derive(Clone)]
+/// Qdrant-backed implementation of [`crate::vector_index::VectorIndexProvider`].
+///
+/// The provider is created from a catalog table definition and uses table
+/// `options` to configure the Qdrant endpoint/collection and payload behavior.
 pub struct QdrantProvider {
     client: Qdrant,
     collection: String,
@@ -24,6 +30,17 @@ impl std::fmt::Debug for QdrantProvider {
 }
 
 impl QdrantProvider {
+    /// Build a Qdrant provider from a catalog table definition.
+    ///
+    /// Supported table options:
+    /// - `qdrant.endpoint`: Qdrant HTTP endpoint (defaults to `http://127.0.0.1:6334`)
+    /// - `qdrant.collection`: collection name (falls back to `table.uri`, then `table.name`)
+    /// - `qdrant.with_payload`: `true|false` (`1|0`) to include payload JSON in results
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Qdrant client cannot be initialized from the
+    /// configured endpoint.
     pub fn from_table(table: &crate::TableDef) -> Result<Self> {
         let endpoint = table
             .options
@@ -58,14 +75,29 @@ impl VectorIndexProvider for QdrantProvider {
         query_vec: Vec<f32>,
         k: usize,
         filter: Option<String>,
+        options: VectorQueryOptions,
     ) -> BoxFuture<'a, Result<Vec<VectorTopKRow>>> {
         async move {
+            if let Some(metric) = options.metric.as_deref()
+                && !matches!(metric, "cosine" | "dot" | "l2")
+            {
+                return Err(FfqError::InvalidConfig(format!(
+                    "unsupported vector metric override '{metric}'"
+                )));
+            }
             let parsed_filter = parse_filter_spec(filter)?;
             let mut req = SearchPointsBuilder::new(&self.collection, query_vec, k as u64)
                 .with_payload(self.with_payload)
                 .build();
             req.limit = k as u64;
             req.filter = parsed_filter;
+            if let Some(ef_search) = options.ef_search {
+                req.params = Some(
+                    SearchParamsBuilder::default()
+                        .hnsw_ef(ef_search as u64)
+                        .build(),
+                );
+            }
 
             let response = self.client.search_points(req).await.map_err(|e| {
                 FfqError::Execution(format!(

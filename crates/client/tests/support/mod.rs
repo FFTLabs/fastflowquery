@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
@@ -127,12 +128,16 @@ pub fn ensure_integration_parquet_fixtures() -> IntegrationParquetFixtures {
     }
 }
 
+static UNIQUE_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 pub fn unique_path(prefix: &str, ext: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock before epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("{prefix}_{nanos}.{ext}"))
+    let pid = std::process::id();
+    let seq = UNIQUE_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}_{pid}_{nanos}_{seq}.{ext}"))
 }
 
 pub fn write_parquet(path: &Path, schema: Arc<Schema>, cols: Vec<ArrayRef>) {

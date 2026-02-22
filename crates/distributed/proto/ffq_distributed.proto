@@ -59,6 +59,13 @@ message TaskAssignment {
   uint64 task_id = 3;
   uint32 attempt = 4;
   bytes plan_fragment_json = 5;
+  repeated uint32 assigned_reduce_partitions = 6;
+  uint32 assigned_reduce_split_index = 7;
+  uint32 assigned_reduce_split_count = 8;
+  uint32 layout_version = 9;
+  uint64 layout_fingerprint = 10;
+  uint32 recommended_map_output_publish_window_partitions = 11;
+  uint32 recommended_reduce_fetch_window_partitions = 12;
 }
 
 message GetTaskResponse {
@@ -72,6 +79,10 @@ message ReportTaskStatusRequest {
   uint32 attempt = 4;
   TaskState state = 5;
   string message = 6;
+  uint32 layout_version = 7;
+  uint64 layout_fingerprint = 8;
+  uint64 reduce_fetch_inflight_bytes = 9;
+  uint32 reduce_fetch_queue_depth = 10;
 }
 
 message ReportTaskStatusResponse {}
@@ -87,6 +98,41 @@ message QueryStatus {
   uint64 started_at_ms = 4;
   uint64 finished_at_ms = 5;
   string message = 6;
+  repeated StageMetrics stage_metrics = 7;
+}
+
+message StageMetrics {
+  uint64 stage_id = 1;
+  uint32 queued_tasks = 2;
+  uint32 running_tasks = 3;
+  uint32 succeeded_tasks = 4;
+  uint32 failed_tasks = 5;
+  uint64 map_output_rows = 6;
+  uint64 map_output_bytes = 7;
+  uint64 map_output_batches = 8;
+  uint64 map_output_partitions = 9;
+  uint32 planned_reduce_tasks = 10;
+  uint32 adaptive_reduce_tasks = 11;
+  uint64 adaptive_target_bytes = 12;
+  repeated string aqe_events = 13;
+  repeated PartitionBytesHistogramBucket partition_bytes_histogram = 14;
+  uint32 skew_split_tasks = 15;
+  uint32 layout_finalize_count = 16;
+  uint64 backpressure_inflight_bytes = 17;
+  uint32 backpressure_queue_depth = 18;
+  uint32 map_publish_window_partitions = 19;
+  uint32 reduce_fetch_window_partitions = 20;
+  uint64 first_chunk_ms = 21;
+  uint64 first_reduce_row_ms = 22;
+  uint64 stream_lag_ms = 23;
+  uint64 stream_buffered_bytes = 24;
+  uint32 stream_active_count = 25;
+  repeated string backpressure_events = 26;
+}
+
+message PartitionBytesHistogramBucket {
+  uint64 upper_bound_bytes = 1;
+  uint32 partition_count = 2;
 }
 
 message GetQueryStatusResponse {
@@ -124,6 +170,8 @@ message RegisterMapOutputRequest {
   uint64 map_task = 3;
   uint32 attempt = 4;
   repeated MapOutputPartition partitions = 5;
+  uint32 layout_version = 6;
+  uint64 layout_fingerprint = 7;
 }
 
 message MapOutputPartition {
@@ -131,6 +179,9 @@ message MapOutputPartition {
   uint64 bytes = 2;
   uint64 rows = 3;
   uint64 batches = 4;
+  uint32 stream_epoch = 5;
+  uint64 committed_offset = 6;
+  bool finalized = 7;
 }
 
 message RegisterMapOutputResponse {}
@@ -141,16 +192,26 @@ message FetchShufflePartitionRequest {
   uint64 map_task = 3;
   uint32 attempt = 4;
   uint32 reduce_partition = 5;
+  uint64 start_offset = 6;
+  uint64 max_bytes = 7;
+  uint32 layout_version = 8;
+  uint32 min_stream_epoch = 9;
 }
 
 message ShufflePartitionChunk {
   bytes payload = 1;
+  uint64 start_offset = 2;
+  uint64 end_offset = 3;
+  uint64 watermark_offset = 4;
+  bool finalized = 5;
+  uint32 stream_epoch = 6;
 }
 
 message HeartbeatRequest {
   string worker_id = 1;
   uint64 at_ms = 2;
   uint32 running_tasks = 3;
+  repeated string custom_operator_capabilities = 4;
 }
 
 message HeartbeatResponse {

@@ -1,177 +1,142 @@
 # LEARN-09: Distributed Correctness - Why Results Match Embedded
 
-This chapter explains why FFQ distributed execution should return the same logical results as embedded execution, how tests compare them safely, and what non-determinism is expected vs not expected.
+This chapter explains why FFQ distributed execution should match embedded logical results in v2, which non-determinism is acceptable, and where parity is validated.
 
 ## 1) Core Claim
 
-For the same SQL, catalog metadata, and compatible config, FFQ expects:
+For the same SQL, tables, and relevant config, embedded and distributed should produce:
 
-1. same logical output schema
-2. same logical row set/aggregates
-3. same semantics for join/aggregate/top-k operators
+1. same logical schema
+2. same logical row set / aggregate values
+3. same semantics for join/aggregate/top-k behavior
 
-Embedded and distributed differ in orchestration/transport, not query meaning.
+Distributed mode changes orchestration and transport, not query meaning.
 
 ## 2) Why Semantic Equivalence Holds
 
-### 2.1 Same planner pipeline
+### 2.1 Same planning path
 
-Both modes go through the same client planning flow:
+Both modes share:
 
-1. SQL -> logical plan
-2. optimizer rewrites
-3. analyzer resolution/type checks
-4. physical plan creation
+1. SQL parse
+2. logical planning
+3. optimizer and analyzer
+4. physical plan generation
 
-Physical plan is then:
+Distributed mode executes plan fragments over coordinator/worker stages; embedded runs locally.
 
-1. executed locally (embedded), or
-2. serialized/submitted to coordinator+workers (distributed)
+### 2.2 Same operator contracts
 
-### 2.2 Same physical operator semantics
+Core operator logic is shared by semantics:
 
-Operator semantics are intended to match:
+1. scan/filter/project
+2. hash join
+3. partial/final hash aggregate
+4. top-k/vector scoring paths
+5. sinks and result materialization
 
-1. `HashJoin`: same equi-join logic
-2. `PartialHashAggregate` + `FinalHashAggregate`: same grouped aggregate logic
-3. `TopKByScore`: same score/evaluation logic
-4. `Filter`/`Project`/`Limit`: same expression and row semantics
+### 2.3 Shuffle and attempt identity correctness
 
-Distributed mode adds:
+Distributed correctness depends on:
 
-1. stage scheduling
-2. shuffle read/write transport
-3. result IPC streaming
+1. stage dependency gating
+2. map output registration keyed by attempt
+3. fetch requiring exact attempt identity
+4. stale attempt isolation (no accidental reuse)
 
-These are data-movement concerns, not semantic operator changes.
+### 2.4 Retry/liveness recovery keeps semantics
 
-### 2.3 Stage/shuffle preserves partition-correctness
+With failures:
 
-Shuffle contracts ensure key correctness:
+1. stale worker running tasks are requeued as new attempts
+2. failed attempts retry with backoff up to attempt budget
+3. latest-attempt tracking ensures terminal state reflects current attempt lineage
 
-1. rows with same partition key are routed to same reduce partition
-2. final aggregations and join probes read the required partition data
-3. attempt identity avoids mixing stale outputs into current attempt flow
+These mechanisms change execution timing, not logical result semantics.
 
-## 3) Where Equivalence Is Verified in Tests
+## 3) Capability-Aware Custom Operators and Correctness
 
-Primary parity test:
+For `PhysicalPlan::Custom`:
 
-1. `crates/client/tests/integration_distributed.rs`
+1. worker heartbeat advertises `custom_operator_capabilities`
+2. coordinator assigns custom-op tasks only to capable workers
+3. worker must have matching factory registered, else task fails explicitly
 
-What it does:
+Why this matters for correctness:
 
-1. run shared query suite in distributed mode
-2. run the same queries in embedded mode (same fixture files and table schemas)
-3. normalize both outputs
-4. assert equality of normalized text snapshots
+1. avoids assigning custom-op work to workers that cannot execute required semantics
+2. prevents silent fallback to wrong execution path
 
-Queries covered in parity loop:
+## 4) Where Parity Is Verified
 
-1. `scan_filter_project`
-2. `join_projection`
-3. `join_aggregate`
+Primary parity checks:
 
-Shared SQL sources:
+1. `make test-13.2-parity`
+2. `crates/client/tests/distributed_runtime_roundtrip.rs`
+3. `crates/client/tests/integration_distributed.rs`
 
-1. `tests/integration/queries/*.sql`
-2. exposed via `crates/client/tests/support/mod.rs::integration_queries`
+Coverage includes:
 
-## 4) Normalization Strategy (Why Comparisons Are Stable)
+1. join + aggregate parity
+2. projection/filter scan parity
+3. distributed vs embedded normalized output comparison
 
-Normalization helper:
+## 5) Normalization Strategy
 
-1. `snapshot_text(...)` in `crates/client/tests/support/mod.rs`
+Parity compares normalized outputs, not incidental execution layout.
 
-Normalization behavior:
+Normalization includes:
 
-1. verify batch schemas are consistent
-2. flatten all batches into row records
-3. sort rows by explicit sort keys
-4. render canonical row text (`col=value|...`)
-5. apply float rounding/tolerance policy in value rendering path
+1. stable schema checks
+2. batch flattening
+3. explicit row sorting by keys
+4. canonical rendering for snapshot/compare
+5. float tolerance handling in comparisons
 
-This avoids false mismatches from:
+This removes false mismatches from:
 
 1. batch boundary differences
-2. worker scheduling order differences
-3. non-semantic row ordering differences
+2. worker interleaving/scheduling order
+3. unordered row emission where SQL has no final `ORDER BY`
 
-## 5) Logical Determinism vs Physical Non-Determinism
+## 6) Expected vs Unexpected Non-Determinism
 
-### 5.1 Expected non-determinism (acceptable)
+### Expected and acceptable
 
-These may vary run-to-run without indicating correctness bugs:
+1. batch counts and batch boundaries
+2. task execution interleaving
+3. timing/metric variance
+4. row order for unordered queries
 
-1. order of rows when query does not define global ordering
-2. number/shape of intermediate batches
-3. task execution interleavings across workers
-4. exact timing and metric values
+### Not acceptable
 
-### 5.2 Logical determinism required
+1. missing/extra rows after normalization
+2. changed aggregate/group values
+3. schema/type divergence for same query
+4. stale-attempt data mixed into final output
 
-These must remain stable:
+## 7) Practical Debug Flow for Parity Failures
 
-1. final row set (modulo ordering when unordered)
-2. final aggregates/group counts/sums/etc.
-3. final join match semantics
-4. schema and data types of result columns
+1. compare SQL text and table registrations in both modes
+2. compare logical/physical explains
+3. inspect normalized outputs (first differing row/column)
+4. verify stage attempt lineage and shuffle registration keys
+5. check worker capability availability for custom-op queries
+6. inspect coordinator logs for requeue/blacklist/retry events
 
-Parity tests intentionally compare logical outputs, not incidental physical ordering.
+## 8) Code References
 
-## 6) Additional Determinism Anchors in Engine
+1. `crates/client/src/runtime.rs`
+2. `crates/distributed/src/coordinator.rs`
+3. `crates/distributed/src/worker.rs`
+4. `crates/client/tests/distributed_runtime_roundtrip.rs`
+5. `crates/client/tests/integration_distributed.rs`
+6. `crates/client/tests/support/mod.rs`
 
-Engine internals include explicit stabilizers:
-
-1. aggregate output keys are sorted before output batch creation
-2. top-k tie handling uses deterministic sequence tiebreak
-3. shared fixtures are deterministic and reused between modes
-
-These reduce flakiness and strengthen parity guarantees.
-
-## 7) Known Boundaries and Assumptions
-
-Equivalence assumes:
-
-1. identical table definitions and schemas registered in both modes
-2. distributed cluster healthy and running expected code/config
-3. no unsupported operator/feature path divergence
-
-Current v1 boundaries to keep in mind:
-
-1. cancellation and retry orchestration are intentionally minimal
-2. heartbeat is advisory in control plane
-3. parity suite currently focuses on representative core queries (scan/join/agg)
-
-## 8) Practical Parity Debug Checklist
-
-If distributed != embedded:
-
-1. compare optimized logical explain for the same SQL
-2. validate table schemas/options match in both runs
-3. inspect normalized snapshot texts for first differing row/column
-4. verify shuffle attempt and partition selection behavior
-5. inspect join key resolution and aggregate group key typing
-
-Key files:
-
-1. `crates/client/tests/integration_distributed.rs`
-2. `crates/client/tests/support/mod.rs`
-3. `crates/client/src/runtime.rs`
-4. `crates/distributed/src/worker.rs`
-5. `crates/distributed/src/coordinator.rs`
-
-## 9) Bottom Line
-
-FFQ distributed correctness is based on:
-
-1. same planned semantics,
-2. same operator contracts,
-3. transport/scheduling layers that preserve key-partition correctness,
-4. parity tests that compare normalized logical outputs rather than unstable physical ordering.
-
-## Runnable command
+## Runnable commands
 
 ```bash
 make test-13.2-parity
+cargo test -p ffq-distributed --features grpc coordinator_requeues_tasks_from_stale_worker
+cargo test -p ffq-distributed --features grpc coordinator_assigns_custom_operator_tasks_only_to_capable_workers
 ```

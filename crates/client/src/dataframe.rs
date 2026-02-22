@@ -1,17 +1,21 @@
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use ffq_common::{FfqError, Result};
+use ffq_execution::stream::SendableRecordBatchStream;
 use ffq_planner::{AggExpr, Expr, JoinType, LogicalPlan};
+#[cfg(feature = "vector")]
+use ffq_planner::PhysicalPlan;
 use ffq_storage::parquet_provider::ParquetProvider;
 use futures::TryStreamExt;
 use parquet::arrow::ArrowWriter;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::engine::{annotate_schema_inference_metadata, read_schema_fingerprint_metadata};
-use crate::runtime::QueryContext;
+use crate::runtime::{QueryContext, RuntimeStatsCollector};
 use crate::session::SchemaCacheEntry;
 use crate::session::SharedSession;
 
@@ -60,6 +64,16 @@ pub enum WriteMode {
 pub struct DataFrame {
     session: SharedSession,
     logical_plan: LogicalPlan,
+}
+
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, Default)]
+/// Per-query overrides for index-backed vector KNN execution.
+pub struct VectorKnnOverrides {
+    /// Optional metric override (`cosine`, `dot`, `l2`).
+    pub metric: Option<String>,
+    /// Optional HNSW `ef_search` override.
+    pub ef_search: Option<usize>,
 }
 
 impl DataFrame {
@@ -138,13 +152,36 @@ impl DataFrame {
         let cat = self.session.catalog.read().expect("catalog lock poisoned");
         let provider = CatalogProvider { catalog: &*cat };
 
-        let opt = self.session.planner.optimize_only(
+        let opt = self.session.planner.optimize_analyze(
             self.logical_plan.clone(),
             &provider,
             &self.session.config,
         )?;
+        let physical = self.session.planner.create_physical_plan(&opt)?;
+        let table_stats = render_table_stats_section(&opt, &*cat);
+        Ok(format!(
+            "== Logical Plan ==\n{}\n== Physical Plan ==\n{}\n== Table Stats ==\n{}",
+            ffq_planner::explain_logical(&opt),
+            ffq_planner::explain_physical(&physical),
+            table_stats
+        ))
+    }
 
-        Ok(ffq_planner::explain_logical(&opt))
+    /// Executes this query and returns explain text with runtime stage/operator statistics.
+    ///
+    /// # Errors
+    /// Returns an error when planning or execution fails.
+    pub async fn explain_analyze(&self) -> Result<String> {
+        let _ = self.collect().await?;
+        let explain = self.explain()?;
+        let stats = self
+            .session
+            .last_query_stats_report
+            .read()
+            .expect("query stats lock poisoned")
+            .clone()
+            .unwrap_or_else(|| "no runtime stats captured".to_string());
+        Ok(format!("{explain}\n== Runtime Stats ==\n{stats}"))
     }
 
     /// df.collect() (async)
@@ -164,8 +201,30 @@ impl DataFrame {
     /// # Errors
     /// Returns an error when planning or execution fails.
     pub async fn collect(&self) -> Result<Vec<RecordBatch>> {
-        let (_schema, batches) = self.execute_with_schema().await?;
-        Ok(batches)
+        let stream = self.collect_stream().await?;
+        stream.try_collect().await
+    }
+
+    /// Executes this plan and returns a streaming batch result.
+    ///
+    /// # Errors
+    /// Returns an error when planning or execution fails.
+    pub async fn collect_stream(&self) -> Result<SendableRecordBatchStream> {
+        self.create_execution_stream().await
+    }
+
+    #[cfg(feature = "vector")]
+    /// Executes this plan with vector KNN query-time overrides.
+    ///
+    /// Overrides are applied to all `VectorKnn` operators in the physical plan for this call only.
+    pub async fn collect_with_vector_knn_overrides(
+        &self,
+        overrides: VectorKnnOverrides,
+    ) -> Result<Vec<RecordBatch>> {
+        let stream = self
+            .create_execution_stream_with_vector_overrides(Some(overrides))
+            .await?;
+        stream.try_collect().await
     }
 
     /// Executes this plan and writes output to parquet, replacing destination by default.
@@ -297,6 +356,22 @@ impl DataFrame {
     }
 
     async fn execute_with_schema(&self) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+        let stream = self.create_execution_stream().await?;
+        let schema = stream.schema();
+        let batches: Vec<RecordBatch> = stream.try_collect().await?;
+        Ok((schema, batches))
+    }
+
+    async fn create_execution_stream(&self) -> Result<SendableRecordBatchStream> {
+        self.create_execution_stream_with_vector_overrides(None)
+            .await
+    }
+
+    async fn create_execution_stream_with_vector_overrides(
+        &self,
+        #[cfg(feature = "vector")] vector_overrides: Option<VectorKnnOverrides>,
+        #[cfg(not(feature = "vector"))] vector_overrides: Option<()>,
+    ) -> Result<SendableRecordBatchStream> {
         self.ensure_inferred_parquet_schemas()?;
         // Ensure both SQL-built and DataFrame-built plans go through the same analyze/optimize pipeline.
         let (analyzed, catalog_snapshot) = {
@@ -313,23 +388,43 @@ impl DataFrame {
             (analyzed, std::sync::Arc::new((*cat_guard).clone()))
         };
 
-        let physical = self.session.planner.create_physical_plan(&analyzed)?;
+        let physical =
+            create_physical_plan_with_vector_overrides(&self.session.planner, &analyzed, vector_overrides)?;
 
+        let stats_collector = Arc::new(RuntimeStatsCollector::default());
         let ctx = QueryContext {
             batch_size_rows: self.session.config.batch_size_rows,
             mem_budget_bytes: self.session.config.mem_budget_bytes,
+            spill_trigger_ratio_num: 1,
+            spill_trigger_ratio_den: 1,
+            broadcast_threshold_bytes: self.session.config.broadcast_threshold_bytes,
+            join_radix_bits: self.session.config.join_radix_bits,
+            join_bloom_enabled: self.session.config.join_bloom_enabled,
+            join_bloom_bits: self.session.config.join_bloom_bits,
             spill_dir: self.session.config.spill_dir.clone(),
+            stats_collector: Some(Arc::clone(&stats_collector)),
         };
 
-        let stream: ffq_execution::stream::SendableRecordBatchStream = self
+        let stream = self
             .session
             .runtime
-            .execute(physical, ctx, catalog_snapshot)
+            .execute(
+                physical,
+                ctx,
+                catalog_snapshot,
+                Arc::clone(&self.session.physical_registry),
+            )
             .await?;
-        let schema = stream.schema();
-
-        let batches: Vec<RecordBatch> = stream.try_collect().await?;
-        Ok((schema, batches))
+        let report = stats_collector.render_report();
+        {
+            let mut slot = self
+                .session
+                .last_query_stats_report
+                .write()
+                .expect("query stats lock poisoned");
+            *slot = report;
+        }
+        Ok(stream)
     }
 
     fn ensure_inferred_parquet_schemas(&self) -> Result<()> {
@@ -460,6 +555,115 @@ impl DataFrame {
     }
 }
 
+#[cfg(feature = "vector")]
+fn create_physical_plan_with_vector_overrides(
+    planner: &crate::planner_facade::PlannerFacade,
+    analyzed: &LogicalPlan,
+    vector_overrides: Option<VectorKnnOverrides>,
+) -> Result<PhysicalPlan> {
+    let mut physical = planner.create_physical_plan(analyzed)?;
+    if let Some(overrides) = vector_overrides {
+        apply_vector_knn_overrides(&mut physical, &overrides)?;
+    }
+    Ok(physical)
+}
+
+#[cfg(not(feature = "vector"))]
+fn create_physical_plan_with_vector_overrides(
+    planner: &crate::planner_facade::PlannerFacade,
+    analyzed: &LogicalPlan,
+    _vector_overrides: Option<()>,
+) -> Result<ffq_planner::PhysicalPlan> {
+    planner.create_physical_plan(analyzed)
+}
+
+#[cfg(feature = "vector")]
+fn apply_vector_knn_overrides(
+    plan: &mut PhysicalPlan,
+    overrides: &VectorKnnOverrides,
+) -> Result<()> {
+    fn validate_metric(metric: &str) -> Result<()> {
+        if matches!(metric, "cosine" | "dot" | "l2") {
+            return Ok(());
+        }
+        Err(ffq_common::FfqError::InvalidConfig(format!(
+            "unsupported vector metric override '{metric}'"
+        )))
+    }
+
+    if let Some(metric) = overrides.metric.as_deref() {
+        validate_metric(metric)?;
+    }
+    if let Some(ef) = overrides.ef_search
+        && ef == 0
+    {
+        return Err(ffq_common::FfqError::InvalidConfig(
+            "vector ef_search override must be > 0".to_string(),
+        ));
+    }
+
+    match plan {
+        PhysicalPlan::VectorKnn(exec) => {
+            if let Some(metric) = overrides.metric.as_deref() {
+                exec.metric = metric.to_string();
+            }
+            if overrides.ef_search.is_some() {
+                exec.ef_search = overrides.ef_search;
+            }
+            Ok(())
+        }
+        PhysicalPlan::Filter(exec) => apply_vector_knn_overrides(&mut exec.input, overrides),
+        PhysicalPlan::InSubqueryFilter(exec) => {
+            apply_vector_knn_overrides(&mut exec.input, overrides)?;
+            apply_vector_knn_overrides(&mut exec.subquery, overrides)
+        }
+        PhysicalPlan::ExistsSubqueryFilter(exec) => {
+            apply_vector_knn_overrides(&mut exec.input, overrides)?;
+            apply_vector_knn_overrides(&mut exec.subquery, overrides)
+        }
+        PhysicalPlan::ScalarSubqueryFilter(exec) => {
+            apply_vector_knn_overrides(&mut exec.input, overrides)?;
+            apply_vector_knn_overrides(&mut exec.subquery, overrides)
+        }
+        PhysicalPlan::Project(exec) => apply_vector_knn_overrides(&mut exec.input, overrides),
+        PhysicalPlan::PartialHashAggregate(exec) => {
+            apply_vector_knn_overrides(&mut exec.input, overrides)
+        }
+        PhysicalPlan::FinalHashAggregate(exec) => {
+            apply_vector_knn_overrides(&mut exec.input, overrides)
+        }
+        PhysicalPlan::Window(exec) => apply_vector_knn_overrides(&mut exec.input, overrides),
+        PhysicalPlan::CoalesceBatches(exec) => {
+            apply_vector_knn_overrides(&mut exec.input, overrides)
+        }
+        PhysicalPlan::Exchange(exec) => match exec {
+            ffq_planner::ExchangeExec::ShuffleWrite(x) => {
+                apply_vector_knn_overrides(&mut x.input, overrides)
+            }
+            ffq_planner::ExchangeExec::ShuffleRead(x) => {
+                apply_vector_knn_overrides(&mut x.input, overrides)
+            }
+            ffq_planner::ExchangeExec::Broadcast(x) => {
+                apply_vector_knn_overrides(&mut x.input, overrides)
+            }
+        },
+        PhysicalPlan::HashJoin(exec) => {
+            apply_vector_knn_overrides(&mut exec.left, overrides)?;
+            apply_vector_knn_overrides(&mut exec.right, overrides)
+        }
+        PhysicalPlan::Limit(exec) => apply_vector_knn_overrides(&mut exec.input, overrides),
+        PhysicalPlan::TopKByScore(exec) => apply_vector_knn_overrides(&mut exec.input, overrides),
+        PhysicalPlan::UnionAll(exec) => {
+            apply_vector_knn_overrides(&mut exec.left, overrides)?;
+            apply_vector_knn_overrides(&mut exec.right, overrides)
+        }
+        PhysicalPlan::CteRef(exec) => apply_vector_knn_overrides(&mut exec.plan, overrides),
+        PhysicalPlan::ParquetWrite(exec) => apply_vector_knn_overrides(&mut exec.input, overrides),
+        PhysicalPlan::Custom(exec) => apply_vector_knn_overrides(&mut exec.input, overrides),
+        PhysicalPlan::ParquetScan(_) | PhysicalPlan::VectorTopK(_) => Ok(()),
+    }
+}
+
 /// Builder for grouped aggregations produced by [`DataFrame::groupby`].
 #[derive(Debug, Clone)]
 pub struct GroupedDataFrame {
@@ -483,23 +687,86 @@ impl GroupedDataFrame {
 
 fn collect_table_refs(plan: &LogicalPlan, out: &mut Vec<String>) {
     match plan {
+        LogicalPlan::SubqueryAlias { input, .. } => collect_table_refs(input, out),
         LogicalPlan::TableScan { table, .. } => out.push(table.clone()),
         LogicalPlan::Projection { input, .. } => collect_table_refs(input, out),
         LogicalPlan::Filter { input, .. } => collect_table_refs(input, out),
+        LogicalPlan::InSubqueryFilter {
+            input, subquery, ..
+        } => {
+            collect_table_refs(input, out);
+            collect_table_refs(subquery, out);
+        }
+        LogicalPlan::ExistsSubqueryFilter {
+            input, subquery, ..
+        } => {
+            collect_table_refs(input, out);
+            collect_table_refs(subquery, out);
+        }
+        LogicalPlan::ScalarSubqueryFilter {
+            input, subquery, ..
+        } => {
+            collect_table_refs(input, out);
+            collect_table_refs(subquery, out);
+        }
         LogicalPlan::Join { left, right, .. } => {
             collect_table_refs(left, out);
             collect_table_refs(right, out);
         }
         LogicalPlan::Aggregate { input, .. } => collect_table_refs(input, out),
+        LogicalPlan::Window { input, .. } => collect_table_refs(input, out),
         LogicalPlan::Limit { input, .. } => collect_table_refs(input, out),
         LogicalPlan::TopKByScore { input, .. } => collect_table_refs(input, out),
+        LogicalPlan::UnionAll { left, right } => {
+            collect_table_refs(left, out);
+            collect_table_refs(right, out);
+        }
+        LogicalPlan::CteRef { plan, .. } => collect_table_refs(plan, out),
         LogicalPlan::VectorTopK { table, .. } => out.push(table.clone()),
+        LogicalPlan::HybridVectorScan { source, .. } => out.push(source.clone()),
         LogicalPlan::InsertInto { input, .. } => {
             // Insert target is a write sink; schema inference/fingerprint checks are only
             // needed for read-side tables referenced by the input query.
             collect_table_refs(input, out);
         }
     }
+}
+
+fn render_table_stats_section(plan: &LogicalPlan, catalog: &ffq_storage::Catalog) -> String {
+    let mut names = Vec::new();
+    collect_table_refs(plan, &mut names);
+    let mut seen = std::collections::HashSet::new();
+    names.retain(|n| seen.insert(n.clone()));
+    if names.is_empty() {
+        return "no table scans".to_string();
+    }
+    let mut lines = Vec::new();
+    for name in names {
+        match catalog.get(&name) {
+            Ok(table) => {
+                let bytes = table
+                    .stats
+                    .bytes
+                    .map(|b| b.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let rows = table
+                    .stats
+                    .rows
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let file_count = table
+                    .options
+                    .get("stats.parquet.file_count")
+                    .cloned()
+                    .unwrap_or_else(|| "n/a".to_string());
+                lines.push(format!(
+                    "- {name}: bytes={bytes} rows={rows} file_count={file_count}"
+                ));
+            }
+            Err(_) => lines.push(format!("- {name}: missing from catalog")),
+        }
+    }
+    lines.join("\n")
 }
 
 fn write_single_parquet_file(
@@ -702,7 +969,12 @@ fn replace_dir_atomically(staged: &Path, target: &Path) -> Result<()> {
 mod tests {
     use std::collections::HashMap;
 
+    #[cfg(feature = "vector")]
+    use ffq_planner::{PhysicalPlan, VectorKnnExec};
+
     use super::CatalogProvider;
+    #[cfg(feature = "vector")]
+    use super::{VectorKnnOverrides, apply_vector_knn_overrides};
     use ffq_planner::OptimizerContext;
 
     #[test]
@@ -739,5 +1011,31 @@ mod tests {
             opts.get("qdrant.collection").expect("collection option"),
             "docs"
         );
+    }
+
+    #[cfg(feature = "vector")]
+    #[test]
+    fn vector_knn_overrides_update_physical_exec() {
+        let mut plan = PhysicalPlan::VectorKnn(VectorKnnExec {
+            source: "docs_idx".to_string(),
+            query_vectors: vec![vec![0.1, 0.2, 0.3]],
+            k: 5,
+            ef_search: Some(64),
+            prefilter: None,
+            metric: "cosine".to_string(),
+            provider: "qdrant".to_string(),
+        });
+        let overrides = VectorKnnOverrides {
+            metric: Some("dot".to_string()),
+            ef_search: Some(256),
+        };
+        apply_vector_knn_overrides(&mut plan, &overrides).expect("apply overrides");
+        match plan {
+            PhysicalPlan::VectorKnn(exec) => {
+                assert_eq!(exec.metric, "dot");
+                assert_eq!(exec.ef_search, Some(256));
+            }
+            other => panic!("expected VectorKnn plan, got {other:?}"),
+        }
     }
 }

@@ -1,7 +1,6 @@
 #![cfg(feature = "distributed")]
 
 use std::collections::HashMap;
-#[cfg(feature = "vector")]
 use std::fs::File;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +22,6 @@ use ffq_distributed::{
 #[cfg(feature = "vector")]
 use ffq_planner::LiteralValue;
 use ffq_storage::{TableDef, TableStats};
-#[cfg(feature = "vector")]
 use parquet::arrow::ArrowWriter;
 use tokio::sync::Mutex;
 use tonic::transport::Server;
@@ -103,6 +101,56 @@ fn register_tables_without_schema(
     );
 }
 
+fn register_window_case_table(engine: &Engine, window_path: &std::path::Path, with_schema: bool) {
+    let schema = Schema::new(vec![
+        Field::new("grp", DataType::Int64, false),
+        Field::new("ord", DataType::Int64, false),
+        Field::new("score", DataType::Int64, true),
+    ]);
+    engine.register_table(
+        "window_case",
+        TableDef {
+            name: "window_case".to_string(),
+            uri: window_path.to_string_lossy().to_string(),
+            paths: Vec::new(),
+            format: "parquet".to_string(),
+            schema: with_schema.then_some(schema),
+            stats: TableStats::default(),
+            options: HashMap::new(),
+        },
+    );
+}
+
+fn write_window_case_parquet(path: &std::path::Path) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("grp", DataType::Int64, false),
+        Field::new("ord", DataType::Int64, false),
+        Field::new("score", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1_i64, 1, 1, 1, 2, 2, 2, 2])),
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 1, 2, 3, 4])),
+            Arc::new(Int64Array::from(vec![
+                Some(10_i64),
+                Some(10),
+                None,
+                Some(20),
+                None,
+                Some(5),
+                Some(5),
+                Some(8),
+            ])),
+        ],
+    )
+    .expect("window_case batch");
+    let file = File::create(path).expect("create window_case parquet");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("window_case writer");
+    writer.write(&batch).expect("window_case write");
+    writer.close().expect("window_case close");
+}
+
 fn collect_group_counts(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
     let mut out = Vec::new();
     for batch in batches {
@@ -169,6 +217,17 @@ fn collect_scan_rows(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
     }
     out.sort_unstable();
     out
+}
+
+#[cfg(feature = "approx")]
+fn collect_single_int64(batches: &[RecordBatch], col: usize) -> i64 {
+    let batch = batches.first().expect("at least one batch");
+    let arr = batch
+        .column(col)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("int64");
+    arr.value(0)
 }
 
 #[cfg(feature = "vector")]
@@ -259,6 +318,8 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     let fixtures = support::ensure_integration_parquet_fixtures();
     let lineitem_path = fixtures.lineitem;
     let orders_path = fixtures.orders;
+    let window_path = support::unique_path("ffq_client_window_case", "parquet");
+    write_window_case_parquet(&window_path);
     let spill_dir = support::unique_path("ffq_client_dist_spill", "dir");
     let shuffle_root = support::unique_path("ffq_client_dist_shuffle", "dir");
     let _ = std::fs::create_dir_all(&shuffle_root);
@@ -281,6 +342,15 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     coordinator_catalog.register_table(TableDef {
         name: "orders".to_string(),
         uri: orders_path.to_string_lossy().to_string(),
+        paths: Vec::new(),
+        format: "parquet".to_string(),
+        schema: None,
+        stats: TableStats::default(),
+        options: HashMap::new(),
+    });
+    coordinator_catalog.register_table(TableDef {
+        name: "window_case".to_string(),
+        uri: window_path.to_string_lossy().to_string(),
         paths: Vec::new(),
         format: "parquet".to_string(),
         schema: None,
@@ -326,6 +396,15 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         stats: TableStats::default(),
         options: HashMap::new(),
     });
+    worker_catalog.register_table(TableDef {
+        name: "window_case".to_string(),
+        uri: window_path.to_string_lossy().to_string(),
+        paths: Vec::new(),
+        format: "parquet".to_string(),
+        schema: None,
+        stats: TableStats::default(),
+        options: HashMap::new(),
+    });
     let executor = Arc::new(DefaultTaskExecutor::new(Arc::new(worker_catalog)));
 
     let cp1 = Arc::new(
@@ -344,8 +423,10 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
             worker_id: "w1".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
+            map_output_publish_window_partitions: 1,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
+            ..WorkerConfig::default()
         },
         cp1,
         Arc::clone(&executor),
@@ -355,8 +436,10 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
             worker_id: "w2".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
+            map_output_publish_window_partitions: 1,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
+            ..WorkerConfig::default()
         },
         cp2,
         executor,
@@ -383,9 +466,76 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
     cfg.coordinator_endpoint = Some(endpoint.clone());
     let dist_engine = Engine::new(cfg.clone()).expect("distributed engine");
     register_tables(&dist_engine, &lineitem_path, &orders_path);
+    register_window_case_table(&dist_engine, &window_path, true);
     let sql_scan = support::integration_queries::scan_filter_project();
     let sql_agg = support::integration_queries::join_aggregate();
     let sql_join = support::integration_queries::join_projection();
+    let sql_cte = "WITH filtered AS (
+        SELECT l_orderkey, l_partkey
+        FROM lineitem
+        WHERE l_orderkey >= 2
+    )
+    SELECT l_orderkey, l_partkey FROM filtered";
+    let sql_in_subquery = "SELECT l_orderkey, l_partkey
+        FROM lineitem
+        WHERE l_orderkey IN (
+            SELECT o_orderkey FROM orders WHERE o_custkey >= 100
+        )";
+    let sql_correlated_exists = "SELECT l_orderkey, l_partkey
+        FROM lineitem
+        WHERE EXISTS (
+            SELECT o_orderkey
+            FROM orders
+            WHERE orders.o_orderkey = lineitem.l_orderkey
+        )";
+    let sql_cte_join_heavy = "WITH c AS (
+        SELECT l_orderkey, l_partkey
+        FROM lineitem
+        WHERE l_orderkey >= 2
+    )
+    SELECT a.l_orderkey, a.l_partkey, b.l_partkey AS other_part
+    FROM c a
+    JOIN c b
+      ON a.l_orderkey = b.l_orderkey";
+    let sql_window = "SELECT l_orderkey, l_partkey,
+        ROW_NUMBER() OVER (PARTITION BY l_orderkey ORDER BY l_partkey) AS rn
+        FROM lineitem
+        WHERE l_orderkey >= 2";
+    let sql_window_rank = "SELECT grp, ord, score,
+        ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score ASC NULLS LAST) AS rn,
+        RANK() OVER (PARTITION BY grp ORDER BY score ASC NULLS LAST) AS rnk,
+        DENSE_RANK() OVER (PARTITION BY grp ORDER BY score ASC NULLS LAST) AS dr
+        FROM window_case";
+    let sql_window_frame = "SELECT grp, ord,
+        SUM(score) OVER (
+            PARTITION BY grp
+            ORDER BY ord
+            ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+        ) AS s_rows,
+        SUM(score) OVER (
+            PARTITION BY grp
+            ORDER BY score
+            GROUPS BETWEEN CURRENT ROW AND 1 FOLLOWING
+        ) AS s_groups
+        FROM window_case";
+    let sql_window_nulls = "SELECT grp, ord,
+        ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score ASC NULLS FIRST) AS rn_nf,
+        ROW_NUMBER() OVER (PARTITION BY grp ORDER BY score ASC NULLS LAST) AS rn_nl
+        FROM window_case";
+    let sql_window_exclude = "SELECT grp, ord,
+        SUM(score) OVER (
+            PARTITION BY grp
+            ORDER BY ord
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+            EXCLUDE CURRENT ROW
+        ) AS s_ex
+        FROM window_case";
+    let sql_count_distinct = "SELECT l_orderkey, COUNT(DISTINCT l_partkey) AS cd
+        FROM lineitem
+        GROUP BY l_orderkey";
+    #[cfg(feature = "approx")]
+    let sql_approx_count_distinct = "SELECT APPROX_COUNT_DISTINCT(l_partkey) AS acd
+        FROM lineitem";
 
     let dist_scan_batches = dist_engine
         .sql(sql_scan)
@@ -406,11 +556,79 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         .collect()
         .await
         .expect("dist join collect");
+    let dist_cte_batches = dist_engine
+        .sql(sql_cte)
+        .expect("dist cte sql")
+        .collect()
+        .await
+        .expect("dist cte collect");
+    let dist_in_subquery_batches = dist_engine
+        .sql(sql_in_subquery)
+        .expect("dist in-subquery sql")
+        .collect()
+        .await
+        .expect("dist in-subquery collect");
+    let dist_correlated_exists_batches = dist_engine
+        .sql(sql_correlated_exists)
+        .expect("dist correlated exists sql")
+        .collect()
+        .await
+        .expect("dist correlated exists collect");
+    let dist_cte_join_heavy_batches = dist_engine
+        .sql(sql_cte_join_heavy)
+        .expect("dist cte join-heavy sql")
+        .collect()
+        .await
+        .expect("dist cte join-heavy collect");
+    let dist_window_batches = dist_engine
+        .sql(sql_window)
+        .expect("dist window sql")
+        .collect()
+        .await
+        .expect("dist window collect");
+    let dist_window_rank_batches = dist_engine
+        .sql(sql_window_rank)
+        .expect("dist window rank sql")
+        .collect()
+        .await
+        .expect("dist window rank collect");
+    let dist_window_frame_batches = dist_engine
+        .sql(sql_window_frame)
+        .expect("dist window frame sql")
+        .collect()
+        .await
+        .expect("dist window frame collect");
+    let dist_window_nulls_batches = dist_engine
+        .sql(sql_window_nulls)
+        .expect("dist window nulls sql")
+        .collect()
+        .await
+        .expect("dist window nulls collect");
+    let dist_window_exclude_batches = dist_engine
+        .sql(sql_window_exclude)
+        .expect("dist window exclude sql")
+        .collect()
+        .await
+        .expect("dist window exclude collect");
+    let dist_count_distinct_batches = dist_engine
+        .sql(sql_count_distinct)
+        .expect("dist count-distinct sql")
+        .collect()
+        .await
+        .expect("dist count-distinct collect");
+    #[cfg(feature = "approx")]
+    let dist_approx_count_distinct_batches = dist_engine
+        .sql(sql_approx_count_distinct)
+        .expect("dist approx-count-distinct sql")
+        .collect()
+        .await
+        .expect("dist approx-count-distinct collect");
 
     cfg.coordinator_endpoint = None;
 
     let embedded_engine = Engine::new(cfg).expect("embedded engine");
     register_tables(&embedded_engine, &lineitem_path, &orders_path);
+    register_window_case_table(&embedded_engine, &window_path, true);
     let embedded_scan_batches = embedded_engine
         .sql(sql_scan)
         .expect("embedded scan sql")
@@ -429,6 +647,73 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         .collect()
         .await
         .expect("embedded join collect");
+    let embedded_cte_batches = embedded_engine
+        .sql(sql_cte)
+        .expect("embedded cte sql")
+        .collect()
+        .await
+        .expect("embedded cte collect");
+    let embedded_in_subquery_batches = embedded_engine
+        .sql(sql_in_subquery)
+        .expect("embedded in-subquery sql")
+        .collect()
+        .await
+        .expect("embedded in-subquery collect");
+    let embedded_correlated_exists_batches = embedded_engine
+        .sql(sql_correlated_exists)
+        .expect("embedded correlated exists sql")
+        .collect()
+        .await
+        .expect("embedded correlated exists collect");
+    let embedded_cte_join_heavy_batches = embedded_engine
+        .sql(sql_cte_join_heavy)
+        .expect("embedded cte join-heavy sql")
+        .collect()
+        .await
+        .expect("embedded cte join-heavy collect");
+    let embedded_window_batches = embedded_engine
+        .sql(sql_window)
+        .expect("embedded window sql")
+        .collect()
+        .await
+        .expect("embedded window collect");
+    let embedded_window_rank_batches = embedded_engine
+        .sql(sql_window_rank)
+        .expect("embedded window rank sql")
+        .collect()
+        .await
+        .expect("embedded window rank collect");
+    let embedded_window_frame_batches = embedded_engine
+        .sql(sql_window_frame)
+        .expect("embedded window frame sql")
+        .collect()
+        .await
+        .expect("embedded window frame collect");
+    let embedded_window_nulls_batches = embedded_engine
+        .sql(sql_window_nulls)
+        .expect("embedded window nulls sql")
+        .collect()
+        .await
+        .expect("embedded window nulls collect");
+    let embedded_window_exclude_batches = embedded_engine
+        .sql(sql_window_exclude)
+        .expect("embedded window exclude sql")
+        .collect()
+        .await
+        .expect("embedded window exclude collect");
+    let embedded_count_distinct_batches = embedded_engine
+        .sql(sql_count_distinct)
+        .expect("embedded count-distinct sql")
+        .collect()
+        .await
+        .expect("embedded count-distinct collect");
+    #[cfg(feature = "approx")]
+    let embedded_approx_count_distinct_batches = embedded_engine
+        .sql(sql_approx_count_distinct)
+        .expect("embedded approx-count-distinct sql")
+        .collect()
+        .await
+        .expect("embedded approx-count-distinct collect");
 
     let dist_agg_norm = support::snapshot_text(&dist_agg_batches, &["l_orderkey"], 1e-9);
     let emb_agg_norm = support::snapshot_text(&embedded_agg_batches, &["l_orderkey"], 1e-9);
@@ -461,6 +746,125 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
         "distributed and embedded scan/filter/project outputs differ"
     );
 
+    let dist_cte_norm =
+        support::snapshot_text(&dist_cte_batches, &["l_orderkey", "l_partkey"], 1e-9);
+    let emb_cte_norm =
+        support::snapshot_text(&embedded_cte_batches, &["l_orderkey", "l_partkey"], 1e-9);
+    assert_eq!(
+        dist_cte_norm, emb_cte_norm,
+        "distributed and embedded CTE outputs differ"
+    );
+
+    let dist_in_norm = support::snapshot_text(
+        &dist_in_subquery_batches,
+        &["l_orderkey", "l_partkey"],
+        1e-9,
+    );
+    let emb_in_norm = support::snapshot_text(
+        &embedded_in_subquery_batches,
+        &["l_orderkey", "l_partkey"],
+        1e-9,
+    );
+    assert_eq!(
+        dist_in_norm, emb_in_norm,
+        "distributed and embedded IN-subquery outputs differ"
+    );
+
+    let dist_exists_norm = support::snapshot_text(
+        &dist_correlated_exists_batches,
+        &["l_orderkey", "l_partkey"],
+        1e-9,
+    );
+    let emb_exists_norm = support::snapshot_text(
+        &embedded_correlated_exists_batches,
+        &["l_orderkey", "l_partkey"],
+        1e-9,
+    );
+    assert_eq!(
+        dist_exists_norm, emb_exists_norm,
+        "distributed and embedded correlated EXISTS outputs differ"
+    );
+
+    let dist_cte_join_heavy_norm = support::snapshot_text(
+        &dist_cte_join_heavy_batches,
+        &["l_orderkey", "l_partkey", "other_part"],
+        1e-9,
+    );
+    let emb_cte_join_heavy_norm = support::snapshot_text(
+        &embedded_cte_join_heavy_batches,
+        &["l_orderkey", "l_partkey", "other_part"],
+        1e-9,
+    );
+    assert_eq!(
+        dist_cte_join_heavy_norm, emb_cte_join_heavy_norm,
+        "distributed and embedded CTE join-heavy outputs differ"
+    );
+    let dist_window_norm = support::snapshot_text(
+        &dist_window_batches,
+        &["l_orderkey", "l_partkey", "rn"],
+        1e-9,
+    );
+    let emb_window_norm = support::snapshot_text(
+        &embedded_window_batches,
+        &["l_orderkey", "l_partkey", "rn"],
+        1e-9,
+    );
+    assert_eq!(
+        dist_window_norm, emb_window_norm,
+        "distributed and embedded window outputs differ"
+    );
+    let dist_window_rank_norm =
+        support::snapshot_text(&dist_window_rank_batches, &["grp", "ord"], 1e-9);
+    let emb_window_rank_norm =
+        support::snapshot_text(&embedded_window_rank_batches, &["grp", "ord"], 1e-9);
+    assert_eq!(
+        dist_window_rank_norm, emb_window_rank_norm,
+        "distributed and embedded window rank outputs differ"
+    );
+    let dist_window_frame_norm =
+        support::snapshot_text(&dist_window_frame_batches, &["grp", "ord"], 1e-9);
+    let emb_window_frame_norm =
+        support::snapshot_text(&embedded_window_frame_batches, &["grp", "ord"], 1e-9);
+    assert_eq!(
+        dist_window_frame_norm, emb_window_frame_norm,
+        "distributed and embedded window frame outputs differ"
+    );
+    let dist_window_nulls_norm =
+        support::snapshot_text(&dist_window_nulls_batches, &["grp", "ord"], 1e-9);
+    let emb_window_nulls_norm =
+        support::snapshot_text(&embedded_window_nulls_batches, &["grp", "ord"], 1e-9);
+    assert_eq!(
+        dist_window_nulls_norm, emb_window_nulls_norm,
+        "distributed and embedded window null-order outputs differ"
+    );
+    let dist_window_exclude_norm =
+        support::snapshot_text(&dist_window_exclude_batches, &["grp", "ord"], 1e-9);
+    let emb_window_exclude_norm =
+        support::snapshot_text(&embedded_window_exclude_batches, &["grp", "ord"], 1e-9);
+    assert_eq!(
+        dist_window_exclude_norm, emb_window_exclude_norm,
+        "distributed and embedded window exclusion outputs differ"
+    );
+    let dist_count_distinct_norm =
+        support::snapshot_text(&dist_count_distinct_batches, &["l_orderkey"], 1e-9);
+    let emb_count_distinct_norm =
+        support::snapshot_text(&embedded_count_distinct_batches, &["l_orderkey"], 1e-9);
+    assert_eq!(
+        dist_count_distinct_norm, emb_count_distinct_norm,
+        "distributed and embedded COUNT(DISTINCT) outputs differ"
+    );
+    #[cfg(feature = "approx")]
+    {
+        let dist_approx = collect_single_int64(&dist_approx_count_distinct_batches, 0) as f64;
+        let emb_approx = collect_single_int64(&embedded_approx_count_distinct_batches, 0) as f64;
+        let denom = emb_approx.max(1.0);
+        let rel_err = ((dist_approx - emb_approx) / denom).abs();
+        assert!(
+            rel_err <= 0.10,
+            "distributed and embedded APPROX_COUNT_DISTINCT diverged too much: dist={dist_approx}, emb={emb_approx}, rel_err={rel_err}"
+        );
+    }
+
     let dist_agg = collect_group_counts(&dist_agg_batches);
     let emb_agg = collect_group_counts(&embedded_agg_batches);
     assert_eq!(dist_agg, emb_agg);
@@ -489,6 +893,7 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
 
     let _ = std::fs::remove_dir_all(&spill_dir);
     let _ = std::fs::remove_dir_all(&shuffle_root);
+    let _ = std::fs::remove_file(&window_path);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -582,8 +987,10 @@ async fn distributed_runtime_no_schema_parity_matches_embedded() {
             worker_id: "w1".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
+            map_output_publish_window_partitions: 1,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
+            ..WorkerConfig::default()
         },
         cp1,
         Arc::clone(&executor),
@@ -593,8 +1000,10 @@ async fn distributed_runtime_no_schema_parity_matches_embedded() {
             worker_id: "w2".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
+            map_output_publish_window_partitions: 1,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
+            ..WorkerConfig::default()
         },
         cp2,
         executor,
@@ -757,8 +1166,10 @@ async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
             worker_id: "w1".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
+            map_output_publish_window_partitions: 1,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
+            ..WorkerConfig::default()
         },
         cp1,
         Arc::clone(&executor),
@@ -768,8 +1179,10 @@ async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
             worker_id: "w2".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
+            map_output_publish_window_partitions: 1,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
+            ..WorkerConfig::default()
         },
         cp2,
         executor,

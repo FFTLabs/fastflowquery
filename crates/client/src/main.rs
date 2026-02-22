@@ -206,6 +206,38 @@ fn parse_repl_opts(args: &[String]) -> Result<ReplOpts, Box<dyn std::error::Erro
                     .parse()
                     .map_err(|_| "invalid value for --broadcast-threshold-bytes")?;
             }
+            "--join-radix-bits" => {
+                i += 1;
+                config.join_radix_bits = args
+                    .get(i)
+                    .ok_or("missing value for --join-radix-bits")?
+                    .parse()
+                    .map_err(|_| "invalid value for --join-radix-bits")?;
+            }
+            "--join-bloom-enabled" => {
+                i += 1;
+                config.join_bloom_enabled = parse_bool(
+                    args.get(i)
+                        .ok_or("missing value for --join-bloom-enabled")?,
+                    "--join-bloom-enabled",
+                )?;
+            }
+            "--join-bloom-bits" => {
+                i += 1;
+                config.join_bloom_bits = args
+                    .get(i)
+                    .ok_or("missing value for --join-bloom-bits")?
+                    .parse()
+                    .map_err(|_| "invalid value for --join-bloom-bits")?;
+            }
+            "--prefer-sort-merge-join" => {
+                i += 1;
+                config.prefer_sort_merge_join = parse_bool(
+                    args.get(i)
+                        .ok_or("missing value for --prefer-sort-merge-join")?,
+                    "--prefer-sort-merge-join",
+                )?;
+            }
             "--schema-inference" => {
                 i += 1;
                 let raw = args.get(i).ok_or("missing value for --schema-inference")?;
@@ -241,7 +273,7 @@ fn print_usage() {
     eprintln!("  ffq-client --plan \"<SQL>\"");
     eprintln!("  ffq-client query --sql \"<SQL>\" [--catalog PATH] [--plan]");
     eprintln!(
-        "  ffq-client repl [--catalog PATH] [--coordinator-endpoint URL] [--batch-size-rows N] [--mem-budget-bytes N] [--spill-dir PATH] [--shuffle-partitions N] [--broadcast-threshold-bytes N] [--schema-inference off|on|strict|permissive] [--schema-writeback true|false] [--schema-drift-policy fail|refresh]"
+        "  ffq-client repl [--catalog PATH] [--coordinator-endpoint URL] [--batch-size-rows N] [--mem-budget-bytes N] [--spill-dir PATH] [--shuffle-partitions N] [--broadcast-threshold-bytes N] [--join-radix-bits N] [--join-bloom-enabled true|false] [--join-bloom-bits N] [--prefer-sort-merge-join true|false] [--schema-inference off|on|strict|permissive] [--schema-writeback true|false] [--schema-drift-policy fail|refresh]"
     );
 }
 
@@ -327,6 +359,11 @@ fn classify_ffq_error(err: &FfqError) -> (&'static str, Option<&'static str>) {
 
 fn planning_hint(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
+    if m.contains("e_recursive_cte_overflow") {
+        return Some(
+            "increase recursive CTE depth limit (FFQ_RECURSIVE_CTE_MAX_DEPTH / config.recursive_cte_max_depth)",
+        );
+    }
     if m.contains("unknown table") {
         return Some("table is not registered; pass --catalog or register it before querying");
     }
@@ -338,6 +375,9 @@ fn planning_hint(msg: &str) -> Option<&'static str> {
 
 fn execution_hint(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
+    if m.contains("e_subquery_scalar_row_violation") {
+        return Some("scalar subquery must return one column and at most one row");
+    }
     if m.contains("schema inference failed") {
         return Some(
             "check parquet path(s) exist/readable and set schema policy (--schema-inference on|strict|permissive)",
@@ -392,6 +432,11 @@ fn config_hint(msg: &str) -> Option<&'static str> {
 
 fn unsupported_hint(msg: &str) -> Option<&'static str> {
     let m = msg.to_ascii_lowercase();
+    if m.contains("e_subquery_unsupported_correlation") {
+        return Some(
+            "rewrite the correlated predicate to supported equality correlation shape, or use uncorrelated subquery form",
+        );
+    }
     if m.contains("qdrant") {
         return Some(
             "enable required feature flags (vector/qdrant) or use brute-force fallback shape",

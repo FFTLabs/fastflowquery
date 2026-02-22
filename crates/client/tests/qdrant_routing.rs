@@ -52,7 +52,8 @@ fn explain_uses_vector_topk_for_supported_projection() {
         )
         .expect("sql");
     let explain = df.explain().expect("explain");
-    assert!(explain.contains("VectorTopK table=docs_idx"));
+    assert!(explain.contains("HybridVectorScan source=docs_idx"));
+    assert!(explain.contains("_score"));
     assert!(explain.contains("rewrite=index_applied"));
 }
 

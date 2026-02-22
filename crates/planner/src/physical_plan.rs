@@ -1,6 +1,7 @@
-use crate::logical_plan::{AggExpr, Expr, JoinStrategyHint, JoinType};
+use crate::logical_plan::{AggExpr, Expr, JoinStrategyHint, JoinType, WindowExpr};
 use arrow_schema::Schema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// The physical operator graph.
 ///
@@ -14,8 +15,16 @@ pub enum PhysicalPlan {
     ParquetWrite(ParquetWriteExec),
     /// Row filter.
     Filter(FilterExec),
+    /// Uncorrelated IN-subquery filter.
+    InSubqueryFilter(InSubqueryFilterExec),
+    /// Uncorrelated EXISTS-subquery filter.
+    ExistsSubqueryFilter(ExistsSubqueryFilterExec),
+    /// Uncorrelated scalar-subquery comparison filter.
+    ScalarSubqueryFilter(ScalarSubqueryFilterExec),
     /// Projection.
     Project(ProjectExec),
+    /// Window function execution.
+    Window(WindowExec),
     /// Batch coalescing.
     CoalesceBatches(CoalesceBatchesExec),
 
@@ -34,8 +43,16 @@ pub enum PhysicalPlan {
     Limit(LimitExec),
     /// Brute-force top-k.
     TopKByScore(TopKByScoreExec),
+    /// Concatenate child outputs (UNION ALL).
+    UnionAll(UnionAllExec),
+    /// Shared materialized CTE reference.
+    CteRef(CteRefExec),
     /// Index-backed vector top-k.
     VectorTopK(VectorTopKExec),
+    /// Hybrid vector KNN execution.
+    VectorKnn(VectorKnnExec),
+    /// Custom operator instantiated via runtime physical operator registry.
+    Custom(CustomExec),
 }
 
 impl PhysicalPlan {
@@ -48,7 +65,11 @@ impl PhysicalPlan {
             PhysicalPlan::ParquetScan(_) => vec![],
             PhysicalPlan::ParquetWrite(x) => vec![x.input.as_ref()],
             PhysicalPlan::Filter(x) => vec![x.input.as_ref()],
+            PhysicalPlan::InSubqueryFilter(x) => vec![x.input.as_ref(), x.subquery.as_ref()],
+            PhysicalPlan::ExistsSubqueryFilter(x) => vec![x.input.as_ref(), x.subquery.as_ref()],
+            PhysicalPlan::ScalarSubqueryFilter(x) => vec![x.input.as_ref(), x.subquery.as_ref()],
             PhysicalPlan::Project(x) => vec![x.input.as_ref()],
+            PhysicalPlan::Window(x) => vec![x.input.as_ref()],
             PhysicalPlan::CoalesceBatches(x) => vec![x.input.as_ref()],
             PhysicalPlan::PartialHashAggregate(x) => vec![x.input.as_ref()],
             PhysicalPlan::FinalHashAggregate(x) => vec![x.input.as_ref()],
@@ -60,7 +81,11 @@ impl PhysicalPlan {
             },
             PhysicalPlan::Limit(x) => vec![x.input.as_ref()],
             PhysicalPlan::TopKByScore(x) => vec![x.input.as_ref()],
+            PhysicalPlan::UnionAll(x) => vec![x.left.as_ref(), x.right.as_ref()],
+            PhysicalPlan::CteRef(x) => vec![x.plan.as_ref()],
             PhysicalPlan::VectorTopK(_) => vec![],
+            PhysicalPlan::VectorKnn(_) => vec![],
+            PhysicalPlan::Custom(x) => vec![x.input.as_ref()],
         }
     }
 }
@@ -100,11 +125,57 @@ pub struct FilterExec {
     pub input: Box<PhysicalPlan>,
 }
 
+/// Physical uncorrelated IN-subquery filter operator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InSubqueryFilterExec {
+    /// Input plan.
+    pub input: Box<PhysicalPlan>,
+    /// Left expression evaluated on input batches.
+    pub expr: Expr,
+    /// Uncorrelated subquery plan (must output one column).
+    pub subquery: Box<PhysicalPlan>,
+    /// `true` for NOT IN behavior.
+    pub negated: bool,
+}
+
+/// Physical uncorrelated EXISTS-subquery filter operator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExistsSubqueryFilterExec {
+    /// Input plan.
+    pub input: Box<PhysicalPlan>,
+    /// Uncorrelated subquery plan.
+    pub subquery: Box<PhysicalPlan>,
+    /// `true` for NOT EXISTS behavior.
+    pub negated: bool,
+}
+
+/// Physical uncorrelated scalar-subquery comparison filter operator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScalarSubqueryFilterExec {
+    /// Input plan.
+    pub input: Box<PhysicalPlan>,
+    /// Left expression evaluated on input batches.
+    pub expr: Expr,
+    /// Comparison operator.
+    pub op: crate::logical_plan::BinaryOp,
+    /// Scalar subquery plan (must output one column, <= 1 row).
+    pub subquery: Box<PhysicalPlan>,
+}
+
 /// Projection operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectExec {
     /// (expr, output_name)
     pub exprs: Vec<(Expr, String)>,
+    /// Input plan.
+    pub input: Box<PhysicalPlan>,
+}
+
+/// Window execution operator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowExec {
+    /// Window expressions to evaluate.
+    pub exprs: Vec<WindowExpr>,
     /// Input plan.
     pub input: Box<PhysicalPlan>,
 }
@@ -172,6 +243,25 @@ pub struct HashJoinExec {
     /// From optimizer (broadcast/shuffle hint). Physical planner inserts exchanges accordingly.
     pub strategy_hint: JoinStrategyHint,
     /// The side we build the hash table from (usually the broadcast side).
+    pub build_side: BuildSide,
+    /// Adaptive alternatives considered at runtime before join child execution.
+    ///
+    /// When non-empty, runtime may swap `left/right/build_side/strategy_hint`
+    /// to one of the alternatives based on observed or estimated side sizes.
+    #[serde(default)]
+    pub alternatives: Vec<HashJoinAlternativeExec>,
+}
+
+/// Alternative execution shape for adaptive hash-join choice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HashJoinAlternativeExec {
+    /// Alternative left subtree.
+    pub left: Box<PhysicalPlan>,
+    /// Alternative right subtree.
+    pub right: Box<PhysicalPlan>,
+    /// Strategy represented by this alternative.
+    pub strategy_hint: JoinStrategyHint,
+    /// Build side for this alternative.
     pub build_side: BuildSide,
 }
 
@@ -248,6 +338,24 @@ pub struct TopKByScoreExec {
     pub input: Box<PhysicalPlan>,
 }
 
+/// Physical UNION ALL operator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnionAllExec {
+    /// Left input.
+    pub left: Box<PhysicalPlan>,
+    /// Right input.
+    pub right: Box<PhysicalPlan>,
+}
+
+/// Physical shared CTE reference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CteRefExec {
+    /// CTE name used as cache key.
+    pub name: String,
+    /// CTE definition physical plan.
+    pub plan: Box<PhysicalPlan>,
+}
+
 /// Index-backed vector top-k physical operator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorTopKExec {
@@ -259,4 +367,35 @@ pub struct VectorTopKExec {
     pub k: usize,
     /// Optional provider-specific filter payload.
     pub filter: Option<String>,
+}
+
+/// Hybrid vector KNN physical operator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorKnnExec {
+    /// Source table.
+    pub source: String,
+    /// One or more query vector literals.
+    pub query_vectors: Vec<Vec<f32>>,
+    /// Number of rows to return.
+    pub k: usize,
+    /// Optional query-time HNSW `ef_search` override.
+    pub ef_search: Option<usize>,
+    /// Optional provider-specific prefilter payload.
+    pub prefilter: Option<String>,
+    /// Distance/similarity metric identifier.
+    pub metric: String,
+    /// Vector provider backend identifier.
+    pub provider: String,
+}
+
+/// Custom physical operator descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomExec {
+    /// Registered factory name.
+    pub op_name: String,
+    /// Opaque operator configuration map.
+    #[serde(default)]
+    pub config: HashMap<String, String>,
+    /// Input plan.
+    pub input: Box<PhysicalPlan>,
 }

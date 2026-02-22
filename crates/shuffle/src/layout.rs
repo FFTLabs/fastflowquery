@@ -37,6 +37,19 @@ pub fn index_bin_path(query_id: u64, stage_id: u64, map_task: u64, attempt: u32)
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+/// Compression codec for on-disk shuffle partition payloads.
+pub enum ShuffleCompressionCodec {
+    /// Store payload as raw Arrow IPC stream bytes.
+    #[default]
+    None,
+    /// Store payload as LZ4 frame-compressed bytes.
+    Lz4,
+    /// Store payload as Zstd-compressed bytes.
+    Zstd,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 /// Metadata describing one map-output partition artifact.
 pub struct ShufflePartitionMeta {
@@ -46,10 +59,41 @@ pub struct ShufflePartitionMeta {
     pub file: String,
     /// Payload size in bytes.
     pub bytes: u64,
+    /// Compressed payload bytes (excluding framing header).
+    #[serde(default)]
+    pub compressed_bytes: u64,
+    /// Uncompressed Arrow IPC payload bytes.
+    #[serde(default)]
+    pub uncompressed_bytes: u64,
+    /// Compression codec used for this partition payload.
+    #[serde(default)]
+    pub codec: ShuffleCompressionCodec,
+    /// Chunk metadata entries appended to this partition payload file.
+    #[serde(default)]
+    pub chunks: Vec<ShufflePartitionChunkMeta>,
     /// Row count in payload.
     pub rows: u64,
     /// Batch count in payload.
     pub batches: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Metadata describing one appended chunk in a partition payload file.
+pub struct ShufflePartitionChunkMeta {
+    /// Byte offset in partition payload file where this chunk frame starts.
+    pub offset_bytes: u64,
+    /// Total framed bytes written for this chunk (header + compressed payload).
+    pub frame_bytes: u64,
+    /// Compressed payload bytes for this chunk.
+    pub compressed_bytes: u64,
+    /// Uncompressed Arrow IPC bytes for this chunk.
+    pub uncompressed_bytes: u64,
+    /// Rows contained in this chunk.
+    pub rows: u64,
+    /// Record batches contained in this chunk.
+    pub batches: u64,
+    /// Adler-32 checksum for the framed chunk payload.
+    pub checksum32: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

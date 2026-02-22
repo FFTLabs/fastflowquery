@@ -1,5 +1,6 @@
 use ffq_common::Result;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 
 use crate::analyzer::SchemaProvider;
 use crate::logical_plan::{BinaryOp, Expr, JoinStrategyHint, JoinType, LiteralValue, LogicalPlan};
@@ -9,12 +10,15 @@ use crate::logical_plan::{BinaryOp, Expr, JoinStrategyHint, JoinType, LiteralVal
 pub struct OptimizerConfig {
     /// Max table byte size eligible for broadcast join hinting.
     pub broadcast_threshold_bytes: u64,
+    /// Prefer sort-merge strategy for eligible joins.
+    pub prefer_sort_merge_join: bool,
 }
 
 impl Default for OptimizerConfig {
     fn default() -> Self {
         Self {
             broadcast_threshold_bytes: 64 * 1024 * 1024,
+            prefer_sort_merge_join: false,
         }
     }
 }
@@ -49,18 +53,75 @@ pub trait OptimizerContext: SchemaProvider {
     }
 }
 
-#[derive(Debug, Default)]
 /// Rule-based optimizer for v1 logical plans.
 ///
 /// The implementation is intentionally conservative: pushdowns and rewrites are
 /// applied only when correctness preconditions are satisfied; otherwise, the
 /// original logical behavior is preserved.
-pub struct Optimizer;
+pub struct Optimizer {
+    custom_rules: RwLock<HashMap<String, Arc<dyn OptimizerRule>>>,
+}
+
+/// Custom optimizer rule hook.
+pub trait OptimizerRule: Send + Sync {
+    /// Stable rule name used by registry.
+    fn name(&self) -> &str;
+    /// Rewrite input plan and return transformed plan.
+    fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        ctx: &dyn OptimizerContext,
+        cfg: OptimizerConfig,
+    ) -> Result<LogicalPlan>;
+}
+
+impl std::fmt::Debug for Optimizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self
+            .custom_rules
+            .read()
+            .map(|m| m.len())
+            .unwrap_or_default();
+        f.debug_struct("Optimizer")
+            .field("custom_rules", &count)
+            .finish()
+    }
+}
+
+impl Default for Optimizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Optimizer {
     /// Create a new optimizer.
     pub fn new() -> Self {
-        Self
+        Self {
+            custom_rules: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register or replace a custom optimizer rule.
+    ///
+    /// Returns `true` when an existing rule with the same name was replaced.
+    pub fn register_rule(&self, rule: Arc<dyn OptimizerRule>) -> bool {
+        self.custom_rules
+            .write()
+            .expect("optimizer rule lock poisoned")
+            .insert(rule.name().to_string(), rule)
+            .is_some()
+    }
+
+    /// Deregister a custom optimizer rule by name.
+    ///
+    /// Returns `true` when an existing rule was removed.
+    pub fn deregister_rule(&self, name: &str) -> bool {
+        self.custom_rules
+            .write()
+            .expect("optimizer rule lock poisoned")
+            .remove(name)
+            .is_some()
     }
 
     /// Apply v1 rule pipeline to a logical plan.
@@ -98,7 +159,20 @@ impl Optimizer {
         let plan = join_strategy_hint(plan, ctx, cfg)?;
 
         // 6) rewrite to vector index execution when possible
-        let plan = vector_index_rewrite(plan, ctx)?;
+        let mut plan = vector_index_rewrite(plan, ctx)?;
+
+        // 7) user-registered custom rules (deterministic by name)
+        let mut rules = self
+            .custom_rules
+            .read()
+            .expect("optimizer rule lock poisoned")
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            .collect::<Vec<_>>();
+        rules.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_name, rule) in rules {
+            plan = rule.rewrite(plan, ctx, cfg)?;
+        }
 
         Ok(plan)
     }
@@ -170,6 +244,16 @@ fn fold_constants_expr(e: Expr) -> Expr {
                 to_type,
             }
         }
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => Expr::CaseWhen {
+            branches: branches
+                .into_iter()
+                .map(|(c, v)| (fold_constants_expr(c), fold_constants_expr(v)))
+                .collect(),
+            else_expr: else_expr.map(|e| Box::new(fold_constants_expr(*e))),
+        },
         #[cfg(feature = "vector")]
         Expr::CosineSimilarity { vector, query } => Expr::CosineSimilarity {
             vector: Box::new(fold_constants_expr(*vector)),
@@ -184,6 +268,10 @@ fn fold_constants_expr(e: Expr) -> Expr {
         Expr::DotProduct { vector, query } => Expr::DotProduct {
             vector: Box::new(fold_constants_expr(*vector)),
             query: Box::new(fold_constants_expr(*query)),
+        },
+        Expr::ScalarUdf { name, args } => Expr::ScalarUdf {
+            name,
+            args: args.into_iter().map(fold_constants_expr).collect(),
         },
         other => other,
     }
@@ -270,6 +358,16 @@ fn proj_rewrite(
     ctx: &dyn OptimizerContext,
 ) -> Result<(LogicalPlan, HashSet<String>)> {
     match plan {
+        LogicalPlan::SubqueryAlias { alias, input } => {
+            let (new_in, req) = proj_rewrite(*input, required, ctx)?;
+            Ok((
+                LogicalPlan::SubqueryAlias {
+                    alias,
+                    input: Box::new(new_in),
+                },
+                req,
+            ))
+        }
         LogicalPlan::Limit { n, input } => {
             let (new_in, req) = proj_rewrite(*input, required, ctx)?;
             Ok((
@@ -297,6 +395,27 @@ fn proj_rewrite(
                 child_req,
             ))
         }
+        LogicalPlan::UnionAll { left, right } => {
+            let (new_left, _lreq) = proj_rewrite(*left, None, ctx)?;
+            let (new_right, _rreq) = proj_rewrite(*right, None, ctx)?;
+            Ok((
+                LogicalPlan::UnionAll {
+                    left: Box::new(new_left),
+                    right: Box::new(new_right),
+                },
+                required.unwrap_or_default(),
+            ))
+        }
+        LogicalPlan::CteRef { name, plan } => {
+            let (new_plan, req) = proj_rewrite(*plan, required, ctx)?;
+            Ok((
+                LogicalPlan::CteRef {
+                    name,
+                    plan: Box::new(new_plan),
+                },
+                req,
+            ))
+        }
 
         LogicalPlan::Filter { predicate, input } => {
             let mut req = required.unwrap_or_default();
@@ -306,6 +425,70 @@ fn proj_rewrite(
                 LogicalPlan::Filter {
                     predicate,
                     input: Box::new(new_in),
+                },
+                child_req,
+            ))
+        }
+        LogicalPlan::InSubqueryFilter {
+            input,
+            expr,
+            subquery,
+            negated,
+            correlation,
+        } => {
+            // Keep full left input shape before analysis so correlated-IN decorrelation
+            // can still discover/use outer reference columns.
+            let (new_in, child_req) = proj_rewrite(*input, None, ctx)?;
+            let (new_sub, _sub_req) = proj_rewrite(*subquery, None, ctx)?;
+            Ok((
+                LogicalPlan::InSubqueryFilter {
+                    input: Box::new(new_in),
+                    expr,
+                    subquery: Box::new(new_sub),
+                    negated,
+                    correlation,
+                },
+                child_req,
+            ))
+        }
+        LogicalPlan::ExistsSubqueryFilter {
+            input,
+            subquery,
+            negated,
+            correlation,
+        } => {
+            // Keep full left input shape before analysis so correlated-EXISTS
+            // decorrelation can still discover/use outer reference columns.
+            let (new_in, child_req) = proj_rewrite(*input, None, ctx)?;
+            let (new_sub, _sub_req) = proj_rewrite(*subquery, None, ctx)?;
+            Ok((
+                LogicalPlan::ExistsSubqueryFilter {
+                    input: Box::new(new_in),
+                    subquery: Box::new(new_sub),
+                    negated,
+                    correlation,
+                },
+                child_req,
+            ))
+        }
+        LogicalPlan::ScalarSubqueryFilter {
+            input,
+            expr,
+            op,
+            subquery,
+            correlation,
+        } => {
+            let mut req = required.unwrap_or_default();
+            req.extend(expr_columns(&expr));
+            let (new_in, child_req) = proj_rewrite(*input, Some(req), ctx)?;
+            let (new_sub, _sub_req) = proj_rewrite(*subquery, None, ctx)?;
+            Ok((
+                LogicalPlan::ScalarSubqueryFilter {
+                    input: Box::new(new_in),
+                    expr,
+                    op,
+                    subquery: Box::new(new_sub),
+                    correlation,
                 },
                 child_req,
             ))
@@ -356,6 +539,47 @@ fn proj_rewrite(
                 LogicalPlan::Aggregate {
                     group_exprs,
                     aggr_exprs,
+                    input: Box::new(new_in),
+                },
+                child_req,
+            ))
+        }
+        LogicalPlan::Window { exprs, input } => {
+            let mut child_req = required.unwrap_or_default();
+            for w in &exprs {
+                for p in &w.partition_by {
+                    child_req.extend(expr_columns(p));
+                }
+                for o in &w.order_by {
+                    child_req.extend(expr_columns(&o.expr));
+                }
+                match &w.func {
+                    crate::logical_plan::WindowFunction::Count(arg)
+                    | crate::logical_plan::WindowFunction::Sum(arg)
+                    | crate::logical_plan::WindowFunction::Avg(arg)
+                    | crate::logical_plan::WindowFunction::Min(arg)
+                    | crate::logical_plan::WindowFunction::Max(arg) => {
+                        child_req.extend(expr_columns(arg));
+                    }
+                    crate::logical_plan::WindowFunction::Lag { expr, default, .. }
+                    | crate::logical_plan::WindowFunction::Lead { expr, default, .. } => {
+                        child_req.extend(expr_columns(expr));
+                        if let Some(d) = default {
+                            child_req.extend(expr_columns(d));
+                        }
+                    }
+                    crate::logical_plan::WindowFunction::FirstValue(expr)
+                    | crate::logical_plan::WindowFunction::LastValue(expr)
+                    | crate::logical_plan::WindowFunction::NthValue { expr, .. } => {
+                        child_req.extend(expr_columns(expr));
+                    }
+                    _ => {}
+                }
+            }
+            let (new_in, _) = proj_rewrite(*input, Some(child_req.clone()), ctx)?;
+            Ok((
+                LogicalPlan::Window {
+                    exprs,
                     input: Box::new(new_in),
                 },
                 child_req,
@@ -447,6 +671,26 @@ fn proj_rewrite(
             },
             HashSet::new(),
         )),
+        LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            ef_search,
+            prefilter,
+            metric,
+            provider,
+        } => Ok((
+            LogicalPlan::HybridVectorScan {
+                source,
+                query_vectors,
+                k,
+                ef_search,
+                prefilter,
+                metric,
+                provider,
+            },
+            HashSet::new(),
+        )),
 
         LogicalPlan::TableScan {
             table,
@@ -509,6 +753,18 @@ fn predicate_pushdown(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result<L
                 mut filters,
             } = input
             {
+                // Keep CASE predicates above scan: parquet pushdown path does
+                // not evaluate general expression trees.
+                if expr_contains_case(&predicate) {
+                    return Ok(LogicalPlan::Filter {
+                        predicate,
+                        input: Box::new(LogicalPlan::TableScan {
+                            table,
+                            projection,
+                            filters,
+                        }),
+                    });
+                }
                 filters.push(predicate);
                 return Ok(LogicalPlan::TableScan {
                     table,
@@ -541,6 +797,78 @@ fn predicate_pushdown(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result<L
                         }),
                     });
                 }
+            }
+
+            // push below subquery filters by pushing only the left/input branch.
+            if let LogicalPlan::InSubqueryFilter {
+                input: sub_input,
+                expr,
+                subquery,
+                negated,
+                correlation,
+            } = input
+            {
+                let pushed_left = predicate_pushdown(
+                    LogicalPlan::Filter {
+                        predicate,
+                        input: sub_input,
+                    },
+                    ctx,
+                )?;
+                let pushed_subquery = predicate_pushdown(*subquery, ctx)?;
+                return Ok(LogicalPlan::InSubqueryFilter {
+                    input: Box::new(pushed_left),
+                    expr,
+                    subquery: Box::new(pushed_subquery),
+                    negated,
+                    correlation,
+                });
+            }
+            if let LogicalPlan::ExistsSubqueryFilter {
+                input: sub_input,
+                subquery,
+                negated,
+                correlation,
+            } = input
+            {
+                let pushed_left = predicate_pushdown(
+                    LogicalPlan::Filter {
+                        predicate,
+                        input: sub_input,
+                    },
+                    ctx,
+                )?;
+                let pushed_subquery = predicate_pushdown(*subquery, ctx)?;
+                return Ok(LogicalPlan::ExistsSubqueryFilter {
+                    input: Box::new(pushed_left),
+                    subquery: Box::new(pushed_subquery),
+                    negated,
+                    correlation,
+                });
+            }
+            if let LogicalPlan::ScalarSubqueryFilter {
+                input: sub_input,
+                expr,
+                op,
+                subquery,
+                correlation,
+            } = input
+            {
+                let pushed_left = predicate_pushdown(
+                    LogicalPlan::Filter {
+                        predicate,
+                        input: sub_input,
+                    },
+                    ctx,
+                )?;
+                let pushed_subquery = predicate_pushdown(*subquery, ctx)?;
+                return Ok(LogicalPlan::ScalarSubqueryFilter {
+                    input: Box::new(pushed_left),
+                    expr,
+                    op,
+                    subquery: Box::new(pushed_subquery),
+                    correlation,
+                });
             }
 
             // push to join sides
@@ -636,7 +964,7 @@ fn predicate_pushdown(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result<L
             })
         }
 
-        other => Ok(map_children(other, |p| predicate_pushdown(p, ctx).unwrap())),
+        other => try_map_children(other, |p| predicate_pushdown(p, ctx)),
     }
 }
 
@@ -660,7 +988,9 @@ fn join_strategy_hint(
             let l_bytes = estimate_bytes(&left, ctx)?;
             let r_bytes = estimate_bytes(&right, ctx)?;
 
-            let hint = if let (Some(lb), Some(rb)) = (l_bytes, r_bytes) {
+            let hint = if cfg.prefer_sort_merge_join && matches!(join_type, JoinType::Inner) {
+                JoinStrategyHint::SortMerge
+            } else if let (Some(lb), Some(rb)) = (l_bytes, r_bytes) {
                 if lb <= cfg.broadcast_threshold_bytes && lb <= rb {
                     JoinStrategyHint::BroadcastLeft
                 } else if rb <= cfg.broadcast_threshold_bytes && rb < lb {
@@ -681,17 +1011,56 @@ fn join_strategy_hint(
                 strategy_hint: hint,
             })
         }
-        other => Ok(map_children(other, |p| {
-            join_strategy_hint(p, ctx, cfg).unwrap()
-        })),
+        other => try_map_children(other, |p| join_strategy_hint(p, ctx, cfg)),
     }
 }
 
 fn vector_index_rewrite(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result<LogicalPlan> {
     match plan {
+        LogicalPlan::SubqueryAlias { alias, input } => Ok(LogicalPlan::SubqueryAlias {
+            alias,
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+        }),
         LogicalPlan::Filter { predicate, input } => Ok(LogicalPlan::Filter {
             predicate,
             input: Box::new(vector_index_rewrite(*input, ctx)?),
+        }),
+        LogicalPlan::InSubqueryFilter {
+            input,
+            expr,
+            subquery,
+            negated,
+            correlation,
+        } => Ok(LogicalPlan::InSubqueryFilter {
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+            expr,
+            subquery: Box::new(vector_index_rewrite(*subquery, ctx)?),
+            negated,
+            correlation,
+        }),
+        LogicalPlan::ExistsSubqueryFilter {
+            input,
+            subquery,
+            negated,
+            correlation,
+        } => Ok(LogicalPlan::ExistsSubqueryFilter {
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+            subquery: Box::new(vector_index_rewrite(*subquery, ctx)?),
+            negated,
+            correlation,
+        }),
+        LogicalPlan::ScalarSubqueryFilter {
+            input,
+            expr,
+            op,
+            subquery,
+            correlation,
+        } => Ok(LogicalPlan::ScalarSubqueryFilter {
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+            expr,
+            op,
+            subquery: Box::new(vector_index_rewrite(*subquery, ctx)?),
+            correlation,
         }),
         LogicalPlan::Projection { exprs, input } => {
             let rewritten_input = vector_index_rewrite(*input, ctx)?;
@@ -716,6 +1085,10 @@ fn vector_index_rewrite(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result
         } => Ok(LogicalPlan::Aggregate {
             group_exprs,
             aggr_exprs,
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+        }),
+        LogicalPlan::Window { exprs, input } => Ok(LogicalPlan::Window {
+            exprs,
             input: Box::new(vector_index_rewrite(*input, ctx)?),
         }),
         LogicalPlan::Join {
@@ -753,8 +1126,17 @@ fn vector_index_rewrite(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result
             columns,
             input: Box::new(vector_index_rewrite(*input, ctx)?),
         }),
+        LogicalPlan::UnionAll { left, right } => Ok(LogicalPlan::UnionAll {
+            left: Box::new(vector_index_rewrite(*left, ctx)?),
+            right: Box::new(vector_index_rewrite(*right, ctx)?),
+        }),
+        LogicalPlan::CteRef { name, plan } => Ok(LogicalPlan::CteRef {
+            name,
+            plan: Box::new(vector_index_rewrite(*plan, ctx)?),
+        }),
         leaf @ LogicalPlan::TableScan { .. } => Ok(leaf),
         leaf @ LogicalPlan::VectorTopK { .. } => Ok(leaf),
+        leaf @ LogicalPlan::HybridVectorScan { .. } => Ok(leaf),
     }
 }
 
@@ -769,15 +1151,21 @@ fn try_rewrite_projection_topk_to_vector(
     }
     match evaluate_vector_topk_rewrite(exprs, input, ctx)? {
         VectorRewriteDecision::Apply {
-            table,
+            source,
             query_vector,
             k,
-            filter,
-        } => Ok(Some(LogicalPlan::VectorTopK {
-            table,
-            query_vector,
+            ef_search,
+            prefilter,
+            metric,
+            provider,
+        } => Ok(Some(LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors: vec![query_vector],
             k,
-            filter,
+            ef_search,
+            prefilter,
+            metric,
+            provider,
         })),
         VectorRewriteDecision::Fallback { .. } => Ok(None),
     }
@@ -845,11 +1233,14 @@ fn try_rewrite_projection_topk_to_two_phase(
             projection: None,
             filters: Vec::new(),
         }),
-        right: Box::new(LogicalPlan::VectorTopK {
-            table: index_table,
-            query_vector: query_vector.clone(),
+        right: Box::new(LogicalPlan::HybridVectorScan {
+            source: index_table,
+            query_vectors: vec![query_vector.clone()],
             k: prefetch_k,
-            filter: None,
+            ef_search: None,
+            prefilter: None,
+            metric: "cosine".to_string(),
+            provider: "qdrant".to_string(),
         }),
         on: vec![(id_col, "id".to_string())],
         join_type: JoinType::Inner,
@@ -915,6 +1306,9 @@ fn two_phase_join_projection_exprs(
             (Expr::Column(format!("{docs_table}.{name}")), name)
         })
         .collect();
+    if schema.index_of("_score").is_err() {
+        out.push((Expr::Column("_score".to_string()), "_score".to_string()));
+    }
     if schema.index_of("score").is_err() {
         out.push((Expr::Column("score".to_string()), "score".to_string()));
     }
@@ -927,14 +1321,45 @@ fn two_phase_join_projection_exprs(
 #[cfg(feature = "vector")]
 enum VectorRewriteDecision {
     Apply {
-        table: String,
+        source: String,
         query_vector: Vec<f32>,
         k: usize,
-        filter: Option<String>,
+        ef_search: Option<usize>,
+        prefilter: Option<String>,
+        metric: String,
+        provider: String,
     },
     Fallback {
         _reason: &'static str,
     },
+}
+
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PushdownFilterOp {
+    Eq,
+    And,
+    Or,
+}
+
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone)]
+struct PushdownFilterCaps {
+    enabled: bool,
+    ops: HashSet<PushdownFilterOp>,
+}
+
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct QdrantFilterSpec {
+    must: Vec<QdrantMatchClause>,
+}
+
+#[cfg(feature = "vector")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+struct QdrantMatchClause {
+    field: String,
+    value: serde_json::Value,
 }
 
 #[cfg(feature = "vector")]
@@ -973,10 +1398,15 @@ fn evaluate_vector_topk_rewrite(
             _reason: "table format is not qdrant",
         });
     }
-    let Expr::CosineSimilarity { vector, query } = score_expr else {
-        return Ok(VectorRewriteDecision::Fallback {
-            _reason: "score expr is not cosine_similarity",
-        });
+    let (metric, vector, query) = match score_expr {
+        Expr::CosineSimilarity { vector, query } => ("cosine", vector, query),
+        Expr::DotProduct { vector, query } => ("dot", vector, query),
+        Expr::L2Distance { vector, query } => ("l2", vector, query),
+        _ => {
+            return Ok(VectorRewriteDecision::Fallback {
+                _reason: "score expr is not vector metric function",
+            });
+        }
     };
     if !matches!(vector.as_ref(), Expr::Column(_) | Expr::ColumnRef { .. }) {
         return Ok(VectorRewriteDecision::Fallback {
@@ -988,7 +1418,28 @@ fn evaluate_vector_topk_rewrite(
             _reason: "query arg is not vector literal",
         });
     };
-    let filter = match translate_qdrant_filter(filters) {
+    let options = ctx.table_options(table)?.unwrap_or_default();
+    if let Some(max_k) = parse_usize_opt(&options, "vector.knn.max_k")?
+        && *k > max_k
+    {
+        return Err(ffq_common::FfqError::Planning(format!(
+            "vector k={} exceeds configured cap vector.knn.max_k={max_k}",
+            *k
+        )));
+    }
+    let ef_search = parse_usize_opt(&options, "vector.ef_search")?;
+    if let (Some(ef), Some(max_ef)) = (
+        ef_search,
+        parse_usize_opt(&options, "vector.knn.max_ef_search")?,
+    ) && ef > max_ef
+    {
+        return Err(ffq_common::FfqError::Planning(format!(
+            "vector ef_search={} exceeds configured cap vector.knn.max_ef_search={max_ef}",
+            ef
+        )));
+    }
+    let caps = pushdown_filter_caps(ctx, table)?;
+    let filter = match translate_qdrant_filter(filters, &caps) {
         Ok(v) => v,
         Err(_) => {
             return Ok(VectorRewriteDecision::Fallback {
@@ -998,11 +1449,73 @@ fn evaluate_vector_topk_rewrite(
     };
 
     Ok(VectorRewriteDecision::Apply {
-        table: table.clone(),
+        source: table.clone(),
         query_vector: query_vector.clone(),
         k: *k,
-        filter,
+        ef_search,
+        prefilter: filter,
+        metric: metric.to_string(),
+        provider: "qdrant".to_string(),
     })
+}
+
+#[cfg(feature = "vector")]
+fn parse_usize_opt(options: &HashMap<String, String>, key: &str) -> Result<Option<usize>> {
+    let Some(raw) = options.get(key) else {
+        return Ok(None);
+    };
+    let parsed = raw.parse::<usize>().map_err(|e| {
+        ffq_common::FfqError::Planning(format!("invalid '{key}' value '{raw}': {e}"))
+    })?;
+    if parsed == 0 {
+        return Err(ffq_common::FfqError::Planning(format!(
+            "'{key}' must be > 0"
+        )));
+    }
+    Ok(Some(parsed))
+}
+
+#[cfg(feature = "vector")]
+fn pushdown_filter_caps(ctx: &dyn OptimizerContext, table: &str) -> Result<PushdownFilterCaps> {
+    let options = ctx.table_options(table)?.unwrap_or_default();
+    let enabled = options
+        .get("vector.filter.pushdown.enabled")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true);
+
+    let mut ops = HashSet::new();
+    let configured = options.get("vector.filter.pushdown.ops").map(|v| {
+        v.split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+    });
+    if let Some(tokens) = configured {
+        for token in tokens {
+            match token.as_str() {
+                "eq" => {
+                    ops.insert(PushdownFilterOp::Eq);
+                }
+                "and" => {
+                    ops.insert(PushdownFilterOp::And);
+                }
+                "or" => {
+                    ops.insert(PushdownFilterOp::Or);
+                }
+                _ => {}
+            }
+        }
+    } else {
+        // qdrant provider subset currently supports conjunctive equality clauses.
+        ops.insert(PushdownFilterOp::Eq);
+        ops.insert(PushdownFilterOp::And);
+    }
+
+    Ok(PushdownFilterCaps { enabled, ops })
 }
 
 #[cfg(feature = "vector")]
@@ -1010,66 +1523,107 @@ fn projection_supported_for_vector_topk(exprs: &[(Expr, String)]) -> bool {
     exprs.iter().all(|(e, _)| {
         matches!(
             e,
-            Expr::Column(c) if c == "id" || c == "score" || c == "payload"
+            Expr::Column(c) if c == "id" || c == "_score" || c == "score" || c == "payload"
         ) || matches!(
             e,
-            Expr::ColumnRef { name, .. } if name == "id" || name == "score" || name == "payload"
+            Expr::ColumnRef { name, .. } if name == "id" || name == "_score" || name == "score" || name == "payload"
         )
     })
 }
 
 #[cfg(feature = "vector")]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct QdrantFilterSpec {
-    must: Vec<QdrantMatchClause>,
-}
-
-#[cfg(feature = "vector")]
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct QdrantMatchClause {
-    field: String,
-    value: serde_json::Value,
-}
-
-#[cfg(feature = "vector")]
-fn translate_qdrant_filter(filters: &[Expr]) -> Result<Option<String>> {
+fn translate_qdrant_filter(filters: &[Expr], caps: &PushdownFilterCaps) -> Result<Option<String>> {
     if filters.is_empty() {
         return Ok(None);
     }
-    let mut clauses = Vec::new();
-    for f in filters {
-        collect_qdrant_match_clauses(f, &mut clauses)?;
+    if !caps.enabled {
+        return Err(ffq_common::FfqError::Planning(
+            "connector filter pushdown is disabled".to_string(),
+        ));
     }
+    let dnf = normalize_pushdownable_dnf(filters, caps)?;
+    if dnf.len() != 1 {
+        return Err(ffq_common::FfqError::Planning(
+            "unsupported qdrant filter expression; disjunction is not supported by this connector path"
+                .to_string(),
+        ));
+    }
+    let clauses = dnf.into_iter().next().unwrap_or_default();
     let encoded = serde_json::to_string(&QdrantFilterSpec { must: clauses })
         .map_err(|e| ffq_common::FfqError::Planning(format!("qdrant filter encode failed: {e}")))?;
     Ok(Some(encoded))
 }
 
 #[cfg(feature = "vector")]
-fn collect_qdrant_match_clauses(e: &Expr, out: &mut Vec<QdrantMatchClause>) -> Result<()> {
+fn normalize_pushdownable_dnf(
+    filters: &[Expr],
+    caps: &PushdownFilterCaps,
+) -> Result<Vec<Vec<QdrantMatchClause>>> {
+    let mut out = vec![Vec::new()];
+    for f in filters {
+        let rhs = qdrant_dnf_expr(f, caps)?;
+        out = dnf_and_product(out, rhs)?;
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "vector")]
+fn qdrant_dnf_expr(e: &Expr, caps: &PushdownFilterCaps) -> Result<Vec<Vec<QdrantMatchClause>>> {
     match e {
-        Expr::And(a, b) => {
-            collect_qdrant_match_clauses(a, out)?;
-            collect_qdrant_match_clauses(b, out)?;
-            Ok(())
+        Expr::And(a, b) if caps.ops.contains(&PushdownFilterOp::And) => {
+            let left = qdrant_dnf_expr(a, caps)?;
+            let right = qdrant_dnf_expr(b, caps)?;
+            dnf_and_product(left, right)
         }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOp::Eq,
-            right,
-        } => {
+        Expr::Or(a, b) if caps.ops.contains(&PushdownFilterOp::Or) => {
+            let mut out = qdrant_dnf_expr(a, caps)?;
+            out.extend(qdrant_dnf_expr(b, caps)?);
+            Ok(out)
+        }
+        Expr::BinaryOp { left, op, right } if *op == BinaryOp::Eq => {
+            if !caps.ops.contains(&PushdownFilterOp::Eq) {
+                return Err(ffq_common::FfqError::Planning(
+                    "connector does not support equality filter pushdown".to_string(),
+                ));
+            }
             if let Some((field, value)) = eq_clause_parts(left, right) {
-                out.push(QdrantMatchClause { field, value });
-                return Ok(());
+                return Ok(vec![vec![QdrantMatchClause { field, value }]]);
             }
             Err(ffq_common::FfqError::Planning(
                 "unsupported qdrant filter expression; expected `col = literal`".to_string(),
             ))
         }
         _ => Err(ffq_common::FfqError::Planning(
-            "unsupported qdrant filter expression; only equality and AND are supported".to_string(),
+            "unsupported qdrant filter expression for pushdown; expected a DNF subset over `col = literal`"
+                .to_string(),
         )),
     }
+}
+
+#[cfg(feature = "vector")]
+fn dnf_and_product(
+    left: Vec<Vec<QdrantMatchClause>>,
+    right: Vec<Vec<QdrantMatchClause>>,
+) -> Result<Vec<Vec<QdrantMatchClause>>> {
+    const MAX_TERMS: usize = 256;
+    if left.is_empty() || right.is_empty() {
+        return Ok(Vec::new());
+    }
+    if left.len().saturating_mul(right.len()) > MAX_TERMS {
+        return Err(ffq_common::FfqError::Planning(
+            "filter pushdown DNF expansion too large".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(left.len() * right.len());
+    for l in &left {
+        for r in &right {
+            let mut conj = Vec::with_capacity(l.len() + r.len());
+            conj.extend(l.iter().cloned());
+            conj.extend(r.iter().cloned());
+            out.push(conj);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(feature = "vector")]
@@ -1108,9 +1662,50 @@ fn extract_filter_literal(e: &Expr) -> Option<serde_json::Value> {
 
 fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy) -> LogicalPlan {
     match plan {
+        LogicalPlan::SubqueryAlias { alias, input } => LogicalPlan::SubqueryAlias {
+            alias,
+            input: Box::new(f(*input)),
+        },
         LogicalPlan::Filter { predicate, input } => LogicalPlan::Filter {
             predicate,
             input: Box::new(f(*input)),
+        },
+        LogicalPlan::InSubqueryFilter {
+            input,
+            expr,
+            subquery,
+            negated,
+            correlation,
+        } => LogicalPlan::InSubqueryFilter {
+            input: Box::new(f(*input)),
+            expr,
+            subquery: Box::new(f(*subquery)),
+            negated,
+            correlation,
+        },
+        LogicalPlan::ExistsSubqueryFilter {
+            input,
+            subquery,
+            negated,
+            correlation,
+        } => LogicalPlan::ExistsSubqueryFilter {
+            input: Box::new(f(*input)),
+            subquery: Box::new(f(*subquery)),
+            negated,
+            correlation,
+        },
+        LogicalPlan::ScalarSubqueryFilter {
+            input,
+            expr,
+            op,
+            subquery,
+            correlation,
+        } => LogicalPlan::ScalarSubqueryFilter {
+            input: Box::new(f(*input)),
+            expr,
+            op,
+            subquery: Box::new(f(*subquery)),
+            correlation,
         },
         LogicalPlan::Projection { exprs, input } => LogicalPlan::Projection {
             exprs,
@@ -1123,6 +1718,10 @@ fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy
         } => LogicalPlan::Aggregate {
             group_exprs,
             aggr_exprs,
+            input: Box::new(f(*input)),
+        },
+        LogicalPlan::Window { exprs, input } => LogicalPlan::Window {
+            exprs,
             input: Box::new(f(*input)),
         },
         LogicalPlan::Join {
@@ -1162,6 +1761,23 @@ fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy
             k,
             filter,
         },
+        LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            ef_search,
+            prefilter,
+            metric,
+            provider,
+        } => LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            ef_search,
+            prefilter,
+            metric,
+            provider,
+        },
         LogicalPlan::InsertInto {
             table,
             columns,
@@ -1171,15 +1787,206 @@ fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy
             columns,
             input: Box::new(f(*input)),
         },
+        LogicalPlan::UnionAll { left, right } => LogicalPlan::UnionAll {
+            left: Box::new(f(*left)),
+            right: Box::new(f(*right)),
+        },
+        LogicalPlan::CteRef { name, plan } => LogicalPlan::CteRef {
+            name,
+            plan: Box::new(f(*plan)),
+        },
         s @ LogicalPlan::TableScan { .. } => s,
     }
 }
 
+fn try_map_children(
+    plan: LogicalPlan,
+    f: impl Fn(LogicalPlan) -> Result<LogicalPlan> + Copy,
+) -> Result<LogicalPlan> {
+    Ok(match plan {
+        LogicalPlan::SubqueryAlias { alias, input } => LogicalPlan::SubqueryAlias {
+            alias,
+            input: Box::new(f(*input)?),
+        },
+        LogicalPlan::Filter { predicate, input } => LogicalPlan::Filter {
+            predicate,
+            input: Box::new(f(*input)?),
+        },
+        LogicalPlan::InSubqueryFilter {
+            input,
+            expr,
+            subquery,
+            negated,
+            correlation,
+        } => LogicalPlan::InSubqueryFilter {
+            input: Box::new(f(*input)?),
+            expr,
+            subquery: Box::new(f(*subquery)?),
+            negated,
+            correlation,
+        },
+        LogicalPlan::ExistsSubqueryFilter {
+            input,
+            subquery,
+            negated,
+            correlation,
+        } => LogicalPlan::ExistsSubqueryFilter {
+            input: Box::new(f(*input)?),
+            subquery: Box::new(f(*subquery)?),
+            negated,
+            correlation,
+        },
+        LogicalPlan::ScalarSubqueryFilter {
+            input,
+            expr,
+            op,
+            subquery,
+            correlation,
+        } => LogicalPlan::ScalarSubqueryFilter {
+            input: Box::new(f(*input)?),
+            expr,
+            op,
+            subquery: Box::new(f(*subquery)?),
+            correlation,
+        },
+        LogicalPlan::Projection { exprs, input } => LogicalPlan::Projection {
+            exprs,
+            input: Box::new(f(*input)?),
+        },
+        LogicalPlan::Aggregate {
+            group_exprs,
+            aggr_exprs,
+            input,
+        } => LogicalPlan::Aggregate {
+            group_exprs,
+            aggr_exprs,
+            input: Box::new(f(*input)?),
+        },
+        LogicalPlan::Window { exprs, input } => LogicalPlan::Window {
+            exprs,
+            input: Box::new(f(*input)?),
+        },
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            join_type,
+            strategy_hint,
+        } => LogicalPlan::Join {
+            left: Box::new(f(*left)?),
+            right: Box::new(f(*right)?),
+            on,
+            join_type,
+            strategy_hint,
+        },
+        LogicalPlan::Limit { n, input } => LogicalPlan::Limit {
+            n,
+            input: Box::new(f(*input)?),
+        },
+        LogicalPlan::TopKByScore {
+            score_expr,
+            k,
+            input,
+        } => LogicalPlan::TopKByScore {
+            score_expr,
+            k,
+            input: Box::new(f(*input)?),
+        },
+        LogicalPlan::VectorTopK {
+            table,
+            query_vector,
+            k,
+            filter,
+        } => LogicalPlan::VectorTopK {
+            table,
+            query_vector,
+            k,
+            filter,
+        },
+        LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            ef_search,
+            prefilter,
+            metric,
+            provider,
+        } => LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            ef_search,
+            prefilter,
+            metric,
+            provider,
+        },
+        LogicalPlan::InsertInto {
+            table,
+            columns,
+            input,
+        } => LogicalPlan::InsertInto {
+            table,
+            columns,
+            input: Box::new(f(*input)?),
+        },
+        LogicalPlan::UnionAll { left, right } => LogicalPlan::UnionAll {
+            left: Box::new(f(*left)?),
+            right: Box::new(f(*right)?),
+        },
+        LogicalPlan::CteRef { name, plan } => LogicalPlan::CteRef {
+            name,
+            plan: Box::new(f(*plan)?),
+        },
+        s @ LogicalPlan::TableScan { .. } => s,
+    })
+}
+
 fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> LogicalPlan {
     match plan {
+        LogicalPlan::SubqueryAlias { alias, input } => LogicalPlan::SubqueryAlias {
+            alias,
+            input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+        },
         LogicalPlan::Filter { predicate, input } => LogicalPlan::Filter {
             predicate: rewrite_expr(predicate, rewrite),
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+        },
+        LogicalPlan::InSubqueryFilter {
+            input,
+            expr,
+            subquery,
+            negated,
+            correlation,
+        } => LogicalPlan::InSubqueryFilter {
+            input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+            expr: rewrite_expr(expr, rewrite),
+            subquery: Box::new(rewrite_plan_exprs(*subquery, rewrite)),
+            negated,
+            correlation,
+        },
+        LogicalPlan::ExistsSubqueryFilter {
+            input,
+            subquery,
+            negated,
+            correlation,
+        } => LogicalPlan::ExistsSubqueryFilter {
+            input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+            subquery: Box::new(rewrite_plan_exprs(*subquery, rewrite)),
+            negated,
+            correlation,
+        },
+        LogicalPlan::ScalarSubqueryFilter {
+            input,
+            expr,
+            op,
+            subquery,
+            correlation,
+        } => LogicalPlan::ScalarSubqueryFilter {
+            input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+            expr: rewrite_expr(expr, rewrite),
+            op,
+            subquery: Box::new(rewrite_plan_exprs(*subquery, rewrite)),
+            correlation,
         },
         LogicalPlan::Projection { exprs, input } => LogicalPlan::Projection {
             exprs: exprs
@@ -1198,6 +2005,80 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
                 .map(|e| rewrite_expr(e, rewrite))
                 .collect(),
             aggr_exprs,
+            input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+        },
+        LogicalPlan::Window { exprs, input } => LogicalPlan::Window {
+            exprs: exprs
+                .into_iter()
+                .map(|mut w| {
+                    w.partition_by = w
+                        .partition_by
+                        .into_iter()
+                        .map(|e| rewrite_expr(e, rewrite))
+                        .collect();
+                    w.order_by = w
+                        .order_by
+                        .into_iter()
+                        .map(|mut o| {
+                            o.expr = rewrite_expr(o.expr, rewrite);
+                            o
+                        })
+                        .collect();
+                    w.func = match w.func {
+                        crate::logical_plan::WindowFunction::Count(arg) => {
+                            crate::logical_plan::WindowFunction::Count(rewrite_expr(arg, rewrite))
+                        }
+                        crate::logical_plan::WindowFunction::Sum(arg) => {
+                            crate::logical_plan::WindowFunction::Sum(rewrite_expr(arg, rewrite))
+                        }
+                        crate::logical_plan::WindowFunction::Avg(arg) => {
+                            crate::logical_plan::WindowFunction::Avg(rewrite_expr(arg, rewrite))
+                        }
+                        crate::logical_plan::WindowFunction::Min(arg) => {
+                            crate::logical_plan::WindowFunction::Min(rewrite_expr(arg, rewrite))
+                        }
+                        crate::logical_plan::WindowFunction::Max(arg) => {
+                            crate::logical_plan::WindowFunction::Max(rewrite_expr(arg, rewrite))
+                        }
+                        crate::logical_plan::WindowFunction::Lag {
+                            expr,
+                            offset,
+                            default,
+                        } => crate::logical_plan::WindowFunction::Lag {
+                            expr: rewrite_expr(expr, rewrite),
+                            offset,
+                            default: default.map(|d| rewrite_expr(d, rewrite)),
+                        },
+                        crate::logical_plan::WindowFunction::Lead {
+                            expr,
+                            offset,
+                            default,
+                        } => crate::logical_plan::WindowFunction::Lead {
+                            expr: rewrite_expr(expr, rewrite),
+                            offset,
+                            default: default.map(|d| rewrite_expr(d, rewrite)),
+                        },
+                        crate::logical_plan::WindowFunction::FirstValue(expr) => {
+                            crate::logical_plan::WindowFunction::FirstValue(rewrite_expr(
+                                expr, rewrite,
+                            ))
+                        }
+                        crate::logical_plan::WindowFunction::LastValue(expr) => {
+                            crate::logical_plan::WindowFunction::LastValue(rewrite_expr(
+                                expr, rewrite,
+                            ))
+                        }
+                        crate::logical_plan::WindowFunction::NthValue { expr, n } => {
+                            crate::logical_plan::WindowFunction::NthValue {
+                                expr: rewrite_expr(expr, rewrite),
+                                n,
+                            }
+                        }
+                        other => other,
+                    };
+                    w
+                })
+                .collect(),
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
         },
         LogicalPlan::Join {
@@ -1237,6 +2118,23 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
             k,
             filter,
         },
+        LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            ef_search,
+            prefilter,
+            metric,
+            provider,
+        } => LogicalPlan::HybridVectorScan {
+            source,
+            query_vectors,
+            k,
+            ef_search,
+            prefilter,
+            metric,
+            provider,
+        },
         LogicalPlan::InsertInto {
             table,
             columns,
@@ -1245,6 +2143,14 @@ fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> Logi
             table,
             columns,
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+        },
+        LogicalPlan::UnionAll { left, right } => LogicalPlan::UnionAll {
+            left: Box::new(rewrite_plan_exprs(*left, rewrite)),
+            right: Box::new(rewrite_plan_exprs(*right, rewrite)),
+        },
+        LogicalPlan::CteRef { name, plan } => LogicalPlan::CteRef {
+            name,
+            plan: Box::new(rewrite_plan_exprs(*plan, rewrite)),
         },
         s @ LogicalPlan::TableScan { .. } => s,
     }
@@ -1266,9 +2172,21 @@ fn rewrite_expr(e: Expr, rewrite: &dyn Fn(Expr) -> Expr) -> Expr {
             Box::new(rewrite_expr(*b, rewrite)),
         ),
         Expr::Not(x) => Expr::Not(Box::new(rewrite_expr(*x, rewrite))),
+        Expr::IsNull(x) => Expr::IsNull(Box::new(rewrite_expr(*x, rewrite))),
+        Expr::IsNotNull(x) => Expr::IsNotNull(Box::new(rewrite_expr(*x, rewrite))),
         Expr::Cast { expr, to_type } => Expr::Cast {
             expr: Box::new(rewrite_expr(*expr, rewrite)),
             to_type,
+        },
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => Expr::CaseWhen {
+            branches: branches
+                .into_iter()
+                .map(|(c, v)| (rewrite_expr(c, rewrite), rewrite_expr(v, rewrite)))
+                .collect(),
+            else_expr: else_expr.map(|e| Box::new(rewrite_expr(*e, rewrite))),
         },
         #[cfg(feature = "vector")]
         Expr::CosineSimilarity { vector, query } => Expr::CosineSimilarity {
@@ -1284,6 +2202,13 @@ fn rewrite_expr(e: Expr, rewrite: &dyn Fn(Expr) -> Expr) -> Expr {
         Expr::DotProduct { vector, query } => Expr::DotProduct {
             vector: Box::new(rewrite_expr(*vector, rewrite)),
             query: Box::new(rewrite_expr(*query, rewrite)),
+        },
+        Expr::ScalarUdf { name, args } => Expr::ScalarUdf {
+            name,
+            args: args
+                .into_iter()
+                .map(|arg| rewrite_expr(arg, rewrite))
+                .collect(),
         },
         other => other,
     };
@@ -1340,10 +2265,27 @@ fn collect_cols(e: &Expr, out: &mut HashSet<String>) {
             collect_cols(a, out);
             collect_cols(b, out);
         }
-        Expr::Not(x) | Expr::Cast { expr: x, .. } => {
+        Expr::Not(x) | Expr::IsNull(x) | Expr::IsNotNull(x) | Expr::Cast { expr: x, .. } => {
             collect_cols(x, out);
         }
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
+            for (cond, value) in branches {
+                collect_cols(cond, out);
+                collect_cols(value, out);
+            }
+            if let Some(e) = else_expr {
+                collect_cols(e, out);
+            }
+        }
         Expr::Literal(_) => {}
+        Expr::ScalarUdf { args, .. } => {
+            for arg in args {
+                collect_cols(arg, out);
+            }
+        }
         #[cfg(feature = "vector")]
         Expr::CosineSimilarity { vector, query }
         | Expr::L2Distance { vector, query }
@@ -1354,9 +2296,30 @@ fn collect_cols(e: &Expr, out: &mut HashSet<String>) {
     }
 }
 
+fn expr_contains_case(e: &Expr) -> bool {
+    match e {
+        Expr::CaseWhen { .. } => true,
+        Expr::BinaryOp { left, right, .. } => expr_contains_case(left) || expr_contains_case(right),
+        Expr::And(a, b) | Expr::Or(a, b) => expr_contains_case(a) || expr_contains_case(b),
+        Expr::Not(x) | Expr::IsNull(x) | Expr::IsNotNull(x) | Expr::Cast { expr: x, .. } => {
+            expr_contains_case(x)
+        }
+        Expr::ScalarUdf { args, .. } => args.iter().any(expr_contains_case),
+        #[cfg(feature = "vector")]
+        Expr::CosineSimilarity { vector, query }
+        | Expr::L2Distance { vector, query }
+        | Expr::DotProduct { vector, query } => {
+            expr_contains_case(vector) || expr_contains_case(query)
+        }
+        Expr::Column(_) | Expr::ColumnRef { .. } | Expr::Literal(_) => false,
+    }
+}
+
 fn agg_columns(agg: &crate::logical_plan::AggExpr) -> HashSet<String> {
     match agg {
         crate::logical_plan::AggExpr::Count(e)
+        | crate::logical_plan::AggExpr::CountDistinct(e)
+        | crate::logical_plan::AggExpr::ApproxCountDistinct(e)
         | crate::logical_plan::AggExpr::Sum(e)
         | crate::logical_plan::AggExpr::Min(e)
         | crate::logical_plan::AggExpr::Max(e)
@@ -1374,6 +2337,7 @@ fn strip_qual(s: &str) -> String {
 
 fn plan_output_columns(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result<HashSet<String>> {
     match plan {
+        LogicalPlan::SubqueryAlias { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::TableScan {
             table, projection, ..
         } => {
@@ -1391,21 +2355,46 @@ fn plan_output_columns(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result
             Ok(set)
         }
         LogicalPlan::Filter { input, .. } => plan_output_columns(input, ctx),
+        LogicalPlan::InSubqueryFilter { input, .. } => plan_output_columns(input, ctx),
+        LogicalPlan::ExistsSubqueryFilter { input, .. } => plan_output_columns(input, ctx),
+        LogicalPlan::ScalarSubqueryFilter { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::Limit { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::TopKByScore { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::Projection { exprs, .. } => Ok(exprs.iter().map(|(_, n)| n.clone()).collect()),
         LogicalPlan::Aggregate { .. } => Ok(HashSet::new()), // v1: conservative
+        LogicalPlan::Window { exprs, input } => {
+            let mut cols = plan_output_columns(input, ctx)?;
+            for w in exprs {
+                cols.insert(w.output_name.clone());
+            }
+            Ok(cols)
+        }
         LogicalPlan::VectorTopK { .. } => Ok(["id", "score", "payload"]
             .into_iter()
             .map(std::string::ToString::to_string)
             .collect()),
-        LogicalPlan::Join { left, right, .. } => {
+        LogicalPlan::HybridVectorScan { .. } => {
+            Ok(["query_id", "id", "doc_id", "_score", "score", "payload"]
+                .into_iter()
+                .map(std::string::ToString::to_string)
+                .collect())
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            ..
+        } => {
             let mut l = plan_output_columns(left, ctx)?;
-            let r = plan_output_columns(right, ctx)?;
-            l.extend(r);
+            if !matches!(join_type, JoinType::Semi | JoinType::Anti) {
+                let r = plan_output_columns(right, ctx)?;
+                l.extend(r);
+            }
             Ok(l)
         }
         LogicalPlan::InsertInto { input, .. } => plan_output_columns(input, ctx),
+        LogicalPlan::UnionAll { left, .. } => plan_output_columns(left, ctx),
+        LogicalPlan::CteRef { plan, .. } => plan_output_columns(plan, ctx),
     }
 }
 
@@ -1422,12 +2411,20 @@ fn estimate_bytes(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result<Opti
             Ok(None)
         }
         LogicalPlan::Filter { input, .. }
+        | LogicalPlan::InSubqueryFilter { input, .. }
+        | LogicalPlan::ExistsSubqueryFilter { input, .. }
+        | LogicalPlan::ScalarSubqueryFilter { input, .. }
         | LogicalPlan::Projection { input, .. }
         | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Window { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::TopKByScore { input, .. }
+        | LogicalPlan::SubqueryAlias { input, .. }
+        | LogicalPlan::UnionAll { left: input, .. }
+        | LogicalPlan::CteRef { plan: input, .. }
         | LogicalPlan::InsertInto { input, .. } => estimate_bytes(input, ctx),
         LogicalPlan::VectorTopK { .. } => Ok(None),
+        LogicalPlan::HybridVectorScan { .. } => Ok(None),
         LogicalPlan::Join { .. } => Ok(None),
     }
 }
@@ -1447,6 +2444,8 @@ mod tests {
     struct TestCtx {
         schema: SchemaRef,
         format: String,
+        options: HashMap<String, String>,
+        stats: HashMap<String, (Option<u64>, Option<u64>)>,
     }
 
     impl SchemaProvider for TestCtx {
@@ -1456,14 +2455,14 @@ mod tests {
     }
 
     impl OptimizerContext for TestCtx {
-        fn table_stats(&self, _table: &str) -> ffq_common::Result<(Option<u64>, Option<u64>)> {
-            Ok((None, None))
+        fn table_stats(&self, table: &str) -> ffq_common::Result<(Option<u64>, Option<u64>)> {
+            Ok(self.stats.get(table).cloned().unwrap_or((None, None)))
         }
 
         fn table_metadata(&self, _table: &str) -> ffq_common::Result<Option<TableMetadata>> {
             Ok(Some(TableMetadata {
                 format: self.format.clone(),
-                options: HashMap::new(),
+                options: self.options.clone(),
             }))
         }
     }
@@ -1499,6 +2498,8 @@ mod tests {
                 Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
             ])),
             format: "qdrant".to_string(),
+            options: HashMap::new(),
+            stats: HashMap::new(),
         };
 
         let optimized = Optimizer::new()
@@ -1510,20 +2511,104 @@ mod tests {
             .expect("optimize");
         match optimized {
             LogicalPlan::Projection { input, .. } => match *input {
-                LogicalPlan::VectorTopK {
-                    table,
-                    query_vector,
+                LogicalPlan::HybridVectorScan {
+                    source,
+                    query_vectors,
                     k,
                     ..
                 } => {
-                    assert_eq!(table, "docs_idx");
-                    assert_eq!(query_vector, vec![1.0, 0.0, 0.0]);
+                    assert_eq!(source, "docs_idx");
+                    assert_eq!(query_vectors.len(), 1);
+                    let query_vector = &query_vectors[0];
+                    assert_eq!(query_vector.as_slice(), &[1.0, 0.0, 0.0]);
                     assert_eq!(k, 5);
                 }
-                other => panic!("expected VectorTopK, got {other:?}"),
+                other => panic!("expected HybridVectorScan, got {other:?}"),
             },
             other => panic!("expected Projection, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rewrite_uses_metric_and_ef_search_knobs() {
+        let emb_field = Field::new("item", DataType::Float32, true);
+        let mut options = HashMap::new();
+        options.insert("vector.ef_search".to_string(), "128".to_string());
+        let ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+            ])),
+            format: "qdrant".to_string(),
+            options,
+            stats: HashMap::new(),
+        };
+
+        let plan = LogicalPlan::Projection {
+            exprs: vec![
+                (Expr::Column("id".to_string()), "id".to_string()),
+                (Expr::Column("score".to_string()), "score".to_string()),
+                (Expr::Column("payload".to_string()), "payload".to_string()),
+            ],
+            input: Box::new(LogicalPlan::TopKByScore {
+                score_expr: Expr::DotProduct {
+                    vector: Box::new(Expr::Column("emb".to_string())),
+                    query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+                },
+                k: 5,
+                input: Box::new(LogicalPlan::TableScan {
+                    table: "docs_idx".to_string(),
+                    projection: None,
+                    filters: vec![],
+                }),
+            }),
+        };
+
+        let optimized = Optimizer::new()
+            .optimize(plan, &ctx, OptimizerConfig::default())
+            .expect("optimize");
+        match optimized {
+            LogicalPlan::Projection { input, .. } => match *input {
+                LogicalPlan::HybridVectorScan {
+                    metric, ef_search, ..
+                } => {
+                    assert_eq!(metric, "dot");
+                    assert_eq!(ef_search, Some(128));
+                }
+                other => panic!("expected HybridVectorScan, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_fails_when_k_exceeds_cap() {
+        let emb_field = Field::new("item", DataType::Float32, true);
+        let mut options = HashMap::new();
+        options.insert("vector.knn.max_k".to_string(), "4".to_string());
+        let ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+            ])),
+            format: "qdrant".to_string(),
+            options,
+            stats: HashMap::new(),
+        };
+
+        let err = Optimizer::new()
+            .optimize(
+                topk_plan(&["id", "score", "payload"]),
+                &ctx,
+                OptimizerConfig::default(),
+            )
+            .expect_err("k cap violation");
+        assert!(
+            err.to_string().contains("vector.knn.max_k"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1536,6 +2621,8 @@ mod tests {
                 Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
             ])),
             format: "parquet".to_string(),
+            options: HashMap::new(),
+            stats: HashMap::new(),
         };
 
         let optimized = Optimizer::new()
@@ -1565,6 +2652,8 @@ mod tests {
                 Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
             ])),
             format: "qdrant".to_string(),
+            options: HashMap::new(),
+            stats: HashMap::new(),
         };
 
         let optimized = Optimizer::new()
@@ -1589,6 +2678,8 @@ mod tests {
                 Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
             ])),
             format: "qdrant".to_string(),
+            options: HashMap::new(),
+            stats: HashMap::new(),
         };
 
         let plan = LogicalPlan::Projection {
@@ -1627,8 +2718,8 @@ mod tests {
             .expect("optimize");
         match optimized {
             LogicalPlan::Projection { input, .. } => match *input {
-                LogicalPlan::VectorTopK { filter, .. } => {
-                    let filter = filter.expect("translated filter");
+                LogicalPlan::HybridVectorScan { prefilter, .. } => {
+                    let filter = prefilter.expect("translated filter");
                     let parsed: serde_json::Value =
                         serde_json::from_str(&filter).expect("json filter");
                     assert_eq!(
@@ -1640,7 +2731,119 @@ mod tests {
                         2
                     );
                 }
-                other => panic!("expected VectorTopK, got {other:?}"),
+                other => panic!("expected HybridVectorScan, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pushdown_disabled_falls_back_without_error() {
+        let emb_field = Field::new("item", DataType::Float32, true);
+        let mut options = HashMap::new();
+        options.insert(
+            "vector.filter.pushdown.enabled".to_string(),
+            "false".to_string(),
+        );
+        let ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+            ])),
+            format: "qdrant".to_string(),
+            options,
+            stats: HashMap::new(),
+        };
+
+        let plan = LogicalPlan::Projection {
+            exprs: vec![
+                (Expr::Column("id".to_string()), "id".to_string()),
+                (Expr::Column("score".to_string()), "score".to_string()),
+                (Expr::Column("payload".to_string()), "payload".to_string()),
+            ],
+            input: Box::new(LogicalPlan::TopKByScore {
+                score_expr: Expr::CosineSimilarity {
+                    vector: Box::new(Expr::Column("emb".to_string())),
+                    query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+                },
+                k: 3,
+                input: Box::new(LogicalPlan::TableScan {
+                    table: "docs_idx".to_string(),
+                    projection: None,
+                    filters: vec![Expr::BinaryOp {
+                        left: Box::new(Expr::Column("language".to_string())),
+                        op: crate::logical_plan::BinaryOp::Eq,
+                        right: Box::new(Expr::Literal(LiteralValue::Utf8("de".to_string()))),
+                    }],
+                }),
+            }),
+        };
+
+        let optimized = Optimizer::new()
+            .optimize(plan, &ctx, OptimizerConfig::default())
+            .expect("optimize should not fail");
+        match optimized {
+            LogicalPlan::Projection { input, .. } => match *input {
+                LogicalPlan::TopKByScore { .. } => {}
+                other => panic!("expected TopKByScore fallback, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disjunction_filter_falls_back_when_or_not_supported() {
+        let emb_field = Field::new("item", DataType::Float32, true);
+        let ctx = TestCtx {
+            schema: Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("payload", DataType::Utf8, true),
+                Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
+            ])),
+            format: "qdrant".to_string(),
+            options: HashMap::new(),
+            stats: HashMap::new(),
+        };
+
+        let plan = LogicalPlan::Projection {
+            exprs: vec![
+                (Expr::Column("id".to_string()), "id".to_string()),
+                (Expr::Column("score".to_string()), "score".to_string()),
+                (Expr::Column("payload".to_string()), "payload".to_string()),
+            ],
+            input: Box::new(LogicalPlan::TopKByScore {
+                score_expr: Expr::CosineSimilarity {
+                    vector: Box::new(Expr::Column("emb".to_string())),
+                    query: Box::new(Expr::Literal(LiteralValue::VectorF32(vec![1.0, 0.0, 0.0]))),
+                },
+                k: 3,
+                input: Box::new(LogicalPlan::TableScan {
+                    table: "docs_idx".to_string(),
+                    projection: None,
+                    filters: vec![Expr::Or(
+                        Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("language".to_string())),
+                            op: crate::logical_plan::BinaryOp::Eq,
+                            right: Box::new(Expr::Literal(LiteralValue::Utf8("de".to_string()))),
+                        }),
+                        Box::new(Expr::BinaryOp {
+                            left: Box::new(Expr::Column("language".to_string())),
+                            op: crate::logical_plan::BinaryOp::Eq,
+                            right: Box::new(Expr::Literal(LiteralValue::Utf8("en".to_string()))),
+                        }),
+                    )],
+                }),
+            }),
+        };
+
+        let optimized = Optimizer::new()
+            .optimize(plan, &ctx, OptimizerConfig::default())
+            .expect("optimize should not fail");
+        match optimized {
+            LogicalPlan::Projection { input, .. } => match *input {
+                LogicalPlan::TopKByScore { .. } => {}
+                other => panic!("expected TopKByScore fallback, got {other:?}"),
             },
             other => panic!("expected Projection, got {other:?}"),
         }
@@ -1656,6 +2859,8 @@ mod tests {
                 Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
             ])),
             format: "qdrant".to_string(),
+            options: HashMap::new(),
+            stats: HashMap::new(),
         };
 
         let plan = LogicalPlan::Projection {
@@ -1709,6 +2914,8 @@ mod tests {
                 ),
             ])),
             format: "qdrant".to_string(),
+            options: HashMap::new(),
+            stats: HashMap::new(),
         };
         let parquet_ctx = TestCtx {
             schema: Arc::new(Schema::new(vec![
@@ -1717,6 +2924,8 @@ mod tests {
                 Field::new("emb", DataType::FixedSizeList(Arc::new(emb_field), 3), true),
             ])),
             format: "parquet".to_string(),
+            options: HashMap::new(),
+            stats: HashMap::new(),
         };
 
         let applied = Optimizer::new()
@@ -1857,11 +3066,11 @@ mod tests {
                                         other => panic!("expected docs TableScan, got {other:?}"),
                                     }
                                     match *right {
-                                        LogicalPlan::VectorTopK { table, k, .. } => {
-                                            assert_eq!(table, "docs_idx");
+                                        LogicalPlan::HybridVectorScan { source, k, .. } => {
+                                            assert_eq!(source, "docs_idx");
                                             assert_eq!(k, 6);
                                         }
-                                        other => panic!("expected VectorTopK, got {other:?}"),
+                                        other => panic!("expected HybridVectorScan, got {other:?}"),
                                     }
                                 }
                                 other => panic!("expected Join, got {other:?}"),
@@ -1874,6 +3083,195 @@ mod tests {
                 other => panic!("expected TopKByScore, got {other:?}"),
             },
             other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod subquery_integration_tests {
+    use std::collections::HashMap;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field, Schema, SchemaRef};
+
+    use super::{Optimizer, OptimizerConfig, OptimizerContext, TableMetadata};
+    use crate::analyzer::SchemaProvider;
+    use crate::logical_plan::{Expr, JoinStrategyHint, JoinType, LogicalPlan, SubqueryCorrelation};
+
+    struct Ctx {
+        schemas: HashMap<String, SchemaRef>,
+    }
+
+    impl SchemaProvider for Ctx {
+        fn table_schema(&self, table: &str) -> ffq_common::Result<SchemaRef> {
+            self.schemas
+                .get(table)
+                .cloned()
+                .ok_or_else(|| ffq_common::FfqError::Planning(format!("unknown table {table}")))
+        }
+    }
+
+    impl OptimizerContext for Ctx {
+        fn table_stats(&self, table: &str) -> ffq_common::Result<(Option<u64>, Option<u64>)> {
+            if table == "bad_stats" {
+                return Err(ffq_common::FfqError::Planning(
+                    "table stats unavailable".to_string(),
+                ));
+            }
+            Ok((Some(1024), Some(10)))
+        }
+
+        fn table_metadata(&self, _table: &str) -> ffq_common::Result<Option<TableMetadata>> {
+            Ok(None)
+        }
+    }
+
+    fn basic_schema(col: &str) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(col, DataType::Int64, true)]))
+    }
+
+    #[test]
+    fn predicate_pushdown_through_in_subquery_filter_pushes_left_branch() {
+        let ctx = Ctx {
+            schemas: HashMap::from([
+                ("t".to_string(), basic_schema("a")),
+                ("s".to_string(), basic_schema("b")),
+            ]),
+        };
+        let plan = LogicalPlan::Filter {
+            predicate: Expr::BinaryOp {
+                left: Box::new(Expr::Column("a".to_string())),
+                op: crate::logical_plan::BinaryOp::Gt,
+                right: Box::new(Expr::Literal(crate::logical_plan::LiteralValue::Int64(1))),
+            },
+            input: Box::new(LogicalPlan::InSubqueryFilter {
+                input: Box::new(LogicalPlan::TableScan {
+                    table: "t".to_string(),
+                    projection: None,
+                    filters: vec![],
+                }),
+                expr: Expr::Column("a".to_string()),
+                subquery: Box::new(LogicalPlan::TableScan {
+                    table: "s".to_string(),
+                    projection: None,
+                    filters: vec![],
+                }),
+                negated: false,
+                correlation: SubqueryCorrelation::Unresolved,
+            }),
+        };
+
+        let optimized = Optimizer::new()
+            .optimize(plan, &ctx, OptimizerConfig::default())
+            .expect("optimize");
+
+        match optimized {
+            LogicalPlan::InSubqueryFilter { input, .. } => match *input {
+                LogicalPlan::TableScan { filters, .. } => {
+                    assert_eq!(filters.len(), 1, "expected pushed filter at scan");
+                }
+                other => panic!("expected left branch TableScan with pushed filter, got {other:?}"),
+            },
+            other => panic!("expected InSubqueryFilter root after pushdown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optimizer_returns_error_instead_of_panicking_when_child_rewrite_fails() {
+        let ctx = Ctx {
+            schemas: HashMap::from([
+                ("ok".to_string(), basic_schema("k")),
+                ("bad_stats".to_string(), basic_schema("k")),
+            ]),
+        };
+        let plan = LogicalPlan::Projection {
+            exprs: vec![(Expr::Column("k".to_string()), "k".to_string())],
+            input: Box::new(LogicalPlan::Join {
+                left: Box::new(LogicalPlan::TableScan {
+                    table: "ok".to_string(),
+                    projection: None,
+                    filters: vec![],
+                }),
+                right: Box::new(LogicalPlan::TableScan {
+                    table: "bad_stats".to_string(),
+                    projection: None,
+                    filters: vec![],
+                }),
+                on: vec![("k".to_string(), "k".to_string())],
+                join_type: JoinType::Inner,
+                strategy_hint: JoinStrategyHint::Auto,
+            }),
+        };
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            Optimizer::new().optimize(plan, &ctx, OptimizerConfig::default())
+        }));
+        assert!(result.is_ok(), "optimizer should not panic");
+        let out = result.expect("no panic");
+        assert!(out.is_err(), "optimizer should propagate planning error");
+    }
+
+    #[test]
+    fn join_strategy_hint_uses_sort_merge_when_enabled_by_config() {
+        struct SmjCtx {
+            schemas: HashMap<String, SchemaRef>,
+        }
+        impl SchemaProvider for SmjCtx {
+            fn table_schema(&self, table: &str) -> ffq_common::Result<SchemaRef> {
+                self.schemas.get(table).cloned().ok_or_else(|| {
+                    ffq_common::FfqError::Planning(format!("unknown table: {table}"))
+                })
+            }
+        }
+        impl OptimizerContext for SmjCtx {
+            fn table_stats(&self, table: &str) -> ffq_common::Result<(Option<u64>, Option<u64>)> {
+                let bytes = match table {
+                    "left_t" => Some(256 * 1024 * 1024),
+                    "right_t" => Some(320 * 1024 * 1024),
+                    _ => None,
+                };
+                Ok((bytes, None))
+            }
+        }
+
+        let schema = basic_schema("k");
+        let ctx = SmjCtx {
+            schemas: HashMap::from([
+                ("left_t".to_string(), schema.clone()),
+                ("right_t".to_string(), schema),
+            ]),
+        };
+        let plan = LogicalPlan::Join {
+            left: Box::new(LogicalPlan::TableScan {
+                table: "left_t".to_string(),
+                projection: None,
+                filters: vec![],
+            }),
+            right: Box::new(LogicalPlan::TableScan {
+                table: "right_t".to_string(),
+                projection: None,
+                filters: vec![],
+            }),
+            on: vec![("k".to_string(), "k".to_string())],
+            join_type: JoinType::Inner,
+            strategy_hint: JoinStrategyHint::Auto,
+        };
+        let optimized = Optimizer::new()
+            .optimize(
+                plan,
+                &ctx,
+                OptimizerConfig {
+                    broadcast_threshold_bytes: 64 * 1024 * 1024,
+                    prefer_sort_merge_join: true,
+                },
+            )
+            .expect("optimize");
+        match optimized {
+            LogicalPlan::Join { strategy_hint, .. } => {
+                assert_eq!(strategy_hint, JoinStrategyHint::SortMerge);
+            }
+            other => panic!("expected join plan, got {other:?}"),
         }
     }
 }

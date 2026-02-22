@@ -17,21 +17,26 @@
 //! Feature flags:
 //! - `profiling`: enables the metrics HTTP exporter helpers.
 
+/// Shared adaptive partition-planning utilities.
+pub mod adaptive;
 /// Shared engine/runtime configuration types.
 pub mod config;
 /// Shared error taxonomy.
 pub mod error;
 /// Strongly-typed identifier wrappers.
 pub mod ids;
+/// Engine-level memory budget and spill-pressure helpers.
+pub mod memory;
 /// Metrics registry and Prometheus rendering helpers.
 pub mod metrics;
 #[cfg(feature = "profiling")]
 /// Optional HTTP metrics exporter.
 pub mod metrics_exporter;
 
-pub use config::{EngineConfig, SchemaDriftPolicy, SchemaInferencePolicy};
+pub use config::{CteReusePolicy, EngineConfig, SchemaDriftPolicy, SchemaInferencePolicy};
 pub use error::{FfqError, Result};
 pub use ids::*;
+pub use memory::{MemoryPressure, MemoryPressureSignal, MemorySpillManager};
 pub use metrics::MetricsRegistry;
 #[cfg(feature = "profiling")]
 pub use metrics_exporter::run_metrics_exporter;

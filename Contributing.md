@@ -24,14 +24,33 @@ Open an issue describing:
 ## Pull requests
 - Keep PRs focused (one logical change).
 - Add/update tests when behavior changes.
-- Update docs/README if you change usage.
+- Update docs when behavior/API/config changes (see policy below).
 - Be respectful in review discussions.
+
+## Documentation policy (v2 first)
+Contributor entrypoint docs:
+1. `docs/v2/README.md`
+2. `docs/v2/quickstart.md`
+3. `docs/v2/testing.md`
+
+Policy:
+1. `docs/v2/*` is canonical for current behavior.
+2. Any behavior, API, config, runtime, or workflow change must update relevant `docs/v2/*` pages in the same PR.
+3. PRs that change behavior but do not update docs must include an explicit reason why no doc update is needed.
+4. `docs/v1/*` is archived reference and must not be the primary target for new behavior documentation.
+
+Guardrail command:
+1. `make docs-v2-guardrails`
 
 Source-level Rust documentation standard:
 - `docs/dev/rustdoc-style.md`
 
+API SemVer + deprecation policy:
+- `docs/dev/api-semver-policy.md`
+- CI workflow: `.github/workflows/api-semver.yml`
+
 ## Distributed Compose Smoke Test
-Use the v1 coordinator + 2 worker topology:
+Use the coordinator + 2 worker topology:
 
 ```bash
 docker compose -f docker/compose/ffq.yml up --build -d

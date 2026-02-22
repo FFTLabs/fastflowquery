@@ -39,6 +39,12 @@ struct CliOptions {
     spill_dir: PathBuf,
     keep_spill_dir: bool,
     max_cv_pct: Option<f64>,
+    include_window: bool,
+    window_matrix: String,
+    include_adaptive_shuffle: bool,
+    adaptive_shuffle_matrix: String,
+    #[cfg(feature = "vector")]
+    include_rag: bool,
     #[cfg(feature = "vector")]
     rag_matrix: String,
 }
@@ -167,7 +173,14 @@ fn main() -> Result<()> {
     let engine = Engine::new(config.clone())?;
     register_benchmark_tables(&engine, &opts.fixture_root, &opts.tpch_subdir)?;
 
-    for spec in canonical_specs(opts.mode, &opts.tpch_subdir) {
+    for spec in canonical_specs(
+        opts.mode,
+        &opts.tpch_subdir,
+        opts.include_window,
+        &opts.window_matrix,
+        opts.include_adaptive_shuffle,
+        &opts.adaptive_shuffle_matrix,
+    )? {
         let query = load_benchmark_query_from_root(&opts.query_root, spec.id)?;
         if let Err(err) = maybe_verify_official_tpch_correctness(
             &engine,
@@ -281,7 +294,7 @@ fn main() -> Result<()> {
         }
     }
     #[cfg(feature = "vector")]
-    if opts.mode == BenchMode::Embedded {
+    if opts.mode == BenchMode::Embedded && opts.include_rag {
         run_rag_matrix(&engine, &opts, &mut results)?;
     }
 
@@ -383,6 +396,20 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
             }
         })
         .or(Some(30.0));
+    let mut include_window = env::var("FFQ_BENCH_INCLUDE_WINDOW")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut window_matrix = env::var("FFQ_BENCH_WINDOW_MATRIX")
+        .unwrap_or_else(|_| "narrow;wide;skewed;many_exprs".to_string());
+    let mut include_adaptive_shuffle = env::var("FFQ_BENCH_INCLUDE_ADAPTIVE_SHUFFLE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut adaptive_shuffle_matrix = env::var("FFQ_BENCH_ADAPTIVE_SHUFFLE_MATRIX")
+        .unwrap_or_else(|_| "tiny;large;skewed;mixed".to_string());
+    #[cfg(feature = "vector")]
+    let mut include_rag = env::var("FFQ_BENCH_INCLUDE_RAG")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
     #[cfg(feature = "vector")]
     let mut rag_matrix = env::var("FFQ_BENCH_RAG_MATRIX")
         .unwrap_or_else(|_| "1000,16,10,1.0;5000,32,10,0.8;10000,64,10,0.2".to_string());
@@ -469,6 +496,24 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
             "--no-variance-check" => {
                 max_cv_pct = None;
             }
+            "--window-matrix" => {
+                i += 1;
+                window_matrix = require_arg(&args, i, "--window-matrix")?;
+            }
+            "--include-window" => {
+                include_window = true;
+            }
+            "--adaptive-shuffle-matrix" => {
+                i += 1;
+                adaptive_shuffle_matrix = require_arg(&args, i, "--adaptive-shuffle-matrix")?;
+            }
+            "--include-adaptive-shuffle" => {
+                include_adaptive_shuffle = true;
+            }
+            #[cfg(feature = "vector")]
+            "--no-rag" => {
+                include_rag = false;
+            }
             #[cfg(feature = "vector")]
             "--rag-matrix" => {
                 i += 1;
@@ -533,6 +578,12 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
         spill_dir,
         keep_spill_dir,
         max_cv_pct,
+        include_window,
+        window_matrix,
+        include_adaptive_shuffle,
+        adaptive_shuffle_matrix,
+        #[cfg(feature = "vector")]
+        include_rag,
         #[cfg(feature = "vector")]
         rag_matrix,
     })
@@ -540,7 +591,7 @@ fn parse_args(args: Vec<String>) -> Result<CliOptions> {
 
 fn print_usage() {
     eprintln!(
-        "Usage: run_bench_13_3 [--mode embedded|distributed] [--fixture-root PATH] [--tpch-subdir NAME] [--query-root PATH] [--out-dir PATH] [--warmup N] [--iterations N] [--threads N] [--batch-size-rows N] [--mem-budget-bytes N] [--shuffle-partitions N] [--spill-dir PATH] [--keep-spill-dir] [--max-cv-pct N|--no-variance-check] [--rag-matrix \"N,dim,k,sel;...\"]"
+        "Usage: run_bench_13_3 [--mode embedded|distributed] [--fixture-root PATH] [--tpch-subdir NAME] [--query-root PATH] [--out-dir PATH] [--warmup N] [--iterations N] [--threads N] [--batch-size-rows N] [--mem-budget-bytes N] [--shuffle-partitions N] [--spill-dir PATH] [--keep-spill-dir] [--max-cv-pct N|--no-variance-check] [--include-window] [--window-matrix \"narrow;wide;skewed;many_exprs\"] [--include-adaptive-shuffle] [--adaptive-shuffle-matrix \"tiny;large;skewed;mixed\"] [--no-rag] [--rag-matrix \"N,dim,k,sel;...\"]"
     );
 }
 
@@ -692,7 +743,118 @@ fn register_parquet(engine: &Engine, name: &str, path: &Path, schema: Schema) ->
     Ok(())
 }
 
-fn canonical_specs(mode: BenchMode, tpch_subdir: &str) -> Vec<QuerySpec> {
+#[derive(Debug, Clone, Copy)]
+enum WindowScenario {
+    Narrow,
+    Wide,
+    Skewed,
+    ManyExprs,
+}
+
+impl WindowScenario {
+    fn parse_many(raw: &str) -> Result<Vec<Self>> {
+        let mut out = Vec::new();
+        for item in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let scenario = match item {
+                "narrow" => Self::Narrow,
+                "wide" => Self::Wide,
+                "skewed" => Self::Skewed,
+                "many_exprs" | "many" => Self::ManyExprs,
+                other => {
+                    return Err(FfqError::InvalidConfig(format!(
+                        "invalid window matrix item '{other}'; expected narrow|wide|skewed|many_exprs"
+                    )));
+                }
+            };
+            out.push(scenario);
+        }
+        if out.is_empty() {
+            return Err(FfqError::InvalidConfig(
+                "window matrix is empty; provide at least one scenario".to_string(),
+            ));
+        }
+        Ok(out)
+    }
+
+    fn query_id(self) -> BenchmarkQueryId {
+        match self {
+            Self::Narrow => BenchmarkQueryId::WindowNarrowPartitions,
+            Self::Wide => BenchmarkQueryId::WindowWidePartitions,
+            Self::Skewed => BenchmarkQueryId::WindowSkewedKeys,
+            Self::ManyExprs => BenchmarkQueryId::WindowManyExpressions,
+        }
+    }
+
+    fn variant(self) -> &'static str {
+        match self {
+            Self::Narrow => "narrow_partition",
+            Self::Wide => "wide_partition",
+            Self::Skewed => "skewed_partition",
+            Self::ManyExprs => "many_window_exprs",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AdaptiveShuffleScenario {
+    Tiny,
+    Large,
+    Skewed,
+    Mixed,
+}
+
+impl AdaptiveShuffleScenario {
+    fn parse_many(raw: &str) -> Result<Vec<Self>> {
+        let mut out = Vec::new();
+        for item in raw.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let scenario = match item {
+                "tiny" => Self::Tiny,
+                "large" => Self::Large,
+                "skewed" => Self::Skewed,
+                "mixed" => Self::Mixed,
+                other => {
+                    return Err(FfqError::InvalidConfig(format!(
+                        "invalid adaptive shuffle matrix item '{other}'; expected tiny|large|skewed|mixed"
+                    )));
+                }
+            };
+            out.push(scenario);
+        }
+        if out.is_empty() {
+            return Err(FfqError::InvalidConfig(
+                "adaptive shuffle matrix is empty; provide at least one scenario".to_string(),
+            ));
+        }
+        Ok(out)
+    }
+
+    fn query_id(self) -> BenchmarkQueryId {
+        match self {
+            Self::Tiny => BenchmarkQueryId::AdaptiveShuffleTinyPartitions,
+            Self::Large => BenchmarkQueryId::AdaptiveShuffleLargePartitions,
+            Self::Skewed => BenchmarkQueryId::AdaptiveShuffleSkewedKeys,
+            Self::Mixed => BenchmarkQueryId::AdaptiveShuffleMixedWorkload,
+        }
+    }
+
+    fn variant(self) -> &'static str {
+        match self {
+            Self::Tiny => "adaptive_tiny_partitions",
+            Self::Large => "adaptive_large_partitions",
+            Self::Skewed => "adaptive_skewed_keys",
+            Self::Mixed => "adaptive_mixed_workload",
+        }
+    }
+}
+
+fn canonical_specs(
+    mode: BenchMode,
+    tpch_subdir: &str,
+    include_window: bool,
+    window_matrix: &str,
+    include_adaptive_shuffle: bool,
+    adaptive_shuffle_matrix: &str,
+) -> Result<Vec<QuerySpec>> {
     #[allow(unused_mut)]
     let mut specs = vec![
         QuerySpec {
@@ -708,8 +870,28 @@ fn canonical_specs(mode: BenchMode, tpch_subdir: &str) -> Vec<QuerySpec> {
             params: HashMap::new(),
         },
     ];
+    if include_window {
+        for scenario in WindowScenario::parse_many(window_matrix)? {
+            specs.push(QuerySpec {
+                id: scenario.query_id(),
+                variant: scenario.variant(),
+                dataset: tpch_subdir.to_string(),
+                params: HashMap::new(),
+            });
+        }
+    }
+    if include_adaptive_shuffle {
+        for scenario in AdaptiveShuffleScenario::parse_many(adaptive_shuffle_matrix)? {
+            specs.push(QuerySpec {
+                id: scenario.query_id(),
+                variant: scenario.variant(),
+                dataset: tpch_subdir.to_string(),
+                params: HashMap::new(),
+            });
+        }
+    }
     let _ = mode;
-    specs
+    Ok(specs)
 }
 
 fn distributed_preflight() -> Result<()> {

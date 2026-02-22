@@ -9,11 +9,14 @@ SHELL := /bin/bash
 	tree \
 	test-planner \
 	test-unit \
+	test-distributed \
+	test-vector \
 	test \
 	test-fast \
 	test-slow-official \
 	test-13.1-core \
 	test-13.1-vector \
+	test-13.1-object-store \
 	test-13.1-distributed \
 	test-13.1 \
 	bless-13.1-snapshots \
@@ -23,6 +26,16 @@ SHELL := /bin/bash
 	bench-13.3-embedded \
 	bench-13.3-distributed \
 	bench-13.3-rag \
+	bench-v2-window-embedded \
+	bench-v2-window-distributed \
+	bench-v2-window-compare \
+	bench-v2-adaptive-shuffle-embedded \
+	bench-v2-adaptive-shuffle-distributed \
+	bench-v2-adaptive-shuffle-compare \
+	bench-v2-pipelined-shuffle \
+	bench-v2-pipelined-shuffle-gate \
+	bench-v2-join-radix \
+	bench-v2-join-bloom \
 	bench-13.4-official-embedded \
 	bench-13.4-official-distributed \
 	bench-13.4-official \
@@ -33,7 +46,12 @@ SHELL := /bin/bash
 	validate-tpch-dbgen-manifests \
 	compare-13.3 \
 	repl \
-	repl-smoke
+	repl-smoke \
+	ffi-build \
+	ffi-example \
+	python-wheel \
+	python-dev-install \
+	docs-v2-guardrails
 
 clean:
 	cargo clean
@@ -59,6 +77,20 @@ test-planner:
 test-unit:
 	cargo test --workspace --lib
 
+test-distributed:
+	@set -euo pipefail; \
+	docker compose -f docker/compose/ffq.yml up --build -d; \
+	trap 'docker compose -f docker/compose/ffq.yml down -v' EXIT; \
+	cargo test -p ffq-distributed --features grpc; \
+	$(MAKE) test-13.1-distributed; \
+	$(MAKE) test-13.2-distributed
+
+test-vector:
+	$(MAKE) test-13.1-vector
+	cargo test -p ffq-client --test embedded_two_phase_retrieval --features vector
+	cargo test -p ffq-client --test qdrant_routing --features "vector,qdrant"
+	cargo test -p ffq-client --test public_api_contract --features vector
+
 test:
 	cargo test
 
@@ -82,10 +114,15 @@ test-13.1-vector:
 	cargo test -p ffq-client --features vector --lib
 	cargo test -p ffq-client --features vector --test embedded_vector_topk
 
+test-13.1-object-store:
+	cargo test -p ffq-storage --features s3 object_store_uri_detection_requires_scheme -- --nocapture
+	cargo test -p ffq-storage --features s3 object_store_scan_reads_file_uri_parquet -- --nocapture
+	cargo test -p ffq-storage --features s3 object_store_scan_retries_then_fails_for_missing_object -- --nocapture
+
 test-13.1-distributed:
 	cargo test -p ffq-client --test distributed_runtime_roundtrip --features distributed
 
-test-13.1: test-13.1-core test-13.1-vector test-13.1-distributed
+test-13.1: test-13.1-core test-13.1-vector test-13.1-object-store test-13.1-distributed
 
 bless-13.1-snapshots:
 	BLESS=1 cargo test -p ffq-planner --test optimizer_golden
@@ -114,6 +151,42 @@ bench-13.3-distributed:
 bench-13.3-rag:
 	FFQ_BENCH_MODE=embedded FFQ_BENCH_RAG_MATRIX="$${FFQ_BENCH_RAG_MATRIX:-1000,16,10,1.0;5000,32,10,0.8;10000,64,10,0.2}" ./scripts/run-bench-13.3.sh
 
+bench-v2-window-embedded:
+	FFQ_BENCH_MODE=embedded FFQ_BENCH_INCLUDE_WINDOW=1 FFQ_BENCH_INCLUDE_RAG=0 FFQ_BENCH_WINDOW_MATRIX="$${FFQ_BENCH_WINDOW_MATRIX:-narrow;wide;skewed;many_exprs}" ./scripts/run-bench-v2-window.sh
+
+bench-v2-window-distributed:
+	FFQ_BENCH_MODE=distributed FFQ_BENCH_INCLUDE_WINDOW=1 FFQ_BENCH_INCLUDE_RAG=0 FFQ_BENCH_WINDOW_MATRIX="$${FFQ_BENCH_WINDOW_MATRIX:-narrow;wide;skewed;many_exprs}" ./scripts/run-bench-v2-window.sh
+
+bench-v2-window-compare:
+	@test -n "$$BASELINE" || (echo "BASELINE is required (json file or dir)" && exit 1)
+	@test -n "$$CANDIDATE" || (echo "CANDIDATE is required (json file or dir)" && exit 1)
+	./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}" --threshold-file "$${THRESHOLD_FILE:-tests/bench/thresholds/window_regression_thresholds.json}"
+
+bench-v2-adaptive-shuffle-embedded:
+	FFQ_BENCH_MODE=embedded FFQ_BENCH_INCLUDE_WINDOW=0 FFQ_BENCH_INCLUDE_RAG=0 FFQ_BENCH_INCLUDE_ADAPTIVE_SHUFFLE=1 FFQ_BENCH_ADAPTIVE_SHUFFLE_MATRIX="$${FFQ_BENCH_ADAPTIVE_SHUFFLE_MATRIX:-tiny;large;skewed;mixed}" ./scripts/run-bench-v2-adaptive-shuffle.sh
+
+bench-v2-adaptive-shuffle-distributed:
+	FFQ_BENCH_MODE=distributed FFQ_BENCH_INCLUDE_WINDOW=0 FFQ_BENCH_INCLUDE_RAG=0 FFQ_BENCH_INCLUDE_ADAPTIVE_SHUFFLE=1 FFQ_BENCH_ADAPTIVE_SHUFFLE_MATRIX="$${FFQ_BENCH_ADAPTIVE_SHUFFLE_MATRIX:-tiny;large;skewed;mixed}" ./scripts/run-bench-v2-adaptive-shuffle.sh
+
+bench-v2-adaptive-shuffle-compare:
+	@test -n "$$BASELINE" || (echo "BASELINE is required (json file or dir)" && exit 1)
+	@test -n "$$CANDIDATE" || (echo "CANDIDATE is required (json file or dir)" && exit 1)
+	./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}" --threshold-file "$${THRESHOLD_FILE:-tests/bench/thresholds/adaptive_shuffle_regression_thresholds.json}"
+
+bench-v2-pipelined-shuffle:
+	./scripts/run-bench-v2-pipelined-shuffle.sh
+
+bench-v2-pipelined-shuffle-gate:
+	@CANDIDATE="$${CANDIDATE:-$$(ls -t tests/bench/results/bench_v2_pipelined_shuffle_ttfr_*.json 2>/dev/null | head -n1)}"; \
+	test -n "$$CANDIDATE" || (echo "CANDIDATE is required (or run bench-v2-pipelined-shuffle first)" && exit 1); \
+	./scripts/check-bench-v2-pipelined-ttfr.py --candidate "$$CANDIDATE" --threshold-file "$${THRESHOLD_FILE:-tests/bench/thresholds/pipelined_shuffle_ttfr_thresholds.json}"
+
+bench-v2-join-radix:
+	cargo run -p ffq-client --example bench_join_radix
+
+bench-v2-join-bloom:
+	cargo run -p ffq-client --example bench_join_bloom
+
 bench-13.4-official-embedded:
 	FFQ_BENCH_MODE=embedded FFQ_BENCH_TPCH_SUBDIR="$${FFQ_BENCH_TPCH_SUBDIR:-tpch_dbgen_sf1_parquet}" ./scripts/run-bench-13.4-tpch-official.sh
 
@@ -125,7 +198,11 @@ bench-13.4-official: bench-13.4-official-embedded
 bench-13.3-compare:
 	@test -n "$$BASELINE" || (echo "BASELINE is required (json file or dir)" && exit 1)
 	@test -n "$$CANDIDATE" || (echo "CANDIDATE is required (json file or dir)" && exit 1)
-	./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}"
+	@if [ -n "$$THRESHOLD_FILE" ]; then \
+		./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}" --threshold-file "$$THRESHOLD_FILE"; \
+	else \
+		./scripts/compare-bench-13.3.py --baseline "$$BASELINE" --candidate "$$CANDIDATE" --threshold "$${THRESHOLD:-0.10}"; \
+	fi
 
 tpch-dbgen-build:
 	./scripts/build-tpch-dbgen.sh
@@ -151,3 +228,20 @@ repl:
 
 repl-smoke:
 	./scripts/run-repl-smoke.sh
+
+ffi-build:
+	cargo build -p ffq-client --features ffi
+
+ffi-example:
+	./scripts/run-ffi-c-example.sh "$${PARQUET_PATH:-tests/fixtures/parquet/lineitem.parquet}"
+
+python-wheel:
+	python -m pip install --upgrade maturin
+	maturin build --release
+
+python-dev-install:
+	python -m pip install --upgrade maturin
+	maturin develop --features python
+
+docs-v2-guardrails:
+	python3 scripts/validate-docs-v2.py

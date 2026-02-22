@@ -1,0 +1,292 @@
+# Distributed Runtime (Coordinator/Worker) - v2
+
+- Status: draft
+- Owner: @ffq-runtime
+- Last Verified Commit: e2baae0
+- Last Verified Date: 2026-02-21
+
+## Scope
+
+This page documents the distributed runtime execution contract in v2:
+
+1. stage/task execution model
+2. task pull scheduling and query/task lifecycle
+3. map output registry and shuffle lookup
+4. liveness, retry/backoff, blacklisting
+5. capability-aware custom-operator assignment
+6. adaptive shuffle reduce-layout behavior (barrier-time planning)
+7. pipelined shuffle stream protocol and backpressure controls
+8. speculative execution for straggler mitigation (partial)
+
+Related control-plane RPC details are documented in `docs/v2/control-plane.md`.
+Adaptive operator playbook and tuning profiles are documented in `docs/v2/adaptive-shuffle-tuning.md`.
+
+Core implementation references:
+
+1. `crates/distributed/src/coordinator.rs`
+2. `crates/distributed/src/worker.rs`
+3. `crates/distributed/src/grpc.rs`
+4. `crates/distributed/proto/ffq_distributed.proto`
+
+## Execution Model
+
+The coordinator accepts a physical plan and schedules task attempts by stage.
+
+1. `SubmitQuery` stores the plan and creates stage/task runtime state.
+2. Workers pull assignments via `GetTask(worker_id, capacity)`.
+3. Workers execute assigned task fragments and report status (`Succeeded` or `Failed`).
+4. On map stages, workers register shuffle partition metadata (`RegisterMapOutput`).
+5. Query completion is reached when latest task attempts are all succeeded.
+
+## Query and Task State
+
+### Query states
+
+1. `Queued`
+2. `Running`
+3. `Succeeded`
+4. `Failed`
+5. `Canceled`
+
+### Task states
+
+1. `Queued`
+2. `Running`
+3. `Succeeded`
+4. `Failed`
+
+Retry behavior:
+
+1. failed task attempts are retried up to `max_task_attempts`
+2. retries are queued with exponential backoff from `retry_backoff_base_ms`
+3. when retry budget is exhausted, query is marked `Failed`
+
+## Pull Scheduling and Limits
+
+Scheduling is pull-based: coordinator never pushes tasks.
+
+Assignment gates in `Coordinator::get_task`:
+
+1. worker must not be blacklisted
+2. worker capacity must be non-zero
+3. per-worker running limit: `max_concurrent_tasks_per_worker`
+4. per-query running limit: `max_concurrent_tasks_per_query`
+5. task must be from a runnable stage and latest attempt
+6. worker must satisfy required custom-operator capabilities (if any)
+
+This prevents unbounded assignment and controls memory pressure by limiting concurrent active work.
+
+## Capability-Aware Scheduling
+
+Capability-aware scheduling is active behavior, not advisory metadata.
+
+1. worker heartbeats include `custom_operator_capabilities`
+2. coordinator stores capabilities per worker heartbeat record
+3. each task attempt includes `required_custom_ops` (derived from plan fragment)
+4. coordinator only assigns a task when worker capabilities cover all required ops
+
+Selection rule (`worker_supports_task`):
+
+1. tasks with no required custom ops are assignable to any healthy worker
+2. tasks with required custom ops are assignable only if all required op names are present in worker capabilities
+
+Operational consequence:
+
+1. if no worker advertises required capabilities, matching tasks remain queued and are not incorrectly assigned
+2. once a capable worker heartbeats/polls, those tasks become assignable
+
+## Liveness and Requeue
+
+Liveness is enforced through heartbeat timeout.
+
+1. coordinator tracks last heartbeat timestamp per worker
+2. stale workers are detected using `worker_liveness_timeout_ms`
+3. running tasks owned by stale workers are requeued to new attempts
+4. stale worker heartbeat records are dropped
+
+This enables recovery from worker loss without requiring manual cleanup.
+
+## Failure Tracking and Blacklisting
+
+On failed task status reports:
+
+1. worker failure count is incremented
+2. when count reaches `blacklist_failure_threshold`, worker is blacklisted
+3. blacklisted workers receive no further assignments
+
+On succeeded task status reports:
+
+1. worker failure count is cleared for that worker
+
+## Map Output Registry and Shuffle
+
+Map output metadata is keyed by:
+
+1. `query_id`
+2. `stage_id`
+3. `map_task`
+4. `attempt`
+
+`FetchShufflePartition` requires an exact key match for the requested attempt.
+This ensures stale map attempts are not used by downstream stages.
+
+## Pipelined Shuffle Stream Protocol
+
+Pipelined scheduling allows reduce tasks to start before all map tasks are terminal.
+
+### Stream metadata and readable boundaries
+
+Each `RegisterMapOutput` payload carries per-partition progress:
+
+1. `stream_epoch`
+2. `committed_offset`
+3. `finalized`
+
+Coordinator keeps latest-attempt partition metadata and only exposes committed ranges.
+
+### Incremental fetch contract
+
+`FetchShufflePartition` request carries:
+
+1. `start_offset`
+2. `max_bytes`
+3. `layout_version`
+4. `min_stream_epoch`
+
+Response chunks carry:
+
+1. `start_offset` / `end_offset`
+2. `watermark_offset` (highest currently readable byte)
+3. `finalized`
+4. `stream_epoch`
+
+Reader behavior:
+
+1. if `start_offset >= watermark_offset`, service returns EOF-style empty payload chunk
+2. stale epoch (`min_stream_epoch > available`) is rejected
+3. stale layout version is rejected when versioned fetch is requested
+
+### Pipelined scheduling gates
+
+Coordinator enables early reduce assignment when:
+
+1. `FFQ_PIPELINED_SHUFFLE_ENABLED=true`
+2. parent map completion ratio is above `FFQ_PIPELINED_SHUFFLE_MIN_MAP_COMPLETION_RATIO`
+3. required reduce partitions have `committed_offset >= FFQ_PIPELINED_SHUFFLE_MIN_COMMITTED_OFFSET_BYTES` (or are finalized)
+
+### Backpressure loop
+
+Reducers report:
+
+1. `reduce_fetch_inflight_bytes`
+2. `reduce_fetch_queue_depth`
+
+Coordinator computes recommended windows and returns them in `TaskAssignment`:
+
+1. `recommended_map_output_publish_window_partitions`
+2. `recommended_reduce_fetch_window_partitions`
+
+Observed values are published into stage metrics:
+
+1. `backpressure_inflight_bytes`
+2. `backpressure_queue_depth`
+3. `map_publish_window_partitions`
+4. `reduce_fetch_window_partitions`
+5. `backpressure_events`
+6. `stream_buffered_bytes`
+7. `stream_active_count`
+8. `first_chunk_ms`
+9. `first_reduce_row_ms`
+10. `stream_lag_ms`
+
+## Adaptive Shuffle (Barrier-Time Layout Finalization)
+
+Adaptive shuffle is finalized exactly once after map completion and before reduce scheduling.
+
+1. map stage collects per-partition bytes via map-output registration
+2. coordinator computes adaptive reduce assignments from observed bytes
+3. stage transitions:
+   - `MapRunning -> MapDone -> LayoutFinalized -> ReduceSchedulable`
+4. reduce assignments include:
+   - `assigned_reduce_partitions`
+   - `assigned_reduce_split_index`
+   - `assigned_reduce_split_count`
+   - `layout_version` and `layout_fingerprint`
+5. workers only read assigned partitions/splits
+
+Exposed diagnostics in stage metrics:
+
+1. `planned_reduce_tasks`
+2. `adaptive_reduce_tasks`
+3. `adaptive_target_bytes`
+4. `aqe_events`
+5. `partition_bytes_histogram`
+6. `skew_split_tasks`
+7. `layout_finalize_count`
+8. `first_chunk_ms`
+9. `first_reduce_row_ms`
+10. `stream_lag_ms`
+11. `stream_buffered_bytes`
+12. `stream_active_count`
+13. `backpressure_events`
+
+## Speculative Execution (Partial)
+
+Speculative execution is available for straggler mitigation in distributed scheduling.
+
+Coordinator behavior:
+
+1. tracks task runtime samples by stage
+2. computes a straggler threshold from completed-task runtime distribution (`p95`-based multiplier)
+3. launches a speculative attempt on another worker when a running task exceeds threshold and minimum runtime
+4. preserves latest-attempt correctness rules so duplicate success does not corrupt query state
+
+Current status:
+
+1. speculative attempt scheduling and race resolution are implemented
+2. stage metrics expose speculative attempt counters
+3. locality-aware scheduling remains limited and is not yet a full placement strategy
+
+Relevant config knobs (coordinator):
+
+1. `speculative_execution_enabled`
+2. `speculative_min_completed_samples`
+3. `speculative_p95_multiplier`
+4. `speculative_min_runtime_ms`
+
+## Minimal Runtime Walkthrough (Coordinator + 2 Workers)
+
+1. client submits query plan
+2. coordinator builds stage/runtime state
+3. worker `w1` and `w2` heartbeat with capability sets
+4. both workers poll `GetTask`
+5. coordinator assigns only runnable tasks that fit worker/query limits
+6. for custom-op tasks, coordinator assigns only to workers that advertised required op names
+7. workers execute and report status
+8. failures are retried/backed off; stale worker tasks are requeued
+9. query reaches `Succeeded` when all latest attempts succeed, otherwise `Failed`
+
+## Reproducible Checks
+
+```bash
+cargo test -p ffq-distributed --features grpc coordinator_requeues_tasks_from_stale_worker
+cargo test -p ffq-distributed --features grpc coordinator_blacklists_failing_worker
+cargo test -p ffq-distributed --features grpc coordinator_enforces_worker_and_query_concurrency_limits
+cargo test -p ffq-distributed --features grpc coordinator_assigns_custom_operator_tasks_only_to_capable_workers
+cargo test -p ffq-distributed --features grpc coordinator_applies_barrier_time_adaptive_partition_coalescing
+cargo test -p ffq-distributed --features grpc coordinator_barrier_time_hot_partition_splitting_increases_reduce_tasks
+cargo test -p ffq-distributed --features grpc coordinator_allows_pipelined_reduce_assignment_when_partition_ready
+cargo test -p ffq-distributed --features grpc coordinator_pipeline_requires_committed_offset_threshold_before_scheduling
+cargo test -p ffq-distributed --features grpc coordinator_backpressure_throttles_assignment_windows
+cargo test -p ffq-distributed --features grpc worker_shuffle_fetch_respects_committed_watermark_and_emits_eof_marker
+cargo test -p ffq-distributed --features grpc coordinator_launches_speculative_attempt_for_straggler_and_accepts_older_success
+```
+
+Expected:
+
+1. stale-worker tasks are requeued
+2. failing workers can be blacklisted
+3. per-worker/per-query assignment limits are enforced
+4. custom-op tasks are assigned only to capable workers
+5. pipelined shuffle readiness/backpressure checks pass
+6. speculative attempt scheduling triggers on straggler test and query state remains correct

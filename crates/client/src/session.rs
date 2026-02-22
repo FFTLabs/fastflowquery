@@ -5,11 +5,14 @@ use std::sync::{Arc, RwLock};
 use std::{env, path::Path, path::PathBuf};
 
 use arrow_schema::Schema;
-use ffq_common::{EngineConfig, MetricsRegistry, Result, SchemaDriftPolicy, SchemaInferencePolicy};
+use ffq_common::{
+    CteReusePolicy, EngineConfig, MetricsRegistry, Result, SchemaDriftPolicy, SchemaInferencePolicy,
+};
 use ffq_storage::Catalog;
 use ffq_storage::parquet_provider::FileFingerprint;
 
 use crate::engine::maybe_infer_table_schema_on_register;
+use crate::physical_registry::{PhysicalOperatorRegistry, global_physical_operator_registry};
 use crate::planner_facade::PlannerFacade;
 #[cfg(feature = "distributed")]
 use crate::runtime::DistributedRuntime;
@@ -30,8 +33,10 @@ pub struct Session {
     pub catalog_path: String,
     pub metrics: MetricsRegistry,
     pub planner: PlannerFacade,
+    pub physical_registry: Arc<PhysicalOperatorRegistry>,
     pub runtime: Arc<dyn Runtime>,
     pub(crate) schema_cache: RwLock<HashMap<String, SchemaCacheEntry>>,
+    pub(crate) last_query_stats_report: RwLock<Option<String>>,
 }
 
 impl Session {
@@ -69,12 +74,12 @@ impl Session {
         } else {
             Catalog::new()
         };
-        if config.schema_inference.allows_inference() {
+        {
             let mut changed = false;
             for mut table in catalog.tables() {
-                let inferred =
+                let inferred_or_stats_changed =
                     maybe_infer_table_schema_on_register(config.schema_inference, &mut table)?;
-                changed |= inferred;
+                changed |= inferred_or_stats_changed;
                 catalog.register_table(table);
             }
             if changed && config.schema_writeback {
@@ -88,8 +93,10 @@ impl Session {
             catalog_path,
             metrics: MetricsRegistry::new(),
             planner: PlannerFacade::new(),
+            physical_registry: global_physical_operator_registry(),
             runtime,
             schema_cache: RwLock::new(HashMap::new()),
+            last_query_stats_report: RwLock::new(None),
         })
     }
 
@@ -127,6 +134,9 @@ fn apply_schema_policy_env_overrides(config: &mut EngineConfig) -> Result<()> {
     if let Ok(raw) = env::var("FFQ_SCHEMA_DRIFT_POLICY") {
         config.schema_drift_policy = parse_schema_drift_policy(&raw)?;
     }
+    if let Ok(raw) = env::var("FFQ_CTE_REUSE_POLICY") {
+        config.cte_reuse_policy = parse_cte_reuse_policy(&raw)?;
+    }
     Ok(())
 }
 
@@ -148,6 +158,16 @@ fn parse_schema_drift_policy(raw: &str) -> Result<SchemaDriftPolicy> {
         "refresh" => Ok(SchemaDriftPolicy::Refresh),
         other => Err(ffq_common::FfqError::InvalidConfig(format!(
             "invalid FFQ_SCHEMA_DRIFT_POLICY='{other}'; expected fail|refresh"
+        ))),
+    }
+}
+
+fn parse_cte_reuse_policy(raw: &str) -> Result<CteReusePolicy> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "inline" => Ok(CteReusePolicy::Inline),
+        "materialize" => Ok(CteReusePolicy::Materialize),
+        other => Err(ffq_common::FfqError::InvalidConfig(format!(
+            "invalid FFQ_CTE_REUSE_POLICY='{other}'; expected inline|materialize"
         ))),
     }
 }

@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use ffq_common::Result;
 use ffq_execution::ExecNode;
+use ffq_planner::Expr;
 
 /// Lightweight statistics used by planner/optimizer.
 #[derive(Debug, Clone, Default)]
@@ -33,6 +34,6 @@ pub trait StorageProvider: Send + Sync {
         &self,
         table: &crate::catalog::TableDef,
         projection: Option<Vec<String>>,
-        filters: Vec<String>,
+        filters: Vec<Expr>,
     ) -> Result<StorageExecNode>;
 }

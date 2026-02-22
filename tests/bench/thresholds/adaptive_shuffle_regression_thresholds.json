@@ -1,0 +1,7 @@
+{
+  "default": 0.1,
+  "adaptive_shuffle_tiny_partitions": 0.15,
+  "adaptive_shuffle_large_partitions": 0.15,
+  "adaptive_shuffle_skewed_keys": 0.2,
+  "adaptive_shuffle_mixed_workload": 0.2
+}

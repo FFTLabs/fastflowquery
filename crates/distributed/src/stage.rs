@@ -117,7 +117,11 @@ fn op_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::ParquetScan(_) => "ParquetScan",
         PhysicalPlan::ParquetWrite(_) => "ParquetWrite",
         PhysicalPlan::Filter(_) => "Filter",
+        PhysicalPlan::InSubqueryFilter(_) => "InSubqueryFilter",
+        PhysicalPlan::ExistsSubqueryFilter(_) => "ExistsSubqueryFilter",
+        PhysicalPlan::ScalarSubqueryFilter(_) => "ScalarSubqueryFilter",
         PhysicalPlan::Project(_) => "Project",
+        PhysicalPlan::Window(_) => "Window",
         PhysicalPlan::CoalesceBatches(_) => "CoalesceBatches",
         PhysicalPlan::PartialHashAggregate(_) => "PartialHashAggregate",
         PhysicalPlan::FinalHashAggregate(_) => "FinalHashAggregate",
@@ -127,7 +131,11 @@ fn op_name(plan: &PhysicalPlan) -> &'static str {
         PhysicalPlan::Exchange(ExchangeExec::Broadcast(_)) => "Broadcast",
         PhysicalPlan::Limit(_) => "Limit",
         PhysicalPlan::TopKByScore(_) => "TopKByScore",
+        PhysicalPlan::UnionAll(_) => "UnionAll",
+        PhysicalPlan::CteRef(_) => "CteRef",
         PhysicalPlan::VectorTopK(_) => "VectorTopK",
+        PhysicalPlan::VectorKnn(_) => "VectorKnn",
+        PhysicalPlan::Custom(_) => "Custom",
     }
 }
 

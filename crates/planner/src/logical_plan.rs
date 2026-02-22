@@ -2,12 +2,20 @@ use arrow_schema::DataType;
 use serde::{Deserialize, Serialize};
 
 /// Join semantics supported by the logical planner.
-///
-/// v1 currently only supports [`JoinType::Inner`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinType {
     /// Keep only rows where join keys match on both sides.
     Inner,
+    /// Keep all rows from the left input, null-extending unmatched right rows.
+    Left,
+    /// Keep all rows from the right input, null-extending unmatched left rows.
+    Right,
+    /// Keep all rows from both inputs, null-extending non-matching rows.
+    Full,
+    /// Keep left rows with at least one matching right row (no right columns in output).
+    Semi,
+    /// Keep left rows with no matching right row (no right columns in output).
+    Anti,
 }
 
 /// Optimizer hint controlling join distribution strategy.
@@ -24,6 +32,8 @@ pub enum JoinStrategyHint {
     BroadcastRight,
     /// Shuffle both sides by join key and join partition-wise.
     Shuffle,
+    /// Sort-merge join (inputs may require local sort before merge).
+    SortMerge,
 }
 
 /// Scalar expression used by logical and physical planning.
@@ -62,6 +72,20 @@ pub enum Expr {
     Or(Box<Expr>, Box<Expr>),
     /// Boolean negation.
     Not(Box<Expr>),
+    /// `expr IS NULL`
+    IsNull(Box<Expr>),
+    /// `expr IS NOT NULL`
+    IsNotNull(Box<Expr>),
+    /// Searched CASE expression.
+    ///
+    /// SQL form:
+    /// `CASE WHEN <cond> THEN <value> [WHEN ...] [ELSE <value>] END`
+    CaseWhen {
+        /// Ordered `WHEN`/`THEN` branches.
+        branches: Vec<(Expr, Expr)>,
+        /// Optional `ELSE` branch; defaults to `NULL` when omitted.
+        else_expr: Option<Box<Expr>>,
+    },
 
     #[cfg(feature = "vector")]
     /// Cosine similarity between a vector expression and query vector literal.
@@ -86,6 +110,16 @@ pub enum Expr {
         vector: Box<Expr>,
         /// Query vector expression (typically a literal).
         query: Box<Expr>,
+    },
+
+    /// Scalar UDF call.
+    ///
+    /// The analyzer resolves return type via registered UDF type resolvers.
+    ScalarUdf {
+        /// Function name (normalized lower-case from SQL frontend).
+        name: String,
+        /// Function arguments.
+        args: Vec<Expr>,
     },
 }
 
@@ -133,6 +167,154 @@ pub enum BinaryOp {
     Divide,
 }
 
+/// Window function kinds supported by MVP window execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WindowFunction {
+    /// `ROW_NUMBER() OVER (...)`
+    RowNumber,
+    /// `RANK() OVER (...)`
+    Rank,
+    /// `DENSE_RANK() OVER (...)`
+    DenseRank,
+    /// `PERCENT_RANK() OVER (...)`
+    PercentRank,
+    /// `CUME_DIST() OVER (...)`
+    CumeDist,
+    /// `NTILE(n) OVER (...)`
+    Ntile(usize),
+    /// `COUNT(expr) OVER (...)`
+    Count(Expr),
+    /// `SUM(expr) OVER (...)`
+    Sum(Expr),
+    /// `AVG(expr) OVER (...)`
+    Avg(Expr),
+    /// `MIN(expr) OVER (...)`
+    Min(Expr),
+    /// `MAX(expr) OVER (...)`
+    Max(Expr),
+    /// `LAG(expr [, offset [, default]]) OVER (...)`
+    Lag {
+        /// Value expression.
+        expr: Expr,
+        /// Positive row offset.
+        offset: usize,
+        /// Optional fallback value when the offset row is out of range.
+        default: Option<Expr>,
+    },
+    /// `LEAD(expr [, offset [, default]]) OVER (...)`
+    Lead {
+        /// Value expression.
+        expr: Expr,
+        /// Positive row offset.
+        offset: usize,
+        /// Optional fallback value when the offset row is out of range.
+        default: Option<Expr>,
+    },
+    /// `FIRST_VALUE(expr) OVER (...)`
+    FirstValue(Expr),
+    /// `LAST_VALUE(expr) OVER (...)`
+    LastValue(Expr),
+    /// `NTH_VALUE(expr, n) OVER (...)`
+    NthValue {
+        /// Value expression.
+        expr: Expr,
+        /// 1-based row index in partition.
+        n: usize,
+    },
+}
+
+/// One ORDER BY element inside a window specification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowOrderExpr {
+    /// Sort key expression.
+    pub expr: Expr,
+    /// `true` for ascending order, `false` for descending.
+    pub asc: bool,
+    /// `true` when nulls are ordered first, `false` when nulls are ordered last.
+    pub nulls_first: bool,
+}
+
+/// Window frame units.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WindowFrameUnits {
+    /// `ROWS`
+    Rows,
+    /// `RANGE`
+    Range,
+    /// `GROUPS`
+    Groups,
+}
+
+/// Window frame exclusion mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowFrameExclusion {
+    /// `EXCLUDE NO OTHERS` (default)
+    NoOthers,
+    /// `EXCLUDE CURRENT ROW`
+    CurrentRow,
+    /// `EXCLUDE GROUP`
+    Group,
+    /// `EXCLUDE TIES`
+    Ties,
+}
+
+/// Window frame bound.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WindowFrameBound {
+    /// `UNBOUNDED PRECEDING`
+    UnboundedPreceding,
+    /// `n PRECEDING`
+    Preceding(usize),
+    /// `CURRENT ROW`
+    CurrentRow,
+    /// `n FOLLOWING`
+    Following(usize),
+    /// `UNBOUNDED FOLLOWING`
+    UnboundedFollowing,
+}
+
+/// Window frame specification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowFrameSpec {
+    /// Frame unit kind.
+    pub units: WindowFrameUnits,
+    /// Frame lower bound.
+    pub start_bound: WindowFrameBound,
+    /// Frame upper bound.
+    pub end_bound: WindowFrameBound,
+    /// Frame exclusion mode.
+    pub exclusion: WindowFrameExclusion,
+}
+
+/// One window expression with partition/order specification and output name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowExpr {
+    /// Function kind.
+    pub func: WindowFunction,
+    /// Partition key expressions.
+    pub partition_by: Vec<Expr>,
+    /// Order key expressions.
+    pub order_by: Vec<WindowOrderExpr>,
+    /// Optional explicit frame clause from SQL.
+    pub frame: Option<WindowFrameSpec>,
+    /// Output column name.
+    pub output_name: String,
+}
+
+/// Correlation classification for subquery filter operators.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubqueryCorrelation {
+    /// Correlation has not been classified yet (frontend output).
+    Unresolved,
+    /// Subquery does not reference any outer query columns.
+    Uncorrelated,
+    /// Subquery references one or more outer query columns.
+    Correlated {
+        /// Outer references observed while analyzing this subquery.
+        outer_refs: Vec<String>,
+    },
+}
+
 /// Logical plan tree produced by SQL/DataFrame frontend and rewritten by
 /// analyzer/optimizer passes.
 ///
@@ -144,6 +326,18 @@ pub enum BinaryOp {
 ///   be applied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
+    /// Apply a relation alias to an input plan for name resolution.
+    ///
+    /// This is an analysis-time wrapper emitted by the SQL frontend for
+    /// `FROM source alias` (including aliased CTE references). The analyzer uses
+    /// it to expose the input schema under a single relation name and may strip
+    /// it from the analyzed logical plan.
+    SubqueryAlias {
+        /// Relation alias visible to expressions (e.g. `a` in `a.col`).
+        alias: String,
+        /// Aliased input plan.
+        input: Box<LogicalPlan>,
+    },
     /// Scan a catalog table.
     TableScan {
         /// Catalog table name.
@@ -160,12 +354,63 @@ pub enum LogicalPlan {
         /// Input plan.
         input: Box<LogicalPlan>,
     },
+    /// Evaluate window expressions over input rows.
+    ///
+    /// Window outputs are appended as additional columns to input schema.
+    Window {
+        /// Window expressions to evaluate.
+        exprs: Vec<WindowExpr>,
+        /// Input plan.
+        input: Box<LogicalPlan>,
+    },
     /// Keep rows matching predicate.
     Filter {
         /// Boolean predicate.
         predicate: Expr,
         /// Input plan.
         input: Box<LogicalPlan>,
+    },
+    /// Uncorrelated `IN (SELECT ...)` filter.
+    ///
+    /// The subquery must project exactly one column.
+    InSubqueryFilter {
+        /// Left input.
+        input: Box<LogicalPlan>,
+        /// Left expression to check for membership.
+        expr: Expr,
+        /// Uncorrelated subquery plan.
+        subquery: Box<LogicalPlan>,
+        /// `true` for `NOT IN`.
+        negated: bool,
+        /// Correlation classification emitted by analyzer.
+        correlation: SubqueryCorrelation,
+    },
+    /// Uncorrelated `EXISTS (SELECT ...)` filter.
+    ExistsSubqueryFilter {
+        /// Left input.
+        input: Box<LogicalPlan>,
+        /// Uncorrelated subquery plan.
+        subquery: Box<LogicalPlan>,
+        /// `true` for `NOT EXISTS`.
+        negated: bool,
+        /// Correlation classification emitted by analyzer.
+        correlation: SubqueryCorrelation,
+    },
+    /// Uncorrelated scalar-subquery comparison filter.
+    ///
+    /// Represents predicates like `a < (SELECT ...)` where subquery must
+    /// produce exactly one column and at most one row.
+    ScalarSubqueryFilter {
+        /// Left input.
+        input: Box<LogicalPlan>,
+        /// Left expression evaluated on input rows.
+        expr: Expr,
+        /// Comparison operator.
+        op: BinaryOp,
+        /// Uncorrelated scalar subquery plan.
+        subquery: Box<LogicalPlan>,
+        /// Correlation classification emitted by analyzer.
+        correlation: SubqueryCorrelation,
     },
     /// Equi-join two inputs using `on` key pairs.
     Join {
@@ -211,6 +456,23 @@ pub enum LogicalPlan {
         /// Input plan.
         input: Box<LogicalPlan>,
     },
+    /// Concatenate rows from two inputs (UNION ALL semantics).
+    UnionAll {
+        /// Left input.
+        left: Box<LogicalPlan>,
+        /// Right input.
+        right: Box<LogicalPlan>,
+    },
+    /// Shared CTE reference for materialized reuse mode.
+    ///
+    /// When planned in materialized mode, repeated references to the same CTE
+    /// name are emitted as `CteRef` nodes and can share one runtime result.
+    CteRef {
+        /// CTE name.
+        name: String,
+        /// CTE definition plan to evaluate/cache.
+        plan: Box<LogicalPlan>,
+    },
     /// Index-backed vector top-k logical operator.
     ///
     /// Rewritten from `TopKByScore` only when optimizer preconditions are met.
@@ -223,6 +485,27 @@ pub enum LogicalPlan {
         k: usize,
         /// Optional provider-specific filter payload.
         filter: Option<String>,
+    },
+    /// Hybrid vector scan logical operator (v2).
+    ///
+    /// This is the canonical logical representation for index-backed vector
+    /// retrieval and carries provider/metric metadata and stable score schema
+    /// naming (`_score`).
+    HybridVectorScan {
+        /// Source table name.
+        source: String,
+        /// One or more query vectors (phase-1 uses first vector).
+        query_vectors: Vec<Vec<f32>>,
+        /// Number of rows to keep.
+        k: usize,
+        /// Optional query-time HNSW `ef_search` override.
+        ef_search: Option<usize>,
+        /// Optional provider-specific prefilter payload.
+        prefilter: Option<String>,
+        /// Distance/similarity metric (for example `cosine`).
+        metric: String,
+        /// Vector provider backend identifier (for example `qdrant`).
+        provider: String,
     },
     /// Insert query result into a target table.
     InsertInto {
@@ -240,6 +523,10 @@ pub enum LogicalPlan {
 pub enum AggExpr {
     /// Count non-null input rows.
     Count(Expr),
+    /// Count distinct non-null input values.
+    CountDistinct(Expr),
+    /// Approximate count distinct using HyperLogLog sketch state.
+    ApproxCountDistinct(Expr),
     /// Sum numeric input.
     Sum(Expr),
     /// Minimum input value.

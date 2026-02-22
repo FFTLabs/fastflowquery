@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder, Int64Array,
-    Int64Builder, StringArray, StringBuilder,
+    Int64Builder, LargeStringArray, LargeStringBuilder, StringArray, StringBuilder,
 };
 use arrow::compute::kernels::{
     boolean::{and_kleene, not, or_kleene},
@@ -23,6 +23,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, SchemaRef};
 use ffq_common::{FfqError, Result};
 
+use crate::udf::get_scalar_udf;
 use ffq_planner::{BinaryOp, Expr, LiteralValue};
 
 /// Executable expression for the execution engine.
@@ -76,6 +77,20 @@ pub fn compile_expr(expr: &Expr, input_schema: &SchemaRef) -> Result<Arc<dyn Phy
             let inner = compile_expr(e, input_schema)?;
             Ok(Arc::new(NotExpr { inner }))
         }
+        Expr::IsNull(e) => {
+            let inner = compile_expr(e, input_schema)?;
+            Ok(Arc::new(IsNullExpr {
+                inner,
+                negated: false,
+            }))
+        }
+        Expr::IsNotNull(e) => {
+            let inner = compile_expr(e, input_schema)?;
+            Ok(Arc::new(IsNullExpr {
+                inner,
+                negated: true,
+            }))
+        }
 
         Expr::And(a, b) => {
             let left = compile_expr(a, input_schema)?;
@@ -96,6 +111,31 @@ pub fn compile_expr(expr: &Expr, input_schema: &SchemaRef) -> Result<Arc<dyn Phy
                 op: BoolOp::Or,
             }))
         }
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
+            let compiled_branches = branches
+                .iter()
+                .map(|(cond, value)| {
+                    Ok((
+                        compile_expr(cond, input_schema)?,
+                        compile_expr(value, input_schema)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let else_compiled = if let Some(e) = else_expr {
+                compile_expr(e, input_schema)?
+            } else {
+                compile_expr(&Expr::Literal(LiteralValue::Null), input_schema)?
+            };
+            let out = else_compiled.data_type();
+            Ok(Arc::new(CaseWhenExpr {
+                branches: compiled_branches,
+                else_expr: else_compiled,
+                out,
+            }))
+        }
 
         Expr::BinaryOp { left, op, right } => {
             let l = compile_expr(left, input_schema)?;
@@ -106,6 +146,30 @@ pub fn compile_expr(expr: &Expr, input_schema: &SchemaRef) -> Result<Arc<dyn Phy
                 left: l,
                 right: r,
                 op: *op,
+                out,
+            }))
+        }
+        Expr::ScalarUdf { name, args } => {
+            let compiled_args = args
+                .iter()
+                .map(|a| compile_expr(a, input_schema))
+                .collect::<Result<Vec<_>>>()?;
+            let udf = get_scalar_udf(name).ok_or_else(|| {
+                FfqError::Execution(format!(
+                    "scalar udf '{}' is not registered in execution registry",
+                    name
+                ))
+            })?;
+            let out = udf.return_type(
+                &compiled_args
+                    .iter()
+                    .map(|arg| arg.data_type())
+                    .collect::<Vec<_>>(),
+            )?;
+            Ok(Arc::new(ScalarUdfExpr {
+                udf_name: name.clone(),
+                udf,
+                args: compiled_args,
                 out,
             }))
         }
@@ -217,6 +281,27 @@ impl PhysicalExpr for NotExpr {
     }
 }
 
+struct IsNullExpr {
+    inner: Arc<dyn PhysicalExpr>,
+    negated: bool,
+}
+
+impl PhysicalExpr for IsNullExpr {
+    fn data_type(&self) -> DataType {
+        DataType::Boolean
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
+        let arr = self.inner.evaluate(batch)?;
+        let mut out = BooleanBuilder::with_capacity(arr.len());
+        for i in 0..arr.len() {
+            let is_null = arr.is_null(i);
+            out.append_value(if self.negated { !is_null } else { is_null });
+        }
+        Ok(Arc::new(out.finish()))
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BoolOp {
     And,
@@ -227,6 +312,34 @@ struct BoolBinaryExpr {
     left: Arc<dyn PhysicalExpr>,
     right: Arc<dyn PhysicalExpr>,
     op: BoolOp,
+}
+
+struct CaseWhenExpr {
+    branches: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)>,
+    else_expr: Arc<dyn PhysicalExpr>,
+    out: DataType,
+}
+
+impl PhysicalExpr for CaseWhenExpr {
+    fn data_type(&self) -> DataType {
+        self.out.clone()
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
+        let mut out = self.else_expr.evaluate(batch)?;
+        for (cond, then_expr) in self.branches.iter().rev() {
+            let cond_arr = cond.evaluate(batch)?;
+            let cond_bool = cond_arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    FfqError::Execution("CASE WHEN condition must evaluate to boolean".to_string())
+                })?;
+            let then_arr = then_expr.evaluate(batch)?;
+            out = case_select_arrays(cond_bool, &then_arr, &out)?;
+        }
+        Ok(out)
+    }
 }
 
 impl PhysicalExpr for BoolBinaryExpr {
@@ -262,6 +375,30 @@ struct BinaryExpr {
     right: Arc<dyn PhysicalExpr>,
     op: BinaryOp,
     out: DataType,
+}
+
+struct ScalarUdfExpr {
+    udf_name: String,
+    udf: Arc<dyn crate::udf::ScalarUdf>,
+    args: Vec<Arc<dyn PhysicalExpr>>,
+    out: DataType,
+}
+
+impl PhysicalExpr for ScalarUdfExpr {
+    fn data_type(&self) -> DataType {
+        self.out.clone()
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ArrayRef> {
+        let arrays = self
+            .args
+            .iter()
+            .map(|arg| arg.evaluate(batch))
+            .collect::<Result<Vec<_>>>()?;
+        self.udf
+            .invoke(&arrays)
+            .map_err(|e| FfqError::Execution(format!("scalar udf '{}' failed: {e}", self.udf_name)))
+    }
 }
 
 impl PhysicalExpr for BinaryExpr {
@@ -339,6 +476,139 @@ fn scalar_to_array(v: &LiteralValue, len: usize) -> Result<ArrayRef> {
             "Vector literal can only be used as query literal for vector functions in v1"
                 .to_string(),
         )),
+    }
+}
+
+fn case_select_arrays(
+    cond: &BooleanArray,
+    then_arr: &ArrayRef,
+    else_arr: &ArrayRef,
+) -> Result<ArrayRef> {
+    if then_arr.data_type() != else_arr.data_type() {
+        return Err(FfqError::Execution(format!(
+            "CASE branch type mismatch at execution: then={:?} else={:?}",
+            then_arr.data_type(),
+            else_arr.data_type()
+        )));
+    }
+    let dt = then_arr.data_type();
+    let len = cond.len();
+    if then_arr.len() != len || else_arr.len() != len {
+        return Err(FfqError::Execution(
+            "CASE branch lengths do not match condition length".to_string(),
+        ));
+    }
+
+    match dt {
+        DataType::Int64 => {
+            let t = then_arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| FfqError::Execution("CASE expected Int64 array".to_string()))?;
+            let e = else_arr
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| FfqError::Execution("CASE expected Int64 array".to_string()))?;
+            let mut b = Int64Builder::with_capacity(len);
+            for i in 0..len {
+                let choose_then = cond.is_valid(i) && cond.value(i);
+                let src = if choose_then { t } else { e };
+                if src.is_null(i) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(i));
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Float64 => {
+            let t = then_arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| FfqError::Execution("CASE expected Float64 array".to_string()))?;
+            let e = else_arr
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| FfqError::Execution("CASE expected Float64 array".to_string()))?;
+            let mut b = Float64Builder::with_capacity(len);
+            for i in 0..len {
+                let choose_then = cond.is_valid(i) && cond.value(i);
+                let src = if choose_then { t } else { e };
+                if src.is_null(i) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(i));
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Boolean => {
+            let t = then_arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| FfqError::Execution("CASE expected Boolean array".to_string()))?;
+            let e = else_arr
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| FfqError::Execution("CASE expected Boolean array".to_string()))?;
+            let mut b = BooleanBuilder::with_capacity(len);
+            for i in 0..len {
+                let choose_then = cond.is_valid(i) && cond.value(i);
+                let src = if choose_then { t } else { e };
+                if src.is_null(i) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(i));
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Utf8 => {
+            let t = then_arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| FfqError::Execution("CASE expected Utf8 array".to_string()))?;
+            let e = else_arr
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| FfqError::Execution("CASE expected Utf8 array".to_string()))?;
+            let mut b = StringBuilder::with_capacity(len, 0);
+            for i in 0..len {
+                let choose_then = cond.is_valid(i) && cond.value(i);
+                let src = if choose_then { t } else { e };
+                if src.is_null(i) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(i));
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::LargeUtf8 => {
+            let t = then_arr
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| FfqError::Execution("CASE expected LargeUtf8 array".to_string()))?;
+            let e = else_arr
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .ok_or_else(|| FfqError::Execution("CASE expected LargeUtf8 array".to_string()))?;
+            let mut b = LargeStringBuilder::with_capacity(len, 0);
+            for i in 0..len {
+                let choose_then = cond.is_valid(i) && cond.value(i);
+                let src = if choose_then { t } else { e };
+                if src.is_null(i) {
+                    b.append_null();
+                } else {
+                    b.append_value(src.value(i));
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Null => Ok(arrow::array::new_null_array(&DataType::Null, len)),
+        other => Err(FfqError::Unsupported(format!(
+            "CASE not supported for output type {other:?} in v1"
+        ))),
     }
 }
 

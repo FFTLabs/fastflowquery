@@ -6,11 +6,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_schema::Schema;
 use ffq_common::{EngineConfig, Result, SchemaInferencePolicy};
-use ffq_planner::LiteralValue;
-use ffq_storage::TableDef;
+use ffq_execution::{ScalarUdf, deregister_scalar_udf, register_scalar_udf};
+use ffq_planner::{LiteralValue, OptimizerRule, ScalarUdfTypeResolver};
 use ffq_storage::parquet_provider::{FileFingerprint, ParquetProvider};
+use ffq_storage::{ParquetFileStats, TableDef};
 
 use crate::DataFrame;
+use crate::physical_registry::PhysicalOperatorFactory;
 use crate::session::{Session, SharedSession};
 
 /// Primary entry point for planning and executing queries.
@@ -58,6 +60,13 @@ impl Engine {
     pub fn new(config: EngineConfig) -> Result<Self> {
         let session = Arc::new(Session::new(config)?);
         Ok(Self { session })
+    }
+
+    /// Returns the effective engine configuration for this session.
+    ///
+    /// This reflects env-driven overrides applied during session bootstrap.
+    pub fn config(&self) -> EngineConfig {
+        self.session.config.clone()
     }
 
     /// Register a table under a given name.
@@ -135,7 +144,11 @@ impl Engine {
     /// # Errors
     /// Returns an error when SQL parsing fails.
     pub fn sql(&self, query: &str) -> Result<DataFrame> {
-        let logical = self.session.planner.plan_sql(query)?;
+        let logical = self.session.planner.plan_sql_with_params(
+            query,
+            &HashMap::new(),
+            &self.session.config,
+        )?;
         Ok(DataFrame::new(self.session.clone(), logical))
     }
 
@@ -148,7 +161,85 @@ impl Engine {
         query: &str,
         params: HashMap<String, LiteralValue>,
     ) -> Result<DataFrame> {
-        let logical = self.session.planner.plan_sql_with_params(query, &params)?;
+        let logical =
+            self.session
+                .planner
+                .plan_sql_with_params(query, &params, &self.session.config)?;
+        Ok(DataFrame::new(self.session.clone(), logical))
+    }
+
+    /// Embeds input texts using a pluggable provider.
+    ///
+    /// This keeps model/vendor integration outside the core engine surface.
+    pub fn embed_texts<P: crate::embedding::EmbeddingProvider>(
+        &self,
+        provider: &P,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>> {
+        let _ = self;
+        provider.embed(texts)
+    }
+
+    #[cfg(feature = "vector")]
+    /// Convenience helper for vector top-k search.
+    ///
+    /// This constructs a query equivalent to:
+    /// `SELECT <id_col>, cosine_similarity(<vector_col>, :query_vec) AS score
+    ///  FROM <table> ORDER BY cosine_similarity(<vector_col>, :query_vec) DESC LIMIT <k>`.
+    ///
+    /// # Errors
+    /// Returns an error when SQL planning fails.
+    pub fn hybrid_search(
+        &self,
+        table: &str,
+        id_col: &str,
+        vector_col: &str,
+        query_vector: Vec<f32>,
+        k: usize,
+    ) -> Result<DataFrame> {
+        let sql = format!(
+            "SELECT {id_col}, cosine_similarity({vector_col}, :query_vec) AS score \
+             FROM {table} \
+             ORDER BY cosine_similarity({vector_col}, :query_vec) DESC \
+             LIMIT {k}"
+        );
+        let mut params = HashMap::new();
+        params.insert(
+            "query_vec".to_string(),
+            LiteralValue::VectorF32(query_vector),
+        );
+        self.sql_with_params(&sql, params)
+    }
+
+    #[cfg(feature = "vector")]
+    /// Convenience helper for batched vector top-k search against an index table.
+    ///
+    /// This bypasses SQL parsing and builds a `HybridVectorScan` directly.
+    pub fn hybrid_search_batch(
+        &self,
+        source: &str,
+        query_vecs: Vec<Vec<f32>>,
+        k: usize,
+    ) -> Result<DataFrame> {
+        if query_vecs.is_empty() {
+            return Err(ffq_common::FfqError::InvalidConfig(
+                "hybrid_search_batch requires at least one query vector".to_string(),
+            ));
+        }
+        if query_vecs.iter().any(Vec::is_empty) {
+            return Err(ffq_common::FfqError::InvalidConfig(
+                "hybrid_search_batch query vectors cannot be empty".to_string(),
+            ));
+        }
+        let logical = ffq_planner::LogicalPlan::HybridVectorScan {
+            source: source.to_string(),
+            query_vectors: query_vecs,
+            k,
+            ef_search: None,
+            prefilter: None,
+            metric: "cosine".to_string(),
+            provider: "qdrant".to_string(),
+        };
         Ok(DataFrame::new(self.session.clone(), logical))
     }
 
@@ -215,6 +306,91 @@ impl Engine {
         self.session.prometheus_metrics()
     }
 
+    /// Returns the most recent query execution stats report captured by this engine session.
+    ///
+    /// The report is populated by query execution paths (`collect`, write methods).
+    pub fn last_query_stats_report(&self) -> Option<String> {
+        self.session
+            .last_query_stats_report
+            .read()
+            .expect("query stats lock poisoned")
+            .clone()
+    }
+
+    /// Register a custom optimizer rule.
+    ///
+    /// Rules are applied after built-in optimizer passes in deterministic name order.
+    /// Returns `true` when an existing rule with same name was replaced.
+    pub fn register_optimizer_rule(&self, rule: Arc<dyn OptimizerRule>) -> bool {
+        self.session.planner.register_optimizer_rule(rule)
+    }
+
+    /// Deregister a custom optimizer rule by name.
+    ///
+    /// Returns `true` when an existing rule was removed.
+    pub fn deregister_optimizer_rule(&self, name: &str) -> bool {
+        self.session.planner.deregister_optimizer_rule(name)
+    }
+
+    /// Register a scalar UDF for SQL/DataFrame execution.
+    ///
+    /// This registers:
+    /// - planner-side return type resolver
+    /// - execution-side batch invocation implementation
+    ///
+    /// Returns `true` when existing UDF with same name was replaced.
+    pub fn register_scalar_udf(&self, udf: Arc<dyn ScalarUdf>) -> bool {
+        let udf_name = udf.name().to_ascii_lowercase();
+        let resolver_udf = Arc::clone(&udf);
+        let resolver: ScalarUdfTypeResolver =
+            Arc::new(move |arg_types| resolver_udf.return_type(arg_types));
+        let replaced_analyzer = self
+            .session
+            .planner
+            .register_scalar_udf_type(udf_name.clone(), resolver);
+        let replaced_exec = register_scalar_udf(udf);
+        replaced_analyzer || replaced_exec
+    }
+
+    /// Register a numeric scalar UDF type resolver only.
+    ///
+    /// Useful when expression type can be inferred as numeric passthrough.
+    pub fn register_numeric_udf_type(&self, name: impl Into<String>) -> bool {
+        self.session
+            .planner
+            .register_numeric_passthrough_udf_type(name)
+    }
+
+    /// Deregister a scalar UDF by name from planner and execution registries.
+    ///
+    /// Returns `true` when an existing registration was removed.
+    pub fn deregister_scalar_udf(&self, name: &str) -> bool {
+        let a = self.session.planner.deregister_scalar_udf_type(name);
+        let b = deregister_scalar_udf(name);
+        a || b
+    }
+
+    /// Register a custom physical operator factory.
+    ///
+    /// This registry is used as the extension point for custom runtime
+    /// operators in v2.
+    pub fn register_physical_operator_factory(
+        &self,
+        factory: Arc<dyn PhysicalOperatorFactory>,
+    ) -> bool {
+        self.session.physical_registry.register(factory)
+    }
+
+    /// Deregister a custom physical operator factory by name.
+    pub fn deregister_physical_operator_factory(&self, name: &str) -> bool {
+        self.session.physical_registry.deregister(name)
+    }
+
+    /// List registered custom physical operator factory names.
+    pub fn list_physical_operator_factories(&self) -> Vec<String> {
+        self.session.physical_registry.names()
+    }
+
     #[cfg(feature = "profiling")]
     /// Serves metrics exporter endpoint for profiling/observability workflows.
     ///
@@ -233,7 +409,7 @@ pub(crate) fn maybe_infer_table_schema_on_register(
         || !table.format.eq_ignore_ascii_case("parquet")
         || table.schema.is_some()
     {
-        return Ok(false);
+        return maybe_collect_parquet_file_stats_on_register(table);
     }
     let paths = table.data_paths()?;
     let fingerprint = ParquetProvider::fingerprint_paths(&paths)?;
@@ -249,6 +425,7 @@ pub(crate) fn maybe_infer_table_schema_on_register(
     })?;
     table.schema = Some(schema);
     annotate_schema_inference_metadata(table, &fingerprint)?;
+    let _ = maybe_collect_parquet_file_stats_on_register(table)?;
     Ok(true)
 }
 
@@ -286,4 +463,62 @@ pub(crate) fn read_schema_fingerprint_metadata(
         ))
     })?;
     Ok(Some(fp))
+}
+
+pub(crate) fn maybe_collect_parquet_file_stats_on_register(table: &mut TableDef) -> Result<bool> {
+    if !table.format.eq_ignore_ascii_case("parquet") {
+        return Ok(false);
+    }
+    let paths = table.data_paths()?;
+    let file_stats = match ParquetProvider::collect_parquet_file_stats(&paths) {
+        Ok(stats) => stats,
+        Err(e) if table.schema.is_some() && is_missing_parquet_path_error(&e) => {
+            // Allow registering parquet sink targets before INSERT creates output path(s).
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    if file_stats.is_empty() {
+        return Ok(false);
+    }
+    let total_rows = file_stats
+        .iter()
+        .fold(0_u64, |acc, s| acc.saturating_add(s.row_count));
+    let total_bytes = file_stats
+        .iter()
+        .fold(0_u64, |acc, s| acc.saturating_add(s.size_bytes));
+    table.stats.rows = Some(total_rows);
+    table.stats.bytes = Some(total_bytes);
+    annotate_parquet_file_stats_metadata(table, &file_stats)?;
+    Ok(true)
+}
+
+fn is_missing_parquet_path_error(err: &ffq_common::FfqError) -> bool {
+    match err {
+        ffq_common::FfqError::InvalidConfig(msg) => {
+            msg.contains("failed to stat parquet path")
+                && msg.contains("No such file or directory")
+        }
+        ffq_common::FfqError::Io(ioe) => ioe.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
+pub(crate) fn annotate_parquet_file_stats_metadata(
+    table: &mut TableDef,
+    file_stats: &[ParquetFileStats],
+) -> Result<()> {
+    table.options.insert(
+        "stats.parquet.files".to_string(),
+        serde_json::to_string(file_stats).map_err(|e| {
+            ffq_common::FfqError::InvalidConfig(format!(
+                "failed to encode parquet file stats metadata: {e}"
+            ))
+        })?,
+    );
+    table.options.insert(
+        "stats.parquet.file_count".to_string(),
+        file_stats.len().to_string(),
+    );
+    Ok(())
 }

@@ -1,9 +1,15 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use ffq_common::{FfqError, Result};
 
-use crate::logical_plan::{AggExpr, BinaryOp, Expr, JoinType, LiteralValue, LogicalPlan};
+use crate::logical_plan::{
+    AggExpr, BinaryOp, Expr, LiteralValue, LogicalPlan, SubqueryCorrelation, WindowExpr,
+    WindowFrameBound, WindowFrameSpec, WindowFrameUnits, WindowFunction, WindowOrderExpr,
+};
+
+const E_SUBQUERY_UNSUPPORTED_CORRELATION: &str = "E_SUBQUERY_UNSUPPORTED_CORRELATION";
 
 /// The analyzer needs schemas to resolve columns.
 /// The client (Engine) will provide this from its Catalog.
@@ -12,14 +18,66 @@ pub trait SchemaProvider {
     fn table_schema(&self, table: &str) -> Result<SchemaRef>;
 }
 
-#[derive(Debug, Default)]
 /// Logical-plan semantic analyzer.
-pub struct Analyzer;
+pub struct Analyzer {
+    udf_type_resolvers: RwLock<HashMap<String, ScalarUdfTypeResolver>>,
+}
+
+/// Type resolver callback for scalar UDFs.
+pub type ScalarUdfTypeResolver =
+    Arc<dyn Fn(&[DataType]) -> Result<DataType> + Send + Sync + 'static>;
+
+impl std::fmt::Debug for Analyzer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self
+            .udf_type_resolvers
+            .read()
+            .map(|m| m.len())
+            .unwrap_or_default();
+        f.debug_struct("Analyzer")
+            .field("udf_type_resolvers", &count)
+            .finish()
+    }
+}
+
+impl Default for Analyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Analyzer {
     /// Create a new analyzer.
     pub fn new() -> Self {
-        Self
+        Self {
+            udf_type_resolvers: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Register or replace a scalar UDF type resolver.
+    ///
+    /// Returns `true` when an existing resolver with the same name was replaced.
+    pub fn register_scalar_udf_type(
+        &self,
+        name: impl Into<String>,
+        resolver: ScalarUdfTypeResolver,
+    ) -> bool {
+        self.udf_type_resolvers
+            .write()
+            .expect("udf resolver lock poisoned")
+            .insert(name.into().to_ascii_lowercase(), resolver)
+            .is_some()
+    }
+
+    /// Deregister a scalar UDF type resolver by name.
+    ///
+    /// Returns `true` when an existing resolver was removed.
+    pub fn deregister_scalar_udf_type(&self, name: &str) -> bool {
+        self.udf_type_resolvers
+            .write()
+            .expect("udf resolver lock poisoned")
+            .remove(&name.to_ascii_lowercase())
+            .is_some()
     }
 
     /// Analyze a logical plan and return a semantically validated plan.
@@ -48,6 +106,11 @@ impl Analyzer {
         provider: &dyn SchemaProvider,
     ) -> Result<(LogicalPlan, SchemaRef, Resolver)> {
         match plan {
+            LogicalPlan::SubqueryAlias { alias, input } => {
+                let (analyzed_input, schema, _resolver) = self.analyze_plan(*input, provider)?;
+                let resolver = Resolver::aliased(&alias, schema.clone());
+                Ok((analyzed_input, schema, resolver))
+            }
             LogicalPlan::TableScan {
                 table,
                 projection,
@@ -111,6 +174,182 @@ impl Analyzer {
                     resolver,
                 ))
             }
+            LogicalPlan::InSubqueryFilter {
+                input,
+                expr,
+                subquery,
+                negated,
+                correlation: _,
+            } => {
+                let (ain, in_schema, in_resolver) = self.analyze_plan(*input, provider)?;
+                let raw_subquery = *subquery;
+                let (aexpr, expr_dt) = self.analyze_expr(expr.clone(), &in_resolver)?;
+                let uncorrelated = self.analyze_uncorrelated_subquery(
+                    raw_subquery.clone(),
+                    provider,
+                    &in_resolver,
+                    "IN subquery",
+                );
+                match uncorrelated {
+                    Ok((asub, sub_schema, _sub_resolver)) => {
+                        if sub_schema.fields().len() != 1 {
+                            return Err(FfqError::Planning(
+                                "IN subquery must return exactly one column".to_string(),
+                            ));
+                        }
+                        let sub_col_name = sub_schema.field(0).name().clone();
+                        let sub_col_dt = sub_schema.field(0).data_type().clone();
+                        let sub_expr = Expr::ColumnRef {
+                            name: sub_col_name.clone(),
+                            index: 0,
+                        };
+                        let (coerced_left, coerced_sub, target_dt) =
+                            coerce_for_compare(aexpr, expr_dt, sub_expr, sub_col_dt)?;
+                        let coerced_subquery = LogicalPlan::Projection {
+                            exprs: vec![(coerced_sub, "__in_key".to_string())],
+                            input: Box::new(asub),
+                        };
+                        let out_schema = in_schema.clone();
+                        let out_resolver = Resolver::anonymous(out_schema.clone());
+                        let _ = target_dt;
+                        if let Some(rewritten) = self.rewrite_uncorrelated_in_subquery_to_join(
+                            ain.clone(),
+                            in_schema.clone(),
+                            coerced_left.clone(),
+                            coerced_subquery.clone(),
+                            negated,
+                        ) {
+                            Ok((rewritten, out_schema, out_resolver))
+                        } else {
+                            Ok((
+                                LogicalPlan::InSubqueryFilter {
+                                    input: Box::new(ain),
+                                    expr: coerced_left,
+                                    subquery: Box::new(coerced_subquery),
+                                    negated,
+                                    correlation: SubqueryCorrelation::Uncorrelated,
+                                },
+                                out_schema,
+                                out_resolver,
+                            ))
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(rewritten) = self.try_decorrelate_in_subquery(
+                            ain,
+                            aexpr,
+                            raw_subquery,
+                            negated,
+                            provider,
+                            &in_resolver,
+                        )? {
+                            let (aplan, schema, resolver) =
+                                self.analyze_plan(rewritten, provider)?;
+                            return Ok((aplan, schema, resolver));
+                        }
+                        Err(err)
+                    }
+                }
+            }
+            LogicalPlan::ExistsSubqueryFilter {
+                input,
+                subquery,
+                negated,
+                correlation: _,
+            } => {
+                let (ain, in_schema, in_resolver) = self.analyze_plan(*input, provider)?;
+                let raw_subquery = *subquery;
+                let (asub, _sub_schema, _sub_resolver) = match self.analyze_uncorrelated_subquery(
+                    raw_subquery.clone(),
+                    provider,
+                    &in_resolver,
+                    "EXISTS subquery",
+                ) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        if let Some((decorrelated_subquery, on)) = self
+                            .try_decorrelate_exists_subquery(raw_subquery, provider, &in_resolver)?
+                        {
+                            let out_schema = in_schema.clone();
+                            let out_resolver = Resolver::anonymous(out_schema.clone());
+                            return Ok((
+                                LogicalPlan::Join {
+                                    left: Box::new(ain),
+                                    right: Box::new(decorrelated_subquery),
+                                    on,
+                                    join_type: if negated {
+                                        crate::logical_plan::JoinType::Anti
+                                    } else {
+                                        crate::logical_plan::JoinType::Semi
+                                    },
+                                    strategy_hint: crate::logical_plan::JoinStrategyHint::Auto,
+                                },
+                                out_schema,
+                                out_resolver,
+                            ));
+                        }
+                        return Err(err);
+                    }
+                };
+                let out_schema = in_schema.clone();
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                Ok((
+                    self.rewrite_uncorrelated_exists_subquery_to_join(
+                        ain,
+                        in_schema.clone(),
+                        asub,
+                        negated,
+                    ),
+                    out_schema,
+                    out_resolver,
+                ))
+            }
+            LogicalPlan::ScalarSubqueryFilter {
+                input,
+                expr,
+                op,
+                subquery,
+                correlation: _,
+            } => {
+                let (ain, in_schema, in_resolver) = self.analyze_plan(*input, provider)?;
+                let (asub, sub_schema, _sub_resolver) = self.analyze_uncorrelated_subquery(
+                    *subquery,
+                    provider,
+                    &in_resolver,
+                    "scalar subquery",
+                )?;
+                if sub_schema.fields().len() != 1 {
+                    return Err(FfqError::Planning(
+                        "scalar subquery must return exactly one column".to_string(),
+                    ));
+                }
+                let sub_col_name = sub_schema.field(0).name().clone();
+                let sub_col_dt = sub_schema.field(0).data_type().clone();
+                let (aexpr, expr_dt) = self.analyze_expr(expr, &in_resolver)?;
+                let sub_expr = Expr::ColumnRef {
+                    name: sub_col_name,
+                    index: 0,
+                };
+                let (coerced_left, coerced_sub, _target) =
+                    coerce_for_compare(aexpr, expr_dt, sub_expr, sub_col_dt)?;
+                let coerced_subquery = LogicalPlan::Projection {
+                    exprs: vec![(coerced_sub, "__scalar".to_string())],
+                    input: Box::new(asub),
+                };
+                let out_schema = in_schema.clone();
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                Ok((
+                    LogicalPlan::ScalarSubqueryFilter {
+                        input: Box::new(ain),
+                        expr: coerced_left,
+                        op,
+                        subquery: Box::new(coerced_subquery),
+                        correlation: SubqueryCorrelation::Uncorrelated,
+                    },
+                    out_schema,
+                    out_resolver,
+                ))
+            }
 
             LogicalPlan::Projection { exprs, input } => {
                 let (ain, _in_schema, in_resolver) = self.analyze_plan(*input, provider)?;
@@ -120,7 +359,8 @@ impl Analyzer {
 
                 for (e, name) in exprs {
                     let (ae, dt) = self.analyze_expr(e, &in_resolver)?;
-                    out_fields.push(Field::new(&name, dt.clone(), true));
+                    let nullable = expr_nullable(&ae, &in_resolver)?;
+                    out_fields.push(Field::new(&name, dt.clone(), nullable));
                     out_exprs.push((ae, name));
                 }
 
@@ -129,6 +369,31 @@ impl Analyzer {
 
                 Ok((
                     LogicalPlan::Projection {
+                        exprs: out_exprs,
+                        input: Box::new(ain),
+                    },
+                    out_schema,
+                    out_resolver,
+                ))
+            }
+            LogicalPlan::Window { exprs, input } => {
+                let (ain, in_schema, in_resolver) = self.analyze_plan(*input, provider)?;
+                let mut out_fields: Vec<Field> = in_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.as_ref().clone())
+                    .collect();
+                let mut out_exprs = Vec::with_capacity(exprs.len());
+                for w in exprs {
+                    let aw = self.analyze_window_expr(w, &in_resolver)?;
+                    let (dt, nullable) = window_output_type_and_nullable(&aw.func, &in_resolver)?;
+                    out_fields.push(Field::new(&aw.output_name, dt, nullable));
+                    out_exprs.push(aw);
+                }
+                let out_schema = Arc::new(Schema::new(out_fields));
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                Ok((
+                    LogicalPlan::Window {
                         exprs: out_exprs,
                         input: Box::new(ain),
                     },
@@ -180,12 +445,6 @@ impl Analyzer {
                 join_type,
                 strategy_hint,
             } => {
-                if join_type != JoinType::Inner {
-                    return Err(FfqError::Unsupported(
-                        "only INNER join supported in v1".to_string(),
-                    ));
-                }
-
                 let (al, _ls, lres) = self.analyze_plan(*left, provider)?;
                 let (ar, _rs, rres) = self.analyze_plan(*right, provider)?;
 
@@ -200,7 +459,12 @@ impl Analyzer {
                     }
                 }
 
-                let out_resolver = Resolver::join(lres, rres);
+                let out_resolver = match join_type {
+                    crate::logical_plan::JoinType::Semi | crate::logical_plan::JoinType::Anti => {
+                        lres.clone()
+                    }
+                    _ => Resolver::join(lres, rres),
+                };
                 let out_schema = out_resolver.schema();
 
                 Ok((
@@ -252,6 +516,47 @@ impl Analyzer {
                     resolver,
                 ))
             }
+            LogicalPlan::UnionAll { left, right } => {
+                let (al, ls, _lr) = self.analyze_plan(*left, provider)?;
+                let (ar, rs, _rr) = self.analyze_plan(*right, provider)?;
+                if ls.fields().len() != rs.fields().len() {
+                    return Err(FfqError::Planning(format!(
+                        "UNION ALL column-count mismatch: left has {}, right has {}",
+                        ls.fields().len(),
+                        rs.fields().len()
+                    )));
+                }
+                for idx in 0..ls.fields().len() {
+                    let ldt = ls.field(idx).data_type();
+                    let rdt = rs.field(idx).data_type();
+                    if ldt != rdt {
+                        return Err(FfqError::Planning(format!(
+                            "UNION ALL type mismatch at column {idx}: left={ldt:?}, right={rdt:?}"
+                        )));
+                    }
+                }
+                let out_schema = ls.clone();
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                Ok((
+                    LogicalPlan::UnionAll {
+                        left: Box::new(al),
+                        right: Box::new(ar),
+                    },
+                    out_schema,
+                    out_resolver,
+                ))
+            }
+            LogicalPlan::CteRef { name, plan } => {
+                let (aplan, schema, resolver) = self.analyze_plan(*plan, provider)?;
+                Ok((
+                    LogicalPlan::CteRef {
+                        name,
+                        plan: Box::new(aplan),
+                    },
+                    schema,
+                    resolver,
+                ))
+            }
             LogicalPlan::VectorTopK {
                 table,
                 query_vector,
@@ -280,6 +585,60 @@ impl Analyzer {
                         query_vector,
                         k,
                         filter,
+                    },
+                    out_schema,
+                    out_resolver,
+                ))
+            }
+            LogicalPlan::HybridVectorScan {
+                source,
+                query_vectors,
+                k,
+                ef_search,
+                prefilter,
+                metric,
+                provider: backend,
+            } => {
+                if k == 0 {
+                    return Err(FfqError::Planning("TOP-K value must be > 0".to_string()));
+                }
+                if query_vectors.is_empty() || query_vectors.iter().any(Vec::is_empty) {
+                    return Err(FfqError::Planning(
+                        "HybridVectorScan query vector(s) cannot be empty".to_string(),
+                    ));
+                }
+                if !matches!(metric.as_str(), "cosine" | "dot" | "l2") {
+                    return Err(FfqError::Planning(format!(
+                        "HybridVectorScan metric must be one of cosine|dot|l2, got '{metric}'"
+                    )));
+                }
+                if let Some(ef) = ef_search
+                    && ef == 0
+                {
+                    return Err(FfqError::Planning(
+                        "HybridVectorScan ef_search must be > 0".to_string(),
+                    ));
+                }
+                let _ = provider.table_schema(&source)?;
+                let mut out_fields = Vec::new();
+                if query_vectors.len() > 1 {
+                    out_fields.push(Field::new("query_id", DataType::Int64, false));
+                }
+                out_fields.push(Field::new("id", DataType::Int64, false));
+                out_fields.push(Field::new("_score", DataType::Float32, false));
+                out_fields.push(Field::new("score", DataType::Float32, false));
+                out_fields.push(Field::new("payload", DataType::Utf8, true));
+                let out_schema = Arc::new(Schema::new(out_fields));
+                let out_resolver = Resolver::anonymous(out_schema.clone());
+                Ok((
+                    LogicalPlan::HybridVectorScan {
+                        source,
+                        query_vectors,
+                        k,
+                        ef_search,
+                        prefilter,
+                        metric,
+                        provider: backend,
                     },
                     out_schema,
                     out_resolver,
@@ -350,11 +709,354 @@ impl Analyzer {
         }
     }
 
+    fn analyze_uncorrelated_subquery(
+        &self,
+        subquery: LogicalPlan,
+        provider: &dyn SchemaProvider,
+        outer_resolver: &Resolver,
+        subquery_kind: &str,
+    ) -> Result<(LogicalPlan, SchemaRef, Resolver)> {
+        match self.analyze_plan(subquery, provider) {
+            Ok(v) => Ok(v),
+            Err(err) => {
+                if let Some(col) = unknown_column_name(&err) {
+                    if resolver_has_col(outer_resolver, col) {
+                        return Err(FfqError::Unsupported(format!(
+                            "{E_SUBQUERY_UNSUPPORTED_CORRELATION}: {subquery_kind} correlated outer reference is not supported yet: {col}"
+                        )));
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn try_decorrelate_exists_subquery(
+        &self,
+        subquery: LogicalPlan,
+        provider: &dyn SchemaProvider,
+        outer_resolver: &Resolver,
+    ) -> Result<Option<(LogicalPlan, Vec<(String, String)>)>> {
+        let mut core = subquery;
+        while let LogicalPlan::Projection { input, .. } = core {
+            core = *input;
+        }
+
+        let (mut base_input, mut predicates) = match core {
+            LogicalPlan::Filter { predicate, input } => (*input, split_conjuncts(predicate)),
+            other => (other, Vec::new()),
+        };
+        if let LogicalPlan::TableScan {
+            table,
+            projection,
+            filters,
+        } = base_input
+        {
+            predicates.extend(filters.into_iter().flat_map(split_conjuncts));
+            base_input = LogicalPlan::TableScan {
+                table,
+                projection,
+                filters: Vec::new(),
+            };
+        }
+
+        let mut join_keys = Vec::<(String, String)>::new();
+        let mut inner_only = Vec::<Expr>::new();
+        for pred in predicates {
+            if let Some((outer_col, inner_col)) = extract_outer_inner_eq_pair(&pred, outer_resolver)
+            {
+                join_keys.push((outer_col, inner_col));
+                continue;
+            }
+            if predicate_has_outer_ref(&pred, outer_resolver) {
+                return Err(FfqError::Unsupported(format!(
+                    "{E_SUBQUERY_UNSUPPORTED_CORRELATION}: EXISTS subquery correlated predicate shape is not supported yet: {pred:?}"
+                )));
+            }
+            inner_only.push(strip_inner_qualifiers(pred, outer_resolver));
+        }
+
+        if join_keys.is_empty() {
+            return Ok(None);
+        }
+
+        let rewritten_subquery = if inner_only.is_empty() {
+            base_input
+        } else {
+            LogicalPlan::Filter {
+                predicate: combine_conjuncts(inner_only),
+                input: Box::new(base_input),
+            }
+        };
+        let (analyzed_subquery, _schema, _resolver) =
+            self.analyze_plan(rewritten_subquery, provider)?;
+        Ok(Some((analyzed_subquery, join_keys)))
+    }
+
+    fn try_decorrelate_in_subquery(
+        &self,
+        input: LogicalPlan,
+        expr: Expr,
+        subquery: LogicalPlan,
+        negated: bool,
+        _provider: &dyn SchemaProvider,
+        outer_resolver: &Resolver,
+    ) -> Result<Option<LogicalPlan>> {
+        let lhs_name = column_name_from_expr(&expr)
+            .ok_or_else(|| {
+                FfqError::Unsupported(format!(
+                    "{E_SUBQUERY_UNSUPPORTED_CORRELATION}: correlated IN currently requires column lhs"
+                ))
+            })?
+            .clone();
+
+        let (inner_value_col, mut core) = extract_subquery_projection_col(subquery)?;
+        let (base_input, mut predicates) = match core {
+            LogicalPlan::Filter { predicate, input } => (*input, split_conjuncts(predicate)),
+            other => (other, Vec::new()),
+        };
+        core = base_input;
+        if let LogicalPlan::TableScan {
+            table,
+            projection,
+            filters,
+        } = core
+        {
+            predicates.extend(filters.into_iter().flat_map(split_conjuncts));
+            core = LogicalPlan::TableScan {
+                table,
+                projection,
+                filters: Vec::new(),
+            };
+        }
+
+        let mut corr_keys = Vec::<(String, String)>::new();
+        let mut inner_only = Vec::<Expr>::new();
+        for pred in predicates {
+            if let Some((outer_col, inner_col)) = extract_outer_inner_eq_pair(&pred, outer_resolver)
+            {
+                corr_keys.push((outer_col, inner_col));
+                continue;
+            }
+            if predicate_has_outer_ref(&pred, outer_resolver) {
+                return Err(FfqError::Unsupported(format!(
+                    "{E_SUBQUERY_UNSUPPORTED_CORRELATION}: IN subquery correlated predicate shape is not supported yet: {pred:?}"
+                )));
+            }
+            inner_only.push(strip_inner_qualifiers(pred, outer_resolver));
+        }
+        if corr_keys.is_empty() {
+            return Ok(None);
+        }
+
+        let inner_base = if inner_only.is_empty() {
+            core
+        } else {
+            LogicalPlan::Filter {
+                predicate: combine_conjuncts(inner_only),
+                input: Box::new(core),
+            }
+        };
+        let mut needed_inner_cols: std::collections::HashSet<String> = corr_keys
+            .iter()
+            .map(|(_, inner)| split_qual(inner).1.to_string())
+            .collect();
+        needed_inner_cols.insert(split_qual(&inner_value_col).1.to_string());
+        let inner_base = ensure_scan_projection_contains(inner_base, &needed_inner_cols);
+
+        let inner_non_null = LogicalPlan::Filter {
+            predicate: Expr::IsNotNull(Box::new(Expr::Column(inner_value_col.clone()))),
+            input: Box::new(inner_base.clone()),
+        };
+        let mut eq_on = corr_keys.clone();
+        eq_on.push((lhs_name.clone(), inner_value_col.clone()));
+
+        if !negated {
+            return Ok(Some(LogicalPlan::Join {
+                left: Box::new(input),
+                right: Box::new(inner_non_null),
+                on: eq_on,
+                join_type: crate::logical_plan::JoinType::Semi,
+                strategy_hint: crate::logical_plan::JoinStrategyHint::Auto,
+            }));
+        }
+
+        let left_non_null = LogicalPlan::Filter {
+            predicate: Expr::IsNotNull(Box::new(Expr::Column(lhs_name))),
+            input: Box::new(input),
+        };
+        let anti_equal = LogicalPlan::Join {
+            left: Box::new(left_non_null),
+            right: Box::new(inner_non_null),
+            on: eq_on,
+            join_type: crate::logical_plan::JoinType::Anti,
+            strategy_hint: crate::logical_plan::JoinStrategyHint::Auto,
+        };
+        let inner_null = LogicalPlan::Filter {
+            predicate: Expr::IsNull(Box::new(Expr::Column(inner_value_col))),
+            input: Box::new(inner_base),
+        };
+        Ok(Some(LogicalPlan::Join {
+            left: Box::new(anti_equal),
+            right: Box::new(inner_null),
+            on: corr_keys,
+            join_type: crate::logical_plan::JoinType::Anti,
+            strategy_hint: crate::logical_plan::JoinStrategyHint::Auto,
+        }))
+    }
+
+    fn rewrite_uncorrelated_in_subquery_to_join(
+        &self,
+        input: LogicalPlan,
+        input_schema: SchemaRef,
+        expr: Expr,
+        subquery: LogicalPlan,
+        negated: bool,
+    ) -> Option<LogicalPlan> {
+        let (left_key_name, left_key_index) = match expr {
+            Expr::ColumnRef { name, index } => (name, index),
+            _ => return None,
+        };
+        let right_key_name = "__in_key".to_string();
+
+        let right_non_null = LogicalPlan::Filter {
+            predicate: Expr::IsNotNull(Box::new(Expr::ColumnRef {
+                name: right_key_name.clone(),
+                index: 0,
+            })),
+            input: Box::new(subquery.clone()),
+        };
+        let left_non_null = LogicalPlan::Filter {
+            predicate: Expr::IsNotNull(Box::new(Expr::ColumnRef {
+                name: left_key_name.clone(),
+                index: left_key_index,
+            })),
+            input: Box::new(input),
+        };
+        let on = vec![(left_key_name, right_key_name.clone())];
+        let join_hint = crate::logical_plan::JoinStrategyHint::Auto;
+
+        if !negated {
+            return Some(LogicalPlan::Join {
+                left: Box::new(left_non_null),
+                right: Box::new(right_non_null),
+                on,
+                join_type: crate::logical_plan::JoinType::Semi,
+                strategy_hint: join_hint,
+            });
+        }
+
+        // SQL NOT IN semantics in WHERE:
+        // - lhs NULL => UNKNOWN (filtered out)
+        // - rhs contains NULL => UNKNOWN for every lhs no-match row (filtered out)
+        // We model this as: anti(lhs, rhs_non_null) then anti(., rhs_null_exists).
+        let anti_equal = LogicalPlan::Join {
+            left: Box::new(left_non_null),
+            right: Box::new(right_non_null),
+            on,
+            join_type: crate::logical_plan::JoinType::Anti,
+            strategy_hint: join_hint,
+        };
+        let rhs_null = LogicalPlan::Filter {
+            predicate: Expr::IsNull(Box::new(Expr::ColumnRef {
+                name: right_key_name,
+                index: 0,
+            })),
+            input: Box::new(subquery),
+        };
+        let anti_cols = identity_projection_exprs(&input_schema);
+        let anti_with_const = LogicalPlan::Projection {
+            exprs: anti_cols
+                .into_iter()
+                .chain(std::iter::once((
+                    Expr::Literal(LiteralValue::Int64(1)),
+                    "__not_in_guard".to_string(),
+                )))
+                .collect(),
+            input: Box::new(anti_equal),
+        };
+        let rhs_null_with_const = LogicalPlan::Projection {
+            exprs: vec![(
+                Expr::Literal(LiteralValue::Int64(1)),
+                "__not_in_guard".to_string(),
+            )],
+            input: Box::new(rhs_null),
+        };
+        let anti_rhs_null = LogicalPlan::Join {
+            left: Box::new(anti_with_const),
+            right: Box::new(rhs_null_with_const),
+            on: vec![("__not_in_guard".to_string(), "__not_in_guard".to_string())],
+            join_type: crate::logical_plan::JoinType::Anti,
+            strategy_hint: join_hint,
+        };
+        Some(LogicalPlan::Projection {
+            exprs: identity_projection_exprs(&input_schema),
+            input: Box::new(anti_rhs_null),
+        })
+    }
+
+    fn rewrite_uncorrelated_exists_subquery_to_join(
+        &self,
+        input: LogicalPlan,
+        input_schema: SchemaRef,
+        subquery: LogicalPlan,
+        negated: bool,
+    ) -> LogicalPlan {
+        // EXISTS is true for every input row iff subquery is non-empty.
+        // We encode this as a semi/anti join on a constant key.
+        let join_hint = crate::logical_plan::JoinStrategyHint::Auto;
+        let left_key = "__exists_key_l".to_string();
+        let right_key = "__exists_key_r".to_string();
+        let left_with_key = LogicalPlan::Projection {
+            exprs: identity_projection_exprs(&input_schema)
+                .into_iter()
+                .chain(std::iter::once((
+                    Expr::Literal(LiteralValue::Int64(1)),
+                    left_key.clone(),
+                )))
+                .collect(),
+            input: Box::new(input),
+        };
+        let right_with_key = LogicalPlan::Projection {
+            exprs: vec![(Expr::Literal(LiteralValue::Int64(1)), right_key.clone())],
+            input: Box::new(subquery),
+        };
+        let join = LogicalPlan::Join {
+            left: Box::new(left_with_key),
+            right: Box::new(right_with_key),
+            on: vec![(left_key, right_key)],
+            join_type: if negated {
+                crate::logical_plan::JoinType::Anti
+            } else {
+                crate::logical_plan::JoinType::Semi
+            },
+            strategy_hint: join_hint,
+        };
+        LogicalPlan::Projection {
+            exprs: identity_projection_exprs(&input_schema),
+            input: Box::new(join),
+        }
+    }
+
     fn analyze_agg(&self, agg: AggExpr, resolver: &Resolver) -> Result<(AggExpr, DataType)> {
         match agg {
             AggExpr::Count(e) => {
                 let (ae, _dt) = self.analyze_expr(e, resolver)?;
                 Ok((AggExpr::Count(ae), DataType::Int64))
+            }
+            AggExpr::CountDistinct(e) => {
+                let (ae, _dt) = self.analyze_expr(e, resolver)?;
+                Ok((AggExpr::CountDistinct(ae), DataType::Int64))
+            }
+            AggExpr::ApproxCountDistinct(e) => {
+                if !cfg!(feature = "approx") {
+                    return Err(FfqError::Unsupported(
+                        "APPROX_COUNT_DISTINCT is disabled; enable planner feature 'approx'"
+                            .to_string(),
+                    ));
+                }
+                let (ae, _dt) = self.analyze_expr(e, resolver)?;
+                Ok((AggExpr::ApproxCountDistinct(ae), DataType::Int64))
             }
             AggExpr::Sum(e) => {
                 let (ae, dt) = self.analyze_expr(e, resolver)?;
@@ -380,6 +1082,128 @@ impl Analyzer {
                 Ok((AggExpr::Avg(ae), DataType::Float64))
             }
         }
+    }
+
+    fn analyze_window_expr(&self, w: WindowExpr, resolver: &Resolver) -> Result<WindowExpr> {
+        let partition_by = w
+            .partition_by
+            .into_iter()
+            .map(|e| self.analyze_expr(e, resolver).map(|(ae, _)| ae))
+            .collect::<Result<Vec<_>>>()?;
+        let order_by = w
+            .order_by
+            .into_iter()
+            .map(|o| {
+                self.analyze_expr(o.expr, resolver)
+                    .map(|(ae, _)| WindowOrderExpr {
+                        expr: ae,
+                        asc: o.asc,
+                        nulls_first: o.nulls_first,
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let func = match w.func {
+            WindowFunction::RowNumber => WindowFunction::RowNumber,
+            WindowFunction::Rank => WindowFunction::Rank,
+            WindowFunction::DenseRank => WindowFunction::DenseRank,
+            WindowFunction::PercentRank => WindowFunction::PercentRank,
+            WindowFunction::CumeDist => WindowFunction::CumeDist,
+            WindowFunction::Ntile(n) => WindowFunction::Ntile(n),
+            WindowFunction::Count(expr) => {
+                let (arg, _dt) = self.analyze_expr(expr, resolver)?;
+                WindowFunction::Count(arg)
+            }
+            WindowFunction::Sum(expr) => {
+                let (arg, dt) = self.analyze_expr(expr, resolver)?;
+                if !is_numeric(&dt) {
+                    return Err(FfqError::Planning(
+                        "SUM() OVER requires numeric argument".to_string(),
+                    ));
+                }
+                WindowFunction::Sum(arg)
+            }
+            WindowFunction::Avg(expr) => {
+                let (arg, dt) = self.analyze_expr(expr, resolver)?;
+                if !is_numeric(&dt) {
+                    return Err(FfqError::Planning(
+                        "AVG() OVER requires numeric argument".to_string(),
+                    ));
+                }
+                WindowFunction::Avg(arg)
+            }
+            WindowFunction::Min(expr) => {
+                let (arg, _dt) = self.analyze_expr(expr, resolver)?;
+                WindowFunction::Min(arg)
+            }
+            WindowFunction::Max(expr) => {
+                let (arg, _dt) = self.analyze_expr(expr, resolver)?;
+                WindowFunction::Max(arg)
+            }
+            WindowFunction::Lag {
+                expr,
+                offset,
+                default,
+            } => {
+                let (arg, arg_dt) = self.analyze_expr(expr, resolver)?;
+                let (arg, analyzed_default) = analyze_window_value_with_default(
+                    "LAG", arg, &arg_dt, default, resolver, self,
+                )?;
+                WindowFunction::Lag {
+                    expr: arg,
+                    offset,
+                    default: analyzed_default,
+                }
+            }
+            WindowFunction::Lead {
+                expr,
+                offset,
+                default,
+            } => {
+                let (arg, arg_dt) = self.analyze_expr(expr, resolver)?;
+                let (arg, analyzed_default) = analyze_window_value_with_default(
+                    "LEAD", arg, &arg_dt, default, resolver, self,
+                )?;
+                WindowFunction::Lead {
+                    expr: arg,
+                    offset,
+                    default: analyzed_default,
+                }
+            }
+            WindowFunction::FirstValue(expr) => {
+                let (arg, _dt) = self.analyze_expr(expr, resolver)?;
+                WindowFunction::FirstValue(arg)
+            }
+            WindowFunction::LastValue(expr) => {
+                let (arg, _dt) = self.analyze_expr(expr, resolver)?;
+                WindowFunction::LastValue(arg)
+            }
+            WindowFunction::NthValue { expr, n } => {
+                let (arg, _dt) = self.analyze_expr(expr, resolver)?;
+                WindowFunction::NthValue { expr: arg, n }
+            }
+        };
+        let frame = if let Some(frame) = w.frame {
+            validate_window_frame(&frame)?;
+            if matches!(
+                frame.units,
+                WindowFrameUnits::Range | WindowFrameUnits::Groups
+            ) && order_by.is_empty()
+            {
+                return Err(FfqError::Planning(
+                    "RANGE/GROUPS frame requires ORDER BY".to_string(),
+                ));
+            }
+            Some(frame)
+        } else {
+            None
+        };
+        Ok(WindowExpr {
+            func,
+            partition_by,
+            order_by,
+            frame,
+            output_name: w.output_name,
+        })
     }
 
     fn analyze_expr(&self, expr: Expr, resolver: &Resolver) -> Result<(Expr, DataType)> {
@@ -431,6 +1255,60 @@ impl Analyzer {
                     ));
                 }
                 Ok((Expr::Not(Box::new(ae)), DataType::Boolean))
+            }
+            Expr::IsNull(e) => {
+                let (ae, _dt) = self.analyze_expr(*e, resolver)?;
+                Ok((Expr::IsNull(Box::new(ae)), DataType::Boolean))
+            }
+            Expr::IsNotNull(e) => {
+                let (ae, _dt) = self.analyze_expr(*e, resolver)?;
+                Ok((Expr::IsNotNull(Box::new(ae)), DataType::Boolean))
+            }
+            Expr::CaseWhen {
+                branches,
+                else_expr,
+            } => {
+                if branches.is_empty() {
+                    return Err(FfqError::Planning(
+                        "CASE requires at least one WHEN/THEN branch".to_string(),
+                    ));
+                }
+                let mut analyzed_branches = Vec::with_capacity(branches.len());
+                let mut result_types = Vec::with_capacity(branches.len() + 1);
+                for (cond, result) in branches {
+                    let (acond, cdt) = self.analyze_expr(cond, resolver)?;
+                    if cdt != DataType::Boolean {
+                        return Err(FfqError::Planning(
+                            "CASE WHEN condition must be boolean".to_string(),
+                        ));
+                    }
+                    let (aresult, rdt) = self.analyze_expr(result, resolver)?;
+                    analyzed_branches.push((acond, aresult));
+                    result_types.push(rdt);
+                }
+
+                let (analyzed_else, else_dt) = if let Some(e) = else_expr {
+                    self.analyze_expr(*e, resolver)?
+                } else {
+                    (Expr::Literal(LiteralValue::Null), DataType::Null)
+                };
+                result_types.push(else_dt.clone());
+                let target_dt = coerce_case_result_type(&result_types)?;
+
+                let coerced_branches = analyzed_branches
+                    .into_iter()
+                    .zip(result_types.iter())
+                    .map(|((cond, result), rdt)| (cond, cast_if_needed(result, rdt, &target_dt)))
+                    .collect::<Vec<_>>();
+                let coerced_else = cast_if_needed(analyzed_else, &else_dt, &target_dt);
+
+                Ok((
+                    Expr::CaseWhen {
+                        branches: coerced_branches,
+                        else_expr: Some(Box::new(coerced_else)),
+                    },
+                    target_dt,
+                ))
             }
             Expr::BinaryOp { left, op, right } => {
                 let (al, ldt) = self.analyze_expr(*left, resolver)?;
@@ -512,6 +1390,30 @@ impl Analyzer {
                     DataType::Float32,
                 ))
             }
+            Expr::ScalarUdf { name, args } => {
+                let mut analyzed_args = Vec::with_capacity(args.len());
+                let mut arg_types = Vec::with_capacity(args.len());
+                for arg in args {
+                    let (a, dt) = self.analyze_expr(arg, resolver)?;
+                    analyzed_args.push(a);
+                    arg_types.push(dt);
+                }
+                let resolver_fn = self
+                    .udf_type_resolvers
+                    .read()
+                    .expect("udf resolver lock poisoned")
+                    .get(&name.to_ascii_lowercase())
+                    .cloned()
+                    .ok_or_else(|| FfqError::Planning(format!("unknown scalar udf: {name}")))?;
+                let out_type = resolver_fn(&arg_types)?;
+                Ok((
+                    Expr::ScalarUdf {
+                        name,
+                        args: analyzed_args,
+                    },
+                    out_type,
+                ))
+            }
         }
     }
 }
@@ -550,6 +1452,15 @@ impl Resolver {
         }
     }
 
+    fn aliased(alias: &str, schema: SchemaRef) -> Self {
+        Self {
+            relations: vec![Relation {
+                name: alias.to_string(),
+                fields: schema.fields().iter().cloned().collect(),
+            }],
+        }
+    }
+
     fn join(left: Resolver, right: Resolver) -> Self {
         let mut rels = vec![];
         rels.extend(left.relations);
@@ -582,23 +1493,32 @@ impl Resolver {
     fn resolve(&self, col: &str) -> Result<(usize, DataType)> {
         let (rel_opt, name) = split_qual(col);
 
-        let mut found: Vec<(usize, DataType)> = vec![];
-        let mut base = 0usize;
+        let resolve_with_rel = |rel_opt: Option<&str>| {
+            let mut found: Vec<(usize, DataType)> = vec![];
+            let mut base = 0usize;
 
-        for r in &self.relations {
-            let rel_match = match rel_opt {
-                Some(rel) => r.name == rel,
-                None => true,
-            };
+            for r in &self.relations {
+                let rel_match = match rel_opt {
+                    Some(rel) => r.name == rel,
+                    None => true,
+                };
 
-            if rel_match {
-                for (i, f) in r.fields.iter().enumerate() {
-                    if f.name() == name {
-                        found.push((base + i, f.data_type().clone()));
+                if rel_match {
+                    for (i, f) in r.fields.iter().enumerate() {
+                        if f.name() == name {
+                            found.push((base + i, f.data_type().clone()));
+                        }
                     }
                 }
+                base += r.fields.len();
             }
-            base += r.fields.len();
+            found
+        };
+
+        let mut found = resolve_with_rel(rel_opt);
+        if found.is_empty() && rel_opt.is_some() {
+            // Be tolerant after rewrites that can drop relation qualifiers.
+            found = resolve_with_rel(None);
         }
 
         match found.len() {
@@ -634,6 +1554,266 @@ fn split_qual(s: &str) -> (Option<&str>, &str) {
         (Some(a), b)
     } else {
         (None, s)
+    }
+}
+
+fn unknown_column_name(err: &FfqError) -> Option<&str> {
+    let msg = match err {
+        FfqError::Planning(msg) => msg,
+        _ => return None,
+    };
+    msg.strip_prefix("unknown column: ")
+}
+
+fn split_conjuncts(expr: Expr) -> Vec<Expr> {
+    match expr {
+        Expr::And(left, right) => {
+            let mut out = split_conjuncts(*left);
+            out.extend(split_conjuncts(*right));
+            out
+        }
+        other => vec![other],
+    }
+}
+
+fn identity_projection_exprs(schema: &SchemaRef) -> Vec<(Expr, String)> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| {
+            (
+                Expr::ColumnRef {
+                    name: field.name().clone(),
+                    index: idx,
+                },
+                field.name().clone(),
+            )
+        })
+        .collect()
+}
+
+fn combine_conjuncts(mut exprs: Vec<Expr>) -> Expr {
+    let mut it = exprs.drain(..);
+    let first = it
+        .next()
+        .expect("combine_conjuncts requires non-empty expression list");
+    it.fold(first, |acc, e| Expr::And(Box::new(acc), Box::new(e)))
+}
+
+fn predicate_has_outer_ref(expr: &Expr, outer_resolver: &Resolver) -> bool {
+    match expr {
+        Expr::Column(name) => resolver_has_col(outer_resolver, name),
+        Expr::ColumnRef { name, .. } => resolver_has_col(outer_resolver, name),
+        Expr::Literal(_) => false,
+        Expr::BinaryOp { left, right, .. } => {
+            predicate_has_outer_ref(left, outer_resolver)
+                || predicate_has_outer_ref(right, outer_resolver)
+        }
+        Expr::Cast { expr, .. } => predicate_has_outer_ref(expr, outer_resolver),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            predicate_has_outer_ref(inner, outer_resolver)
+        }
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            predicate_has_outer_ref(left, outer_resolver)
+                || predicate_has_outer_ref(right, outer_resolver)
+        }
+        Expr::Not(inner) => predicate_has_outer_ref(inner, outer_resolver),
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
+            branches.iter().any(|(c, v)| {
+                predicate_has_outer_ref(c, outer_resolver)
+                    || predicate_has_outer_ref(v, outer_resolver)
+            }) || else_expr
+                .as_ref()
+                .is_some_and(|e| predicate_has_outer_ref(e, outer_resolver))
+        }
+        #[cfg(feature = "vector")]
+        Expr::CosineSimilarity { vector, query }
+        | Expr::L2Distance { vector, query }
+        | Expr::DotProduct { vector, query } => {
+            predicate_has_outer_ref(vector, outer_resolver)
+                || predicate_has_outer_ref(query, outer_resolver)
+        }
+        Expr::ScalarUdf { args, .. } => args
+            .iter()
+            .any(|a| predicate_has_outer_ref(a, outer_resolver)),
+    }
+}
+
+fn extract_outer_inner_eq_pair(expr: &Expr, outer_resolver: &Resolver) -> Option<(String, String)> {
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return None;
+    };
+    if *op != BinaryOp::Eq {
+        return None;
+    }
+    let left_name = column_name_from_expr(left)?;
+    let right_name = column_name_from_expr(right)?;
+    let left_outer = resolver_has_col(outer_resolver, left_name);
+    let right_outer = resolver_has_col(outer_resolver, right_name);
+    match (left_outer, right_outer) {
+        (true, false) => Some((left_name.clone(), right_name.clone())),
+        (false, true) => Some((right_name.clone(), left_name.clone())),
+        _ => None,
+    }
+}
+
+fn column_name_from_expr(expr: &Expr) -> Option<&String> {
+    match expr {
+        Expr::Column(name) | Expr::ColumnRef { name, .. } => Some(name),
+        Expr::Cast { expr, .. } => column_name_from_expr(expr),
+        _ => None,
+    }
+}
+
+fn extract_subquery_projection_col(subquery: LogicalPlan) -> Result<(String, LogicalPlan)> {
+    match subquery {
+        LogicalPlan::Projection { exprs, input } => {
+            if exprs.len() != 1 {
+                return Err(FfqError::Planning(
+                    "IN subquery must return exactly one column".to_string(),
+                ));
+            }
+            let (expr, _alias) = exprs.into_iter().next().expect("single projection expr");
+            let col = column_name_from_expr(&expr).ok_or_else(|| {
+                FfqError::Unsupported(format!(
+                    "{E_SUBQUERY_UNSUPPORTED_CORRELATION}: correlated IN subquery currently requires projected column expression"
+                ))
+            })?;
+            Ok((split_qual(col).1.to_string(), *input))
+        }
+        _ => Err(FfqError::Planning(
+            "IN subquery must return exactly one projected column".to_string(),
+        )),
+    }
+}
+
+fn ensure_scan_projection_contains(
+    plan: LogicalPlan,
+    needed: &std::collections::HashSet<String>,
+) -> LogicalPlan {
+    match plan {
+        LogicalPlan::SubqueryAlias { alias, input } => LogicalPlan::SubqueryAlias {
+            alias,
+            input: Box::new(ensure_scan_projection_contains(*input, needed)),
+        },
+        LogicalPlan::TableScan {
+                table,
+                projection,
+                filters,
+            } => {
+            let mut cols = projection.unwrap_or_default();
+            for col in needed {
+                if !cols.iter().any(|c| split_qual(c).1 == split_qual(col).1) {
+                    cols.push(split_qual(col).1.to_string());
+                }
+            }
+            LogicalPlan::TableScan {
+                table,
+                projection: Some(cols),
+                filters,
+            }
+        }
+        LogicalPlan::Filter { predicate, input } => LogicalPlan::Filter {
+            predicate,
+            input: Box::new(ensure_scan_projection_contains(*input, needed)),
+        },
+        LogicalPlan::Projection { exprs, input } => LogicalPlan::Projection {
+            exprs,
+            input: Box::new(ensure_scan_projection_contains(*input, needed)),
+        },
+        other => other,
+    }
+}
+
+fn resolver_has_col(resolver: &Resolver, col: &str) -> bool {
+    resolver.resolve(col).is_ok() || resolver.resolve(split_qual(col).1).is_ok()
+}
+
+fn strip_inner_qualifiers(expr: Expr, outer_resolver: &Resolver) -> Expr {
+    match expr {
+        Expr::Column(name) => {
+            if resolver_has_col(outer_resolver, &name) {
+                Expr::Column(name)
+            } else {
+                Expr::Column(split_qual(&name).1.to_string())
+            }
+        }
+        Expr::ColumnRef { name, index } => {
+            if resolver_has_col(outer_resolver, &name) {
+                Expr::ColumnRef { name, index }
+            } else {
+                Expr::ColumnRef {
+                    name: split_qual(&name).1.to_string(),
+                    index,
+                }
+            }
+        }
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(strip_inner_qualifiers(*left, outer_resolver)),
+            op,
+            right: Box::new(strip_inner_qualifiers(*right, outer_resolver)),
+        },
+        Expr::Cast { expr, to_type } => Expr::Cast {
+            expr: Box::new(strip_inner_qualifiers(*expr, outer_resolver)),
+            to_type,
+        },
+        Expr::IsNull(inner) => {
+            Expr::IsNull(Box::new(strip_inner_qualifiers(*inner, outer_resolver)))
+        }
+        Expr::IsNotNull(inner) => {
+            Expr::IsNotNull(Box::new(strip_inner_qualifiers(*inner, outer_resolver)))
+        }
+        Expr::And(left, right) => Expr::And(
+            Box::new(strip_inner_qualifiers(*left, outer_resolver)),
+            Box::new(strip_inner_qualifiers(*right, outer_resolver)),
+        ),
+        Expr::Or(left, right) => Expr::Or(
+            Box::new(strip_inner_qualifiers(*left, outer_resolver)),
+            Box::new(strip_inner_qualifiers(*right, outer_resolver)),
+        ),
+        Expr::Not(inner) => Expr::Not(Box::new(strip_inner_qualifiers(*inner, outer_resolver))),
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => Expr::CaseWhen {
+            branches: branches
+                .into_iter()
+                .map(|(c, v)| {
+                    (
+                        strip_inner_qualifiers(c, outer_resolver),
+                        strip_inner_qualifiers(v, outer_resolver),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr.map(|e| Box::new(strip_inner_qualifiers(*e, outer_resolver))),
+        },
+        #[cfg(feature = "vector")]
+        Expr::CosineSimilarity { vector, query } => Expr::CosineSimilarity {
+            vector: Box::new(strip_inner_qualifiers(*vector, outer_resolver)),
+            query: Box::new(strip_inner_qualifiers(*query, outer_resolver)),
+        },
+        #[cfg(feature = "vector")]
+        Expr::L2Distance { vector, query } => Expr::L2Distance {
+            vector: Box::new(strip_inner_qualifiers(*vector, outer_resolver)),
+            query: Box::new(strip_inner_qualifiers(*query, outer_resolver)),
+        },
+        #[cfg(feature = "vector")]
+        Expr::DotProduct { vector, query } => Expr::DotProduct {
+            vector: Box::new(strip_inner_qualifiers(*vector, outer_resolver)),
+            query: Box::new(strip_inner_qualifiers(*query, outer_resolver)),
+        },
+        Expr::ScalarUdf { name, args } => Expr::ScalarUdf {
+            name,
+            args: args
+                .into_iter()
+                .map(|arg| strip_inner_qualifiers(arg, outer_resolver))
+                .collect(),
+        },
+        Expr::Literal(v) => Expr::Literal(v),
     }
 }
 
@@ -687,6 +1867,171 @@ fn is_numeric(dt: &DataType) -> bool {
     )
 }
 
+fn validate_window_frame(frame: &WindowFrameSpec) -> Result<()> {
+    use WindowFrameBound::*;
+    if matches!(frame.start_bound, UnboundedFollowing) {
+        return Err(FfqError::Planning(
+            "window frame start cannot be UNBOUNDED FOLLOWING".to_string(),
+        ));
+    }
+    if matches!(frame.end_bound, UnboundedPreceding) {
+        return Err(FfqError::Planning(
+            "window frame end cannot be UNBOUNDED PRECEDING".to_string(),
+        ));
+    }
+    let start_rank = frame_bound_rank(&frame.start_bound);
+    let end_rank = frame_bound_rank(&frame.end_bound);
+    if start_rank > end_rank {
+        return Err(FfqError::Planning(
+            "window frame start bound must be <= end bound".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn window_output_type_and_nullable(
+    func: &WindowFunction,
+    resolver: &Resolver,
+) -> Result<(DataType, bool)> {
+    match func {
+        WindowFunction::RowNumber
+        | WindowFunction::Rank
+        | WindowFunction::DenseRank
+        | WindowFunction::Ntile(_)
+        | WindowFunction::Count(_) => Ok((DataType::Int64, false)),
+        WindowFunction::PercentRank | WindowFunction::CumeDist => Ok((DataType::Float64, false)),
+        WindowFunction::Sum(expr) | WindowFunction::Avg(expr) => {
+            let dt = expr_data_type(expr, resolver)?;
+            if !is_numeric(&dt) {
+                return Err(FfqError::Planning(
+                    "window aggregate requires numeric argument".to_string(),
+                ));
+            }
+            // Runtime currently normalizes SUM/AVG window outputs to Float64.
+            Ok((DataType::Float64, true))
+        }
+        WindowFunction::Min(expr) | WindowFunction::Max(expr) => {
+            Ok((expr_data_type(expr, resolver)?, true))
+        }
+        WindowFunction::Lag { expr, .. }
+        | WindowFunction::Lead { expr, .. }
+        | WindowFunction::FirstValue(expr)
+        | WindowFunction::LastValue(expr)
+        | WindowFunction::NthValue { expr, .. } => Ok((expr_data_type(expr, resolver)?, true)),
+    }
+}
+
+fn expr_data_type(expr: &Expr, resolver: &Resolver) -> Result<DataType> {
+    match expr {
+        Expr::ColumnRef { index, .. } => resolver.data_type_at(*index),
+        Expr::Column(name) => {
+            let (_idx, dt) = resolver.resolve(name)?;
+            Ok(dt)
+        }
+        Expr::Literal(v) => Ok(literal_type(v)),
+        Expr::Cast { to_type, .. } => Ok(to_type.clone()),
+        _ => Err(FfqError::Planning(
+            "window function argument must resolve to a typed expression".to_string(),
+        )),
+    }
+}
+
+fn expr_nullable(expr: &Expr, resolver: &Resolver) -> Result<bool> {
+    match expr {
+        Expr::ColumnRef { index, .. } => Ok(resolver.field_at(*index)?.is_nullable()),
+        Expr::Column(name) => {
+            let (idx, _dt) = resolver.resolve(name)?;
+            Ok(resolver.field_at(idx)?.is_nullable())
+        }
+        Expr::Literal(v) => Ok(matches!(v, LiteralValue::Null)),
+        Expr::Cast { expr, .. } => expr_nullable(expr, resolver),
+        Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(false),
+        Expr::And(l, r)
+        | Expr::Or(l, r)
+        | Expr::BinaryOp {
+            left: l, right: r, ..
+        } => Ok(expr_nullable(l, resolver)? || expr_nullable(r, resolver)?),
+        Expr::Not(inner) => expr_nullable(inner, resolver),
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
+            let mut nullable = false;
+            for (cond, value) in branches {
+                nullable |= expr_nullable(cond, resolver)?;
+                nullable |= expr_nullable(value, resolver)?;
+            }
+            nullable |= else_expr
+                .as_ref()
+                .map(|e| expr_nullable(e, resolver))
+                .transpose()?
+                .unwrap_or(true);
+            Ok(nullable)
+        }
+        #[cfg(feature = "vector")]
+        Expr::CosineSimilarity { .. } | Expr::L2Distance { .. } | Expr::DotProduct { .. } => {
+            Ok(false)
+        }
+        Expr::ScalarUdf { .. } => Ok(true),
+    }
+}
+
+fn analyze_window_value_with_default(
+    func_name: &str,
+    value_expr: Expr,
+    value_dt: &DataType,
+    default_expr: Option<Expr>,
+    resolver: &Resolver,
+    analyzer: &Analyzer,
+) -> Result<(Expr, Option<Expr>)> {
+    let Some(def) = default_expr else {
+        return Ok((value_expr, None));
+    };
+    let (analyzed_default, default_dt) = analyzer.analyze_expr(def, resolver)?;
+    let target_dt = if default_dt == DataType::Null {
+        value_dt.clone()
+    } else if value_dt == &default_dt {
+        value_dt.clone()
+    } else if is_numeric(value_dt) && is_numeric(&default_dt) {
+        wider_numeric(value_dt, &default_dt).ok_or_else(|| {
+            FfqError::Planning(format!(
+                "{func_name}() default type widening failed for {value_dt:?} and {default_dt:?}"
+            ))
+        })?
+    } else if matches!(
+        (value_dt, &default_dt),
+        (DataType::Utf8, DataType::LargeUtf8)
+            | (DataType::LargeUtf8, DataType::Utf8)
+            | (DataType::Utf8, DataType::Utf8)
+            | (DataType::LargeUtf8, DataType::LargeUtf8)
+    ) {
+        if *value_dt == DataType::LargeUtf8 || default_dt == DataType::LargeUtf8 {
+            DataType::LargeUtf8
+        } else {
+            DataType::Utf8
+        }
+    } else {
+        return Err(FfqError::Planning(format!(
+            "{func_name}() default type is not compatible with value expression: {value_dt:?} vs {default_dt:?}"
+        )));
+    };
+
+    Ok((
+        cast_if_needed(value_expr, value_dt, &target_dt),
+        Some(cast_if_needed(analyzed_default, &default_dt, &target_dt)),
+    ))
+}
+
+fn frame_bound_rank(bound: &WindowFrameBound) -> i32 {
+    match bound {
+        WindowFrameBound::UnboundedPreceding => -10_000,
+        WindowFrameBound::Preceding(v) => -(*v as i32) - 1,
+        WindowFrameBound::CurrentRow => 0,
+        WindowFrameBound::Following(v) => *v as i32 + 1,
+        WindowFrameBound::UnboundedFollowing => 10_000,
+    }
+}
+
 fn insert_type_compatible(src: &DataType, dst: &DataType) -> bool {
     src == dst
         || matches!(
@@ -703,7 +2048,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
     use super::{Analyzer, SchemaProvider};
-    use crate::logical_plan::LogicalPlan;
+    use crate::logical_plan::{JoinType, LogicalPlan};
     use crate::sql_frontend::sql_to_logical;
 
     struct TestSchemaProvider {
@@ -759,6 +2104,265 @@ mod tests {
         assert!(
             err.to_string().contains("INSERT type mismatch"),
             "err={err}"
+        );
+    }
+
+    #[test]
+    fn analyze_exists_subquery_rewrites_to_semijoin() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        schemas.insert(
+            "s".to_string(),
+            Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, false)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT a FROM t WHERE EXISTS (SELECT b FROM s)",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let analyzed = analyzer.analyze(plan, &provider).expect("analyze");
+        match analyzed {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                    LogicalPlan::Join { join_type, .. } => {
+                        assert_eq!(*join_type, JoinType::Semi);
+                    }
+                    other => panic!("expected semi Join, got {other:?}"),
+                },
+                other => panic!("expected intermediate Projection, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_uncorrelated_in_rewrites_to_semijoin() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        schemas.insert(
+            "s".to_string(),
+            Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, true)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT a FROM t WHERE a IN (SELECT b FROM s)",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let analyzed = analyzer.analyze(plan, &provider).expect("analyze");
+        match analyzed {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Join { join_type, .. } => {
+                    assert_eq!(*join_type, JoinType::Semi);
+                }
+                other => panic!("expected semi Join, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_decorrelates_correlated_exists_subquery_to_semijoin() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        schemas.insert(
+            "s".to_string(),
+            Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, false)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT a FROM t WHERE EXISTS (SELECT b FROM s WHERE s.b = t.a)",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let analyzed = analyzer.analyze(plan, &provider).expect("analyze");
+        match analyzed {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Join { on, join_type, .. } => {
+                    assert_eq!(*join_type, JoinType::Semi);
+                    assert_eq!(on, &vec![("t.a".to_string(), "s.b".to_string())]);
+                }
+                other => panic!("expected decorrelated Join, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_rejects_nested_correlated_subquery_reference() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        schemas.insert(
+            "s".to_string(),
+            Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, false)])),
+        );
+        schemas.insert(
+            "u".to_string(),
+            Arc::new(Schema::new(vec![Field::new("c", DataType::Int64, false)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT a FROM t WHERE EXISTS (SELECT b FROM s WHERE EXISTS (SELECT c FROM u WHERE u.c = t.a))",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let err = analyzer.analyze(plan, &provider).expect_err("must reject");
+        assert!(
+            err.to_string()
+                .contains("E_SUBQUERY_UNSUPPORTED_CORRELATION"),
+            "unexpected taxonomy code: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("correlated predicate shape is not supported yet")
+                || err
+                    .to_string()
+                    .contains("correlated outer reference is not supported yet"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn analyze_decorrelates_correlated_in_to_semijoin() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("k", DataType::Int64, true),
+            ])),
+        );
+        schemas.insert(
+            "s".to_string(),
+            Arc::new(Schema::new(vec![
+                Field::new("g", DataType::Int64, false),
+                Field::new("k2", DataType::Int64, true),
+            ])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT k FROM t WHERE k IN (SELECT k2 FROM s WHERE s.g = t.a)",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let analyzed = analyzer.analyze(plan, &provider).expect("analyze");
+        match analyzed {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Join { join_type, .. } => {
+                    assert_eq!(*join_type, JoinType::Semi);
+                }
+                other => panic!("expected decorrelated Join, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_decorrelates_correlated_not_in_to_anti_pipeline() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("k", DataType::Int64, true),
+            ])),
+        );
+        schemas.insert(
+            "s".to_string(),
+            Arc::new(Schema::new(vec![
+                Field::new("g", DataType::Int64, false),
+                Field::new("k2", DataType::Int64, true),
+            ])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT k FROM t WHERE k NOT IN (SELECT k2 FROM s WHERE s.g = t.a)",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let analyzed = analyzer.analyze(plan, &provider).expect("analyze");
+        match analyzed {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Join { join_type, .. } => {
+                    assert_eq!(*join_type, JoinType::Anti);
+                }
+                other => panic!("expected top-level anti Join, got {other:?}"),
+            },
+            other => panic!("expected Projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_window_lag_default_allows_numeric_coercion() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT LAG(f, 1, 0) OVER (ORDER BY f) AS lagf FROM t",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let analyzed = analyzer.analyze(plan, &provider).expect("analyze");
+        match analyzed {
+            LogicalPlan::Projection { input, .. } => match input.as_ref() {
+                LogicalPlan::Window { exprs, .. } => match &exprs[0].func {
+                    crate::logical_plan::WindowFunction::Lag { expr, default, .. } => {
+                        let _ = expr;
+                        assert!(matches!(
+                            default.as_ref(),
+                            Some(crate::logical_plan::Expr::Cast { .. })
+                        ));
+                    }
+                    other => panic!("expected lag window func, got {other:?}"),
+                },
+                other => panic!("expected window plan, got {other:?}"),
+            },
+            other => panic!("expected projection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_window_lead_default_rejects_incompatible_types() {
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            "t".to_string(),
+            Arc::new(Schema::new(vec![Field::new("f", DataType::Float64, false)])),
+        );
+        let provider = TestSchemaProvider { schemas };
+        let analyzer = Analyzer::new();
+        let plan = sql_to_logical(
+            "SELECT LEAD(f, 1, 'x') OVER (ORDER BY f) AS leadf FROM t",
+            &HashMap::new(),
+        )
+        .expect("parse");
+        let err = analyzer.analyze(plan, &provider).expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("LEAD() default type is not compatible with value expression"),
+            "unexpected error: {err}"
         );
     }
 
@@ -915,6 +2519,35 @@ fn coerce_for_arith(
         cast_if_needed(right, &rdt, &target),
         target,
     ))
+}
+
+fn coerce_case_result_type(types: &[DataType]) -> Result<DataType> {
+    let mut target: Option<DataType> = None;
+    for dt in types {
+        if *dt == DataType::Null {
+            continue;
+        }
+        target = Some(match target {
+            None => dt.clone(),
+            Some(t) if t == *dt => t,
+            Some(t) if is_numeric(&t) && is_numeric(dt) => {
+                wider_numeric(&t, dt).ok_or_else(|| {
+                    FfqError::Planning("failed to determine CASE numeric widening type".to_string())
+                })?
+            }
+            Some(DataType::Utf8) if *dt == DataType::LargeUtf8 => DataType::LargeUtf8,
+            Some(DataType::LargeUtf8) if *dt == DataType::Utf8 => DataType::LargeUtf8,
+            Some(DataType::Utf8) if *dt == DataType::Utf8 => DataType::Utf8,
+            Some(DataType::LargeUtf8) if *dt == DataType::LargeUtf8 => DataType::LargeUtf8,
+            Some(DataType::Boolean) if *dt == DataType::Boolean => DataType::Boolean,
+            Some(t) => {
+                return Err(FfqError::Planning(format!(
+                    "CASE branch type mismatch: cannot unify {t:?} and {dt:?}"
+                )));
+            }
+        });
+    }
+    Ok(target.unwrap_or(DataType::Null))
 }
 
 fn types_compatible_for_equality(a: &DataType, b: &DataType) -> bool {

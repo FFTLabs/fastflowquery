@@ -41,5 +41,5 @@ pub mod qdrant_provider;
 
 pub use catalog::*;
 pub use provider::*;
-pub use stats::TableStats;
+pub use stats::{ColumnRangeStats, ParquetFileStats, ScalarStatValue, TableStats};
 pub use vector_index::*;

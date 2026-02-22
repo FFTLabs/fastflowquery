@@ -48,6 +48,22 @@ impl Default for SchemaDriftPolicy {
     }
 }
 
+/// CTE reuse strategy used by SQL frontend planning.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CteReusePolicy {
+    /// Inline CTE definitions at every reference site.
+    Inline,
+    /// Materialize reused CTEs and share results across references.
+    Materialize,
+}
+
+impl Default for CteReusePolicy {
+    fn default() -> Self {
+        Self::Inline
+    }
+}
+
 /// Global engine/session configuration shared across planner/runtime layers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
@@ -60,6 +76,18 @@ pub struct EngineConfig {
     pub shuffle_partitions: usize,
     /// Broadcast join threshold in bytes for optimizer join hinting.
     pub broadcast_threshold_bytes: u64,
+    /// Number of radix bits for in-memory hash join partitioning.
+    ///
+    /// `0` disables radix partitioning and uses the baseline hash-join table.
+    pub join_radix_bits: u8,
+    /// Enables build-side bloom prefiltering on probe rows for join execution.
+    pub join_bloom_enabled: bool,
+    /// Bloom filter bit-width as log2(number_of_bits) for join prefiltering.
+    ///
+    /// For example `20` means `1 << 20` bits (128KiB bitset).
+    pub join_bloom_bits: u8,
+    /// Prefer sort-merge join strategy for eligible inner joins.
+    pub prefer_sort_merge_join: bool,
 
     /// Directory used for spill files.
     pub spill_dir: String,
@@ -76,6 +104,16 @@ pub struct EngineConfig {
     /// Whether inferred schema/fingerprint metadata should be persisted back to catalog.
     #[serde(default)]
     pub schema_writeback: bool,
+    /// Maximum recursive expansion depth for `WITH RECURSIVE` planning.
+    #[serde(default = "default_recursive_cte_max_depth")]
+    pub recursive_cte_max_depth: usize,
+    /// CTE reuse policy (`inline` or `materialize`).
+    #[serde(default)]
+    pub cte_reuse_policy: CteReusePolicy,
+}
+
+fn default_recursive_cte_max_depth() -> usize {
+    32
 }
 
 impl Default for EngineConfig {
@@ -85,12 +123,18 @@ impl Default for EngineConfig {
             mem_budget_bytes: 512 * 1024 * 1024, // 512MB
             shuffle_partitions: 64,
             broadcast_threshold_bytes: 64 * 1024 * 1024, // 64MB
+            join_radix_bits: 8,
+            join_bloom_enabled: true,
+            join_bloom_bits: 20,
+            prefer_sort_merge_join: false,
             spill_dir: "./ffq_spill".to_string(),
             catalog_path: None,
             coordinator_endpoint: None,
             schema_inference: SchemaInferencePolicy::default(),
             schema_drift_policy: SchemaDriftPolicy::default(),
             schema_writeback: false,
+            recursive_cte_max_depth: default_recursive_cte_max_depth(),
+            cte_reuse_policy: CteReusePolicy::default(),
         }
     }
 }
