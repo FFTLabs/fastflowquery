@@ -1138,16 +1138,17 @@ fn eval_plan_for_stage(
                 Arc::clone(&physical_registry),
             )?;
             let mut out_batches = Vec::with_capacity(child.batches.len());
-            let schema = Arc::new(Schema::new(
-                project
-                    .exprs
-                    .iter()
-                    .map(|(expr, name)| {
-                        let dt = compile_expr(expr, &child.schema)?.data_type();
-                        Ok(Field::new(name, dt, true))
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            ));
+                let schema = Arc::new(Schema::new(
+                    project
+                        .exprs
+                        .iter()
+                        .map(|(expr, name)| {
+                            let dt = compile_expr(expr, &child.schema)?.data_type();
+                            let nullable = infer_expr_nullable(expr, &child.schema)?;
+                            Ok(Field::new(name, dt, nullable))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ));
             for batch in &child.batches {
                 let cols = project
                     .exprs
@@ -2967,7 +2968,7 @@ fn evaluate_window_expr_with_ctx(
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut cnt = 0_i64;
-                    for pos in &part[fs..fe] {
+                    for pos in filtered_frame_positions(&frame, &part_ctx, part, fs, fe, i) {
                         if !matches!(values[*pos], ScalarValue::Null) {
                             cnt += 1;
                         }
@@ -2985,7 +2986,7 @@ fn evaluate_window_expr_with_ctx(
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut sum = 0.0_f64;
                     let mut seen = false;
-                    for pos in &part[fs..fe] {
+                    for pos in filtered_frame_positions(&frame, &part_ctx, part, fs, fe, i) {
                         match &values[*pos] {
                             ScalarValue::Int64(v) => {
                                 sum += *v as f64;
@@ -3020,7 +3021,7 @@ fn evaluate_window_expr_with_ctx(
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut sum = 0.0_f64;
                     let mut count = 0_i64;
-                    for pos in &part[fs..fe] {
+                    for pos in filtered_frame_positions(&frame, &part_ctx, part, fs, fe, i) {
                         if let Some(v) = scalar_to_f64(&values[*pos]) {
                             sum += v;
                             count += 1;
@@ -3046,7 +3047,7 @@ fn evaluate_window_expr_with_ctx(
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut current: Option<ScalarValue> = None;
-                    for pos in &part[fs..fe] {
+                    for pos in filtered_frame_positions(&frame, &part_ctx, part, fs, fe, i) {
                         let v = values[*pos].clone();
                         if matches!(v, ScalarValue::Null) {
                             continue;
@@ -3072,7 +3073,7 @@ fn evaluate_window_expr_with_ctx(
                 for i in 0..part.len() {
                     let (fs, fe) = resolve_frame_range(&frame, i, part, &part_ctx)?;
                     let mut current: Option<ScalarValue> = None;
-                    for pos in &part[fs..fe] {
+                    for pos in filtered_frame_positions(&frame, &part_ctx, part, fs, fe, i) {
                         let v = values[*pos].clone();
                         if matches!(v, ScalarValue::Null) {
                             continue;
@@ -3205,6 +3206,50 @@ fn window_output_nullable(w: &WindowExpr) -> bool {
     )
 }
 
+fn infer_expr_nullable(expr: &Expr, schema: &SchemaRef) -> Result<bool> {
+    match expr {
+        Expr::ColumnRef { index, .. } => Ok(schema.field(*index).is_nullable()),
+        Expr::Column(name) => {
+            let idx = schema.index_of(name).map_err(|e| {
+                FfqError::Execution(format!(
+                    "projection column resolution failed for '{name}': {e}"
+                ))
+            })?;
+            Ok(schema.field(idx).is_nullable())
+        }
+        Expr::Literal(v) => Ok(matches!(v, ffq_planner::LiteralValue::Null)),
+        Expr::Cast { expr, .. } => infer_expr_nullable(expr, schema),
+        Expr::IsNull(_) | Expr::IsNotNull(_) => Ok(false),
+        Expr::And(l, r)
+        | Expr::Or(l, r)
+        | Expr::BinaryOp {
+            left: l, right: r, ..
+        } => Ok(infer_expr_nullable(l, schema)? || infer_expr_nullable(r, schema)?),
+        Expr::Not(inner) => infer_expr_nullable(inner, schema),
+        Expr::CaseWhen {
+            branches,
+            else_expr,
+        } => {
+            let mut nullable = false;
+            for (cond, value) in branches {
+                nullable |= infer_expr_nullable(cond, schema)?;
+                nullable |= infer_expr_nullable(value, schema)?;
+            }
+            nullable |= else_expr
+                .as_ref()
+                .map(|e| infer_expr_nullable(e, schema))
+                .transpose()?
+                .unwrap_or(true);
+            Ok(nullable)
+        }
+        #[cfg(feature = "vector")]
+        Expr::CosineSimilarity { .. } | Expr::L2Distance { .. } | Expr::DotProduct { .. } => {
+            Ok(false)
+        }
+        Expr::ScalarUdf { .. } => Ok(true),
+    }
+}
+
 fn effective_window_frame(w: &WindowExpr) -> WindowFrameSpec {
     if let Some(frame) = &w.frame {
         return frame.clone();
@@ -3295,7 +3340,49 @@ fn resolve_frame_range(
     if end > part.len() {
         end = part.len();
     }
-    apply_exclusion(frame.exclusion, row_idx, start, end, ctx)
+    Ok((start, end))
+}
+
+fn filtered_frame_positions<'a>(
+    frame: &WindowFrameSpec,
+    ctx: &'a FrameCtx,
+    part: &'a [usize],
+    fs: usize,
+    fe: usize,
+    row_idx: usize,
+) -> Vec<&'a usize> {
+    match frame.exclusion {
+        WindowFrameExclusion::NoOthers => part[fs..fe].iter().collect(),
+        WindowFrameExclusion::CurrentRow => part[fs..fe]
+            .iter()
+            .filter(|p| **p != part[row_idx])
+            .collect(),
+        WindowFrameExclusion::Group => {
+            let g = ctx.row_group[row_idx];
+            let (gs, ge) = ctx.peer_groups[g];
+            part[fs..fe]
+                .iter()
+                .filter(|p| {
+                    let abs = part.iter().position(|v| *v == **p).unwrap_or(usize::MAX);
+                    abs < gs || abs >= ge
+                })
+                .collect()
+        }
+        WindowFrameExclusion::Ties => {
+            let g = ctx.row_group[row_idx];
+            let (gs, ge) = ctx.peer_groups[g];
+            part[fs..fe]
+                .iter()
+                .filter(|p| {
+                    if **p == part[row_idx] {
+                        return true;
+                    }
+                    let abs = part.iter().position(|v| *v == **p).unwrap_or(usize::MAX);
+                    abs < gs || abs >= ge
+                })
+                .collect()
+        }
+    }
 }
 
 fn resolve_rows_frame(
@@ -3363,63 +3450,6 @@ fn resolve_groups_frame(
     ctx: &FrameCtx,
 ) -> Result<(usize, usize)> {
     resolve_range_frame(frame, row_idx, ctx)
-}
-
-fn apply_exclusion(
-    exclusion: WindowFrameExclusion,
-    row_idx: usize,
-    start: usize,
-    end: usize,
-    ctx: &FrameCtx,
-) -> Result<(usize, usize)> {
-    if start >= end {
-        return Ok((0, 0));
-    }
-    let (s, e) = match exclusion {
-        WindowFrameExclusion::NoOthers => (start, end),
-        WindowFrameExclusion::CurrentRow => {
-            if row_idx < start || row_idx >= end {
-                (start, end)
-            } else if row_idx == start {
-                (start + 1, end)
-            } else if row_idx + 1 == end {
-                (start, end - 1)
-            } else {
-                return Ok((0, 0));
-            }
-        }
-        WindowFrameExclusion::Group => {
-            let g = ctx.row_group[row_idx];
-            let (gs, ge) = ctx.peer_groups[g];
-            if ge <= start || gs >= end {
-                (start, end)
-            } else if gs <= start && ge >= end {
-                (0, 0)
-            } else if gs <= start {
-                (ge, end)
-            } else if ge >= end {
-                (start, gs)
-            } else {
-                return Ok((0, 0));
-            }
-        }
-        WindowFrameExclusion::Ties => {
-            let g = ctx.row_group[row_idx];
-            let (gs, ge) = ctx.peer_groups[g];
-            if ge <= start || gs >= end {
-                (start, end)
-            } else if gs <= start && ge >= end {
-                (row_idx, row_idx + 1)
-            } else if gs <= start {
-                (ge, end)
-            } else if ge >= end {
-                (start, gs)
-            } else {
-                return Ok((row_idx, row_idx + 1));
-            }
-        }
-    };
-    Ok((s.min(e), e))
 }
 
 fn window_bound_preceding_offset(v: usize, where_: &str) -> Result<i64> {

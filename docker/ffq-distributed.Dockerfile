@@ -3,6 +3,7 @@ WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY third_party ./third_party
 COPY rust-toolchain.toml rustfmt.toml ./
 
 RUN cargo build --release -p ffq-distributed --features grpc --bin ffq-coordinator --bin ffq-worker

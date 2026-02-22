@@ -1999,6 +1999,7 @@ fn update_stage_stream_lag(metrics: &mut StageMetrics, elapsed_ms: u64) {
 
 type ReduceTaskAssignmentSpec = ReduceTaskAssignment;
 
+#[cfg(test)]
 fn deterministic_coalesce_split_groups(
     planned_partitions: u32,
     target_bytes: u64,
@@ -2905,7 +2906,9 @@ mod tests {
     #[test]
     fn coordinator_requeues_tasks_from_stale_worker() {
         let mut c = Coordinator::new(CoordinatorConfig {
-            worker_liveness_timeout_ms: 5,
+            // Keep the timeout modest and sleep longer than the timeout below so
+            // this test deterministically exercises stale-worker requeue.
+            worker_liveness_timeout_ms: 20,
             retry_backoff_base_ms: 0,
             ..CoordinatorConfig::default()
         });
@@ -2924,7 +2927,7 @@ mod tests {
         let first = assigned[0].clone();
         assert_eq!(first.attempt, 1);
 
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(25));
         let reassigned = c.get_task("w2", 1).expect("reassign");
         assert_eq!(reassigned.len(), 1);
         assert_eq!(reassigned[0].query_id, "10");
@@ -3592,13 +3595,14 @@ mod tests {
         let map1 = c.get_task("w1", 10).expect("map1").remove(0);
         assert_eq!(map1.attempt, 1);
 
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(25));
         c.heartbeat("w2", 0, &[]).expect("hb w2");
         let map2 = c.get_task("w2", 10).expect("map2").remove(0);
         assert_eq!(map2.stage_id, map1.stage_id);
         assert_eq!(map2.task_id, map1.task_id);
         assert_eq!(map2.attempt, 2);
 
+        c.heartbeat("w2", 0, &[]).expect("hb w2 before map2 success");
         c.register_map_output(
             "306".to_string(),
             map2.stage_id,
@@ -3662,7 +3666,7 @@ mod tests {
         c.heartbeat("w2", 0, &[]).expect("hb w2 pre-reduce");
         let reduce1 = c.get_task("w2", 10).expect("reduce1").remove(0);
         assert_eq!(reduce1.attempt, 1);
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(25));
 
         c.heartbeat("w3", 0, &[]).expect("hb w3");
         let reduce2 = c.get_task("w3", 10).expect("reduce2").remove(0);

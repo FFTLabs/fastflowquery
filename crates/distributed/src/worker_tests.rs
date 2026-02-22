@@ -91,6 +91,36 @@ fn write_parquet(
     writer.close().expect("close");
 }
 
+fn test_task_context(
+    query_id: &str,
+    stage_id: u64,
+    task_id: u64,
+    attempt: u32,
+    shuffle_root: &std::path::Path,
+) -> TaskContext {
+    TaskContext {
+        query_id: query_id.to_string(),
+        stage_id,
+        task_id,
+        attempt,
+        per_task_memory_budget_bytes: 1,
+        batch_size_rows: 8192,
+        spill_trigger_ratio_num: 1,
+        spill_trigger_ratio_den: 1,
+        join_radix_bits: 8,
+        join_bloom_enabled: true,
+        join_bloom_bits: 20,
+        shuffle_compression_codec: ffq_shuffle::ShuffleCompressionCodec::Lz4,
+        reduce_fetch_window_partitions: 4,
+        map_output_publish_window_partitions: 1,
+        spill_dir: std::env::temp_dir(),
+        shuffle_root: shuffle_root.to_path_buf(),
+        assigned_reduce_partitions: Vec::new(),
+        assigned_reduce_split_index: 0,
+        assigned_reduce_split_count: 1,
+    }
+}
+
 #[tokio::test]
 async fn coordinator_with_two_workers_runs_join_and_agg_query() {
     let lineitem_path = unique_path("ffq_dist_lineitem", "parquet");
@@ -501,24 +531,7 @@ async fn coordinator_with_workers_executes_custom_operator_stage() {
 fn shuffle_read_hash_requires_assigned_partitions() {
     let shuffle_root = unique_path("ffq_shuffle_read_assign_required", "dir");
     let _ = std::fs::create_dir_all(&shuffle_root);
-    let ctx = TaskContext {
-        query_id: "5001".to_string(),
-        stage_id: 0,
-        task_id: 0,
-        attempt: 1,
-        per_task_memory_budget_bytes: 1,
-        join_radix_bits: 8,
-        join_bloom_enabled: true,
-        join_bloom_bits: 20,
-        shuffle_compression_codec: ffq_shuffle::ShuffleCompressionCodec::Lz4,
-        reduce_fetch_window_partitions: 4,
-        map_output_publish_window_partitions: 1,
-        spill_dir: std::env::temp_dir(),
-        shuffle_root: shuffle_root.clone(),
-        assigned_reduce_partitions: Vec::new(),
-        assigned_reduce_split_index: 0,
-        assigned_reduce_split_count: 1,
-    };
+    let ctx = test_task_context("5001", 0, 0, 1, &shuffle_root);
     let err = read_stage_input_from_shuffle(
         1,
         &ffq_planner::PartitioningSpec::HashKeys {
@@ -554,24 +567,7 @@ fn shuffle_read_hash_reads_only_assigned_partition_subset() {
         batches: vec![input_batch],
     };
 
-    let map_ctx = TaskContext {
-        query_id: "5002".to_string(),
-        stage_id: 1,
-        task_id: 0,
-        attempt: 1,
-        per_task_memory_budget_bytes: 1,
-        join_radix_bits: 8,
-        join_bloom_enabled: true,
-        join_bloom_bits: 20,
-        shuffle_compression_codec: ffq_shuffle::ShuffleCompressionCodec::Lz4,
-        reduce_fetch_window_partitions: 4,
-        map_output_publish_window_partitions: 1,
-        spill_dir: std::env::temp_dir(),
-        shuffle_root: shuffle_root.clone(),
-        assigned_reduce_partitions: Vec::new(),
-        assigned_reduce_split_index: 0,
-        assigned_reduce_split_count: 1,
-    };
+    let map_ctx = test_task_context("5002", 1, 0, 1, &shuffle_root);
     let partitioning = ffq_planner::PartitioningSpec::HashKeys {
         keys: vec!["k".to_string()],
         partitions: 4,
@@ -582,22 +578,9 @@ fn shuffle_read_hash_reads_only_assigned_partition_subset() {
     let target = metas[0].clone();
 
     let reduce_ctx = TaskContext {
-        query_id: "5002".to_string(),
-        stage_id: 0,
         task_id: target.reduce_partition as u64,
-        attempt: 1,
-        per_task_memory_budget_bytes: 1,
-        join_radix_bits: 8,
-        join_bloom_enabled: true,
-        join_bloom_bits: 20,
-        shuffle_compression_codec: ffq_shuffle::ShuffleCompressionCodec::Lz4,
-        reduce_fetch_window_partitions: 4,
-        map_output_publish_window_partitions: 1,
-        spill_dir: std::env::temp_dir(),
-        shuffle_root: shuffle_root.clone(),
         assigned_reduce_partitions: vec![target.reduce_partition],
-        assigned_reduce_split_index: 0,
-        assigned_reduce_split_count: 1,
+        ..test_task_context("5002", 0, target.reduce_partition as u64, 1, &shuffle_root)
     };
     let out = read_stage_input_from_shuffle(1, &partitioning, 5002, &reduce_ctx)
         .expect("read assigned partition");
@@ -628,24 +611,7 @@ fn shuffle_read_hash_split_assignment_shards_one_partition_deterministically() {
         partitions: 4,
     };
 
-    let map_ctx = TaskContext {
-        query_id: "5003".to_string(),
-        stage_id: 1,
-        task_id: 0,
-        attempt: 1,
-        per_task_memory_budget_bytes: 1,
-        join_radix_bits: 8,
-        join_bloom_enabled: true,
-        join_bloom_bits: 20,
-        shuffle_compression_codec: ffq_shuffle::ShuffleCompressionCodec::Lz4,
-        reduce_fetch_window_partitions: 4,
-        map_output_publish_window_partitions: 1,
-        spill_dir: std::env::temp_dir(),
-        shuffle_root: shuffle_root.clone(),
-        assigned_reduce_partitions: Vec::new(),
-        assigned_reduce_split_index: 0,
-        assigned_reduce_split_count: 1,
-    };
+    let map_ctx = test_task_context("5003", 1, 0, 1, &shuffle_root);
     let metas =
         write_stage_shuffle_outputs(&child, &partitioning, 5003, &map_ctx).expect("write map");
     let target = metas
@@ -656,22 +622,11 @@ fn shuffle_read_hash_split_assignment_shards_one_partition_deterministically() {
 
     let read_rows = |split_index: u32| -> u64 {
         let reduce_ctx = TaskContext {
-            query_id: "5003".to_string(),
-            stage_id: 0,
             task_id: target.reduce_partition as u64,
-            attempt: 1,
-            per_task_memory_budget_bytes: 1,
-            join_radix_bits: 8,
-            join_bloom_enabled: true,
-            join_bloom_bits: 20,
-            shuffle_compression_codec: ffq_shuffle::ShuffleCompressionCodec::Lz4,
-            reduce_fetch_window_partitions: 4,
-            map_output_publish_window_partitions: 1,
-            spill_dir: std::env::temp_dir(),
-            shuffle_root: shuffle_root.clone(),
             assigned_reduce_partitions: vec![target.reduce_partition],
             assigned_reduce_split_index: split_index,
             assigned_reduce_split_count: 2,
+            ..test_task_context("5003", 0, target.reduce_partition as u64, 1, &shuffle_root)
         };
         let out = read_stage_input_from_shuffle(1, &partitioning, 5003, &reduce_ctx)
             .expect("read assigned partition");
@@ -704,24 +659,7 @@ fn shuffle_read_incremental_cursor_reads_only_unseen_bytes() {
     )
     .expect("batch2");
 
-    let map_ctx = TaskContext {
-        query_id: "5004".to_string(),
-        stage_id: 1,
-        task_id: 0,
-        attempt: 1,
-        per_task_memory_budget_bytes: 1,
-        join_radix_bits: 8,
-        join_bloom_enabled: true,
-        join_bloom_bits: 20,
-        shuffle_compression_codec: ffq_shuffle::ShuffleCompressionCodec::Lz4,
-        reduce_fetch_window_partitions: 4,
-        map_output_publish_window_partitions: 1,
-        spill_dir: std::env::temp_dir(),
-        shuffle_root: shuffle_root.clone(),
-        assigned_reduce_partitions: Vec::new(),
-        assigned_reduce_split_index: 0,
-        assigned_reduce_split_count: 1,
-    };
+    let map_ctx = test_task_context("5004", 1, 0, 1, &shuffle_root);
     let out1 = ExecOutput {
         schema: Arc::clone(&schema),
         batches: vec![batch1],
@@ -773,24 +711,7 @@ fn shuffle_read_incremental_cursor_resets_when_latest_attempt_changes() {
         partitions: 1,
     };
 
-    let base_ctx = TaskContext {
-        query_id: "5006".to_string(),
-        stage_id: 1,
-        task_id: 0,
-        attempt: 1,
-        per_task_memory_budget_bytes: 1,
-        join_radix_bits: 8,
-        join_bloom_enabled: true,
-        join_bloom_bits: 20,
-        shuffle_compression_codec: ffq_shuffle::ShuffleCompressionCodec::Lz4,
-        reduce_fetch_window_partitions: 4,
-        map_output_publish_window_partitions: 1,
-        spill_dir: std::env::temp_dir(),
-        shuffle_root: shuffle_root.clone(),
-        assigned_reduce_partitions: Vec::new(),
-        assigned_reduce_split_index: 0,
-        assigned_reduce_split_count: 1,
-    };
+    let base_ctx = test_task_context("5006", 1, 0, 1, &shuffle_root);
 
     write_stage_shuffle_outputs(
         &ExecOutput {

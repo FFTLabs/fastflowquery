@@ -22,6 +22,10 @@ pub fn explain_physical(plan: &PhysicalPlan) -> String {
 fn fmt_plan(plan: &LogicalPlan, indent: usize, out: &mut String) {
     let pad = "  ".repeat(indent);
     match plan {
+        LogicalPlan::SubqueryAlias { alias, input } => {
+            out.push_str(&format!("{pad}SubqueryAlias alias={alias}\n"));
+            fmt_plan(input, indent + 1, out);
+        }
         LogicalPlan::TableScan {
             table,
             projection,

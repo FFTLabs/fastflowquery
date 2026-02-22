@@ -807,22 +807,32 @@ fn table_factor_to_scan(
     ctes: &HashMap<String, CteBinding>,
 ) -> Result<LogicalPlan> {
     match tf {
-        TableFactor::Table { name, .. } => {
+        TableFactor::Table { name, alias, .. } => {
             let t = object_name_to_string(name);
-            if let Some(cte) = ctes.get(&t) {
+            let base_plan = if let Some(cte) = ctes.get(&t) {
                 if cte.materialize {
-                    return Ok(LogicalPlan::CteRef {
+                    LogicalPlan::CteRef {
                         name: t,
                         plan: Box::new(cte.plan.clone()),
-                    });
+                    }
+                } else {
+                    cte.plan.clone()
                 }
-                return Ok(cte.plan.clone());
+            } else {
+                LogicalPlan::TableScan {
+                    table: t,
+                    projection: None,
+                    filters: vec![],
+                }
+            };
+            if let Some(alias) = alias {
+                Ok(LogicalPlan::SubqueryAlias {
+                    alias: alias.name.value.clone(),
+                    input: Box::new(base_plan),
+                })
+            } else {
+                Ok(base_plan)
             }
-            Ok(LogicalPlan::TableScan {
-                table: t,
-                projection: None,
-                filters: vec![],
-            })
         }
         _ => Err(FfqError::Unsupported(
             "only simple table names in FROM are supported in v1".to_string(),

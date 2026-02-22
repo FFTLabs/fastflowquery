@@ -666,6 +666,7 @@ impl GroupedDataFrame {
 
 fn collect_table_refs(plan: &LogicalPlan, out: &mut Vec<String>) {
     match plan {
+        LogicalPlan::SubqueryAlias { input, .. } => collect_table_refs(input, out),
         LogicalPlan::TableScan { table, .. } => out.push(table.clone()),
         LogicalPlan::Projection { input, .. } => collect_table_refs(input, out),
         LogicalPlan::Filter { input, .. } => collect_table_refs(input, out),

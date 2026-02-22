@@ -21,7 +21,6 @@ use ffq_distributed::{
 };
 #[cfg(feature = "vector")]
 use ffq_planner::LiteralValue;
-use ffq_shuffle::ShuffleCompressionCodec;
 use ffq_storage::{TableDef, TableStats};
 use parquet::arrow::ArrowWriter;
 use tokio::sync::Mutex;
@@ -424,14 +423,10 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
             worker_id: "w1".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
-            join_radix_bits: 8,
-            join_bloom_enabled: true,
-            join_bloom_bits: 20,
-            shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
             map_output_publish_window_partitions: 1,
-            reduce_fetch_window_partitions: 4,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
+            ..WorkerConfig::default()
         },
         cp1,
         Arc::clone(&executor),
@@ -441,14 +436,10 @@ async fn distributed_runtime_collect_matches_embedded_for_join_agg() {
             worker_id: "w2".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
-            join_radix_bits: 8,
-            join_bloom_enabled: true,
-            join_bloom_bits: 20,
-            shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
             map_output_publish_window_partitions: 1,
-            reduce_fetch_window_partitions: 4,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
+            ..WorkerConfig::default()
         },
         cp2,
         executor,
@@ -996,14 +987,10 @@ async fn distributed_runtime_no_schema_parity_matches_embedded() {
             worker_id: "w1".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
-            join_radix_bits: 8,
-            join_bloom_enabled: true,
-            join_bloom_bits: 20,
-            shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
             map_output_publish_window_partitions: 1,
-            reduce_fetch_window_partitions: 4,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
+            ..WorkerConfig::default()
         },
         cp1,
         Arc::clone(&executor),
@@ -1013,14 +1000,10 @@ async fn distributed_runtime_no_schema_parity_matches_embedded() {
             worker_id: "w2".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
-            join_radix_bits: 8,
-            join_bloom_enabled: true,
-            join_bloom_bits: 20,
-            shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
             map_output_publish_window_partitions: 1,
-            reduce_fetch_window_partitions: 4,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
+            ..WorkerConfig::default()
         },
         cp2,
         executor,
@@ -1183,14 +1166,10 @@ async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
             worker_id: "w1".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
-            join_radix_bits: 8,
-            join_bloom_enabled: true,
-            join_bloom_bits: 20,
-            shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
             map_output_publish_window_partitions: 1,
-            reduce_fetch_window_partitions: 4,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
+            ..WorkerConfig::default()
         },
         cp1,
         Arc::clone(&executor),
@@ -1200,14 +1179,10 @@ async fn distributed_runtime_two_phase_vector_join_rerank_matches_embedded() {
             worker_id: "w2".to_string(),
             cpu_slots: 1,
             per_task_memory_budget_bytes: 1024 * 1024,
-            join_radix_bits: 8,
-            join_bloom_enabled: true,
-            join_bloom_bits: 20,
-            shuffle_compression_codec: ShuffleCompressionCodec::Lz4,
             map_output_publish_window_partitions: 1,
-            reduce_fetch_window_partitions: 4,
             spill_dir: spill_dir.clone(),
             shuffle_root: shuffle_root.clone(),
+            ..WorkerConfig::default()
         },
         cp2,
         executor,

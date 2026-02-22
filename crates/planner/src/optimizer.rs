@@ -358,6 +358,16 @@ fn proj_rewrite(
     ctx: &dyn OptimizerContext,
 ) -> Result<(LogicalPlan, HashSet<String>)> {
     match plan {
+        LogicalPlan::SubqueryAlias { alias, input } => {
+            let (new_in, req) = proj_rewrite(*input, required, ctx)?;
+            Ok((
+                LogicalPlan::SubqueryAlias {
+                    alias,
+                    input: Box::new(new_in),
+                },
+                req,
+            ))
+        }
         LogicalPlan::Limit { n, input } => {
             let (new_in, req) = proj_rewrite(*input, required, ctx)?;
             Ok((
@@ -1007,6 +1017,10 @@ fn join_strategy_hint(
 
 fn vector_index_rewrite(plan: LogicalPlan, ctx: &dyn OptimizerContext) -> Result<LogicalPlan> {
     match plan {
+        LogicalPlan::SubqueryAlias { alias, input } => Ok(LogicalPlan::SubqueryAlias {
+            alias,
+            input: Box::new(vector_index_rewrite(*input, ctx)?),
+        }),
         LogicalPlan::Filter { predicate, input } => Ok(LogicalPlan::Filter {
             predicate,
             input: Box::new(vector_index_rewrite(*input, ctx)?),
@@ -1648,6 +1662,10 @@ fn extract_filter_literal(e: &Expr) -> Option<serde_json::Value> {
 
 fn map_children(plan: LogicalPlan, f: impl Fn(LogicalPlan) -> LogicalPlan + Copy) -> LogicalPlan {
     match plan {
+        LogicalPlan::SubqueryAlias { alias, input } => LogicalPlan::SubqueryAlias {
+            alias,
+            input: Box::new(f(*input)),
+        },
         LogicalPlan::Filter { predicate, input } => LogicalPlan::Filter {
             predicate,
             input: Box::new(f(*input)),
@@ -1786,6 +1804,10 @@ fn try_map_children(
     f: impl Fn(LogicalPlan) -> Result<LogicalPlan> + Copy,
 ) -> Result<LogicalPlan> {
     Ok(match plan {
+        LogicalPlan::SubqueryAlias { alias, input } => LogicalPlan::SubqueryAlias {
+            alias,
+            input: Box::new(f(*input)?),
+        },
         LogicalPlan::Filter { predicate, input } => LogicalPlan::Filter {
             predicate,
             input: Box::new(f(*input)?),
@@ -1921,6 +1943,10 @@ fn try_map_children(
 
 fn rewrite_plan_exprs(plan: LogicalPlan, rewrite: &dyn Fn(Expr) -> Expr) -> LogicalPlan {
     match plan {
+        LogicalPlan::SubqueryAlias { alias, input } => LogicalPlan::SubqueryAlias {
+            alias,
+            input: Box::new(rewrite_plan_exprs(*input, rewrite)),
+        },
         LogicalPlan::Filter { predicate, input } => LogicalPlan::Filter {
             predicate: rewrite_expr(predicate, rewrite),
             input: Box::new(rewrite_plan_exprs(*input, rewrite)),
@@ -2311,6 +2337,7 @@ fn strip_qual(s: &str) -> String {
 
 fn plan_output_columns(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result<HashSet<String>> {
     match plan {
+        LogicalPlan::SubqueryAlias { input, .. } => plan_output_columns(input, ctx),
         LogicalPlan::TableScan {
             table, projection, ..
         } => {
@@ -2392,6 +2419,7 @@ fn estimate_bytes(plan: &LogicalPlan, ctx: &dyn OptimizerContext) -> Result<Opti
         | LogicalPlan::Window { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::TopKByScore { input, .. }
+        | LogicalPlan::SubqueryAlias { input, .. }
         | LogicalPlan::UnionAll { left: input, .. }
         | LogicalPlan::CteRef { plan: input, .. }
         | LogicalPlan::InsertInto { input, .. } => estimate_bytes(input, ctx),

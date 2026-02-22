@@ -106,6 +106,11 @@ impl Analyzer {
         provider: &dyn SchemaProvider,
     ) -> Result<(LogicalPlan, SchemaRef, Resolver)> {
         match plan {
+            LogicalPlan::SubqueryAlias { alias, input } => {
+                let (analyzed_input, schema, _resolver) = self.analyze_plan(*input, provider)?;
+                let resolver = Resolver::aliased(&alias, schema.clone());
+                Ok((analyzed_input, schema, resolver))
+            }
             LogicalPlan::TableScan {
                 table,
                 projection,
@@ -1447,6 +1452,15 @@ impl Resolver {
         }
     }
 
+    fn aliased(alias: &str, schema: SchemaRef) -> Self {
+        Self {
+            relations: vec![Relation {
+                name: alias.to_string(),
+                fields: schema.fields().iter().cloned().collect(),
+            }],
+        }
+    }
+
     fn join(left: Resolver, right: Resolver) -> Self {
         let mut rels = vec![];
         rels.extend(left.relations);
@@ -1682,11 +1696,15 @@ fn ensure_scan_projection_contains(
     needed: &std::collections::HashSet<String>,
 ) -> LogicalPlan {
     match plan {
+        LogicalPlan::SubqueryAlias { alias, input } => LogicalPlan::SubqueryAlias {
+            alias,
+            input: Box::new(ensure_scan_projection_contains(*input, needed)),
+        },
         LogicalPlan::TableScan {
-            table,
-            projection,
-            filters,
-        } => {
+                table,
+                projection,
+                filters,
+            } => {
             let mut cols = projection.unwrap_or_default();
             for col in needed {
                 if !cols.iter().any(|c| split_qual(c).1 == split_qual(col).1) {

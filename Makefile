@@ -9,6 +9,8 @@ SHELL := /bin/bash
 	tree \
 	test-planner \
 	test-unit \
+	test-distributed \
+	test-vector \
 	test \
 	test-fast \
 	test-slow-official \
@@ -74,6 +76,20 @@ test-planner:
 
 test-unit:
 	cargo test --workspace --lib
+
+test-distributed:
+	@set -euo pipefail; \
+	docker compose -f docker/compose/ffq.yml up --build -d; \
+	trap 'docker compose -f docker/compose/ffq.yml down -v' EXIT; \
+	cargo test -p ffq-distributed --features grpc; \
+	$(MAKE) test-13.1-distributed; \
+	$(MAKE) test-13.2-distributed
+
+test-vector:
+	$(MAKE) test-13.1-vector
+	cargo test -p ffq-client --test embedded_two_phase_retrieval --features vector
+	cargo test -p ffq-client --test qdrant_routing --features "vector,qdrant"
+	cargo test -p ffq-client --test public_api_contract --features vector
 
 test:
 	cargo test

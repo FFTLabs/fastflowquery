@@ -326,6 +326,18 @@ pub enum SubqueryCorrelation {
 ///   be applied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogicalPlan {
+    /// Apply a relation alias to an input plan for name resolution.
+    ///
+    /// This is an analysis-time wrapper emitted by the SQL frontend for
+    /// `FROM source alias` (including aliased CTE references). The analyzer uses
+    /// it to expose the input schema under a single relation name and may strip
+    /// it from the analyzed logical plan.
+    SubqueryAlias {
+        /// Relation alias visible to expressions (e.g. `a` in `a.col`).
+        alias: String,
+        /// Aliased input plan.
+        input: Box<LogicalPlan>,
+    },
     /// Scan a catalog table.
     TableScan {
         /// Catalog table name.

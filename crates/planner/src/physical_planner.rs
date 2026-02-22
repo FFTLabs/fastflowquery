@@ -40,6 +40,7 @@ pub fn create_physical_plan(
     cfg: &PhysicalPlannerConfig,
 ) -> Result<PhysicalPlan> {
     match logical {
+        LogicalPlan::SubqueryAlias { input, .. } => create_physical_plan(input, cfg),
         LogicalPlan::TableScan {
             table,
             projection,
